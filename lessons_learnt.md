@@ -9,6 +9,18 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- `ironrdp::connector::Config` and `Credentials` both derive `Debug`, so one `{:?}` prints the password (`creds::Secret`).
+  A redacting wrapper only protects the value up to the point it is handed to a
+  third-party type. IronRDP takes the password as a plain `String` inside a
+  `#[derive(Debug)]` struct, so the protection stops at the call boundary. Worth checking
+  for any secret passed into a dependency, not just this one.
+
+- `ironrdp-tls` accepts every certificate — `NoCertificateVerification` in its rustls backend (`crate::trust`).
+  Not a bug in the library: it cannot know the caller's trust policy. But it means a
+  client using it never detects a man-in-the-middle, and the failure is silent. We
+  replaced it with trust-on-first-use pinning; only the chain check is replaced, TLS
+  signature verification still runs the provider's real algorithms.
+
 - A coverage proxy you choose can be gamed by you: `rtt::coverage` needs a ≥6 h span, not 3 distinct UTC hour labels.
   P0a had to prove a latency baseline was "spread across ≥3 times of day". I picked
   "≥3 distinct UTC hours" as the machine-checkable proxy, wrote the check, and then

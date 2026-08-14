@@ -151,3 +151,9 @@ pre-bump. Patch unless semver clearly calls for more.
 Never log, print, or commit credentials, session contents, or clipboard payloads. The
 clipboard path in particular handles arbitrary user data — no debug logging of contents,
 only sizes and format IDs.
+
+**Never `{:?}` an `ironrdp::connector::Config` or `Credentials`.** Both
+`#[derive(Debug)]` upstream, so either one debug-printed renders the password in
+plaintext. `crate::creds::Secret` exists precisely so the password cannot print itself;
+that protection ends the moment the value is handed to IronRDP. Our own `ConnectReport`
+carries no credential field and must stay that way.
