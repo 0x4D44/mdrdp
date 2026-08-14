@@ -110,6 +110,53 @@ impl GfxStatsHandle {
 }
 
 /// Turns EGFX PDUs into pixels in a shared [`SurfaceStore`].
+/// Where to dump the bytes of a tile the decoder rejected.
+///
+/// Off unless asked for. The ClearCodec decoder has never been run against a real
+/// server's output and its bands path has no upstream tests, so the first failure is
+/// likely to be the interesting one — and it is far cheaper to debug from the exact
+/// bytes than to try to provoke it again live.
+///
+/// **This is session content.** Only the payload of tiles that FAILED to decode is
+/// written, never a successful frame, and only to a path the operator names.
+#[derive(Debug, Clone, Default)]
+pub struct FailureCapture {
+    dir: Option<std::path::PathBuf>,
+    written: Arc<Mutex<u32>>,
+}
+
+impl FailureCapture {
+    /// Capture into `dir`. Caller is stating they accept session bytes on disk.
+    pub fn to_dir(dir: impl Into<std::path::PathBuf>) -> Self {
+        FailureCapture {
+            dir: Some(dir.into()),
+            written: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    /// Cap the number of files, so one persistently bad stream cannot fill the disk.
+    const MAX_FILES: u32 = 20;
+
+    fn record(&self, width: u16, height: u16, bytes: &[u8]) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        let Ok(mut n) = self.written.lock() else {
+            return;
+        };
+        if *n >= Self::MAX_FILES {
+            return;
+        }
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let path = dir.join(format!("clearcodec-fail-{n:03}-{width}x{height}.bin"));
+        if std::fs::write(&path, bytes).is_ok() {
+            *n += 1;
+        }
+    }
+}
+
 pub struct GfxHandler {
     store: Arc<Mutex<SurfaceStore>>,
     /// One instance for the session — see the module docs.
@@ -123,6 +170,8 @@ pub struct GfxHandler {
     /// destination point that would overflow a `u16` coordinate before the store does
     /// the arithmetic.
     cache_dims: HashMap<u16, (u16, u16)>,
+    /// Opt-in dump of tiles the decoder rejected. Default: off.
+    capture: FailureCapture,
 }
 
 impl std::fmt::Debug for GfxHandler {
@@ -144,7 +193,19 @@ impl GfxHandler {
             stats: GfxStatsHandle::new(),
             live_surfaces: HashSet::new(),
             cache_dims: HashMap::new(),
+            capture: FailureCapture::default(),
         }
+    }
+
+    /// Dump the bytes of any tile the decoder rejects into `dir`.
+    ///
+    /// Writes session content, so it is opt-in and capped. Worth turning on for a first
+    /// run against an unfamiliar server: the ClearCodec bands path has no upstream tests,
+    /// and a captured payload is far cheaper to debug than a failure you must reproduce.
+    #[must_use]
+    pub fn capturing_failures_to(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.capture = FailureCapture::to_dir(dir);
+        self
     }
 
     /// A handle the caller keeps after the handler is boxed into the graphics client.
@@ -200,6 +261,8 @@ impl GfxHandler {
         {
             Ok(pixels) => pixels,
             Err(_) => {
+                self.capture
+                    .record(dest.width(), dest.height(), &pdu.bitmap_data);
                 // The error carries protocol field names, not pixels, but there is
                 // nothing here a counter does not already say. One dropped tile is a
                 // smear the next frame repaints; an error returned to the DVC processor

@@ -24,7 +24,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 fn usage() -> &'static str {
-    "usage: mdrdp <host> --user <account> [--port N] [--size WxH] [--domain D]"
+    "usage: mdrdp <host> --user <account> [--port N] [--size WxH] [--domain D]\n       [--capture-failures DIR]  dump undecodable tiles for offline debugging"
 }
 
 fn main() -> ExitCode {
@@ -49,6 +49,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut port: u16 = 3389;
     let mut domain: Option<String> = None;
     let mut size = (1024u16, 768u16);
+    let mut capture: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -60,6 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--user" => user = Some(value()?.clone()),
             "--port" => port = value()?.parse()?,
             "--domain" => domain = Some(value()?.clone()),
+            "--capture-failures" => capture = Some(value()?.clone()),
             "--size" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--size wants WxH, e.g. 1280x800")?;
@@ -78,6 +80,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // The stats handle must be taken before the handler is boxed away.
     let handler = GfxHandler::new(Arc::clone(&store));
+    let handler = match &capture {
+        Some(dir) => {
+            eprintln!("capturing undecodable tiles to {dir} (session content — your call)");
+            handler.capturing_failures_to(dir)
+        }
+        None => handler,
+    };
     let stats = handler.stats();
 
     let opts = ConnectOptions {
@@ -125,9 +134,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let end = session.shutdown();
     let s = stats.snapshot();
     eprintln!(
-        "session ended: {end:?} — frames {}, decode errors {}, codecs {:?}",
-        s.frames_completed, s.decode_errors, s.codec_ids_seen
+        "session ended: {end:?}\n  frames {}  decode errors {}  undecoded regions {}\n  codecs {:?}",
+        s.frames_completed, s.decode_errors, s.undecoded_regions, s.codec_ids_seen
     );
+    if s.decode_errors > 0 && capture.is_none() {
+        eprintln!(
+            "  {} tiles failed to decode. Re-run with --capture-failures <dir> to keep \
+             the bytes for offline debugging.",
+            s.decode_errors
+        );
+    }
+    if s.undecoded_regions > 0 {
+        eprintln!(
+            "  {} regions arrived in a codec we cannot yet decode (RFX Progressive); \
+             those parts of the desktop will be stale.",
+            s.undecoded_regions
+        );
+    }
 
     window_result?;
     Ok(())
