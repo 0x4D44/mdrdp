@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local machine state
+.DS_Store
+/.vscode
+/.idea
+
+# Never commit connection credentials or captured session data
+/favourites.local.toml
+*.rdpcap
+/bench-out/
