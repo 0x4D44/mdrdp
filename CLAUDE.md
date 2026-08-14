@@ -84,6 +84,23 @@ it does catch the `cfg` drift that actually happens.
   latency-degradation requirements are about behaviour over hours. A green unit test
   does not discharge them.
 
+## Connecting to the test host without breaking it
+
+**Always disconnect gracefully.** Abandoning a connection leaves the Windows host holding
+a session it does not reclaim promptly. On 2026-08-14 an evening of test connects — ours
+plus two Gauntlet critics running eight each — ended with `temper` refusing to complete
+any new logon: TCP and X.224 negotiation stayed perfectly healthy while everything after
+that hung indefinitely. **Pre-auth working while auth hangs is the signature of this
+condition** — it is not a network fault and not a credential fault.
+
+`connect` sends a Shutdown Request before exiting and reports `graceful_shutdown` in its
+output. Anything that connects in a loop must do the same.
+
+**Budget live connects.** Verification that hammers the host degrades the thing every
+later measurement depends on. Prefer a handful of runs with a pause between them over a
+tight loop, and treat "the host stopped completing logons" as a signal to stop and let it
+settle rather than to retry harder.
+
 ## The reference client
 
 Every Gauntlet comparison is against **Microsoft's Windows App 11.3.8**
