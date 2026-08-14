@@ -55,6 +55,8 @@ pub struct ConnectReport {
     pub trust: &'static str,
     pub desktop_width: u16,
     pub desktop_height: u16,
+    /// Whether a Shutdown Request was sent. False means a session may be left behind.
+    pub graceful_shutdown: bool,
     pub total_ms: f64,
 }
 
@@ -156,6 +158,36 @@ impl Trace {
 
 fn ms(d: Duration) -> f64 {
     (d.as_micros() as f64) / 1000.0
+}
+
+/// Send an [MS-RDPBCGR] Shutdown Request so the server tears the session down instead of
+/// leaving it disconnected-but-alive.
+fn disconnect_gracefully<S: std::io::Read + std::io::Write>(
+    result: ironrdp::connector::ConnectionResult,
+    framed: &mut Framed<S>,
+) -> Result<(), ConnectError> {
+    let stage = ironrdp::session::ActiveStageBuilder {
+        static_channels: result.static_channels,
+        user_channel_id: result.user_channel_id,
+        io_channel_id: result.io_channel_id,
+        message_channel_id: result.message_channel_id,
+        share_id: result.share_id,
+        compression_type: result.compression_type,
+        enable_server_pointer: result.enable_server_pointer,
+        pointer_software_rendering: result.pointer_software_rendering,
+    }
+    .build();
+
+    let outputs = stage
+        .graceful_shutdown()
+        .map_err(|e| ConnectError::Protocol(describe(&e)))?;
+
+    for output in outputs {
+        if let ironrdp::session::ActiveStageOutput::ResponseFrame(frame) = output {
+            framed.write_all(&frame).map_err(ConnectError::Io)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, ConnectError> {
@@ -306,6 +338,24 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
     trace.mark("post_tls_sequence", None);
     let connector_stages = stage_log.take();
 
+    // --- Graceful shutdown ------------------------------------------------------
+    //
+    // Not optional politeness. Abandoning the socket leaves a *disconnected session*
+    // alive on the Windows host, and they accumulate: an evening of test connects
+    // wedged `temper` until it stopped completing new logons at all. A client that
+    // cannot disconnect cleanly also makes soak and reconnect testing impossible.
+    //
+    // [MS-RDPBCGR] client-side graceful shutdown is a Shutdown Request PDU.
+    let desktop_size = result.desktop_size;
+    let shutdown = disconnect_gracefully(result, &mut framed);
+    trace.mark(
+        "graceful_shutdown",
+        Some(match &shutdown {
+            Ok(()) => "shutdown request sent".to_owned(),
+            Err(e) => format!("failed: {e}"),
+        }),
+    );
+
     let total_ms = ms(trace.started.elapsed());
     Ok(ConnectReport {
         target,
@@ -315,8 +365,9 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
         tls_cipher_suite,
         certificate_fingerprint: fingerprint.to_string(),
         trust,
-        desktop_width: result.desktop_size.width,
-        desktop_height: result.desktop_size.height,
+        desktop_width: desktop_size.width,
+        desktop_height: desktop_size.height,
+        graceful_shutdown: shutdown.is_ok(),
         total_ms,
     })
 }
@@ -377,6 +428,44 @@ mod tests {
         // Many wrappers embed their source's text. Repeating it makes the message worse.
         let err = layer("outer: inner detail", Some(layer("inner detail", None)));
         assert_eq!(describe(&err), "outer: inner detail");
+    }
+
+    #[test]
+    fn graceful_shutdown_produces_a_shutdown_request_frame() {
+        // Exercises the shutdown path without a server. The bug this guards against is
+        // silence: abandoning a session instead of ending it leaves a disconnected
+        // session alive on the Windows host, and they accumulate until it stops
+        // accepting logons.
+        let stage = ironrdp::session::ActiveStageBuilder {
+            static_channels: ironrdp::svc::StaticChannelSet::new(),
+            user_channel_id: 1002,
+            io_channel_id: 1003,
+            message_channel_id: Some(1004),
+            share_id: 0x0001_0001,
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+        }
+        .build();
+
+        let outputs = stage.graceful_shutdown().expect("shutdown must encode");
+        let frames: Vec<&Vec<u8>> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                ironrdp::session::ActiveStageOutput::ResponseFrame(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(frames.len(), 1, "expected exactly one shutdown frame");
+        assert!(!frames[0].is_empty(), "shutdown frame must carry bytes");
+        // TPKT-framed, like every other X.224-carried PDU on this connection.
+        assert_eq!(
+            frames[0][0],
+            0x03,
+            "should be TPKT version 3: {:02x?}",
+            &frames[0][..4.min(frames[0].len())]
+        );
     }
 
     #[test]

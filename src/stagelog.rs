@@ -21,6 +21,22 @@ use tracing_subscriber::layer::Context;
 /// The one field we read. Anything else is ignored.
 const STATE_FIELD: &str = "connector.state";
 
+/// Module whose activity proves the licensing exchange ran.
+///
+/// Licensing does not appear as a connector *state* when a message channel is present —
+/// IronRDP advances it inline during `SecureSettingsExchange` and never enters
+/// `ClientConnectorState::LicensingExchange`. But the module still emits events, and an
+/// event's **target** is a compile-time module path: it cannot contain session data,
+/// keys, or user input under any circumstances. Observing the target is therefore a
+/// payload-free proof that licensing occurred.
+///
+/// This matters because that module also emits `trace!(?encryption_data, …)` carrying
+/// licensing key material. We record that the module *spoke*, never what it said.
+const LICENSING_TARGET: &str = "ironrdp_connector::license_exchange";
+
+/// Name given to the synthetic stage recorded when licensing activity is observed.
+pub const LICENSING_STAGE: &str = "LicensingExchange (inline)";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StageEvent {
     /// An IronRDP `ClientConnectorState` name.
@@ -97,6 +113,13 @@ impl Visit for StateVisitor {
 
 impl<S: tracing::Subscriber> Layer<S> for StageLog {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        // Target first: licensing is proved by which module spoke, not by any field.
+        // `target()` is `&'static str` from the call site, so no payload can reach here.
+        if event.metadata().target() == LICENSING_TARGET {
+            self.record(LICENSING_STAGE);
+            return;
+        }
+
         let mut visitor = StateVisitor(None);
         event.record(&mut visitor);
         if let Some(state) = visitor.0 {
@@ -165,6 +188,68 @@ mod tests {
         assert!(
             !rendered.contains("4096"),
             "leaked a size field: {rendered}"
+        );
+    }
+
+    #[test]
+    fn licensing_is_recorded_from_the_module_target_not_a_state() {
+        // Licensing never appears as a connector state when a message channel is
+        // present, so the trace proves it happened by observing which module spoke.
+        let stages = with_log(|| {
+            tracing::debug!(connector.state = "Credssp", "step");
+            tracing::info!(target: "ironrdp_connector::license_exchange", "Client licensing completed");
+            tracing::debug!(connector.state = "CapabilitiesExchange", "step");
+        });
+        let names: Vec<&str> = stages.iter().map(|s| s.state.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Credssp", LICENSING_STAGE, "CapabilitiesExchange"],
+            "licensing must appear, in sequence"
+        );
+    }
+
+    #[test]
+    fn licensing_key_material_never_reaches_the_trace() {
+        // ironrdp_connector::license_exchange emits trace!(?encryption_data, ...) which
+        // carries licensing key material. We record that the module spoke, never what
+        // it said — this test is the guard on that distinction.
+        let stages = with_log(|| {
+            tracing::trace!(
+                target: "ironrdp_connector::license_exchange",
+                encryption_data = "SUPER-SECRET-LICENSE-KEY",
+                "Successfully generated Client License Info"
+            );
+            tracing::debug!(
+                target: "ironrdp_connector::license_exchange",
+                message = ?"a challenge PDU body",
+                "Received"
+            );
+        });
+        assert_eq!(
+            stages.len(),
+            1,
+            "both events collapse to one licensing stage"
+        );
+        assert_eq!(stages[0].state, LICENSING_STAGE);
+
+        let rendered = serde_json::to_string(&stages).expect("serialise");
+        for forbidden in ["SUPER-SECRET", "LICENSE-KEY", "challenge PDU"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "leaked {forbidden:?} into the trace: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrelated_module_target_is_not_mistaken_for_licensing() {
+        let stages = with_log(|| {
+            tracing::info!(target: "ironrdp_connector::license_exchange_helper", "not licensing");
+            tracing::info!(target: "some_other::license_exchange", "also not");
+        });
+        assert!(
+            stages.is_empty(),
+            "only the exact target counts: {stages:?}"
         );
     }
 

@@ -9,6 +9,15 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- An RDP client that abandons the socket leaves a live disconnected session on the host; call `graceful_shutdown` (`connect::disconnect_gracefully`).
+  Our connect binary reached capability exchange and exited. Windows keeps disconnected
+  sessions alive, so roughly twenty test connects in an evening ended with the host
+  refusing to complete any new logon — TCP and X.224 still fine, everything after that
+  hanging. `ironrdp-session`'s `ActiveStage::graceful_shutdown()` sends the Shutdown
+  Request that ends the session properly. Anything that connects in a loop — soak tests,
+  reconnect tests, a Gauntlet critic verifying live — needs this or it poisons its own
+  test host.
+
 - Quote a distribution, never one run: mdrdp connect varies 61-238 ms across 8 consecutive runs (`connect::ConnectReport`).
   Twice now a single sample has been published as a settled figure — the 4.20 ms latency
   floor, then a 142 ms connect time — and both were wrong enough to mislead. On a WiFi
