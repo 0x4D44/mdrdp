@@ -95,9 +95,9 @@ that hung indefinitely.
 **The signature, measured precisely:** TCP connects, X.224 still selects HYBRID_EX, and
 **the TLS handshake completes normally** (23.5 ms, correct certificate) — then CredSSP
 hangs forever. So the fault is in the host's logon path, not the network, not the
-transport, and not the credential. `scratchpad/rdp_stage_probe.py` isolates this without
-sending a credential or holding a session, so it is safe to run against a host that is
-already refusing logons.
+transport, and not the credential. `probe stages temper` isolates this without sending a
+credential or holding a session, so it is safe to run against a host that is already
+refusing logons — which is exactly when you need it.
 
 It did not clear on its own over 20 minutes of retries; assume it needs a reboot or a
 session kick.
