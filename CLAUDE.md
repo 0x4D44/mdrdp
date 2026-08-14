@@ -83,12 +83,24 @@ target for all protocol work and all comparisons against Microsoft's client.
 - **Measured latency floor: TCP RTT p50 4.20 ms.** Every latency claim is quoted against
   this baseline.
 
+- **It sends ClearCodec and RFX Progressive over EGFX — not H.264, and not RemoteFX.**
+  Measured, with AVC permitted on both sides and still unused. Neither codec is wired into
+  IronRDP's client decode path, so decoding them is our work. Read
+  `wrk_docs/2026.08.14 - SPIKE - P1b server codec negotiation against temper.md` before
+  designing anything that touches graphics.
+
 See `wrk_docs/2026.08.14 - SPIKE - P1 protocol posture against temper.md` for the
-evidence and the still-open codec question.
+security-negotiation evidence.
 
 Credentials for it live in the macOS keychain (service `mdrdp`), never in a config file,
 a test fixture, an environment variable, or a commit. Read them through the `keyring`
-crate. If you need a credential that is not there, stop and ask Arthur.
+crate. If you need a credential that is not there, stop and ask Arthur. The account
+authenticates as a bare `user@example.com` — no `temper\` or `MicrosoftAccount\`
+prefix.
+
+**Driving FreeRDP for comparison work:** use `sdl-freerdp`, not `xfreerdp`. The latter is
+the X11 client and fails instantly on this Mac (`failed to open display`; XQuartz is not
+installed) — a failure that looks like a connection problem and is not.
 
 ## Version policy
 
