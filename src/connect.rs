@@ -9,6 +9,7 @@
 //! elapsed time and negotiated parameters are the evidence; bytes are not.
 
 use crate::creds::Secret;
+use crate::egfx::{EgfxObservations, EgfxProbe};
 use crate::stagelog::{StageEvent, StageLog};
 use crate::trust::{Fingerprint, KnownHosts, TofuVerifier, TrustOutcome};
 use ironrdp::connector::{ClientConnector, Config, Credentials, DesktopSize};
@@ -31,6 +32,9 @@ pub struct ConnectOptions {
     pub domain: Option<String>,
     pub desktop_size: DesktopSize,
     pub known_hosts: PathBuf,
+    /// Open the graphics channel and observe what the server negotiates, for how long.
+    /// `None` connects and disconnects without touching EGFX (P2 behaviour).
+    pub observe_egfx: Option<Duration>,
 }
 
 /// One step of the connection sequence.
@@ -57,6 +61,8 @@ pub struct ConnectReport {
     pub desktop_height: u16,
     /// Whether a Shutdown Request was sent. False means a session may be left behind.
     pub graceful_shutdown: bool,
+    /// What the graphics pipeline negotiated, when observation was requested.
+    pub egfx: Option<EgfxObservations>,
     pub total_ms: f64,
 }
 
@@ -160,13 +166,12 @@ fn ms(d: Duration) -> f64 {
     (d.as_micros() as f64) / 1000.0
 }
 
-/// Send an [MS-RDPBCGR] Shutdown Request so the server tears the session down instead of
-/// leaving it disconnected-but-alive.
-fn disconnect_gracefully<S: std::io::Read + std::io::Write>(
+/// Build the active stage once. It owns the static channel set, so it cannot be built
+/// twice from one `ConnectionResult` — and both observation and shutdown need it.
+fn build_active_stage(
     result: ironrdp::connector::ConnectionResult,
-    framed: &mut Framed<S>,
-) -> Result<(), ConnectError> {
-    let stage = ironrdp::session::ActiveStageBuilder {
+) -> ironrdp::session::ActiveStage {
+    ironrdp::session::ActiveStageBuilder {
         static_channels: result.static_channels,
         user_channel_id: result.user_channel_id,
         io_channel_id: result.io_channel_id,
@@ -176,8 +181,19 @@ fn disconnect_gracefully<S: std::io::Read + std::io::Write>(
         enable_server_pointer: result.enable_server_pointer,
         pointer_software_rendering: result.pointer_software_rendering,
     }
-    .build();
+    .build()
+}
 
+/// Send an [MS-RDPBCGR] Shutdown Request so the server tears the session down instead of
+/// leaving it disconnected-but-alive.
+///
+/// Not optional politeness. Abandoning the socket leaves a session the host does not
+/// reclaim promptly; an evening of test connects wedged `temper` until it stopped
+/// completing logons at all.
+fn send_shutdown<S: std::io::Read + std::io::Write>(
+    stage: &ironrdp::session::ActiveStage,
+    framed: &mut Framed<S>,
+) -> Result<(), ConnectError> {
     let outputs = stage
         .graceful_shutdown()
         .map_err(|e| ConnectError::Protocol(describe(&e)))?;
@@ -185,6 +201,62 @@ fn disconnect_gracefully<S: std::io::Read + std::io::Write>(
     for output in outputs {
         if let ironrdp::session::ActiveStageOutput::ResponseFrame(frame) = output {
             framed.write_all(&frame).map_err(ConnectError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// Pump the session so the graphics channel can open, for a bounded time.
+///
+/// Bounded two ways: a wall-clock budget, and a socket read timeout so a server that
+/// simply says nothing cannot hold us. Both matter — if the server declines to open the
+/// graphics channel (see `crate::egfx` on the missing DYNVC_GFX flag) the correct
+/// outcome is a report saying so, not a hang.
+fn observe_egfx<S: std::io::Read + std::io::Write>(
+    stage: &mut ironrdp::session::ActiveStage,
+    framed: &mut Framed<S>,
+    socket: &TcpStream,
+    desktop: DesktopSize,
+    budget: Duration,
+) -> Result<(), ConnectError> {
+    use ironrdp::session::{ActiveStageOutput, image::DecodedImage};
+
+    // Short read timeout: quiet is an expected outcome here, not an error.
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+    let mut image = DecodedImage::new(
+        ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+        desktop.width,
+        desktop.height,
+    );
+
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        let (action, payload) = match framed.read_pdu() {
+            Ok(pdu) => pdu,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(ConnectError::Io(e)),
+        };
+
+        let outputs = stage
+            .process(&mut image, action, &payload)
+            .map_err(|e| ConnectError::Protocol(describe(&e)))?;
+
+        for out in outputs {
+            match out {
+                ActiveStageOutput::ResponseFrame(frame) => {
+                    framed.write_all(&frame).map_err(ConnectError::Io)?
+                }
+                ActiveStageOutput::Terminate(_) => return Ok(()),
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -237,7 +309,20 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
     };
 
     let client_addr = tcp.local_addr()?;
+    // A second handle to the same socket, so the observation phase can bound its reads
+    // without imposing a timeout on the CredSSP exchange.
+    let socket = tcp.try_clone()?;
+
     let mut connector = ClientConnector::new(config, client_addr);
+
+    // The dynamic virtual channel must be registered BEFORE connecting: it is announced
+    // in the MCS Connect Initial GCC network block, so it cannot be added afterwards.
+    let probe = opts.observe_egfx.map(|_| EgfxProbe::new());
+    if let Some(probe) = probe.clone() {
+        let graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(Box::new(probe), None);
+        connector = connector
+            .with_static_channel(ironrdp_dvc::DrdynvcClient::new().with_dynamic_channel(graphics));
+    }
 
     // --- X.224 security negotiation --------------------------------------------
     let mut framed = Framed::new(tcp);
@@ -338,16 +423,26 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
     trace.mark("post_tls_sequence", None);
     let connector_stages = stage_log.take();
 
-    // --- Graceful shutdown ------------------------------------------------------
-    //
-    // Not optional politeness. Abandoning the socket leaves a *disconnected session*
-    // alive on the Windows host, and they accumulate: an evening of test connects
-    // wedged `temper` until it stopped completing new logons at all. A client that
-    // cannot disconnect cleanly also makes soak and reconnect testing impossible.
-    //
-    // [MS-RDPBCGR] client-side graceful shutdown is a Shutdown Request PDU.
+    // --- Active stage, EGFX observation, and shutdown ----------------------------
     let desktop_size = result.desktop_size;
-    let shutdown = disconnect_gracefully(result, &mut framed);
+    let mut stage = build_active_stage(result);
+
+    let egfx = match (opts.observe_egfx, probe) {
+        (Some(budget), Some(probe)) => {
+            let outcome = observe_egfx(&mut stage, &mut framed, &socket, desktop_size, budget);
+            trace.mark(
+                "egfx_observation",
+                Some(match &outcome {
+                    Ok(()) => "completed".to_owned(),
+                    Err(e) => format!("stopped: {e}"),
+                }),
+            );
+            Some(probe.snapshot())
+        }
+        _ => None,
+    };
+
+    let shutdown = send_shutdown(&stage, &mut framed);
     trace.mark(
         "graceful_shutdown",
         Some(match &shutdown {
@@ -368,6 +463,7 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
         desktop_width: desktop_size.width,
         desktop_height: desktop_size.height,
         graceful_shutdown: shutdown.is_ok(),
+        egfx,
         total_ms,
     })
 }

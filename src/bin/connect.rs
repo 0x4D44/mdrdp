@@ -12,7 +12,7 @@ use mdrdp::trust::KnownHosts;
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "usage: connect <host> --user <account> [--port N] [--domain D] [--size WxH] [--out FILE]"
+    "usage: connect <host> --user <account> [--port N] [--domain D] [--size WxH] [--out FILE] [--egfx SECS]"
 }
 
 fn main() -> ExitCode {
@@ -38,6 +38,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut domain: Option<String> = None;
     let mut size = (1024u16, 768u16);
     let mut out: Option<String> = None;
+    let mut egfx: Option<std::time::Duration> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -50,6 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--port" => port = value()?.parse()?,
             "--domain" => domain = Some(value()?.clone()),
             "--out" => out = Some(value()?.clone()),
+            "--egfx" => egfx = Some(std::time::Duration::from_secs_f64(value()?.parse()?)),
             "--size" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--size wants WxH, e.g. 1024x768")?;
@@ -76,6 +78,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             height: size.1,
         },
         known_hosts,
+        observe_egfx: egfx,
     };
 
     let report = connect(&opts, &secret)?;

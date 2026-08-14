@@ -37,6 +37,16 @@ const LICENSING_TARGET: &str = "ironrdp_connector::license_exchange";
 /// Name given to the synthetic stage recorded when licensing activity is observed.
 pub const LICENSING_STAGE: &str = "LicensingExchange (inline)";
 
+/// Module targets whose activity is itself the milestone worth recording, mapped to the
+/// stage name to record. Targets are compile-time module paths, so this can never carry
+/// session data — which is what lets us observe modules that log payloads without
+/// reading any of them.
+const TARGET_STAGES: &[(&str, &str)] = &[
+    (LICENSING_TARGET, LICENSING_STAGE),
+    ("ironrdp_dvc::client", "DVC channel (drdynvc)"),
+    ("ironrdp_egfx::client", "EGFX graphics pipeline"),
+];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StageEvent {
     /// An IronRDP `ClientConnectorState` name.
@@ -113,10 +123,11 @@ impl Visit for StateVisitor {
 
 impl<S: tracing::Subscriber> Layer<S> for StageLog {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        // Target first: licensing is proved by which module spoke, not by any field.
+        // Target first: some stages are proved by which module spoke, not by any field.
         // `target()` is `&'static str` from the call site, so no payload can reach here.
-        if event.metadata().target() == LICENSING_TARGET {
-            self.record(LICENSING_STAGE);
+        let target = event.metadata().target();
+        if let Some((_, stage)) = TARGET_STAGES.iter().find(|(t, _)| *t == target) {
+            self.record(stage);
             return;
         }
 
