@@ -65,7 +65,9 @@ stdin closed — `cargo test </dev/null` — or a test that reads stdin hangs fo
 - **A latency or throughput claim needs a number and the conditions it was taken under**
   (host, network, resolution, codec, build profile). "Feels fast" is not a result.
 - **Protocol changes need a real server.** Windows 11 Pro over LAN is the reference
-  target. A change that only passes against a mock has not been validated.
+  target. A change that only passes against a mock has not been validated. Arthur can
+  provision a Windows terminal-server box to test against — ask him rather than
+  substituting a mock or a Linux RDP server for protocol work.
 - **Soak-class requirements need soak-class evidence.** The clipboard and
   latency-degradation requirements are about behaviour over hours. A green unit test
   does not discharge them.
