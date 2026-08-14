@@ -31,6 +31,10 @@ const NEG_STRUCT_LEN: u16 = 8;
 /// Byte offset of the negotiation structure: TPKT header (4) + X.224 CC header (7).
 const NEG_OFFSET: usize = 11;
 
+/// Bytes in a class-0 connection confirm after the length indicator and before any
+/// variable part: code, dst-ref, src-ref, class.
+const X224_CC_FIXED_LEN: usize = 6;
+
 pub fn protocol_name(protocol: u32) -> &'static str {
     match protocol {
         PROTOCOL_RDP => "RDP (legacy, no TLS)",
@@ -98,6 +102,8 @@ pub enum ParseError {
     NotConnectionConfirm(u8),
     UnknownNegotiationType(u8),
     BadNegotiationLength(u16),
+    /// The X.224 length indicator is too small to describe a connection confirm.
+    BadX224Length(u8),
 }
 
 impl fmt::Display for ParseError {
@@ -118,6 +124,13 @@ impl fmt::Display for ParseError {
             }
             ParseError::BadNegotiationLength(l) => {
                 write!(f, "negotiation structure declares length {l}, expected 8")
+            }
+            ParseError::BadX224Length(l) => {
+                write!(
+                    f,
+                    "X.224 length indicator {l} is below the {X224_CC_FIXED_LEN}-byte \
+                     connection-confirm minimum"
+                )
             }
         }
     }
@@ -178,17 +191,26 @@ pub fn parse_connection_confirm(buf: &[u8]) -> Result<NegotiationOutcome, ParseE
         return Err(ParseError::NotConnectionConfirm(buf[5]));
     }
 
-    // A confirm with nothing after the X.224 header carries no negotiation structure.
-    if declared <= NEG_OFFSET {
+    // The X.224 length indicator counts the bytes after itself. A class-0 connection
+    // confirm has a 6-byte fixed part; anything beyond that is the variable part, which
+    // is where the negotiation structure lives. Deriving the presence of that structure
+    // from the length indicator — rather than assuming a fixed offset — is what keeps
+    // this correct against a confirm carrying other class-specific fields.
+    let li = buf[4] as usize;
+    if li < X224_CC_FIXED_LEN {
+        return Err(ParseError::BadX224Length(buf[4]));
+    }
+    let variable_len = li - X224_CC_FIXED_LEN;
+    if variable_len == 0 {
         return Ok(NegotiationOutcome::Absent);
     }
 
     // The negotiation structure is fixed at 8 bytes: type, flags, length, payload.
     let end = NEG_OFFSET + NEG_STRUCT_LEN as usize;
-    if declared < end {
+    if variable_len < NEG_STRUCT_LEN as usize || declared < end || buf.len() < end {
         return Err(ParseError::TooShort {
             need: end,
-            got: declared,
+            got: declared.min(buf.len()),
         });
     }
 

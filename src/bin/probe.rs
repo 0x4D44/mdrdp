@@ -8,17 +8,18 @@
 //!     probe rtt <host> [--samples N] [--interval-ms N] [--out FILE]
 //!     probe summarise <file>
 
-use mdrdp::probe::{negotiation, rtt, stats};
+use mdrdp::probe::{negotiation, rtt, stats, wire};
 use serde_json::json;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_PORT: u16 = 3389;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Wall-clock budget for reading one response, enforced across the whole message.
+const READ_DEADLINE: Duration = Duration::from_secs(5);
 
 fn usage() -> &'static str {
     "usage:\n  \
@@ -48,36 +49,16 @@ fn main() -> ExitCode {
     }
 }
 
-/// Read one complete TPKT-framed message.
-///
-/// A single `read` is not guaranteed to return the whole message, so the length is taken
-/// from the header and the remainder read explicitly.
-fn read_tpkt(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header)?;
-
-    let declared = u16::from_be_bytes([header[2], header[3]]) as usize;
-    if declared < header.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("TPKT declares {declared} bytes, shorter than its own header"),
-        ));
-    }
-
-    let mut buf = header.to_vec();
-    buf.resize(declared, 0);
-    stream.read_exact(&mut buf[4..])?;
-    Ok(buf)
-}
-
 /// Send one connection request and report what the server answers.
-fn probe_offer(addr: &SocketAddr, requested: u32) -> io::Result<serde_json::Value> {
+fn probe_offer(addr: &SocketAddr, requested: u32) -> std::io::Result<serde_json::Value> {
     let mut stream = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_nodelay(true)?;
 
     stream.write_all(&negotiation::connection_request(requested))?;
-    let response = read_tpkt(&mut stream)?;
+
+    // The deadline covers the whole response. Per-syscall timeouts do not bound a
+    // trickling peer; see probe::wire.
+    let response = wire::read_tpkt(&mut stream, Instant::now() + READ_DEADLINE)?;
 
     let parsed = negotiation::parse_connection_confirm(&response);
     Ok(match parsed {

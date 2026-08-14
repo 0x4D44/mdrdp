@@ -1,0 +1,23 @@
+{
+  "baseline_status": "PROVISIONAL - does not meet the >=1000 sample / >=3 distinct UTC hour requirement",
+  "coverage": {
+    "distinct_utc_hours": 1,
+    "meets_requirement": false,
+    "required_distinct_hours": 3,
+    "required_samples": 1000,
+    "samples": 1000
+  },
+  "malformed_lines": 0,
+  "source": "baseline/temper-rtt.jsonl",
+  "summary_micros": {
+    "max": 10952,
+    "mean": 3576.018,
+    "min": 2183,
+    "n": 1000,
+    "p50": 3522,
+    "p50_ci_high": 3557,
+    "p50_ci_low": 3469,
+    "p95": 4651,
+    "p99": 5482
+  }
+}
