@@ -6,4 +6,5 @@
 pub mod connect;
 pub mod creds;
 pub mod probe;
+pub mod stagelog;
 pub mod trust;

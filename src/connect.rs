@@ -9,6 +9,7 @@
 //! elapsed time and negotiated parameters are the evidence; bytes are not.
 
 use crate::creds::Secret;
+use crate::stagelog::{StageEvent, StageLog};
 use crate::trust::{Fingerprint, KnownHosts, TofuVerifier, TrustOutcome};
 use ironrdp::connector::{ClientConnector, Config, Credentials, DesktopSize};
 use ironrdp_blocking::{Framed, connect_begin, connect_finalize, mark_as_upgraded};
@@ -21,6 +22,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing_subscriber::layer::SubscriberExt as _;
 
 pub struct ConnectOptions {
     pub host: String,
@@ -42,7 +44,11 @@ pub struct Stage {
 #[derive(Debug, Serialize)]
 pub struct ConnectReport {
     pub target: String,
+    /// Coarse phases measured by this crate.
     pub stages: Vec<Stage>,
+    /// The connector's own state sequence, captured from IronRDP's instrumentation.
+    /// This is what shows CredSSP, licensing and capability exchange as distinct legs.
+    pub connector_stages: Vec<StageEvent>,
     pub tls_version: Option<String>,
     pub tls_cipher_suite: Option<String>,
     pub certificate_fingerprint: String,
@@ -278,22 +284,33 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
     let mut framed = Framed::new(tls);
     let mut network_client = NoKerberos;
 
-    let result = connect_finalize(
-        upgraded,
-        connector,
-        &mut framed,
-        &mut network_client,
-        ironrdp::connector::ServerName::new(opts.host.clone()),
-        public_key,
-        None,
-    )
+    // IronRDP reports each connector state as it steps; capture that rather than
+    // reimplementing its loop. Scoped to this call, so nothing is installed globally.
+    let stage_log = StageLog::new();
+    let subscriber = tracing_subscriber::registry().with(stage_log.clone());
+    stage_log.start();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        connect_finalize(
+            upgraded,
+            connector,
+            &mut framed,
+            &mut network_client,
+            ironrdp::connector::ServerName::new(opts.host.clone()),
+            public_key,
+            None,
+        )
+    })
     .map_err(|e| ConnectError::Protocol(describe(&e)))?;
-    trace.mark("credssp_and_capability_exchange", None);
+    // Named for what it actually covers: CredSSP, MCS, licensing, capability exchange
+    // and finalization together. connector_stages breaks it down.
+    trace.mark("post_tls_sequence", None);
+    let connector_stages = stage_log.take();
 
     let total_ms = ms(trace.started.elapsed());
     Ok(ConnectReport {
         target,
         stages: trace.stages,
+        connector_stages,
         tls_version,
         tls_cipher_suite,
         certificate_fingerprint: fingerprint.to_string(),

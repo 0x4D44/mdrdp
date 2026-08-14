@@ -1,0 +1,58 @@
+{
+  "target": "temper:3389",
+  "stages": [
+    {
+      "name": "tcp_connect",
+      "elapsed_ms": 7.406,
+      "detail": "192.0.2.171:3389"
+    },
+    {
+      "name": "x224_negotiation",
+      "elapsed_ms": 9.474,
+      "detail": "HYBRID_EX requested"
+    },
+    {
+      "name": "tls_handshake",
+      "elapsed_ms": 5.111,
+      "detail": "pinned (matched stored fingerprint)"
+    },
+    {
+      "name": "post_tls_sequence",
+      "elapsed_ms": 51.516,
+      "detail": null
+    }
+  ],
+  "connector_stages": [
+    {
+      "state": "Credssp",
+      "elapsed_ms": 11.705
+    },
+    {
+      "state": "BasicSettingsExchangeWaitResponse",
+      "elapsed_ms": 3.137
+    },
+    {
+      "state": "ChannelConnection",
+      "elapsed_ms": 3.551
+    },
+    {
+      "state": "ConnectTimeAutoDetection",
+      "elapsed_ms": 3.244
+    },
+    {
+      "state": "CapabilitiesExchange",
+      "elapsed_ms": 3.11
+    },
+    {
+      "state": "ConnectionFinalization",
+      "elapsed_ms": 26.735999999999997
+    }
+  ],
+  "tls_version": "TLSv1_3",
+  "tls_cipher_suite": "TLS13_AES_256_GCM_SHA384",
+  "certificate_fingerprint": "sha256:2c7d5aaba40f744c5fb9105eea59346b2aa9105a5e1317e8f086ee69813bebf4",
+  "trust": "pinned (matched stored fingerprint)",
+  "desktop_width": 1024,
+  "desktop_height": 768,
+  "total_ms": 73.508
+}

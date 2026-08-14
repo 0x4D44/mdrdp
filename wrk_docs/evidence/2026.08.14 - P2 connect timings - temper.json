@@ -1,0 +1,82 @@
+{
+  "target": "temper:3389",
+  "note": "Distribution over consecutive connects from one release build, LAN/WiFi. Reported as a distribution because single-run figures for this workload are not reproducible - the spread below is why.",
+  "runs": 8,
+  "total": {
+    "n": 8,
+    "min_ms": 60.85,
+    "median_ms": 129.01,
+    "max_ms": 238.36
+  },
+  "phases": {
+    "tcp_connect": {
+      "n": 8,
+      "min_ms": 5.19,
+      "median_ms": 6.13,
+      "max_ms": 99.81
+    },
+    "x224_negotiation": {
+      "n": 8,
+      "min_ms": 5.04,
+      "median_ms": 7.15,
+      "max_ms": 13.39
+    },
+    "tls_handshake": {
+      "n": 8,
+      "min_ms": 3.41,
+      "median_ms": 4.07,
+      "max_ms": 120.95
+    },
+    "post_tls_sequence": {
+      "n": 8,
+      "min_ms": 43.58,
+      "median_ms": 64.56,
+      "max_ms": 190.51
+    }
+  },
+  "connector_stages": {
+    "Credssp": {
+      "n": 8,
+      "min_ms": 5.17,
+      "median_ms": 6.51,
+      "max_ms": 124.5
+    },
+    "BasicSettingsExchangeWaitResponse": {
+      "n": 8,
+      "min_ms": 2.06,
+      "median_ms": 2.99,
+      "max_ms": 27.26
+    },
+    "ChannelConnection": {
+      "n": 8,
+      "min_ms": 2.55,
+      "median_ms": 3.29,
+      "max_ms": 32.51
+    },
+    "ConnectTimeAutoDetection": {
+      "n": 8,
+      "min_ms": 1.89,
+      "median_ms": 2.62,
+      "max_ms": 4.41
+    },
+    "CapabilitiesExchange": {
+      "n": 8,
+      "min_ms": 2.42,
+      "median_ms": 2.77,
+      "max_ms": 30.88
+    },
+    "ConnectionFinalization": {
+      "n": 8,
+      "min_ms": 25.98,
+      "median_ms": 28.66,
+      "max_ms": 147.28
+    }
+  },
+  "constant_across_runs": {
+    "tls_version": "TLSv1_3",
+    "tls_cipher_suite": "TLS13_AES_256_GCM_SHA384",
+    "certificate_fingerprint": "sha256:2c7d5aaba40f744c5fb9105eea59346b2aa9105a5e1317e8f086ee69813bebf4",
+    "trust": "pinned (matched stored fingerprint)",
+    "desktop": "1024x768"
+  }
+}

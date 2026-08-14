@@ -9,6 +9,25 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- Quote a distribution, never one run: mdrdp connect varies 61-238 ms across 8 consecutive runs (`connect::ConnectReport`).
+  Twice now a single sample has been published as a settled figure — the 4.20 ms latency
+  floor, then a 142 ms connect time — and both were wrong enough to mislead. On a WiFi
+  LAN the spread is 4x. If a number will be reasoned from later, it needs n, min, median
+  and max, or it is an anecdote wearing a decimal point.
+
+- A stage you cannot measure separately is one you must not attribute: "CredSSP is 84% of connect" was the whole post-TLS blob (`stagelog`).
+  The code had one span covering CredSSP, MCS, licensing, capability exchange and
+  finalization, so naming any one of them as the cost was arithmetic dressed as evidence.
+  Real split: CredSSP ~6.5 ms median, ConnectionFinalization ~29 ms. Capture the
+  breakdown before drawing a conclusion from the total, and prefer reading a dependency's
+  own instrumentation over reimplementing its loop to time it.
+
+- macOS keychain ACLs bind to the exact binary, so every rebuild re-prompts — code signing is a functional need, not a distribution chore (`creds`).
+  "Always allow" grants access to a binary hash that the next `cargo build` invalidates.
+  `-A` on the item bypasses ACLs for development. The real fix is a stable code signature,
+  and it matters for the product: a launcher that spawns a process per session would
+  prompt the user on every single launch without one.
+
 - `ironrdp::connector::Config` and `Credentials` both derive `Debug`, so one `{:?}` prints the password (`creds::Secret`).
   A redacting wrapper only protects the value up to the point it is handed to a
   third-party type. IronRDP takes the password as a plain `String` inside a

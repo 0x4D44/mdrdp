@@ -12,7 +12,7 @@ use mdrdp::trust::KnownHosts;
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "usage: connect <host> --user <account> [--port N] [--domain D] [--size WxH]"
+    "usage: connect <host> --user <account> [--port N] [--domain D] [--size WxH] [--out FILE]"
 }
 
 fn main() -> ExitCode {
@@ -37,6 +37,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut port: u16 = 3389;
     let mut domain: Option<String> = None;
     let mut size = (1024u16, 768u16);
+    let mut out: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -48,6 +49,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--user" => user = Some(value()?.clone()),
             "--port" => port = value()?.parse()?,
             "--domain" => domain = Some(value()?.clone()),
+            "--out" => out = Some(value()?.clone()),
             "--size" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--size wants WxH, e.g. 1024x768")?;
@@ -77,6 +79,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let report = connect(&opts, &secret)?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let json = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = &out {
+        std::fs::write(path, format!("{json}\n"))?;
+    }
+    println!("{json}");
     Ok(())
 }
