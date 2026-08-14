@@ -90,8 +90,17 @@ it does catch the `cfg` drift that actually happens.
 a session it does not reclaim promptly. On 2026-08-14 an evening of test connects — ours
 plus two Gauntlet critics running eight each — ended with `temper` refusing to complete
 any new logon: TCP and X.224 negotiation stayed perfectly healthy while everything after
-that hung indefinitely. **Pre-auth working while auth hangs is the signature of this
-condition** — it is not a network fault and not a credential fault.
+that hung indefinitely.
+
+**The signature, measured precisely:** TCP connects, X.224 still selects HYBRID_EX, and
+**the TLS handshake completes normally** (23.5 ms, correct certificate) — then CredSSP
+hangs forever. So the fault is in the host's logon path, not the network, not the
+transport, and not the credential. `scratchpad/rdp_stage_probe.py` isolates this without
+sending a credential or holding a session, so it is safe to run against a host that is
+already refusing logons.
+
+It did not clear on its own over 20 minutes of retries; assume it needs a reboot or a
+session kick.
 
 `connect` sends a Shutdown Request before exiting and reports `graceful_shutdown` in its
 output. Anything that connects in a loop must do the same.
