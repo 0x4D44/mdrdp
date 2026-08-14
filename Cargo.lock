@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "mdrdp"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "ironrdp",
  "ironrdp-blocking",
