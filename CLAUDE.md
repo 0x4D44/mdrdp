@@ -64,13 +64,31 @@ stdin closed — `cargo test </dev/null` — or a test that reads stdin hangs fo
   10-30x slower unoptimised; a debug measurement is noise, not evidence.
 - **A latency or throughput claim needs a number and the conditions it was taken under**
   (host, network, resolution, codec, build profile). "Feels fast" is not a result.
-- **Protocol changes need a real server.** Windows 11 Pro over LAN is the reference
-  target. A change that only passes against a mock has not been validated. Arthur can
-  provision a Windows terminal-server box to test against — ask him rather than
-  substituting a mock or a Linux RDP server for protocol work.
+- **Protocol changes need a real server.** A change that only passes against a mock has
+  not been validated. Never substitute a mock or a Linux RDP server for protocol work.
 - **Soak-class requirements need soak-class evidence.** The clipboard and
   latency-degradation requirements are about behaviour over hours. A green unit test
   does not discharge them.
+
+## The test host
+
+`temper` (`temper.lan.example`, `192.0.2.171`) on the LAN, port 3389. It is the reference
+target for all protocol work and all comparisons against Microsoft's client.
+
+- **ICMP is blocked** (Windows Firewall default). `ping temper` fails on a perfectly
+  healthy host — test reachability with a TCP connect to 3389 instead.
+- **It requires NLA** — it selects HYBRID_EX and rejects legacy RDP security outright.
+  There is no unauthenticated path to a first pixel, so the credential path is on the
+  critical path for the very first working connection, not a later hardening phase.
+- **Measured latency floor: TCP RTT p50 4.20 ms.** Every latency claim is quoted against
+  this baseline.
+
+See `wrk_docs/2026.08.14 - SPIKE - P1 protocol posture against temper.md` for the
+evidence and the still-open codec question.
+
+Credentials for it live in the macOS keychain (service `mdrdp`), never in a config file,
+a test fixture, an environment variable, or a commit. Read them through the `keyring`
+crate. If you need a credential that is not there, stop and ask Arthur.
 
 ## Version policy
 
