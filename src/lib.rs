@@ -3,5 +3,7 @@
 //! The library half exists so the client and the measurement harness share one
 //! implementation of the things both need to agree on.
 
+pub mod connect;
+pub mod creds;
 pub mod probe;
 pub mod trust;

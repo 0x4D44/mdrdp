@@ -1,0 +1,369 @@
+//! Drive an RDP connection through to capability exchange.
+//!
+//! Sequence: TCP → X.224 security negotiation → TLS (pinned) → CredSSP/NLA → MCS →
+//! licensing → Demand Active / Confirm Active → finalization.
+//!
+//! Records a **payload-free** stage trace as it goes. Under HYBRID_EX everything after
+//! negotiation is inside TLS, so a packet capture proves nothing and decrypting one
+//! would manufacture exactly the material we are forbidden to keep. Stage name, outcome,
+//! elapsed time and negotiated parameters are the evidence; bytes are not.
+
+use crate::creds::Secret;
+use crate::trust::{Fingerprint, KnownHosts, TofuVerifier, TrustOutcome};
+use ironrdp::connector::{ClientConnector, Config, Credentials, DesktopSize};
+use ironrdp_blocking::{Framed, connect_begin, connect_finalize, mark_as_upgraded};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConnection, StreamOwned};
+use serde::Serialize;
+use std::fmt;
+use std::io::Write as _;
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+pub struct ConnectOptions {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub domain: Option<String>,
+    pub desktop_size: DesktopSize,
+    pub known_hosts: PathBuf,
+}
+
+/// One step of the connection sequence.
+#[derive(Debug, Clone, Serialize)]
+pub struct Stage {
+    pub name: &'static str,
+    pub elapsed_ms: f64,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConnectReport {
+    pub target: String,
+    pub stages: Vec<Stage>,
+    pub tls_version: Option<String>,
+    pub tls_cipher_suite: Option<String>,
+    pub certificate_fingerprint: String,
+    pub trust: &'static str,
+    pub desktop_width: u16,
+    pub desktop_height: u16,
+    pub total_ms: f64,
+}
+
+#[derive(Debug)]
+pub enum ConnectError {
+    Io(std::io::Error),
+    Tls(String),
+    Trust(String),
+    /// The connector refused. Carries IronRDP's own message, which names the stage.
+    Protocol(String),
+    NoPeerCertificate,
+}
+
+impl fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectError::Io(e) => write!(f, "network error: {e}"),
+            ConnectError::Tls(m) => write!(f, "TLS error: {m}"),
+            ConnectError::Trust(m) => write!(f, "certificate trust failure: {m}"),
+            ConnectError::Protocol(m) => write!(f, "RDP connection failed: {m}"),
+            ConnectError::NoPeerCertificate => write!(f, "server presented no certificate"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
+impl From<std::io::Error> for ConnectError {
+    fn from(e: std::io::Error) -> Self {
+        ConnectError::Io(e)
+    }
+}
+
+/// Render an error together with its `source()` chain.
+///
+/// IronRDP's own `Display` for a connector error prints only the outermost layer, which
+/// for a rejected login reads `[CredSSP @ connector.rs:113] CredSSP` — true, and useless
+/// to whoever has to fix it. The cause naming *why* authentication failed is one or more
+/// links down the chain.
+fn describe(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+/// Kerberos is out of scope; `temper` authenticates with NTLM over CredSSP.
+///
+/// This exists because the connector requires a network client for KDC traffic. If it is
+/// ever called, that is a real finding — say so loudly rather than appearing to work.
+#[derive(Debug, Default)]
+struct NoKerberos;
+
+impl ironrdp::connector::sspi::network_client::NetworkClient for NoKerberos {
+    fn send(
+        &self,
+        _request: &ironrdp::connector::sspi::generator::NetworkRequest,
+    ) -> ironrdp::connector::sspi::Result<Vec<u8>> {
+        Err(ironrdp::connector::sspi::Error::new(
+            ironrdp::connector::sspi::ErrorKind::UnsupportedFunction,
+            "Kerberos KDC traffic is not supported by mdrdp; expected NTLM over CredSSP",
+        ))
+    }
+}
+
+struct Trace {
+    started: Instant,
+    last: Instant,
+    stages: Vec<Stage>,
+}
+
+impl Trace {
+    fn new() -> Self {
+        let now = Instant::now();
+        Trace {
+            started: now,
+            last: now,
+            stages: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str, detail: Option<String>) {
+        let now = Instant::now();
+        self.stages.push(Stage {
+            name,
+            elapsed_ms: ms(now - self.last),
+            detail,
+        });
+        self.last = now;
+    }
+}
+
+fn ms(d: Duration) -> f64 {
+    (d.as_micros() as f64) / 1000.0
+}
+
+pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, ConnectError> {
+    let mut trace = Trace::new();
+    let target = format!("{}:{}", opts.host, opts.port);
+
+    // --- TCP -------------------------------------------------------------------
+    let tcp = TcpStream::connect((opts.host.as_str(), opts.port))?;
+    tcp.set_nodelay(true)?;
+    trace.mark("tcp_connect", Some(tcp.peer_addr()?.to_string()));
+
+    let config = Config {
+        desktop_size: opts.desktop_size,
+        enable_tls: false,
+        enable_credssp: true,
+        credentials: Credentials::UsernamePassword {
+            username: opts.username.clone(),
+            password: secret.expose().to_owned(),
+        },
+        domain: opts.domain.clone(),
+        client_build: 0,
+        client_name: "mdrdp".to_owned(),
+        keyboard_type: ironrdp::pdu::gcc::KeyboardType::IbmEnhanced,
+        keyboard_subtype: 0,
+        keyboard_functional_keys_count: 12,
+        keyboard_layout: 0,
+        ime_file_name: String::new(),
+        bitmap: None,
+        dig_product_id: String::new(),
+        client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
+        platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::MACINTOSH,
+        hardware_id: None,
+        request_data: None,
+        alternate_shell: String::new(),
+        work_dir: String::new(),
+        autologon: false,
+        enable_audio_playback: false,
+        performance_flags: ironrdp::pdu::rdp::client_info::PerformanceFlags::default(),
+        desktop_scale_factor: 0,
+        license_cache: None,
+        timezone_info: Default::default(),
+        compression_type: None,
+        // P2 does not render, so a server-drawn pointer would have nowhere to go.
+        enable_server_pointer: false,
+        pointer_software_rendering: false,
+        multitransport_flags: None,
+    };
+
+    let client_addr = tcp.local_addr()?;
+    let mut connector = ClientConnector::new(config, client_addr);
+
+    // --- X.224 security negotiation --------------------------------------------
+    let mut framed = Framed::new(tcp);
+    let should_upgrade = connect_begin(&mut framed, &mut connector)
+        .map_err(|e| ConnectError::Protocol(describe(&e)))?;
+    trace.mark("x224_negotiation", Some("HYBRID_EX requested".to_owned()));
+
+    let stream = framed.into_inner_no_leftover();
+
+    // --- TLS with trust-on-first-use pinning ------------------------------------
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let store =
+        KnownHosts::load(&opts.known_hosts).map_err(|e| ConnectError::Trust(e.to_string()))?;
+    let verifier = Arc::new(TofuVerifier::new(
+        &target,
+        opts.known_hosts.clone(),
+        store,
+        Arc::clone(&provider),
+    ));
+
+    let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ConnectError::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::clone(&verifier) as Arc<_>)
+        .with_no_client_auth();
+
+    // CredSSP does not support TLS session resumption.
+    // <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cssp/385a7489-d46b-464c-b224-f7340e308a5c>
+    tls_config.resumption = rustls::client::Resumption::disabled();
+
+    let server_name = ServerName::try_from(opts.host.clone())
+        .map_err(|e| ConnectError::Tls(format!("invalid server name: {e}")))?;
+    let tls_conn = ClientConnection::new(Arc::new(tls_config), server_name.clone())
+        .map_err(|e| ConnectError::Tls(e.to_string()))?;
+    let mut tls = StreamOwned::new(tls_conn, stream);
+
+    // Drive the handshake to completion so the certificate is available.
+    tls.flush()?;
+
+    let (fingerprint, public_key) = {
+        let cert = tls
+            .conn
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .ok_or(ConnectError::NoPeerCertificate)?;
+        let fingerprint = Fingerprint::of_der(cert.as_ref());
+
+        use x509_cert::der::Decode as _;
+        let parsed = x509_cert::Certificate::from_der(cert.as_ref())
+            .map_err(|e| ConnectError::Tls(format!("certificate is not valid DER: {e}")))?;
+        let key = parsed
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .as_bytes()
+            .ok_or_else(|| ConnectError::Tls("certificate has no public key bits".to_owned()))?
+            .to_vec();
+        (fingerprint, key)
+    };
+
+    let trust = match verifier.outcome() {
+        Some(TrustOutcome::Pinned) => "pinned (matched stored fingerprint)",
+        Some(TrustOutcome::PinnedOnFirstSight) => "pinned on first sight (newly recorded)",
+        None => "unknown",
+    };
+    let tls_version = tls.conn.protocol_version().map(|v| format!("{v:?}"));
+    let tls_cipher_suite = tls
+        .conn
+        .negotiated_cipher_suite()
+        .map(|s| format!("{:?}", s.suite()));
+    trace.mark("tls_handshake", Some(trust.to_owned()));
+
+    // --- CredSSP and the rest of the connection sequence ------------------------
+    let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+    let mut framed = Framed::new(tls);
+    let mut network_client = NoKerberos;
+
+    let result = connect_finalize(
+        upgraded,
+        connector,
+        &mut framed,
+        &mut network_client,
+        ironrdp::connector::ServerName::new(opts.host.clone()),
+        public_key,
+        None,
+    )
+    .map_err(|e| ConnectError::Protocol(describe(&e)))?;
+    trace.mark("credssp_and_capability_exchange", None);
+
+    let total_ms = ms(trace.started.elapsed());
+    Ok(ConnectReport {
+        target,
+        stages: trace.stages,
+        tls_version,
+        tls_cipher_suite,
+        certificate_fingerprint: fingerprint.to_string(),
+        trust,
+        desktop_width: result.desktop_size.width,
+        desktop_height: result.desktop_size.height,
+        total_ms,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Layer {
+        message: &'static str,
+        inner: Option<Box<Layer>>,
+    }
+
+    impl fmt::Display for Layer {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.inner
+                .as_ref()
+                .map(|b| b.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn layer(message: &'static str, inner: Option<Layer>) -> Layer {
+        Layer {
+            message,
+            inner: inner.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn describe_walks_the_whole_cause_chain() {
+        // The real case: IronRDP's outer message says only "CredSSP"; the useful part —
+        // STATUS_LOGON_FAILURE — is two links down.
+        let err = layer(
+            "CredSSP",
+            Some(layer(
+                "InvalidToken",
+                Some(layer("status is STATUS_LOGON_FAILURE [0xc000006d]", None)),
+            )),
+        );
+        let rendered = describe(&err);
+        assert!(rendered.contains("CredSSP"), "{rendered}");
+        assert!(rendered.contains("InvalidToken"), "{rendered}");
+        assert!(
+            rendered.contains("STATUS_LOGON_FAILURE"),
+            "the actionable cause must survive: {rendered}"
+        );
+    }
+
+    #[test]
+    fn describe_does_not_repeat_a_cause_already_quoted_by_its_parent() {
+        // Many wrappers embed their source's text. Repeating it makes the message worse.
+        let err = layer("outer: inner detail", Some(layer("inner detail", None)));
+        assert_eq!(describe(&err), "outer: inner detail");
+    }
+
+    #[test]
+    fn describe_handles_a_lone_error() {
+        assert_eq!(describe(&layer("just this", None)), "just this");
+    }
+}
