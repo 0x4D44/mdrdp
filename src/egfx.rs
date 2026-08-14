@@ -18,7 +18,7 @@
 //!    upstream. We can observe those PDUs; decoding them is P3a.
 
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface};
-use ironrdp_egfx::pdu::{CapabilitiesV107Flags, CapabilitySet, GfxPdu};
+use ironrdp_egfx::pdu::{CapabilitiesV107Flags, CapabilitySet, GfxPdu, WireToSurface2Pdu};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -82,6 +82,18 @@ impl GraphicsPipelineHandler for EgfxProbe {
     ///
     /// Only the codec id is read. It is a small protocol enum; the PDU itself carries
     /// bitmap data, so the whole PDU is never formatted.
+    /// RFX Progressive arrives here, NOT via `on_unhandled_pdu`.
+    ///
+    /// `ironrdp-egfx` dispatches `WireToSurface2` to this dedicated callback and returns,
+    /// so a `WireToSurface2` arm inside `on_unhandled_pdu` is dead code. An earlier
+    /// version of this file had exactly that, which is why a previous measurement
+    /// reported "ClearCodec only" — the progressive PDUs were arriving and being silently
+    /// dropped by the empty upstream default.
+    fn on_wire_to_surface2(&mut self, pdu: &WireToSurface2Pdu) {
+        let codec = format!("WireToSurface2/{:?}", pdu.codec_id);
+        self.with(|o| *o.codec_ids_seen.entry(codec).or_insert(0) += 1);
+    }
+
     fn on_unhandled_pdu(&mut self, pdu: &GfxPdu) {
         match pdu {
             GfxPdu::WireToSurface1(p) => {

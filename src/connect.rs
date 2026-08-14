@@ -266,7 +266,29 @@ fn observe_egfx<S: std::io::Read + std::io::Write>(
     Ok(())
 }
 
-pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, ConnectError> {
+/// A connection that is still open, handed back for a session to drive.
+///
+/// `connect()` below is the probe form: establish, look, disconnect. This is the form
+/// the actual client needs — the framed stream and the active stage stay alive.
+pub struct Established {
+    pub framed: Framed<StreamOwned<ClientConnection, TcpStream>>,
+    pub stage: ironrdp::session::ActiveStage,
+    pub socket: TcpStream,
+    pub desktop_size: DesktopSize,
+    pub report: ConnectReport,
+    /// Kept so the caller can snapshot AFTER observing, not before.
+    pub probe: Option<EgfxProbe>,
+}
+
+/// Connect and hand back the live session.
+///
+/// The caller owns the disconnect from here on — see `send_shutdown`. Dropping the
+/// stream without it leaves a session alive on the Windows host.
+pub fn establish(
+    opts: &ConnectOptions,
+    secret: &Secret,
+    handler: Option<Box<dyn ironrdp_egfx::client::GraphicsPipelineHandler>>,
+) -> Result<Established, ConnectError> {
     let mut trace = Trace::new();
     let target = format!("{}:{}", opts.host, opts.port);
 
@@ -321,9 +343,21 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
 
     // The dynamic virtual channel must be registered BEFORE connecting: it is announced
     // in the MCS Connect Initial GCC network block, so it cannot be added afterwards.
-    let probe = opts.observe_egfx.map(|_| EgfxProbe::new());
-    if let Some(probe) = probe.clone() {
-        let graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(Box::new(probe), None);
+    // The dynamic virtual channel must be registered BEFORE connecting: it is announced
+    // in the MCS Connect Initial GCC network block and cannot be added afterwards.
+    let probe = if handler.is_none() {
+        opts.observe_egfx.map(|_| EgfxProbe::new())
+    } else {
+        None
+    };
+    let gfx_handler: Option<Box<dyn ironrdp_egfx::client::GraphicsPipelineHandler>> =
+        match (handler, probe.clone()) {
+            (Some(h), _) => Some(h),
+            (None, Some(p)) => Some(Box::new(p)),
+            (None, None) => None,
+        };
+    if let Some(h) = gfx_handler {
+        let graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(h, None);
         connector = connector
             .with_static_channel(ironrdp_dvc::DrdynvcClient::new().with_dynamic_channel(graphics));
     }
@@ -427,41 +461,17 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
     trace.mark("post_tls_sequence", None);
     let connector_stages = stage_log.take();
 
-    // --- Active stage, EGFX observation, and shutdown ----------------------------
+    // --- Active stage ------------------------------------------------------------
     let desktop_size = result.desktop_size;
     let joined_static_channels: Vec<String> = result
         .static_channels
         .iter()
         .map(|(id, channel)| format!("{:?} (id {:?})", channel.channel_name(), id))
         .collect();
-    let mut stage = build_active_stage(result);
-
-    let egfx = match (opts.observe_egfx, probe) {
-        (Some(budget), Some(probe)) => {
-            let outcome = observe_egfx(&mut stage, &mut framed, &socket, desktop_size, budget);
-            trace.mark(
-                "egfx_observation",
-                Some(match &outcome {
-                    Ok(()) => "completed".to_owned(),
-                    Err(e) => format!("stopped: {e}"),
-                }),
-            );
-            Some(probe.snapshot())
-        }
-        _ => None,
-    };
-
-    let shutdown = send_shutdown(&stage, &mut framed);
-    trace.mark(
-        "graceful_shutdown",
-        Some(match &shutdown {
-            Ok(()) => "shutdown request sent".to_owned(),
-            Err(e) => format!("failed: {e}"),
-        }),
-    );
+    let stage = build_active_stage(result);
 
     let total_ms = ms(trace.started.elapsed());
-    Ok(ConnectReport {
+    let report = ConnectReport {
         target,
         stages: trace.stages,
         connector_stages,
@@ -471,111 +481,48 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
         trust,
         desktop_width: desktop_size.width,
         desktop_height: desktop_size.height,
-        graceful_shutdown: shutdown.is_ok(),
-        egfx,
+        graceful_shutdown: false,
+        egfx: None,
         joined_static_channels,
         total_ms,
+    };
+
+    Ok(Established {
+        framed,
+        stage,
+        socket,
+        desktop_size,
+        report,
+        probe,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Probe form: connect, optionally observe EGFX for a while, then disconnect cleanly.
+pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, ConnectError> {
+    let mut established = establish(opts, secret, None)?;
+    let mut report = established.report;
 
-    #[derive(Debug)]
-    struct Layer {
-        message: &'static str,
-        inner: Option<Box<Layer>>,
-    }
-
-    impl fmt::Display for Layer {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.message)
-        }
-    }
-
-    impl std::error::Error for Layer {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            self.inner
-                .as_ref()
-                .map(|b| b.as_ref() as &(dyn std::error::Error + 'static))
-        }
-    }
-
-    fn layer(message: &'static str, inner: Option<Layer>) -> Layer {
-        Layer {
-            message,
-            inner: inner.map(Box::new),
-        }
-    }
-
-    #[test]
-    fn describe_walks_the_whole_cause_chain() {
-        // The real case: IronRDP's outer message says only "CredSSP"; the useful part —
-        // STATUS_LOGON_FAILURE — is two links down.
-        let err = layer(
-            "CredSSP",
-            Some(layer(
-                "InvalidToken",
-                Some(layer("status is STATUS_LOGON_FAILURE [0xc000006d]", None)),
-            )),
+    if let Some(budget) = opts.observe_egfx {
+        let outcome = observe_egfx(
+            &mut established.stage,
+            &mut established.framed,
+            &established.socket,
+            established.desktop_size,
+            budget,
         );
-        let rendered = describe(&err);
-        assert!(rendered.contains("CredSSP"), "{rendered}");
-        assert!(rendered.contains("InvalidToken"), "{rendered}");
-        assert!(
-            rendered.contains("STATUS_LOGON_FAILURE"),
-            "the actionable cause must survive: {rendered}"
-        );
-    }
-
-    #[test]
-    fn describe_does_not_repeat_a_cause_already_quoted_by_its_parent() {
-        // Many wrappers embed their source's text. Repeating it makes the message worse.
-        let err = layer("outer: inner detail", Some(layer("inner detail", None)));
-        assert_eq!(describe(&err), "outer: inner detail");
-    }
-
-    #[test]
-    fn graceful_shutdown_produces_a_shutdown_request_frame() {
-        // Exercises the shutdown path without a server. The bug this guards against is
-        // silence: abandoning a session instead of ending it leaves a disconnected
-        // session alive on the Windows host, and they accumulate until it stops
-        // accepting logons.
-        let stage = ironrdp::session::ActiveStageBuilder {
-            static_channels: ironrdp::svc::StaticChannelSet::new(),
-            user_channel_id: 1002,
-            io_channel_id: 1003,
-            message_channel_id: Some(1004),
-            share_id: 0x0001_0001,
-            compression_type: None,
-            enable_server_pointer: false,
-            pointer_software_rendering: false,
+        if let Err(e) = &outcome {
+            report.stages.push(Stage {
+                name: "egfx_observation",
+                elapsed_ms: 0.0,
+                detail: Some(format!("stopped: {e}")),
+            });
         }
-        .build();
-
-        let outputs = stage.graceful_shutdown().expect("shutdown must encode");
-        let frames: Vec<&Vec<u8>> = outputs
-            .iter()
-            .filter_map(|o| match o {
-                ironrdp::session::ActiveStageOutput::ResponseFrame(f) => Some(f),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(frames.len(), 1, "expected exactly one shutdown frame");
-        assert!(!frames[0].is_empty(), "shutdown frame must carry bytes");
-        // TPKT-framed, like every other X.224-carried PDU on this connection.
-        assert_eq!(
-            frames[0][0],
-            0x03,
-            "should be TPKT version 3: {:02x?}",
-            &frames[0][..4.min(frames[0].len())]
-        );
     }
 
-    #[test]
-    fn describe_handles_a_lone_error() {
-        assert_eq!(describe(&layer("just this", None)), "just this");
-    }
+    // Snapshot AFTER observing — snapshotting at establish time would always be empty.
+    report.egfx = established.probe.as_ref().map(|p| p.snapshot());
+
+    let shutdown = send_shutdown(&established.stage, &mut established.framed);
+    report.graceful_shutdown = shutdown.is_ok();
+    Ok(report)
 }

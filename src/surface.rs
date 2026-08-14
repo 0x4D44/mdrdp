@@ -90,17 +90,34 @@ impl Surface {
         y as usize * self.width as usize * BPP
     }
 
-    /// Copy RGBA rows into `dest`, converting nothing.
+    /// Copy RGBA rows into `dest`.
     ///
-    /// `src` is tightly packed at `dest.width()` pixels per row. Rows are copied
-    /// individually because the destination stride is the surface width, not the
-    /// rectangle width — the single most common source of skewed-image bugs.
-    pub fn blit_rgba(&mut self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
-        let Some(dest) = dest.clip_to(self.width, self.height) else {
+    /// `src` rows are `src_stride_px` pixels wide — **the width the producer used**, not
+    /// the width that survives clipping. Those differ whenever the destination overhangs
+    /// the surface, which is the normal case for tile grids that do not divide evenly.
+    /// Reading clipped rows at the clipped stride shears the image diagonally and
+    /// reports no error at all, so the stride is an explicit argument rather than
+    /// something inferred.
+    pub fn blit_rgba(
+        &mut self,
+        dest: Rect,
+        src: &[u8],
+        src_stride_px: u16,
+    ) -> Result<(), SurfaceError> {
+        let Some(clipped) = dest.clip_to(self.width, self.height) else {
             return Ok(());
         };
-        let row_bytes = dest.width() as usize * BPP;
-        let needed = row_bytes * dest.height() as usize;
+        let stride_bytes = src_stride_px as usize * BPP;
+        let row_bytes = clipped.width() as usize * BPP;
+
+        // Where the surviving region starts inside the source.
+        let skip_rows = (clipped.top - dest.top) as usize;
+        let skip_cols_bytes = (clipped.left - dest.left) as usize * BPP;
+
+        let needed = skip_rows * stride_bytes
+            + skip_cols_bytes
+            + row_bytes
+            + (clipped.height().saturating_sub(1) as usize) * stride_bytes;
         if src.len() < needed {
             return Err(SurfaceError::ShortSource {
                 needed,
@@ -108,9 +125,9 @@ impl Surface {
             });
         }
 
-        for row in 0..dest.height() {
-            let src_off = row as usize * row_bytes;
-            let dst_off = self.row_start(dest.top + row) + dest.left as usize * BPP;
+        for row in 0..clipped.height() {
+            let src_off = (skip_rows + row as usize) * stride_bytes + skip_cols_bytes;
+            let dst_off = self.row_start(clipped.top + row) + clipped.left as usize * BPP;
             self.pixels[dst_off..dst_off + row_bytes]
                 .copy_from_slice(&src[src_off..src_off + row_bytes]);
         }
@@ -157,7 +174,10 @@ impl std::fmt::Display for SurfaceError {
             SurfaceError::NoSuchSurface(id) => write!(f, "no surface with id {id}"),
             SurfaceError::NoSuchCacheSlot(slot) => write!(f, "no cache slot {slot}"),
             SurfaceError::ShortSource { needed, got } => {
-                write!(f, "source buffer too small: needed {needed} bytes, got {got}")
+                write!(
+                    f,
+                    "source buffer too small: needed {needed} bytes, got {got}"
+                )
             }
         }
     }
@@ -214,6 +234,13 @@ impl SurfaceStore {
         self.surfaces.get(&id)
     }
 
+    /// Drop every cached bitmap. Used when the handler resets its own mirror, so the
+    /// two cannot disagree about which slots exist.
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.touch();
+    }
+
     pub fn map_to_output(&mut self, id: u16) {
         self.output = Some(id);
         self.touch();
@@ -224,17 +251,28 @@ impl SurfaceStore {
         self.output.and_then(|id| self.surfaces.get(&id))
     }
 
-    pub fn blit_rgba(&mut self, id: u16, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
+    pub fn blit_rgba(
+        &mut self,
+        id: u16,
+        dest: Rect,
+        src: &[u8],
+        src_stride_px: u16,
+    ) -> Result<(), SurfaceError> {
         let surface = self
             .surfaces
             .get_mut(&id)
             .ok_or(SurfaceError::NoSuchSurface(id))?;
-        surface.blit_rgba(dest, src)?;
+        surface.blit_rgba(dest, src, src_stride_px)?;
         self.touch();
         Ok(())
     }
 
-    pub fn solid_fill(&mut self, id: u16, rects: &[Rect], rgba: [u8; 4]) -> Result<(), SurfaceError> {
+    pub fn solid_fill(
+        &mut self,
+        id: u16,
+        rects: &[Rect],
+        rgba: [u8; 4],
+    ) -> Result<(), SurfaceError> {
         let surface = self
             .surfaces
             .get_mut(&id)
@@ -271,7 +309,11 @@ impl SurfaceStore {
             .get_mut(&dest_id)
             .ok_or(SurfaceError::NoSuchSurface(dest_id))?;
         for (x, y) in dest_points {
-            dest.blit_rgba(Rect::new(*x, *y, x + w, y + h), &pixels)?;
+            // Saturating, not wrapping: a destination that runs off the right edge is
+            // clipped by blit_rgba. `x + w` on u16 panics in debug and wraps in release,
+            // and a panic here poisons the store mutex and takes the session with it.
+            let rect = Rect::new(*x, *y, x.saturating_add(w), y.saturating_add(h));
+            dest.blit_rgba(rect, &pixels, w)?;
         }
         self.touch();
         Ok(())
@@ -287,14 +329,20 @@ impl SurfaceStore {
             .surfaces
             .get(&src_id)
             .ok_or(SurfaceError::NoSuchSurface(src_id))?;
-        let Some(pixels) = surface.extract(src_rect) else {
+        // Record the CLIPPED dimensions: `extract` clips, so storing the requested
+        // width would make every later cache_to_surface ask for more bytes than exist
+        // and fail with ShortSource — silently dropping the cached region.
+        let Some(clipped) = src_rect.clip_to(surface.width, surface.height) else {
+            return Ok(());
+        };
+        let Some(pixels) = surface.extract(clipped) else {
             return Ok(());
         };
         self.cache.insert(
             slot,
             CacheEntry {
-                width: src_rect.width(),
-                height: src_rect.height(),
+                width: clipped.width(),
+                height: clipped.height(),
                 pixels,
             },
         );
@@ -318,10 +366,13 @@ impl SurfaceStore {
             .get_mut(&dest_id)
             .ok_or(SurfaceError::NoSuchSurface(dest_id))?;
         for (x, y) in dest_points {
-            dest.blit_rgba(
-                Rect::new(*x, *y, x + entry.width, y + entry.height),
-                &entry.pixels,
-            )?;
+            let rect = Rect::new(
+                *x,
+                *y,
+                x.saturating_add(entry.width),
+                y.saturating_add(entry.height),
+            );
+            dest.blit_rgba(rect, &entry.pixels, entry.width)?;
         }
         self.touch();
         Ok(())
@@ -363,7 +414,8 @@ mod tests {
         // versa, which skews the image. Blit a 2x2 red block at (1,1) of a 4x4 surface
         // and check exactly which pixels changed.
         let mut s = Surface::new(4, 4);
-        s.blit_rgba(Rect::new(1, 1, 3, 3), &solid(2, 2, RED)).unwrap();
+        s.blit_rgba(Rect::new(1, 1, 3, 3), &solid(2, 2, RED), 2)
+            .unwrap();
 
         for y in 0..4u16 {
             for x in 0..4u16 {
@@ -383,16 +435,66 @@ mod tests {
     fn a_rectangle_overhanging_the_surface_is_clipped_not_rejected() {
         // Tile grids do not divide evenly, so overhang is the normal path.
         let mut s = Surface::new(4, 4);
-        s.blit_rgba(Rect::new(2, 2, 6, 6), &solid(4, 4, RED))
+        s.blit_rgba(Rect::new(2, 2, 6, 6), &solid(4, 4, RED), 4)
             .expect("overhang must clip, not error");
         let off = (3 * 4 + 3) * BPP;
         assert_eq!(&s.pixels()[off..off + BPP], RED);
     }
 
+    /// Per-pixel-distinct source, so a wrong stride is visible.
+    fn ramp(w: u16, h: u16) -> Vec<u8> {
+        let mut v = Vec::with_capacity(w as usize * h as usize * BPP);
+        for y in 0..h {
+            for x in 0..w {
+                v.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn an_overhanging_blit_reads_the_source_at_its_own_stride() {
+        // The bug this guards: clipping the destination and then reading the source at
+        // the CLIPPED width. Row 1 then starts in the middle of row 0 and the image
+        // shears diagonally, with no error reported.
+        //
+        // A uniform-coloured source cannot detect this — which is exactly why the
+        // original version of this test missed it. Use distinct per-pixel values.
+        let mut s = Surface::new(4, 2);
+        // 4x2 tile placed at x=2: only its left 2 columns survive.
+        s.blit_rgba(Rect::new(2, 0, 6, 2), &ramp(4, 2), 4).unwrap();
+
+        // Surviving pixels must be source columns 0..2 of the matching row.
+        for (row, y) in [(0u16, 0u8), (1, 1)] {
+            for col in 0..2u16 {
+                let off = (row as usize * 4 + 2 + col as usize) * BPP;
+                assert_eq!(
+                    &s.pixels()[off..off + BPP],
+                    &[col as u8, y, 0, 255],
+                    "row {row} col {col} came from the wrong source offset (stride bug)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_blit_clipped_on_the_left_and_top_skips_into_the_source() {
+        // Negative-origin equivalent: dest starts before the surface, so the visible
+        // region begins partway into the source rather than at its first byte.
+        let mut s = Surface::new(2, 2);
+        s.blit_rgba(Rect::new(0, 0, 4, 4), &ramp(4, 4), 4).unwrap();
+        // Top-left of the surface is source (0,0); (1,1) is source (1,1).
+        assert_eq!(&s.pixels()[0..BPP], &[0, 0, 0, 255]);
+        let off = (2 + 1) * BPP; // row 1, col 1 of a 2-wide surface
+        assert_eq!(&s.pixels()[off..off + BPP], &[1, 1, 0, 255]);
+    }
+
     #[test]
     fn a_short_source_buffer_is_an_error_not_a_panic() {
         let mut s = Surface::new(4, 4);
-        let err = s.blit_rgba(Rect::new(0, 0, 4, 4), &[0u8; 8]).unwrap_err();
+        let err = s
+            .blit_rgba(Rect::new(0, 0, 4, 4), &[0u8; 8], 4)
+            .unwrap_err();
         assert!(matches!(err, SurfaceError::ShortSource { .. }));
     }
 
@@ -408,7 +510,8 @@ mod tests {
     #[test]
     fn extract_round_trips_through_blit() {
         let mut s = Surface::new(4, 4);
-        s.blit_rgba(Rect::new(1, 1, 3, 3), &solid(2, 2, RED)).unwrap();
+        s.blit_rgba(Rect::new(1, 1, 3, 3), &solid(2, 2, RED), 2)
+            .unwrap();
         let taken = s.extract(Rect::new(1, 1, 3, 3)).unwrap();
         assert_eq!(taken, solid(2, 2, RED));
     }
@@ -419,7 +522,9 @@ mod tests {
         // reads pixels it has already overwritten.
         let mut store = SurfaceStore::new();
         store.create(1, 4, 1);
-        store.blit_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, RED)).unwrap();
+        store
+            .blit_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, RED), 2)
+            .unwrap();
         store
             .surface_to_surface(1, Rect::new(0, 0, 2, 1), 1, &[(1, 0)])
             .unwrap();
@@ -434,7 +539,9 @@ mod tests {
         let mut store = SurfaceStore::new();
         store.create(1, 4, 4);
         store.create(2, 4, 4);
-        store.blit_rgba(1, Rect::new(0, 0, 2, 2), &solid(2, 2, BLUE)).unwrap();
+        store
+            .blit_rgba(1, Rect::new(0, 0, 2, 2), &solid(2, 2, BLUE), 2)
+            .unwrap();
         store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 7).unwrap();
         store.cache_to_surface(7, 2, &[(2, 2)]).unwrap();
 
@@ -447,7 +554,7 @@ mod tests {
     fn operations_on_a_missing_surface_are_errors_not_panics() {
         let mut store = SurfaceStore::new();
         assert_eq!(
-            store.blit_rgba(9, Rect::new(0, 0, 1, 1), &solid(1, 1, RED)),
+            store.blit_rgba(9, Rect::new(0, 0, 1, 1), &solid(1, 1, RED), 1),
             Err(SurfaceError::NoSuchSurface(9))
         );
         assert_eq!(
@@ -473,7 +580,10 @@ mod tests {
         store.map_to_output(1);
         assert!(store.output_surface().is_some());
         store.delete(1);
-        assert!(store.output_surface().is_none(), "deleting clears the mapping");
+        assert!(
+            store.output_surface().is_none(),
+            "deleting clears the mapping"
+        );
     }
 
     #[test]
