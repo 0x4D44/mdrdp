@@ -1605,17 +1605,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironrdp-tls"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea5f0bb732e33159834f06a687f5415dae1a82c71c123c1c3a3689d41ed47645"
-dependencies = [
- "tokio",
- "tokio-rustls",
- "x509-cert",
-]
-
-[[package]]
 name = "iso7816"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1780,10 +1769,12 @@ version = "0.1.1"
 dependencies = [
  "ironrdp",
  "ironrdp-blocking",
- "ironrdp-tls",
  "keyring",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -3085,22 +3076,11 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
- "bytes",
  "libc",
  "mio",
  "pin-project-lite",
  "socket2",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tokio-rustls"
-version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
-dependencies = [
- "rustls",
- "tokio",
 ]
 
 [[package]]

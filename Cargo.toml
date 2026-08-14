@@ -9,7 +9,9 @@ repository = "https://github.com/0x4d44/mdrdp"
 [dependencies]
 ironrdp = { version = "0.17.0", features = ["connector", "session", "svc", "dvc", "graphics", "cliprdr"] }
 ironrdp-blocking = "0.10.0"
-ironrdp-tls = { version = "0.2.2", features = ["rustls-ring"] }
 keyring = "4.1.6"
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1.15.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11.0"

@@ -4,3 +4,4 @@
 //! implementation of the things both need to agree on.
 
 pub mod probe;
+pub mod trust;
