@@ -53,6 +53,12 @@ impl WindowConfig {
     }
 }
 
+/// How many consecutive present failures before the window gives up.
+///
+/// One is a hiccup; a sustained run means the surface is genuinely unusable and holding
+/// the session open serves nobody.
+const MAX_CONSECUTIVE_PRESENT_FAILURES: u32 = 30;
+
 /// Messages a producer thread can push into the event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEvent {
@@ -195,7 +201,12 @@ pub fn present_into(
     // function taking a caller-supplied viewport: an out-of-window origin would underflow
     // the column arithmetic below. Blank the frame instead.
     let origin_inside = viewport.dest_x < window_width && viewport.dest_y < window_height;
-    if !fits || !origin_inside || viewport.is_empty() || src.len() < needed {
+    // A zero-dimension session underflows the column table below (`session_width - 1`)
+    // and indexes an empty source. `letterbox` never produces one, but this is a public
+    // function taking a caller-supplied viewport, and its contract says it blanks rather
+    // than panics.
+    let session_real = viewport.session_width > 0 && viewport.session_height > 0;
+    if !fits || !origin_inside || !session_real || viewport.is_empty() || src.len() < needed {
         dst.fill(0);
         return;
     }
@@ -316,6 +327,8 @@ struct SessionApp {
     /// The store generation last put on screen. `None` until the first frame.
     presented: Option<u64>,
     failure: Option<WindowError>,
+    /// Consecutive failed presents; reset by any successful one.
+    present_failures: u32,
 }
 
 impl SessionApp {
@@ -331,6 +344,7 @@ impl SessionApp {
             config.session_height,
         );
         SessionApp {
+            present_failures: 0,
             config,
             store,
             input,
@@ -348,6 +362,17 @@ impl SessionApp {
     fn send(&mut self, event_loop: &ActiveEventLoop, event: InputEvent) {
         if self.input.send(event).is_err() {
             event_loop.exit();
+        }
+    }
+
+    /// A frame we could not present. Survivable until it stops being occasional.
+    ///
+    /// The session is the expensive thing here: reconnecting costs the user a logon and,
+    /// on a workstation host, can wedge the server. A dropped frame costs one repaint.
+    fn note_present_failure(&mut self, event_loop: &ActiveEventLoop, detail: String) {
+        self.present_failures = self.present_failures.saturating_add(1);
+        if self.present_failures >= MAX_CONSECUTIVE_PRESENT_FAILURES {
+            self.fail(event_loop, WindowError::Present(detail));
         }
     }
 
@@ -382,13 +407,15 @@ impl SessionApp {
         };
 
         if let Err(e) = surface.resize(width, height) {
-            self.fail(event_loop, WindowError::Present(e.to_string()));
+            // Transient: skip this frame. Only a sustained run of failures is fatal —
+            // ending an RDP session because one present hiccuped is a bad trade.
+            self.note_present_failure(event_loop, e.to_string());
             return;
         }
         let mut buffer = match surface.buffer_mut() {
             Ok(b) => b,
             Err(e) => {
-                self.fail(event_loop, WindowError::Present(e.to_string()));
+                self.note_present_failure(event_loop, e.to_string());
                 return;
             }
         };
@@ -422,9 +449,12 @@ impl SessionApp {
 
         window.pre_present_notify();
         if let Err(e) = buffer.present() {
-            self.fail(event_loop, WindowError::Present(e.to_string()));
+            self.note_present_failure(event_loop, e.to_string());
             return;
         }
+        // Streak counts CONSECUTIVE failures: without this reset, 30 unrelated hiccups
+        // across a long session would close a perfectly healthy window.
+        self.present_failures = 0;
         self.presented = Some(generation);
     }
 }

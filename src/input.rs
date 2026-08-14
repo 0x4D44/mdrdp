@@ -496,6 +496,54 @@ pub fn encode_fastpath_input(events: Vec<FastPathInputEvent>) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use winit::event::MouseButton as WButton;
+
+    /// Every winit button maps to the right RDP button.
+    ///
+    /// Untested until now, and a swapped Left/Right survived mutation — which would ship
+    /// a client where right-click opens nothing and left-click opens context menus.
+    #[test]
+    fn every_mouse_button_maps_to_its_own_rdp_button() {
+        let cases = [
+            (WButton::Left, MouseButton::Left),
+            (WButton::Right, MouseButton::Right),
+            (WButton::Middle, MouseButton::Middle),
+            (WButton::Back, MouseButton::X1),
+            (WButton::Forward, MouseButton::X2),
+        ];
+        for (winit_button, expected) in cases {
+            let event = from_mouse_button(winit_button, ElementState::Pressed, (7, 9))
+                .unwrap_or_else(|| panic!("{winit_button:?} should map"));
+            match event {
+                InputEvent::MouseButton { button, x, y, .. } => {
+                    assert_eq!(button, expected, "{winit_button:?} mapped to {button:?}");
+                    assert_eq!((x, y), (7, 9), "coordinates must pass through");
+                }
+                other => panic!("expected MouseButton, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn press_and_release_are_not_confused() {
+        // An inverted `down` makes every click a release: the desktop looks alive but
+        // nothing can be clicked. Cheap to get wrong, invisible in a smoke test.
+        let pressed = from_mouse_button(WButton::Left, ElementState::Pressed, (0, 0)).unwrap();
+        let released = from_mouse_button(WButton::Left, ElementState::Released, (0, 0)).unwrap();
+        match (pressed, released) {
+            (
+                InputEvent::MouseButton { down: true, .. },
+                InputEvent::MouseButton { down: false, .. },
+            ) => {}
+            other => panic!("press/release inverted or malformed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unnamed_button_is_dropped_rather_than_guessed() {
+        assert!(from_mouse_button(WButton::Other(9), ElementState::Pressed, (0, 0)).is_none());
+    }
     use ironrdp::core::decode;
     use winit::dpi::PhysicalPosition;
 
