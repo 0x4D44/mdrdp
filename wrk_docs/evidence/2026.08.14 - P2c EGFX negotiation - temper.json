@@ -1,0 +1,89 @@
+{
+  "target": "temper:3389",
+  "stages": [
+    {
+      "name": "tcp_connect",
+      "elapsed_ms": 6.822,
+      "detail": "192.0.2.171:3389"
+    },
+    {
+      "name": "x224_negotiation",
+      "elapsed_ms": 10.014,
+      "detail": "HYBRID_EX requested"
+    },
+    {
+      "name": "tls_handshake",
+      "elapsed_ms": 5.283,
+      "detail": "pinned (matched stored fingerprint)"
+    },
+    {
+      "name": "post_tls_sequence",
+      "elapsed_ms": 52.533,
+      "detail": null
+    },
+    {
+      "name": "egfx_observation",
+      "elapsed_ms": 5398.805,
+      "detail": "completed"
+    },
+    {
+      "name": "graceful_shutdown",
+      "elapsed_ms": 0.065,
+      "detail": "shutdown request sent"
+    }
+  ],
+  "connector_stages": [
+    {
+      "state": "Credssp",
+      "elapsed_ms": 8.814
+    },
+    {
+      "state": "BasicSettingsExchangeWaitResponse",
+      "elapsed_ms": 2.985
+    },
+    {
+      "state": "ChannelConnection",
+      "elapsed_ms": 3.528
+    },
+    {
+      "state": "ConnectTimeAutoDetection",
+      "elapsed_ms": 2.327
+    },
+    {
+      "state": "LicensingExchange (inline)",
+      "elapsed_ms": 2.482
+    },
+    {
+      "state": "CapabilitiesExchange",
+      "elapsed_ms": 0.002
+    },
+    {
+      "state": "ConnectionFinalization",
+      "elapsed_ms": 32.367
+    }
+  ],
+  "tls_version": "TLSv1_3",
+  "tls_cipher_suite": "TLS13_AES_256_GCM_SHA384",
+  "certificate_fingerprint": "sha256:2c7d5aaba40f744c5fb9105eea59346b2aa9105a5e1317e8f086ee69813bebf4",
+  "trust": "pinned (matched stored fingerprint)",
+  "desktop_width": 1024,
+  "desktop_height": 768,
+  "graceful_shutdown": true,
+  "egfx": {
+    "confirmed_capability": "V10_7 { flags: CapabilitiesV107Flags(SMALL_CACHE | AVC_DISABLED) }",
+    "reset_graphics": [
+      1024,
+      768
+    ],
+    "surfaces_created": 2,
+    "frames_completed": 19,
+    "codec_ids_seen": {
+      "ClearCodec": 32
+    },
+    "unhandled_pdus": 0
+  },
+  "joined_static_channels": [
+    "ChannelName { inner: [100, 114, 100, 121, 110, 118, 99, 0] } (id TypeId(0x3ac3de9ed604c901250c7e1ef7b61c33))"
+  ],
+  "total_ms": 5473.524
+}

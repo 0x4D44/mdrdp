@@ -25,3 +25,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 x509-cert = "0.2.5"
 zeroize = "1.9.0"
+
+[patch.crates-io]
+# See vendor/README.md — one flag, without which EGFX never opens.
+ironrdp-connector = { path = "vendor/ironrdp-connector" }

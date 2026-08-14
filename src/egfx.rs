@@ -18,7 +18,7 @@
 //!    upstream. We can observe those PDUs; decoding them is P3a.
 
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface};
-use ironrdp_egfx::pdu::CapabilitySet;
+use ironrdp_egfx::pdu::{CapabilitiesV107Flags, CapabilitySet, GfxPdu};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -65,6 +65,37 @@ impl EgfxProbe {
 }
 
 impl GraphicsPipelineHandler for EgfxProbe {
+    /// Advertise **V10.7 with AVC explicitly disabled**.
+    ///
+    /// The upstream default advertises V10.7 with AVC implied, and
+    /// `GraphicsPipelineClient` filters every AVC-bearing set when no H.264 decoder is
+    /// configured — so a client without one silently falls back to V8, an older pipeline
+    /// than the server would otherwise use. Saying "V10.7, and no AVC please" gets the
+    /// modern pipeline without needing a decoder we do not have yet.
+    fn capabilities(&self) -> Vec<CapabilitySet> {
+        vec![CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::AVC_DISABLED | CapabilitiesV107Flags::SMALL_CACHE,
+        }]
+    }
+
+    /// Record which codec each surface command used — the P3a question.
+    ///
+    /// Only the codec id is read. It is a small protocol enum; the PDU itself carries
+    /// bitmap data, so the whole PDU is never formatted.
+    fn on_unhandled_pdu(&mut self, pdu: &GfxPdu) {
+        match pdu {
+            GfxPdu::WireToSurface1(p) => {
+                let codec = format!("{:?}", p.codec_id);
+                self.with(|o| *o.codec_ids_seen.entry(codec).or_insert(0) += 1);
+            }
+            GfxPdu::WireToSurface2(p) => {
+                let codec = format!("WireToSurface2/{:?}", p.codec_id);
+                self.with(|o| *o.codec_ids_seen.entry(codec).or_insert(0) += 1);
+            }
+            _ => self.with(|o| o.unhandled_pdus += 1),
+        }
+    }
+
     fn on_capabilities_confirmed(&mut self, caps: &CapabilitySet) {
         // The capability set's Debug is a fixed enum rendering, not payload.
         let rendered = format!("{caps:?}");

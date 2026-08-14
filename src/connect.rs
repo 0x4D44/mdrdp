@@ -63,6 +63,10 @@ pub struct ConnectReport {
     pub graceful_shutdown: bool,
     /// What the graphics pipeline negotiated, when observation was requested.
     pub egfx: Option<EgfxObservations>,
+    /// Static channels the server actually joined. If DRDYNVC is absent, no dynamic
+    /// channel can ever open and an empty EGFX result means the channel was never
+    /// available — not that our observation loop failed.
+    pub joined_static_channels: Vec<String>,
     pub total_ms: f64,
 }
 
@@ -425,6 +429,11 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
 
     // --- Active stage, EGFX observation, and shutdown ----------------------------
     let desktop_size = result.desktop_size;
+    let joined_static_channels: Vec<String> = result
+        .static_channels
+        .iter()
+        .map(|(id, channel)| format!("{:?} (id {:?})", channel.channel_name(), id))
+        .collect();
     let mut stage = build_active_stage(result);
 
     let egfx = match (opts.observe_egfx, probe) {
@@ -464,6 +473,7 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
         desktop_height: desktop_size.height,
         graceful_shutdown: shutdown.is_ok(),
         egfx,
+        joined_static_channels,
         total_ms,
     })
 }
