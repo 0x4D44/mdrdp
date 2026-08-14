@@ -69,6 +69,10 @@ pub struct GfxStats {
     pub surface_errors: u64,
     /// PDUs that reached us with no handling of their own.
     pub unhandled_pdus: u64,
+    /// Regions that arrived in a codec we can observe but not yet decode — today, RFX
+    /// Progressive. Non-zero means part of the desktop is stale on screen, which is
+    /// exactly the kind of silent rot the visibility requirement exists to surface.
+    pub undecoded_regions: u64,
     pub surfaces_created: u64,
     pub surfaces_deleted: u64,
     /// The last `ResetGraphics` dimensions, if any.
@@ -328,9 +332,17 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// V8, an older pipeline than the server would otherwise use. Saying "V10.7, and no
     /// AVC please" survives that filter and keeps the modern pipeline.
     fn capabilities(&self) -> Vec<CapabilitySet> {
-        vec![CapabilitySet::V10_7 {
-            flags: CapabilitiesV107Flags::AVC_DISABLED | CapabilitiesV107Flags::SMALL_CACHE,
-        }]
+        // V8 is kept as a fallback: it carries no AVC so it survives the same filter,
+        // and without it a server that cannot confirm V10.7 has nothing to select. Our
+        // one measured server confirms V10.7; this is for every other one.
+        vec![
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::AVC_DISABLED | CapabilitiesV107Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V8 {
+                flags: ironrdp_egfx::pdu::CapabilitiesV8Flags::SMALL_CACHE,
+            },
+        ]
     }
 
     fn on_reset_graphics(&mut self, width: u32, height: u32) {
@@ -343,7 +355,11 @@ impl GraphicsPipelineHandler for GfxHandler {
                 store.delete(id);
             }
         });
+        // Clear BOTH sides. Clearing only the local mirror leaves the store holding
+        // pixels for slots the handler no longer knows about, so a later CacheToSurface
+        // computes (0,0), drops every point, and counts an error instead of painting.
         self.cache_dims.clear();
+        self.with_store(|store| store.clear_cache());
         self.stats
             .note(|s| s.reset_graphics = Some((width, height)));
     }
@@ -414,6 +430,24 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// routes each of them to exactly one of the two — `handle_pdu` returns after calling
     /// the specific callback and never falls through — so this cannot double-apply, and
     /// it means the handler still behaves correctly if that routing ever changes.
+    /// RFX Progressive arrives HERE, not via `on_unhandled_pdu`.
+    ///
+    /// `ironrdp-egfx` dispatches `WireToSurface2` to this dedicated callback and returns
+    /// (client.rs:490-494), so a `WireToSurface2` arm inside `on_unhandled_pdu` is
+    /// unreachable. An earlier version had exactly that, and it is why a previous
+    /// measurement reported "ClearCodec only" — progressive PDUs were arriving and being
+    /// swallowed by the empty upstream default.
+    ///
+    /// Counting only, for now: decoding progressive needs the surface/tile plumbing that
+    /// is P3a's remaining work. Counting it at least makes it visible instead of silent.
+    fn on_wire_to_surface2(&mut self, pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
+        let name = format!("WireToSurface2/{:?}", pdu.codec_id);
+        self.stats.note(|s| {
+            *s.codec_ids_seen.entry(name).or_insert(0) += 1;
+            s.undecoded_regions = s.undecoded_regions.saturating_add(1);
+        });
+    }
+
     fn on_unhandled_pdu(&mut self, pdu: &GfxPdu) {
         match pdu {
             GfxPdu::WireToSurface1(p) => self.apply_wire_to_surface1(p),
@@ -519,19 +553,64 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_offer_only_v10_7_with_avc_disabled() {
-        // The whole point: one set, modern, AVC off. Anything AVC-bearing gets filtered
-        // out upstream when no H.264 decoder is configured, dropping us to V8.
+    fn capabilities_prefer_v10_7_without_avc_and_keep_a_v8_fallback() {
+        // V10.7 first, so the modern pipeline wins where it is available. AVC must be
+        // explicitly disabled in it, because GraphicsPipelineClient::start filters out
+        // every AVC-bearing set when no H.264 decoder is configured — which would
+        // silently drop us to V8.
+        //
+        // V8 second, so a server that cannot confirm V10.7 still has something to pick.
+        // It carries no AVC, so it survives the same filter.
         let handler = GfxHandler::new(store());
         let caps = handler.capabilities();
-        assert_eq!(caps.len(), 1, "exactly one set, or the filter has choices");
+        assert_eq!(caps.len(), 2, "V10.7 preferred, V8 fallback");
+
         match &caps[0] {
             CapabilitySet::V10_7 { flags } => {
-                assert!(flags.contains(CapabilitiesV107Flags::AVC_DISABLED));
+                assert!(
+                    flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+                    "without AVC_DISABLED this set is filtered out and we drop to V8"
+                );
                 assert!(flags.contains(CapabilitiesV107Flags::SMALL_CACHE));
             }
-            other => panic!("expected V10_7, got {other:?}"),
+            other => panic!("expected V10_7 first, got {other:?}"),
         }
+        assert!(
+            matches!(&caps[1], CapabilitySet::V8 { .. }),
+            "expected a V8 fallback, got {:?}",
+            caps[1]
+        );
+    }
+
+    #[test]
+    fn progressive_arrives_via_on_wire_to_surface2_and_is_counted() {
+        // The regression this guards is subtle and cost a wrong published measurement:
+        // ironrdp-egfx dispatches WireToSurface2 to its own callback and returns, so a
+        // WireToSurface2 arm inside on_unhandled_pdu is unreachable. Progressive PDUs
+        // then vanish silently and a codec census reports "ClearCodec only".
+        let mut handler = GfxHandler::new(store());
+        let pdu = ironrdp_egfx::pdu::WireToSurface2Pdu {
+            surface_id: 1,
+            codec_context_id: 0,
+            codec_id: ironrdp_egfx::pdu::Codec2Type::RemoteFxProgressive,
+            pixel_format: ironrdp_egfx::pdu::PixelFormat::XRgb,
+            bitmap_data: vec![0u8; 8],
+        };
+        handler.on_wire_to_surface2(&pdu);
+
+        let s = handler.stats().snapshot();
+        assert_eq!(
+            s.codec_ids_seen
+                .get("WireToSurface2/RemoteFxProgressive")
+                .copied(),
+            Some(1),
+            "progressive must be counted: {:?}",
+            s.codec_ids_seen
+        );
+        assert_eq!(
+            s.undecoded_regions, 1,
+            "and flagged as a region we cannot yet paint"
+        );
     }
 
     #[test]

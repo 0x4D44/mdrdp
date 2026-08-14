@@ -9,6 +9,7 @@ pub mod egfx;
 pub mod gfx;
 pub mod input;
 pub mod probe;
+pub mod session;
 pub mod stagelog;
 pub mod surface;
 pub mod trust;

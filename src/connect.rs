@@ -106,7 +106,7 @@ impl From<std::io::Error> for ConnectError {
 /// for a rejected login reads `[CredSSP @ connector.rs:113] CredSSP` — true, and useless
 /// to whoever has to fix it. The cause naming *why* authentication failed is one or more
 /// links down the chain.
-fn describe(e: &dyn std::error::Error) -> String {
+pub fn describe(e: &dyn std::error::Error) -> String {
     let mut out = e.to_string();
     let mut source = e.source();
     while let Some(cause) = source {
@@ -194,7 +194,7 @@ fn build_active_stage(
 /// Not optional politeness. Abandoning the socket leaves a session the host does not
 /// reclaim promptly; an evening of test connects wedged `temper` until it stopped
 /// completing logons at all.
-fn send_shutdown<S: std::io::Read + std::io::Write>(
+pub fn send_shutdown<S: std::io::Read + std::io::Write>(
     stage: &ironrdp::session::ActiveStage,
     framed: &mut Framed<S>,
 ) -> Result<(), ConnectError> {
