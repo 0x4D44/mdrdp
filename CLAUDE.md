@@ -80,21 +80,20 @@ target for all protocol work and all comparisons against Microsoft's client.
 - **It requires NLA** — it selects HYBRID_EX and rejects legacy RDP security outright.
   There is no unauthenticated path to a first pixel, so the credential path is on the
   critical path for the very first working connection, not a later hardening phase.
-- **Latency floor — still PROVISIONAL: TCP RTT p50 3.48 ms**, 95% CI [3.46, 3.51],
-  n=3000, release build (p95 4.74 ms, p99 5.84 ms). Good enough to reason with, not
-  settled: every sample was taken inside one 92-minute afternoon sitting, so it describes
-  one contention regime rather than the day.
+- **Latency floor: TCP RTT p50 3.31 ms**, 95% CI [3.29, 3.34], n=4000 over 4 distinct UTC
+  hours spanning 6.6 h (p95 4.72 ms, **p99 10.82 ms, max 119.9 ms**). Settled — the
+  coverage requirement is met.
 
-  To settle it, run `probe rtt temper --samples 1000 --out baseline/temper-rtt.jsonl` at
-  genuinely separated times — morning, evening, late night, ideally across more than one
-  day — then `probe summarise baseline/temper-rtt.jsonl`. The tool reports its own
-  verdict; **never quote a figure it calls PROVISIONAL as settled.**
+  **Quote the tail, not just the median.** The afternoon-only sample this replaced showed
+  p99 5.84 ms; with evening traffic included p99 is 10.82 ms and the worst sample is
+  119.9 ms — a 36x outlier on a "3.3 ms" link. Any latency budget built on the median
+  alone will be wrong in exactly the conditions users complain about.
 
-  The coverage rule requires a ≥6 h wall-clock span, not merely ≥3 distinct UTC hour
-  labels. That is deliberate and was learned the hard way: three short batches run either
-  side of two hour boundaries tick three labels inside ninety minutes while sampling one
-  time of day. A proxy you can satisfy by waiting for a clock to roll over measures the
-  clock, not the network.
+  Regenerate with `probe rtt temper --samples 1000 --out baseline/temper-rtt.jsonl` at
+  genuinely separated times, then `probe summarise`. The rule requires a ≥6 h wall-clock
+  span, not merely ≥3 distinct UTC hour labels — three short batches either side of two
+  hour boundaries tick three labels inside ninety minutes while sampling one time of day.
+  A proxy you can satisfy by waiting for a clock to roll over measures the clock.
 
 - **It sends ClearCodec and RFX Progressive over EGFX — not H.264, and not RemoteFX.**
   Measured, with AVC permitted on both sides and still unused. Neither codec is wired into
