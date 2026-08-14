@@ -1,23 +1,23 @@
 {
-  "baseline_status": "PROVISIONAL - does not meet the >=1000 sample / >=3 distinct UTC hour requirement",
+  "baseline_status": "MEETS the >=1000 sample / >=3 distinct UTC hour requirement",
   "coverage": {
-    "distinct_utc_hours": 2,
-    "meets_requirement": false,
+    "distinct_utc_hours": 3,
+    "meets_requirement": true,
     "required_distinct_hours": 3,
     "required_samples": 1000,
-    "samples": 2000
+    "samples": 3000
   },
   "malformed_lines": 0,
   "source": "baseline/temper-rtt.jsonl",
   "summary_micros": {
-    "max": 14319,
-    "mean": 3549.08,
+    "max": 19962,
+    "mean": 3585.9386666666664,
     "min": 2145,
-    "n": 2000,
-    "p50": 3470,
-    "p50_ci_high": 3507,
-    "p50_ci_low": 3445,
-    "p95": 4625,
-    "p99": 5709
+    "n": 3000,
+    "p50": 3479,
+    "p50_ci_high": 3509,
+    "p50_ci_low": 3458,
+    "p95": 4736,
+    "p99": 5837
   }
 }

@@ -80,12 +80,14 @@ target for all protocol work and all comparisons against Microsoft's client.
 - **It requires NLA** — it selects HYBRID_EX and rejects legacy RDP security outright.
   There is no unauthenticated path to a first pixel, so the credential path is on the
   critical path for the very first working connection, not a later hardening phase.
-- **Measured latency floor: TCP RTT p50 3.52 ms**, 95% CI [3.47, 3.56], n=1000, release
-  build. Every latency claim is quoted against this baseline. Still provisional on
-  time-of-day coverage — regenerate with
-  `probe rtt temper --samples 1000 --out baseline/temper-rtt.jsonl` at different hours,
-  then `probe summarise baseline/temper-rtt.jsonl`, which states plainly whether the
-  requirement is met. Do not quote a figure the tool calls PROVISIONAL as settled.
+- **Measured latency floor: TCP RTT p50 3.48 ms**, 95% CI [3.46, 3.51], n=3000 across 3
+  distinct UTC hours, release build (p95 4.74 ms, p99 5.84 ms). Every latency claim is
+  quoted against this baseline. Regenerate with
+  `probe rtt temper --samples 1000 --out baseline/temper-rtt.jsonl` in each of several
+  hours, then `probe summarise baseline/temper-rtt.jsonl`, which states plainly whether
+  the coverage requirement is met. **Never quote a figure the tool calls PROVISIONAL as
+  settled** — hour-to-hour p50 varied by ~3% here with barely-overlapping CIs, so a
+  single-burst baseline understates real variability.
 
 - **It sends ClearCodec and RFX Progressive over EGFX — not H.264, and not RemoteFX.**
   Measured, with AVC permitted on both sides and still unused. Neither codec is wired into
