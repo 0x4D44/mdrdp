@@ -80,14 +80,22 @@ target for all protocol work and all comparisons against Microsoft's client.
 - **It requires NLA** — it selects HYBRID_EX and rejects legacy RDP security outright.
   There is no unauthenticated path to a first pixel, so the credential path is on the
   critical path for the very first working connection, not a later hardening phase.
-- **Measured latency floor: TCP RTT p50 4.20 ms.** Every latency claim is quoted against
-  this baseline.
+- **Measured latency floor: TCP RTT p50 3.52 ms**, 95% CI [3.47, 3.56], n=1000, release
+  build. Every latency claim is quoted against this baseline. Still provisional on
+  time-of-day coverage — regenerate with
+  `probe rtt temper --samples 1000 --out baseline/temper-rtt.jsonl` at different hours,
+  then `probe summarise baseline/temper-rtt.jsonl`, which states plainly whether the
+  requirement is met. Do not quote a figure the tool calls PROVISIONAL as settled.
 
 - **It sends ClearCodec and RFX Progressive over EGFX — not H.264, and not RemoteFX.**
   Measured, with AVC permitted on both sides and still unused. Neither codec is wired into
-  IronRDP's client decode path, so decoding them is our work. Read
-  `wrk_docs/2026.08.14 - SPIKE - P1b server codec negotiation against temper.md` before
-  designing anything that touches graphics.
+  IronRDP's client decode path, so decoding them is our work.
+
+**Read both of these before designing anything that touches graphics:**
+`wrk_docs/2026.08.14 - SPIKE - P1b server codec negotiation against temper.md` for what
+this server actually sends, and `wrk_docs/2026.08.14 - INVENTORY - P1a IronRDP client
+capability inventory.md` for what IronRDP can and cannot decode. The gap between those two
+documents is the graphics work.
 
 See `wrk_docs/2026.08.14 - SPIKE - P1 protocol posture against temper.md` for the
 security-negotiation evidence.
