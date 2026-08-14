@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 /// peer asks us to keep waiting.
 pub const MAX_TPKT_LEN: usize = 512;
 
-const TPKT_HEADER_LEN: usize = 4;
+/// Version, reserved, and a big-endian total length.
+pub const TPKT_HEADER_LEN: usize = 4;
 
 /// Longest a single blocking read may park before the deadline is re-checked. The
 /// deadline governs; this only bounds the granularity of enforcement.

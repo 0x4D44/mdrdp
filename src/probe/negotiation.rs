@@ -7,6 +7,7 @@
 //! throughout and returns `Result`. A panic in this module is a crash the far end
 //! controls.
 
+use crate::probe::wire::TPKT_HEADER_LEN;
 use serde::Serialize;
 use std::fmt;
 
@@ -104,6 +105,11 @@ pub enum ParseError {
     BadNegotiationLength(u16),
     /// The X.224 length indicator is too small to describe a connection confirm.
     BadX224Length(u8),
+    /// The X.224 length indicator and the TPKT length contradict each other.
+    InconsistentFraming {
+        li: u8,
+        declared: usize,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -124,6 +130,12 @@ impl fmt::Display for ParseError {
             }
             ParseError::BadNegotiationLength(l) => {
                 write!(f, "negotiation structure declares length {l}, expected 8")
+            }
+            ParseError::InconsistentFraming { li, declared } => {
+                write!(
+                    f,
+                    "X.224 length indicator {li} overruns the {declared}-byte TPKT length"
+                )
             }
             ParseError::BadX224Length(l) => {
                 write!(
@@ -199,6 +211,15 @@ pub fn parse_connection_confirm(buf: &[u8]) -> Result<NegotiationOutcome, ParseE
     let li = buf[4] as usize;
     if li < X224_CC_FIXED_LEN {
         return Err(ParseError::BadX224Length(buf[4]));
+    }
+    // The TPDU occupies buf[4..5+li], so it cannot extend past what TPKT declared.
+    // Without this, a confirm claiming li=255 alongside a well-formed 19-byte trailer
+    // parses happily while its two length fields flatly contradict each other.
+    if TPKT_HEADER_LEN + 1 + li > declared {
+        return Err(ParseError::InconsistentFraming {
+            li: buf[4],
+            declared,
+        });
     }
     let variable_len = li - X224_CC_FIXED_LEN;
     if variable_len == 0 {
@@ -368,6 +389,22 @@ mod tests {
         assert_eq!(
             parse_connection_confirm(&buf),
             Err(ParseError::UnknownNegotiationType(0x09))
+        );
+    }
+
+    #[test]
+    fn rejects_length_indicator_that_overruns_the_tpkt_length() {
+        // A confirm whose two length fields contradict each other: li claims 255 bytes
+        // follow, TPKT declares 19 in total. Previously this parsed as a normal
+        // selection, silently ignoring the inconsistency.
+        let mut buf = CONFIRM_HYBRID_EX;
+        buf[4] = 0xff;
+        assert_eq!(
+            parse_connection_confirm(&buf),
+            Err(ParseError::InconsistentFraming {
+                li: 0xff,
+                declared: 19
+            })
         );
     }
 

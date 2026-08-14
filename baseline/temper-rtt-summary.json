@@ -1,14 +1,17 @@
 {
-  "baseline_status": "MEETS the >=1000 sample / >=3 distinct UTC hour requirement",
+  "baseline_status": "PROVISIONAL - does not meet the baseline requirement (>=1000 samples, >=3 distinct UTC hours, >=6h wall-clock span). Distinct hour labels alone are not a spread: batches run either side of an hour boundary tick new labels without sampling a different time of day.",
   "coverage": {
     "distinct_utc_hours": 3,
-    "meets_requirement": true,
+    "meets_requirement": false,
     "required_distinct_hours": 3,
     "required_samples": 1000,
-    "samples": 3000
+    "required_span_ms": 21600000,
+    "samples": 3000,
+    "span_ms": 5548753
   },
   "malformed_lines": 0,
   "source": "baseline/temper-rtt.jsonl",
+  "span_hours": "1.54",
   "summary_micros": {
     "max": 19962,
     "mean": 3585.9386666666664,

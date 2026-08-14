@@ -182,10 +182,15 @@ fn cmd_summarise(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "coverage": coverage,
         "summary_micros": stats::summarise(&micros),
         "baseline_status": if coverage.meets_requirement {
-            "MEETS the >=1000 sample / >=3 distinct UTC hour requirement"
+            "MEETS the baseline requirement (>=1000 samples, >=3 distinct UTC hours, \
+             >=6h wall-clock span)"
         } else {
-            "PROVISIONAL - does not meet the >=1000 sample / >=3 distinct UTC hour requirement"
+            "PROVISIONAL - does not meet the baseline requirement (>=1000 samples, \
+             >=3 distinct UTC hours, >=6h wall-clock span). Distinct hour labels alone \
+             are not a spread: batches run either side of an hour boundary tick new \
+             labels without sampling a different time of day."
         },
+        "span_hours": format!("{:.2}", coverage.span_ms as f64 / 3_600_000.0),
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())

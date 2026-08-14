@@ -15,6 +15,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const REQUIRED_SAMPLES: usize = 1000;
 pub const REQUIRED_DISTINCT_HOURS: usize = 3;
 
+/// Minimum wall-clock span between the earliest and latest sample, in milliseconds (6 h).
+///
+/// Distinct hour *labels* are not a spread. Three short batches run either side of two
+/// hour boundaries tick three labels inside ninety minutes, on one afternoon, under one
+/// contention regime — which is the very defect a spread requirement exists to catch. A
+/// Gauntlet critic caught exactly that here, so the span is now checked directly rather
+/// than inferred from a proxy that rewards waiting for the clock to roll over.
+pub const REQUIRED_SPAN_MS: u64 = 6 * 3_600_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sample {
     /// Wall-clock time of the sample, so batches collected across the day can be merged.
@@ -32,8 +41,11 @@ pub struct Sample {
 pub struct Coverage {
     pub samples: usize,
     pub distinct_utc_hours: usize,
+    /// Wall-clock milliseconds between the earliest and latest sample.
+    pub span_ms: u64,
     pub required_samples: usize,
     pub required_distinct_hours: usize,
+    pub required_span_ms: u64,
     pub meets_requirement: bool,
 }
 
@@ -42,14 +54,23 @@ pub fn coverage(samples: &[Sample]) -> Coverage {
         .iter()
         .map(|s| (s.unix_ms / 3_600_000) % 24)
         .collect();
+
+    let earliest = samples.iter().map(|s| s.unix_ms).min().unwrap_or(0);
+    let latest = samples.iter().map(|s| s.unix_ms).max().unwrap_or(0);
+    let span_ms = latest.saturating_sub(earliest);
+
     let n = samples.len();
     let h = hours.len();
     Coverage {
         samples: n,
         distinct_utc_hours: h,
+        span_ms,
         required_samples: REQUIRED_SAMPLES,
         required_distinct_hours: REQUIRED_DISTINCT_HOURS,
-        meets_requirement: n >= REQUIRED_SAMPLES && h >= REQUIRED_DISTINCT_HOURS,
+        required_span_ms: REQUIRED_SPAN_MS,
+        meets_requirement: n >= REQUIRED_SAMPLES
+            && h >= REQUIRED_DISTINCT_HOURS
+            && span_ms >= REQUIRED_SPAN_MS,
     }
 }
 
@@ -153,6 +174,51 @@ mod tests {
         let c = coverage(&samples);
         assert_eq!(c.distinct_utc_hours, 3);
         assert!(!c.meets_requirement);
+    }
+
+    fn batch_at(base_ms: u64, n: usize) -> Vec<Sample> {
+        (0..n)
+            .map(|i| Sample {
+                unix_ms: base_ms + i as u64,
+                micros: 4_000,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn three_hour_labels_inside_one_sitting_do_not_count_as_a_spread() {
+        // The exact pattern a Gauntlet critic caught: three short batches run either
+        // side of two hour boundaries — 11:33, 12:06, 13:05 — ticking three distinct
+        // UTC hour labels inside 92 minutes, on one afternoon, under one contention
+        // regime. Plenty of samples, three "hours", and still not a spread.
+        let mut samples = batch_at(11 * 3_600_000 + 33 * 60_000, 1000);
+        samples.extend(batch_at(12 * 3_600_000 + 6 * 60_000, 1000));
+        samples.extend(batch_at(13 * 3_600_000 + 5 * 60_000, 1000));
+
+        let c = coverage(&samples);
+        assert_eq!(c.samples, 3000);
+        assert_eq!(c.distinct_utc_hours, 3, "it does tick three hour labels");
+        assert!(
+            c.span_ms < 100 * 60_000,
+            "and it really is inside one short sitting"
+        );
+        assert!(
+            !c.meets_requirement,
+            "three hour labels in 92 minutes must not pass as a time-of-day spread"
+        );
+    }
+
+    #[test]
+    fn genuinely_separated_batches_do_meet_the_requirement() {
+        // Morning, afternoon, late evening — a real spread across the day.
+        let mut samples = batch_at(8 * 3_600_000, 1000);
+        samples.extend(batch_at(14 * 3_600_000, 1000));
+        samples.extend(batch_at(22 * 3_600_000, 1000));
+
+        let c = coverage(&samples);
+        assert_eq!(c.distinct_utc_hours, 3);
+        assert!(c.span_ms >= REQUIRED_SPAN_MS);
+        assert!(c.meets_requirement);
     }
 
     #[test]
