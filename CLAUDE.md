@@ -58,6 +58,20 @@ cargo clippy --all-targets -- -D warnings
 Focused first: `cargo test -p mdrdp <module>` before the whole suite. Run suites with
 stdin closed — `cargo test </dev/null` — or a test that reads stdin hangs forever.
 
+**Keep the Windows target compiling.** This repo mandates macOS *and* Windows, and a
+Rust project drifts into macOS-only silently — nothing fails locally until someone tries
+to build it. Run this after any change that touches platform-facing code (credentials,
+paths, sockets, windowing):
+
+```
+rustup target add x86_64-pc-windows-msvc   # once
+cargo check --target x86_64-pc-windows-msvc --all-targets
+```
+
+Verified clean as of 2026-08-14 with the full IronRDP + rustls + keyring stack. It is a
+type-check, not a link — it will not catch a missing Windows-only runtime dependency, but
+it does catch the `cfg` drift that actually happens.
+
 ## Validation rules specific to this repo
 
 - **Never benchmark or latency-test a debug build.** Decode and colour conversion are
@@ -69,6 +83,15 @@ stdin closed — `cargo test </dev/null` — or a test that reads stdin hangs fo
 - **Soak-class requirements need soak-class evidence.** The clipboard and
   latency-degradation requirements are about behaviour over hours. A green unit test
   does not discharge them.
+
+## The reference client
+
+Every Gauntlet comparison is against **Microsoft's Windows App 11.3.8**
+(`com.microsoft.rdc.macos`, `/Applications/Windows App.app`) on this Mac, connecting to
+`temper`. Confirmed installed 2026-08-14.
+
+Record its version alongside any measurement taken against it. A comparison against an
+unnamed version of the reference is not reproducible, and it updates itself.
 
 ## The test host
 
