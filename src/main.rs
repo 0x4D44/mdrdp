@@ -176,7 +176,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // rather than after a connection has been established and a logon spent.
     let event_loop = SessionWindow::event_loop()?;
 
-    let secret = mdrdp::creds::lookup(&target.user)?;
+    let secret = mdrdp::creds::lookup_or_prompt(&target.user)?;
 
     let store = Arc::new(Mutex::new(SurfaceStore::new()));
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>();

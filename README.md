@@ -18,6 +18,12 @@ security add-generic-password -s mdrdp -a 'YOUR-ACCOUNT' -w
 
 `YOUR-ACCOUNT` is whatever you pass to `--user`, or the `username` on a favourite.
 
+**If the keychain is unavailable**, mdrdp says so and prompts for the password on the
+terminal instead (echo off, used for that session only, never written anywhere). So a
+misbehaving keychain degrades to typing a password — it does not lock you out of your own
+desktop. A *missing* entry is treated differently and is not prompted for: that is a setup
+mistake with a known fix, and mdrdp prints the exact command above.
+
 **2. Add a favourite** (optional — you can connect by host without one). The file is
 created by hand for now; `mdrdp --list` prints its path:
 
