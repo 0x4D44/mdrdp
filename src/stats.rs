@@ -18,6 +18,7 @@
 //! measurement looks surprising.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 /// How many recent samples the rolling window holds.
 ///
@@ -252,6 +253,36 @@ impl SessionStats {
             ));
         }
         lines
+    }
+}
+
+/// A cloneable handle on the live [`SessionStats`].
+///
+/// The session thread writes; the window thread reads to draw the overlay. Mirrors
+/// [`crate::gfx::GfxStatsHandle`], including its treatment of a poisoned lock: a panic
+/// while counting must not take down a working session, so the counters are recovered
+/// rather than propagated.
+#[derive(Debug, Clone, Default)]
+pub struct StatsHandle(Arc<Mutex<SessionStats>>);
+
+impl StatsHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A point-in-time copy. Never aliases later mutation.
+    pub fn snapshot(&self) -> SessionStats {
+        self.lock().clone()
+    }
+
+    pub fn update<F: FnOnce(&mut SessionStats)>(&self, f: F) {
+        f(&mut self.lock());
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionStats> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

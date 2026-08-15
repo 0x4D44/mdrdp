@@ -288,6 +288,7 @@ pub fn establish(
     opts: &ConnectOptions,
     secret: &Secret,
     handler: Option<Box<dyn ironrdp_egfx::client::GraphicsPipelineHandler>>,
+    cliprdr: Option<Box<dyn ironrdp_cliprdr::backend::CliprdrBackend>>,
 ) -> Result<Established, ConnectError> {
     let mut trace = Trace::new();
     let target = format!("{}:{}", opts.host, opts.port);
@@ -360,6 +361,14 @@ pub fn establish(
         let graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(h, None);
         connector = connector
             .with_static_channel(ironrdp_dvc::DrdynvcClient::new().with_dynamic_channel(graphics));
+    }
+
+    // CLIPRDR is a *static* channel, so it must be registered before the MCS channel
+    // join — there is no way to add one to a live session. A client with no clipboard
+    // backend simply never joins the channel, and the server sees a peer that does not
+    // do clipboard rather than one that accepts and then ignores it.
+    if let Some(backend) = cliprdr {
+        connector = connector.with_static_channel(ironrdp_cliprdr::CliprdrClient::new(backend));
     }
 
     // --- X.224 security negotiation --------------------------------------------
@@ -499,7 +508,7 @@ pub fn establish(
 
 /// Probe form: connect, optionally observe EGFX for a while, then disconnect cleanly.
 pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, ConnectError> {
-    let mut established = establish(opts, secret, None)?;
+    let mut established = establish(opts, secret, None, None)?;
     let mut report = established.report;
 
     if let Some(budget) = opts.observe_egfx {

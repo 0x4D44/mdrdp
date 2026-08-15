@@ -30,10 +30,13 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Window, WindowId};
 
 use crate::input::{self, InputEvent, PointerMap};
+use crate::stats::StatsHandle;
 use crate::surface::SurfaceStore;
+use crate::ui::font;
 use crate::window_policy::{Geometry, WindowPolicy};
 
 /// What the caller must decide before a window exists.
@@ -254,6 +257,53 @@ pub fn present_into(
     }
 }
 
+/// Draw the stats panel over the session image.
+///
+/// Pure so the geometry is testable without a window. The panel is drawn on a dimmed
+/// backing rather than straight onto the desktop: white text over an arbitrary remote
+/// screen is unreadable about half the time, and the numbers exist to be read.
+pub fn draw_overlay(dst: &mut [u32], window_width: u32, window_height: u32, lines: &[String]) {
+    if lines.is_empty() || window_width == 0 || window_height == 0 {
+        return;
+    }
+    const MARGIN: i32 = 12;
+    const PAD: i32 = 8;
+
+    let widest = lines.iter().map(|l| font::text_width(l)).max().unwrap_or(0);
+    let panel_w = widest + PAD * 2;
+    let panel_h = font::CHAR_H * lines.len() as i32 + PAD * 2;
+
+    // Clamp so a narrow window gets a clipped panel rather than none at all.
+    let x0 = MARGIN.min(window_width as i32);
+    let y0 = MARGIN.min(window_height as i32);
+    let x1 = (x0 + panel_w).min(window_width as i32);
+    let y1 = (y0 + panel_h).min(window_height as i32);
+
+    for y in y0..y1 {
+        let row = y as usize * window_width as usize;
+        for x in x0..x1 {
+            let Some(px) = dst.get_mut(row + x as usize) else {
+                continue;
+            };
+            // Halve each channel: darkens whatever is behind without hiding it, and
+            // needs no alpha channel that softbuffer's 0RGB format does not have.
+            *px = (*px >> 1) & 0x007f_7f7f;
+        }
+    }
+
+    for (i, line) in lines.iter().enumerate() {
+        font::draw_text(
+            dst,
+            window_width as usize,
+            window_height as usize,
+            x0 + PAD,
+            y0 + PAD + font::CHAR_H * i as i32,
+            line,
+            0x00ff_ffff,
+        );
+    }
+}
+
 /// A window bound to a surface store, not yet running.
 ///
 /// Split from `run` so the caller can take a [`Waker`] before the loop takes over the
@@ -263,6 +313,7 @@ pub struct SessionWindow {
     config: WindowConfig,
     store: Arc<Mutex<SurfaceStore>>,
     input: Sender<InputEvent>,
+    stats: Option<StatsHandle>,
 }
 
 impl SessionWindow {
@@ -299,7 +350,17 @@ impl SessionWindow {
             config,
             store,
             input,
+            stats: None,
         })
+    }
+
+    /// Show these counters when the user asks for the overlay.
+    ///
+    /// Optional so a window can be opened without any: the probe harness has no session
+    /// stats to show, and an overlay of zeroes would be worse than no overlay.
+    pub fn with_stats(mut self, stats: StatsHandle) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     /// A handle the session thread can use to nudge or close the window.
@@ -314,8 +375,9 @@ impl SessionWindow {
             config,
             store,
             input,
+            stats,
         } = self;
-        let mut app = SessionApp::new(config, store, input);
+        let mut app = SessionApp::new(config, store, input, stats);
         event_loop
             .run_app(&mut app)
             .map_err(|e| WindowError::EventLoop(e.to_string()))?;
@@ -348,6 +410,10 @@ struct SessionApp {
     present_failures: u32,
     /// Tells a resize the user asked for from one the system imposed.
     policy: WindowPolicy,
+    /// Live session counters, when the caller wired any up.
+    stats: Option<StatsHandle>,
+    show_stats: bool,
+    modifiers: ModifiersState,
     /// Monotonic origin for the policy's timestamps. Wall-clock would let a clock
     /// adjustment overnight — exactly when displays sleep — corrupt the timing.
     started: Instant,
@@ -358,6 +424,7 @@ impl SessionApp {
         config: WindowConfig,
         store: Arc<Mutex<SurfaceStore>>,
         input: Sender<InputEvent>,
+        stats: Option<StatsHandle>,
     ) -> Self {
         let viewport = Viewport::letterbox(
             u32::from(config.session_width),
@@ -383,7 +450,22 @@ impl SessionApp {
             failure: None,
             policy,
             started: Instant::now(),
+            stats,
+            show_stats: false,
+            modifiers: ModifiersState::empty(),
         }
+    }
+
+    /// Ctrl+Alt+S toggles the overlay.
+    ///
+    /// Chosen because it is not a Windows shortcut worth losing: with the remote desktop
+    /// focused, every keystroke belongs to it, so any local hotkey is a key the user can
+    /// no longer send. Ctrl+Alt+Del is intercepted by the OS long before us and is not
+    /// available to claim.
+    fn is_stats_hotkey(&self, event: &winit::event::KeyEvent) -> bool {
+        self.modifiers.control_key()
+            && self.modifiers.alt_key()
+            && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("s"))
     }
 
     fn now_ms(&self) -> u64 {
@@ -504,6 +586,17 @@ impl SessionApp {
             generation
         };
 
+        if self.show_stats
+            && let Some(stats) = &self.stats
+        {
+            draw_overlay(
+                &mut buffer,
+                size.width,
+                size.height,
+                &stats.snapshot().overlay_lines(),
+            );
+        }
+
         window.pre_present_notify();
         if let Err(e) = buffer.present() {
             self.note_present_failure(event_loop, e.to_string());
@@ -618,11 +711,25 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 self.policy.note_display_event(now);
             }
 
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic,
                 ..
             } => {
+                // Every other key belongs to the remote desktop, so the one local hotkey
+                // is claimed here and deliberately not forwarded — otherwise it would also
+                // type an "s" into whatever has focus on the far end.
+                if !is_synthetic && self.is_stats_hotkey(&event) {
+                    if event.state == winit::event::ElementState::Pressed {
+                        self.show_stats = !self.show_stats;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 // Synthetic events are the platform replaying key state across a focus
                 // change. Forwarding them double-presses keys.
                 if !is_synthetic && let Some(translated) = input::from_key_event(&event) {
@@ -885,6 +992,67 @@ mod tests {
         let mut dst = vec![0xFFFF_FFFF_u32; 4]; // claims 4x4 but holds 2x2
         present_into(&mut dst, 4, 4, &v, &quad());
         assert!(dst.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn the_overlay_dims_what_is_behind_it_and_writes_over_it() {
+        let (w, h) = (400u32, 200u32);
+        let mut buf = vec![0x00ff_ffffu32; (w * h) as usize];
+        draw_overlay(&mut buf, w, h, &overlay_lines());
+
+        // Inside the panel, pure white must have been darkened.
+        let inside = buf[(20 * w + 20) as usize];
+        assert_ne!(inside, 0x00ff_ffff, "the panel should dim its background");
+
+        // Far outside the panel, the image is untouched.
+        let outside = buf[((h - 1) * w + (w - 1)) as usize];
+        assert_eq!(
+            outside, 0x00ff_ffff,
+            "the rest of the desktop is not dimmed"
+        );
+    }
+
+    #[test]
+    fn a_panel_wider_than_the_window_clips_instead_of_wrapping_onto_the_next_row() {
+        // The text is far wider than this window, so the panel must be clipped at the
+        // right edge. A buffer is a flat array: if the clamp is missing, writing past the
+        // row end silently lands on the START of the row below. That is invisible to a
+        // length check, so the oracle is the untouched left margin of the lower rows.
+        let (w, h) = (100u32, 120u32);
+        const SENTINEL: u32 = 0x00ff_ffff;
+        let mut buf = vec![SENTINEL; (w * h) as usize];
+        draw_overlay(&mut buf, w, h, &overlay_lines());
+
+        // Column 0..MARGIN is left of the panel on every row, so nothing should touch it.
+        for y in 0..h {
+            for x in 0..12u32 {
+                assert_eq!(
+                    buf[(y * w + x) as usize],
+                    SENTINEL,
+                    "pixel ({x},{y}) was written; an overflowing row wrapped into it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_overlay_with_nothing_to_say_changes_nothing() {
+        let (w, h) = (64u32, 32u32);
+        let mut buf = vec![0x0012_3456u32; (w * h) as usize];
+        let before = buf.clone();
+        draw_overlay(&mut buf, w, h, &[]);
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn a_zero_sized_window_does_not_panic() {
+        let mut buf: Vec<u32> = Vec::new();
+        draw_overlay(&mut buf, 0, 0, &overlay_lines());
+        assert!(buf.is_empty());
+    }
+
+    fn overlay_lines() -> Vec<String> {
+        vec!["latency p50 3.5ms".to_string(), "cache 75% hit".to_string()]
     }
 
     #[test]

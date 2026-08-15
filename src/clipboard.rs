@@ -28,17 +28,18 @@
 //! accepted inbound as a fallback. File formats get safe no-op handling.
 
 use std::collections::VecDeque;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use ironrdp_cliprdr::backend::CliprdrBackend;
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest, FileContentsResponse,
-    FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse,
+    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
+    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    OwnedFormatDataResponse,
 };
 use ironrdp_cliprdr::{Cliprdr, CliprdrSvcMessages, Role};
-use ironrdp_svc::pdu::ironrdp_core::AsAny;
 use ironrdp_svc::pdu::IntoOwned as _;
+use ironrdp_svc::pdu::ironrdp_core::AsAny;
 use sha2::{Digest, Sha256};
 use tracing::{debug, trace, warn};
 
@@ -162,7 +163,10 @@ impl ClipboardClock for SystemClock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PasteState {
     Idle,
-    Requested { format: ClipboardFormatId, requested_at_ms: u64 },
+    Requested {
+        format: ClipboardFormatId,
+        requested_at_ms: u64,
+    },
 }
 
 /// State of our outbound format-list advertise (us telling the remote what we have).
@@ -225,7 +229,11 @@ impl CliprdrBackend for ClipboardBackend {
         self.send(ClipboardAction::FormatListAcked(ok));
     }
 
-    fn on_process_negotiated_capabilities(&mut self, _capabilities: ClipboardGeneralCapabilityFlags) {}
+    fn on_process_negotiated_capabilities(
+        &mut self,
+        _capabilities: ClipboardGeneralCapabilityFlags,
+    ) {
+    }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         self.send(ClipboardAction::RemoteCopy(available_formats.to_vec()));
@@ -318,14 +326,32 @@ impl ClipboardBridge {
         out
     }
 
+    /// Throw away queued actions when there is no clipboard channel to send them on.
+    ///
+    /// A server that never joins CLIPRDR still leaves us polling the local clipboard, and
+    /// every change queues an advertise that [`Self::pump`] will never be called to drain.
+    /// Over a long session that is an unbounded queue for a channel that does not exist.
+    /// State returns to idle: nothing can be in flight when there is nowhere to send it.
+    pub fn discard_pending(&mut self) {
+        while self.next_action().is_some() {}
+        self.paste_state = PasteState::Idle;
+        self.advertise_state = AdvertiseState::Idle;
+    }
+
     /// Resets any paste request that has been pending too long back to `Idle`, so the next
     /// remote copy is not blocked by one that never got an answer. Safe to call often; also
     /// called at the top of every [`Self::pump`].
     pub fn check_timeouts(&mut self) {
-        if let PasteState::Requested { requested_at_ms, .. } = self.paste_state {
+        if let PasteState::Requested {
+            requested_at_ms, ..
+        } = self.paste_state
+        {
             let elapsed = self.clock.now_ms().saturating_sub(requested_at_ms);
             if elapsed >= self.paste_timeout_ms {
-                warn!(elapsed_ms = elapsed, "clipboard paste request timed out; resetting to idle");
+                warn!(
+                    elapsed_ms = elapsed,
+                    "clipboard paste request timed out; resetting to idle"
+                );
                 self.paste_state = PasteState::Idle;
             }
         }
@@ -356,7 +382,8 @@ impl ClipboardBridge {
         if text.is_empty() {
             return;
         }
-        self.local_pending.push_back(ClipboardAction::AdvertiseRequested);
+        self.local_pending
+            .push_back(ClipboardAction::AdvertiseRequested);
     }
 
     fn next_action(&mut self) -> Option<ClipboardAction> {
@@ -376,17 +403,29 @@ impl ClipboardBridge {
             ClipboardAction::AdvertiseRequested => self.advertise(cliprdr, out),
             ClipboardAction::FormatListAcked(ok) => self.handle_format_list_acked(ok, cliprdr, out),
             ClipboardAction::RemoteCopy(formats) => self.handle_remote_copy(formats, cliprdr, out),
-            ClipboardAction::LocalDataRequested(format) => self.handle_local_data_requested(format, cliprdr, out),
-            ClipboardAction::RemoteDataReceived(response) => self.handle_remote_data_received(response),
+            ClipboardAction::LocalDataRequested(format) => {
+                self.handle_local_data_requested(format, cliprdr, out)
+            }
+            ClipboardAction::RemoteDataReceived(response) => {
+                self.handle_remote_data_received(response)
+            }
         }
     }
 
-    fn advertise<R: Role>(&mut self, cliprdr: &mut Cliprdr<R>, out: &mut Vec<CliprdrSvcMessages<R>>) {
+    fn advertise<R: Role>(
+        &mut self,
+        cliprdr: &mut Cliprdr<R>,
+        out: &mut Vec<CliprdrSvcMessages<R>>,
+    ) {
         self.advertise_state = AdvertiseState::Pending { attempt: 0 };
         self.send_advertise(cliprdr, out);
     }
 
-    fn send_advertise<R: Role>(&mut self, cliprdr: &mut Cliprdr<R>, out: &mut Vec<CliprdrSvcMessages<R>>) {
+    fn send_advertise<R: Role>(
+        &mut self,
+        cliprdr: &mut Cliprdr<R>,
+        out: &mut Vec<CliprdrSvcMessages<R>>,
+    ) {
         match cliprdr.initiate_copy(&text_formats()) {
             Ok(messages) => out.push(messages),
             Err(error) => {
@@ -408,8 +447,13 @@ impl ClipboardBridge {
             }
             AdvertiseState::Pending { attempt } => {
                 if attempt + 1 < MAX_ADVERTISE_ATTEMPTS {
-                    self.advertise_state = AdvertiseState::Pending { attempt: attempt + 1 };
-                    debug!(attempt = attempt + 1, "remote rejected clipboard format list, retrying");
+                    self.advertise_state = AdvertiseState::Pending {
+                        attempt: attempt + 1,
+                    };
+                    debug!(
+                        attempt = attempt + 1,
+                        "remote rejected clipboard format list, retrying"
+                    );
                     self.send_advertise(cliprdr, out);
                 } else {
                     warn!(
@@ -470,7 +514,9 @@ impl ClipboardBridge {
             Ok(text) if format == ClipboardFormatId::CF_UNICODETEXT => {
                 OwnedFormatDataResponse::new_unicode_string(&text)
             }
-            Ok(text) if format == ClipboardFormatId::CF_TEXT => OwnedFormatDataResponse::new_string(&text),
+            Ok(text) if format == ClipboardFormatId::CF_TEXT => {
+                OwnedFormatDataResponse::new_string(&text)
+            }
             Ok(_) => {
                 debug!(?format, "remote requested an unsupported clipboard format");
                 OwnedFormatDataResponse::new_error()
@@ -513,7 +559,9 @@ impl ClipboardBridge {
                 // back to the remote as if the user had copied it locally.
                 self.last_seen_hash = Some(content_hash(&text));
             }
-            Err(error) => warn!(%error, "failed to write remote clipboard data to the OS clipboard"),
+            Err(error) => {
+                warn!(%error, "failed to write remote clipboard data to the OS clipboard")
+            }
         }
     }
 }
@@ -523,9 +571,15 @@ fn text_formats() -> Vec<ClipboardFormat> {
 }
 
 fn best_text_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
-    if formats.iter().any(|format| format.id() == ClipboardFormatId::CF_UNICODETEXT) {
+    if formats
+        .iter()
+        .any(|format| format.id() == ClipboardFormatId::CF_UNICODETEXT)
+    {
         Some(ClipboardFormatId::CF_UNICODETEXT)
-    } else if formats.iter().any(|format| format.id() == ClipboardFormatId::CF_TEXT) {
+    } else if formats
+        .iter()
+        .any(|format| format.id() == ClipboardFormatId::CF_TEXT)
+    {
         Some(ClipboardFormatId::CF_TEXT)
     } else {
         None
@@ -566,8 +620,8 @@ fn decode_ansi_text(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use ironrdp_cliprdr::pdu::{ClipboardPdu, FormatListResponse};
     use ironrdp_cliprdr::{Client, CliprdrClient};
@@ -592,7 +646,10 @@ mod tests {
                 state.fail_next_get = false;
                 return Err("fake read failure".to_string());
             }
-            state.text.clone().ok_or_else(|| "fake clipboard is empty".to_string())
+            state
+                .text
+                .clone()
+                .ok_or_else(|| "fake clipboard is empty".to_string())
         }
 
         fn set_text(&mut self, text: String) -> Result<(), String> {
@@ -634,14 +691,61 @@ mod tests {
     /// just the same encode/decode path the real client would use.
     fn ready_client(backend: ClipboardBackend) -> CliprdrClient {
         let mut cliprdr = CliprdrClient::new(Box::new(backend));
-        let bytes = ironrdp_svc::pdu::encode_vec(&ClipboardPdu::FormatListResponse(FormatListResponse::Ok))
-            .expect("encode FormatListResponse::Ok");
+        let bytes =
+            ironrdp_svc::pdu::encode_vec(&ClipboardPdu::FormatListResponse(FormatListResponse::Ok))
+                .expect("encode FormatListResponse::Ok");
         SvcProcessor::process(&mut cliprdr, &bytes).expect("process FormatListResponse::Ok");
         cliprdr
     }
 
+    #[test]
+    fn discarding_pending_actions_empties_the_queue_and_returns_to_idle() {
+        // A server that never joins CLIPRDR still leaves the local poll queueing
+        // advertises. If they are not drained, the channel grows for the life of the
+        // session for a channel that does not exist.
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel(os);
+        let mut cliprdr = ready_client(backend);
+
+        // Queue work from both sources the bridge drains: the backend's channel...
+        backend_mut(&mut cliprdr).on_request_format_list();
+        // ...and the local-change poll.
+        state.lock().unwrap().text = Some("something copied locally".to_string());
+        bridge.poll_local_change();
+
+        bridge.discard_pending();
+
+        let out = bridge.pump(&mut cliprdr);
+        assert!(
+            out.is_empty(),
+            "discarded actions must not still be waiting to be sent"
+        );
+    }
+
+    #[test]
+    fn a_discard_does_not_stop_the_clipboard_working_later() {
+        // Discarding is not a kill switch: if the channel appears later, or the poll runs
+        // again, the next change must still be advertised.
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel(os);
+        let mut cliprdr = ready_client(backend);
+
+        state.lock().unwrap().text = Some("first".to_string());
+        bridge.poll_local_change();
+        bridge.discard_pending();
+
+        state.lock().unwrap().text = Some("second".to_string());
+        bridge.poll_local_change();
+        assert!(
+            !bridge.pump(&mut cliprdr).is_empty(),
+            "a later change must still be advertised"
+        );
+    }
+
     fn backend_mut(cliprdr: &mut CliprdrClient) -> &mut ClipboardBackend {
-        cliprdr.downcast_backend_mut::<ClipboardBackend>().expect("backend type")
+        cliprdr
+            .downcast_backend_mut::<ClipboardBackend>()
+            .expect("backend type")
     }
 
     fn unicode_format() -> ClipboardFormat {
@@ -654,10 +758,14 @@ mod tests {
             svc_messages.extend(Vec::<SvcMessage>::from(group));
         }
         assert_eq!(svc_messages.len(), 1, "expected exactly one wire PDU");
-        let bytes = svc_messages[0].encode_unframed_pdu().expect("encode wire PDU");
+        let bytes = svc_messages[0]
+            .encode_unframed_pdu()
+            .expect("encode wire PDU");
         let mut cursor = ReadCursor::new(&bytes);
         match ClipboardPdu::decode(&mut cursor).expect("decode wire PDU") {
-            ClipboardPdu::FormatDataResponse(response) => ClipboardPdu::FormatDataResponse(response.into_owned()),
+            ClipboardPdu::FormatDataResponse(response) => {
+                ClipboardPdu::FormatDataResponse(response.into_owned())
+            }
             other => panic!("unexpected pdu variant: {other:?}"),
         }
     }
@@ -680,11 +788,15 @@ mod tests {
             }
         );
 
-        backend_mut(&mut cliprdr).on_format_data_response(FormatDataResponse::new_unicode_string("hello from remote"));
+        backend_mut(&mut cliprdr)
+            .on_format_data_response(FormatDataResponse::new_unicode_string("hello from remote"));
         bridge.pump(&mut cliprdr);
 
         assert_eq!(bridge.paste_state, PasteState::Idle);
-        assert_eq!(state.lock().unwrap().text.as_deref(), Some("hello from remote"));
+        assert_eq!(
+            state.lock().unwrap().text.as_deref(),
+            Some("hello from remote")
+        );
     }
 
     /// The regression test for "stops working after a bit": two independent copy/paste
@@ -699,13 +811,18 @@ mod tests {
         for (cycle, text) in ["first copy", "second copy"].into_iter().enumerate() {
             backend_mut(&mut cliprdr).on_remote_copy(&[unicode_format()]);
             let msgs = bridge.pump(&mut cliprdr);
-            assert_eq!(msgs.len(), 1, "cycle {cycle}: expected a paste request to be sent");
+            assert_eq!(
+                msgs.len(),
+                1,
+                "cycle {cycle}: expected a paste request to be sent"
+            );
             assert!(
                 matches!(bridge.paste_state, PasteState::Requested { .. }),
                 "cycle {cycle}: expected Requested state"
             );
 
-            backend_mut(&mut cliprdr).on_format_data_response(FormatDataResponse::new_unicode_string(text));
+            backend_mut(&mut cliprdr)
+                .on_format_data_response(FormatDataResponse::new_unicode_string(text));
             bridge.pump(&mut cliprdr);
 
             assert_eq!(
@@ -730,17 +847,26 @@ mod tests {
 
         backend_mut(&mut cliprdr).on_request_format_list();
         bridge.pump(&mut cliprdr);
-        assert_eq!(bridge.advertise_state, AdvertiseState::Pending { attempt: 0 });
+        assert_eq!(
+            bridge.advertise_state,
+            AdvertiseState::Pending { attempt: 0 }
+        );
 
         backend_mut(&mut cliprdr).on_format_list_response(false);
         let msgs = bridge.pump(&mut cliprdr);
         assert_eq!(msgs.len(), 1, "first rejection should retry");
-        assert_eq!(bridge.advertise_state, AdvertiseState::Pending { attempt: 1 });
+        assert_eq!(
+            bridge.advertise_state,
+            AdvertiseState::Pending { attempt: 1 }
+        );
 
         backend_mut(&mut cliprdr).on_format_list_response(false);
         let msgs = bridge.pump(&mut cliprdr);
         assert_eq!(msgs.len(), 1, "second rejection should retry");
-        assert_eq!(bridge.advertise_state, AdvertiseState::Pending { attempt: 2 });
+        assert_eq!(
+            bridge.advertise_state,
+            AdvertiseState::Pending { attempt: 2 }
+        );
 
         backend_mut(&mut cliprdr).on_format_list_response(false);
         let msgs = bridge.pump(&mut cliprdr);
@@ -791,7 +917,8 @@ mod tests {
         // A subsequent copy must still work.
         backend_mut(&mut cliprdr).on_remote_copy(&[unicode_format()]);
         bridge.pump(&mut cliprdr);
-        backend_mut(&mut cliprdr).on_format_data_response(FormatDataResponse::new_unicode_string("still works"));
+        backend_mut(&mut cliprdr)
+            .on_format_data_response(FormatDataResponse::new_unicode_string("still works"));
         bridge.pump(&mut cliprdr);
 
         assert_eq!(bridge.paste_state, PasteState::Idle);
@@ -815,7 +942,10 @@ mod tests {
 
         match only_pdu(msgs) {
             ClipboardPdu::FormatDataResponse(response) => {
-                assert!(response.is_error(), "a failed local read must produce an explicit error response");
+                assert!(
+                    response.is_error(),
+                    "a failed local read must produce an explicit error response"
+                );
             }
             other => panic!("unexpected pdu: {other:?}"),
         }
@@ -831,13 +961,23 @@ mod tests {
         state.lock().unwrap().text = Some("user copied this".to_string());
         bridge.poll_local_change();
         let msgs = bridge.pump(&mut cliprdr);
-        assert_eq!(msgs.len(), 1, "a genuinely new local copy must be advertised");
-        assert_eq!(bridge.advertise_state, AdvertiseState::Pending { attempt: 0 });
+        assert_eq!(
+            msgs.len(),
+            1,
+            "a genuinely new local copy must be advertised"
+        );
+        assert_eq!(
+            bridge.advertise_state,
+            AdvertiseState::Pending { attempt: 0 }
+        );
 
         // Polling again with unchanged content must not re-advertise.
         bridge.poll_local_change();
         let msgs = bridge.pump(&mut cliprdr);
-        assert!(msgs.is_empty(), "unchanged content must not be re-advertised on every poll");
+        assert!(
+            msgs.is_empty(),
+            "unchanged content must not be re-advertised on every poll"
+        );
     }
 
     #[test]
@@ -849,7 +989,8 @@ mod tests {
 
         backend_mut(&mut cliprdr).on_remote_copy(&[unicode_format()]);
         bridge.pump(&mut cliprdr);
-        backend_mut(&mut cliprdr).on_format_data_response(FormatDataResponse::new_unicode_string("from remote"));
+        backend_mut(&mut cliprdr)
+            .on_format_data_response(FormatDataResponse::new_unicode_string("from remote"));
         bridge.pump(&mut cliprdr);
         assert_eq!(state.lock().unwrap().text.as_deref(), Some("from remote"));
 
@@ -857,7 +998,10 @@ mod tests {
         // must see "no change" and must not loop it back as a fresh local advertise.
         bridge.poll_local_change();
         let msgs = bridge.pump(&mut cliprdr);
-        assert!(msgs.is_empty(), "must not loop the remote's own content back to it");
+        assert!(
+            msgs.is_empty(),
+            "must not loop the remote's own content back to it"
+        );
     }
 
     #[test]

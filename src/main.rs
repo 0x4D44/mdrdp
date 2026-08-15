@@ -17,12 +17,14 @@
 //! 5. Only then spawn the session thread, which needs the window's waker.
 
 use ironrdp::connector::DesktopSize;
+use mdrdp::clipboard::{ArboardClipboard, clipboard_channel};
 use mdrdp::connect::{ConnectOptions, establish};
 use mdrdp::favourites::{Favourite, Favourites, WindowSize};
 use mdrdp::gfx::GfxHandler;
 use mdrdp::input::InputEvent;
 use mdrdp::launcher;
-use mdrdp::session;
+use mdrdp::session::{self, SessionServices};
+use mdrdp::stats::StatsHandle;
 use mdrdp::surface::SurfaceStore;
 use mdrdp::trust::KnownHosts;
 use mdrdp::window::{SessionWindow, WindowConfig};
@@ -173,7 +175,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => handler,
     };
-    let stats = handler.stats();
+    let gfx_stats = handler.stats();
+
+    // The backend goes into the connection (CLIPRDR is static, so it must be registered
+    // before the channel join); the bridge stays here and is driven by the session loop.
+    let (clipboard_backend, clipboard_bridge) =
+        clipboard_channel(Box::new(ArboardClipboard::new()));
 
     let opts = ConnectOptions {
         host: target.host.clone(),
@@ -189,7 +196,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!("connecting to {}:{} …", target.host, target.port);
-    let established = establish(&opts, &secret, Some(Box::new(handler)))?;
+    let established = establish(
+        &opts,
+        &secret,
+        Some(Box::new(handler)),
+        Some(Box::new(clipboard_backend)),
+    )?;
     let desktop = established.desktop_size;
     eprintln!(
         "connected: {}x{}, {}, {}",
@@ -214,16 +226,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&store),
         input_tx,
     )?;
+    let session_stats = StatsHandle::new();
+    let window = window.with_stats(session_stats.clone());
     let waker = window.waker();
 
-    let session = session::spawn(established, Arc::clone(&store), input_rx, waker);
+    let clipboard_joined = established
+        .report
+        .joined_static_channels
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case("cliprdr"));
+    if !clipboard_joined {
+        eprintln!("note: the server did not join CLIPRDR — clipboard sharing is unavailable");
+    }
+
+    let session = session::spawn(
+        established,
+        Arc::clone(&store),
+        input_rx,
+        waker,
+        SessionServices {
+            clipboard: Some(clipboard_bridge),
+            stats: session_stats.clone(),
+        },
+    );
 
     let window_result = window.run();
 
     // Window gone: disconnect properly rather than dropping the socket, which would
     // leave a session alive on the host.
     let end = session.shutdown();
-    let s = stats.snapshot();
+    let s = gfx_stats.snapshot();
     let cache = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -335,7 +367,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(t.host, "temper.local", "the argument was a name, not a host");
+        assert_eq!(
+            t.host, "temper.local",
+            "the argument was a name, not a host"
+        );
         assert_eq!(t.user, "saved-user");
         assert_eq!(t.domain.as_deref(), Some("SAVED"));
         assert_eq!(t.port, 4000);
@@ -358,7 +393,10 @@ mod tests {
         assert_eq!(t.port, 3389);
         assert_eq!(t.domain.as_deref(), Some("FLAG"));
         assert_eq!(t.size, (800, 600));
-        assert_eq!(t.host, "temper.local", "but the host still comes from the favourite");
+        assert_eq!(
+            t.host, "temper.local",
+            "but the host still comes from the favourite"
+        );
     }
 
     #[test]
