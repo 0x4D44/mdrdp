@@ -5,6 +5,7 @@
 //! efficiently encode text, UI elements, and icons.
 
 mod glyph_cache;
+mod nscodec;
 mod vbar_cache;
 
 pub use self::glyph_cache::{GLYPH_CACHE_SIZE, GlyphCache, GlyphEntry};
@@ -273,7 +274,6 @@ impl ClearCodecDecoder {
         }
     }
 
-    // NsCodec variant will use decoder state in Phase A7
     #[expect(clippy::unused_self)]
     fn decode_subcodec_region(
         &self,
@@ -361,7 +361,14 @@ impl ClearCodecDecoder {
                 }
             }
             SubcodecId::NsCodec => {
-                // Not yet implemented; encoder avoids generating NSCodec tiles.
+                let decoded = nscodec::decode(sub.bitmap_data, sub.width, sub.height)?;
+                let w = usize::from(sub.width);
+                let h = usize::from(sub.height);
+                for row in 0..h {
+                    let src = row * w * 4;
+                    let dst = ((usize::from(sub.y_start) + row) * sw + usize::from(sub.x_start)) * 4;
+                    output[dst..dst + w * 4].copy_from_slice(&decoded[src..src + w * 4]);
+                }
             }
         }
 

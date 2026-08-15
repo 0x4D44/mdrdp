@@ -111,18 +111,25 @@ impl VBarCache {
         let height = usize::from(band_height);
         let mut pixels = Vec::with_capacity(height * 3);
 
-        // Background above y_on
-        for _ in 0..usize::from(short_vbar.y_on) {
+        // A short V-bar can be replayed at a different y_on and against a shorter band.
+        // FreeRDP clips both the leading background and the replayed pixels to the current
+        // band height. Extending the whole cached run here paints beyond y_end and produces
+        // horizontal blocks over the following UI content.
+        let top_rows = usize::from(short_vbar.y_on).min(height);
+        for _ in 0..top_rows {
             pixels.push(bg_blue);
             pixels.push(bg_green);
             pixels.push(bg_red);
         }
 
-        // Pixel data from short V-bar
-        pixels.extend_from_slice(&short_vbar.pixels);
+        let available_rows = height.saturating_sub(top_rows);
+        let short_rows = usize::from(short_vbar.pixel_count)
+            .min(short_vbar.pixels.len() / 3)
+            .min(available_rows);
+        pixels.extend_from_slice(&short_vbar.pixels[..short_rows * 3]);
 
         // Background below y_on + pixel_count
-        let bottom_start = usize::from(short_vbar.y_on) + usize::from(short_vbar.pixel_count);
+        let bottom_start = top_rows + short_rows;
         for _ in bottom_start..height {
             pixels.push(bg_blue);
             pixels.push(bg_green);

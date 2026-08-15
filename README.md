@@ -66,6 +66,7 @@ mdrdp --list                   # print saved favourites
 mdrdp <host> --password-stdin  # read the password from stdin (scripting/CI)
 mdrdp <host> --duration 30     # disconnect cleanly after N seconds
 mdrdp <host> --screenshot f.bmp  # write the final frame to a file
+mdrdp <host> --metrics-json run.json  # write redacted acceptance metrics
 ```
 
 Command-line flags override whatever the favourite specifies.
@@ -92,6 +93,12 @@ Cache effectiveness is reported two ways deliberately. Hit rate flatters a cache
 hits often on tiny regions; the share of *pixels* served from cache is the honest
 measure, and the two disagree exactly when the cache is not earning its keep.
 
+`--metrics-json` writes the same latency, graphics, cache, codec, channel, audio, CPU, and
+peak-memory evidence in a stable JSON schema. It never includes the host, username,
+credential, file paths, clipboard data, pixels, or audio payloads. The report is assembled
+completely before writing begins, so a serialization failure cannot
+leave a plausible-looking partial report.
+
 ## What works
 
 - Connect over NLA/CredSSP with trust-on-first-use certificate pinning
@@ -113,14 +120,18 @@ measure, and the two disagree exactly when the cache is not earning its keep.
 
 Verified against real Windows hosts: NLA/TLS connect, ClearCodec/RFX Progressive and
 uncompressed graphics, the bitmap cache, fixed-resolution windows, graceful disconnect,
-and CLIPRDR/RDPSND/DRDYNVC channel joins. A timed optimized run against Quench rendered
-204 frames at 1920x1080 with zero decode, surface, or unhandled-PDU errors, then ended
-gracefully. `--screenshot` writes the presented frame so rendering can be checked rather
-than taken on trust.
+and CLIPRDR/RDPSND/DRDYNVC channel joins. A 35-second optimized Quench run at 1920x1080
+ended gracefully with zero decode, undecoded-region, surface, cache-miss, or unhandled-PDU
+errors. All 1,021 bitmap-cache lookups hit. The redacted report measured 0.57% average CPU
+and 169 MiB peak resident memory for that short idle first-run screen; it is a smoke result,
+not a multi-hour stability claim. `--screenshot` captured the fully rendered final frame,
+so the counters were checked against pixels rather than taken on trust.
 
-The remote image renders correctly: measured against FreeRDP 3.27.1 on the same host and
-wallpaper, mean absolute error 4.3/255 with a detail ratio of 1.03 (i.e. the same amount
-of real image variation, not a flat field).
+The remote image renders correctly. The current first-run UI exposed NSCodec rectangles
+nested inside ClearCodec; the formerly empty decoder branch left horizontal stale bands.
+The corrected 448x448 command now matches FreeRDP 3.27.1 byte-for-byte across its residual,
+band, and subcodec layers, and the exit screenshot has no missing regions. Earlier wallpaper
+comparison on the same host measured mean absolute error 4.3/255 with a detail ratio of 1.03.
 
 Still unproven, and worth saying plainly:
 

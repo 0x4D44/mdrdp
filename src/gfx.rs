@@ -32,14 +32,14 @@ use std::sync::{Arc, Mutex};
 use ironrdp::pdu::geometry::ExclusiveRectangle;
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface as EgfxSurface};
 use ironrdp_egfx::pdu::{
-    CacheToSurfacePdu, CapabilitiesV107Flags, CapabilitySet, Codec1Type, GfxPdu, Point,
-    SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface1Pdu,
+    CacheToSurfacePdu, CapabilitiesV107Flags, CapabilitySet, Codec1Type, EvictCacheEntryPdu,
+    GfxPdu, Point, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface1Pdu,
 };
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use serde::Serialize;
 
-use crate::surface::{Rect, SurfaceStore};
+use crate::surface::{Rect, SurfaceError, SurfaceStore};
 
 /// Convert an EGFX rectangle to a surface rectangle.
 ///
@@ -92,6 +92,8 @@ pub struct GfxStats {
     /// Store operations refused (unknown surface, unknown cache slot, short source) or
     /// declined by us as out of range. Also a not-painted region.
     pub surface_errors: u64,
+    /// Surface refusals grouped by a stable, payload-free reason.
+    pub surface_error_reasons: BTreeMap<String, u64>,
     /// PDUs that reached us with no handling of their own.
     pub unhandled_pdus: u64,
     /// Regions that arrived in an observed surface codec for which this client has no
@@ -191,9 +193,9 @@ pub struct GfxHandler {
     /// is long-lived.
     progressive: ProgressiveDecoder,
     stats: GfxStatsHandle,
-    /// Surfaces we have mirrored into the store. `ResetGraphics` implicitly destroys all
-    /// surfaces (MS-RDPEGFX 3.3.5.14), and `SurfaceStore` has no bulk clear, so we need
-    /// to know which ids to delete.
+    /// Surfaces we have mirrored into the store. Surface lifetime ends only at an explicit
+    /// `DeleteSurface`; `ResetGraphics` changes the output-buffer dimensions without
+    /// destroying surfaces.
     live_surfaces: HashSet<u16>,
     /// Dimensions of each cached bitmap, mirrored so `CacheToSurface` can reject a
     /// destination point that would overflow a `u16` coordinate before the store does
@@ -250,11 +252,29 @@ impl GfxHandler {
     }
 
     /// Record a store result, counting a refusal rather than propagating it.
-    fn absorb(&self, result: Result<(), crate::surface::SurfaceError>) {
-        if result.is_err() {
-            self.stats
-                .note(|s| s.surface_errors = s.surface_errors.saturating_add(1));
+    fn absorb(&self, result: Result<(), SurfaceError>) {
+        if let Err(error) = result {
+            let reason = match error {
+                SurfaceError::NoSuchSurface(_) => "no_such_surface",
+                SurfaceError::NoSuchCacheSlot(_) => "no_such_cache_slot",
+                SurfaceError::ShortSource { .. } => "short_source",
+            };
+            self.note_surface_error(reason, 1);
         }
+    }
+
+    fn note_surface_error(&self, reason: &'static str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.stats.note(|stats| {
+            stats.surface_errors = stats.surface_errors.saturating_add(count);
+            let total = stats
+                .surface_error_reasons
+                .entry(reason.to_owned())
+                .or_insert(0);
+            *total = total.saturating_add(count);
+        });
     }
 
     fn note_codec(&self, codec: Codec1Type) {
@@ -281,8 +301,7 @@ impl GfxHandler {
         else {
             // The server referenced a surface we never created. Counted as a store error
             // rather than a decode error: nothing was wrong with the bytes.
-            self.stats
-                .note(|s| s.surface_errors = s.surface_errors.saturating_add(1));
+            self.note_surface_error("no_such_surface", 1);
             return;
         };
 
@@ -325,10 +344,7 @@ impl GfxHandler {
             let result = self.with_store(|store| {
                 store.blit_rgba(surface_id, rect, &tile.pixels, PROGRESSIVE_TILE)
             });
-            if result.is_err() {
-                self.stats
-                    .note(|s| s.surface_errors = s.surface_errors.saturating_add(1));
-            }
+            self.absorb(result);
         }
     }
 
@@ -442,20 +458,15 @@ impl GfxHandler {
     }
 
     fn apply_cache_to_surface(&mut self, pdu: &CacheToSurfacePdu) {
-        let (w, h) = self
-            .cache_dims
-            .get(&pdu.cache_slot)
-            .copied()
-            .unwrap_or((0, 0));
+        let Some((w, h)) = self.cache_dims.get(&pdu.cache_slot).copied() else {
+            if !pdu.destination_points.is_empty() {
+                self.note_surface_error("unknown_cache_dimensions", 1);
+            }
+            return;
+        };
         let (points, skipped) = placeable_points(&pdu.destination_points, w, h);
         self.note_skipped(skipped);
         if points.is_empty() {
-            // Either every point was out of range, or we never saw the SurfaceToCache
-            // that filled this slot. Either way the store would refuse it.
-            if !pdu.destination_points.is_empty() {
-                self.stats
-                    .note(|s| s.surface_errors = s.surface_errors.saturating_add(1));
-            }
             return;
         }
         let result = self
@@ -464,10 +475,7 @@ impl GfxHandler {
     }
 
     fn note_skipped(&self, skipped: u64) {
-        if skipped > 0 {
-            self.stats
-                .note(|s| s.surface_errors = s.surface_errors.saturating_add(skipped));
-        }
+        self.note_surface_error("coordinate_overflow", skipped);
     }
 }
 
@@ -529,20 +537,13 @@ impl GraphicsPipelineHandler for GfxHandler {
     }
 
     fn on_reset_graphics(&mut self, width: u32, height: u32) {
-        // Per MS-RDPEGFX the reset implicitly destroys every surface, and the upstream
-        // client clears its own table here. Mirror that, or a stale surface stays mapped
-        // to output and the window keeps showing the previous desktop.
-        let ids: Vec<u16> = self.live_surfaces.drain().collect();
-        self.with_store(|store| {
-            for id in ids {
-                store.delete(id);
-            }
-        });
-        // Clear BOTH sides. Clearing only the local mirror leaves the store holding
-        // pixels for slots the handler no longer knows about, so a later CacheToSurface
-        // computes (0,0), drops every point, and counts an error instead of painting.
-        self.cache_dims.clear();
-        self.with_store(|store| store.clear_cache());
+        // MS-RDPEGFX 3.3.5.14 changes the Graphics Output Buffer dimensions only. It does
+        // not delete offscreen surfaces or bitmap-cache entries; those have explicit
+        // DeleteSurface and EvictCacheEntry PDUs. Windows references existing cache slots
+        // immediately after this reset, so clearing them here creates visible stale areas.
+        //
+        // ironrdp-egfx 0.3 clears its private surface metadata, but this handler's store is
+        // the authoritative pixel state for mdrdp and must follow the wire specification.
         self.stats
             .note(|s| s.reset_graphics = Some((width, height)));
     }
@@ -642,6 +643,11 @@ impl GraphicsPipelineHandler for GfxHandler {
         self.apply_cache_to_surface(pdu);
     }
 
+    fn on_evict_cache_entry(&mut self, pdu: &EvictCacheEntryPdu) {
+        self.cache_dims.remove(&pdu.cache_slot);
+        self.with_store(|store| store.evict_cache(pdu.cache_slot));
+    }
+
     /// The ClearCodec seam.
     ///
     /// The compositing PDUs are matched here as well as on their own callbacks. Upstream
@@ -656,8 +662,8 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// measurement reported "ClearCodec only" — progressive PDUs were arriving and being
     /// swallowed by the empty upstream default.
     ///
-    /// Counting only, for now: decoding progressive needs the surface/tile plumbing that
-    /// is P3a's remaining work. Counting it at least makes it visible instead of silent.
+    /// The callback records the wire codec name, then decodes and paints every updated
+    /// progressive tile through the session-long decoder above.
     fn on_wire_to_surface2(&mut self, pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
         let name = format!("WireToSurface2/{:?}", pdu.codec_id);
         self.stats
@@ -692,7 +698,9 @@ impl GraphicsPipelineHandler for GfxHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironrdp_egfx::pdu::{Color, EvictCacheEntryPdu, MapSurfaceToOutputPdu, PixelFormat, Point};
+    use ironrdp_egfx::pdu::{
+        CacheImportOfferPdu, Color, MapSurfaceToOutputPdu, PixelFormat, Point,
+    };
     use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 
     const BPP: usize = 4;
@@ -826,6 +834,7 @@ mod tests {
             s.surface_errors, 1,
             "a surface we never created is a store problem, not a codec one"
         );
+        assert_eq!(s.surface_error_reasons.get("no_such_surface"), Some(&1));
         assert_eq!(
             s.undecoded_regions, 0,
             "nothing was wrong with the bytes, so this is not an undecodable region"
@@ -892,24 +901,64 @@ mod tests {
     }
 
     #[test]
-    fn reset_graphics_destroys_every_surface_it_created() {
-        // The spec destroys all surfaces on reset. Miss this and a stale surface stays
-        // mapped to output, so the window keeps showing the previous desktop.
+    fn reset_graphics_preserves_surfaces_and_cache_entries() {
+        // MS-RDPEGFX 3.3.5.14 changes only the Graphics Output Buffer dimensions. The
+        // server can legally reference an existing cache slot immediately afterwards.
         let store = store();
         let mut handler = GfxHandler::new(Arc::clone(&store));
         handler.on_surface_created(&egfx_surface(1, 4, 4));
-        handler.on_surface_created(&egfx_surface(2, 4, 4));
         handler.on_surface_mapped(1, 0, 0);
+        handler.on_solid_fill(&SolidFillPdu {
+            surface_id: 1,
+            fill_pixel: Color {
+                b: 0x11,
+                g: 0x22,
+                r: 0x33,
+                xa: 0,
+            },
+            rectangles: vec![rect(0, 0, 1, 1)],
+        });
+        handler.on_surface_to_cache(&SurfaceToCachePdu {
+            surface_id: 1,
+            cache_key: 0,
+            cache_slot: 7,
+            source_rectangle: rect(0, 0, 1, 1),
+        });
 
         handler.on_reset_graphics(1920, 1080);
+        handler.on_cache_to_surface(&CacheToSurfacePdu {
+            cache_slot: 7,
+            surface_id: 1,
+            destination_points: vec![Point { x: 1, y: 0 }],
+        });
 
-        assert!(store.lock().unwrap().get(1).is_none());
-        assert!(store.lock().unwrap().get(2).is_none());
-        assert!(store.lock().unwrap().output_surface().is_none());
+        assert!(store.lock().unwrap().get(1).is_some());
+        assert_eq!(pixel_at(&store, 1, 1, 0), [0x33, 0x22, 0x11, 0xFF]);
+        assert_eq!(handler.stats().snapshot().surface_errors, 0);
         assert_eq!(
             handler.stats().snapshot().reset_graphics,
             Some((1920, 1080))
         );
+    }
+
+    #[test]
+    fn evict_cache_entry_removes_the_slot_from_both_mirrors() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 2, 2));
+        handler.on_surface_to_cache(&SurfaceToCachePdu {
+            surface_id: 1,
+            cache_key: 0,
+            cache_slot: 7,
+            source_rectangle: rect(0, 0, 1, 1),
+        });
+        assert_eq!(store.lock().unwrap().cache_stats().entries, 1);
+
+        handler.on_evict_cache_entry(&EvictCacheEntryPdu { cache_slot: 7 });
+
+        assert_eq!(store.lock().unwrap().cache_stats().entries, 0);
+        assert!(!handler.cache_dims.contains_key(&7));
+        assert_eq!(store.lock().unwrap().cache_stats().evictions, 1);
     }
 
     #[test]
@@ -1008,6 +1057,7 @@ mod tests {
         let stats = handler.stats().snapshot();
         assert_eq!(stats.decode_errors, 0, "the decode itself succeeded");
         assert_eq!(stats.surface_errors, 1, "the store refusal is the count");
+        assert_eq!(stats.surface_error_reasons.get("no_such_surface"), Some(&1));
     }
 
     #[test]
@@ -1109,6 +1159,14 @@ mod tests {
             destination_points: vec![Point { x: 65_000, y: 0 }],
         });
         assert_eq!(handler.stats().snapshot().surface_errors, 1);
+        assert_eq!(
+            handler
+                .stats()
+                .snapshot()
+                .surface_error_reasons
+                .get("coordinate_overflow"),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -1120,8 +1178,8 @@ mod tests {
 
         handler.on_frame_complete(1);
         handler.on_frame_complete(2);
-        handler.on_unhandled_pdu(&GfxPdu::EvictCacheEntry(EvictCacheEntryPdu {
-            cache_slot: 3,
+        handler.on_unhandled_pdu(&GfxPdu::CacheImportOffer(CacheImportOfferPdu {
+            cache_entries: Vec::new(),
         }));
 
         let stats = handler.stats().snapshot();
@@ -1308,6 +1366,95 @@ mod tests {
         assert_eq!(&out2[0..3], &[0x10, 0x20, 0x30]);
     }
 
+    #[test]
+    fn a_short_vbar_replayed_near_the_band_edge_is_clipped_to_the_band() {
+        use ironrdp_graphics::clearcodec::{ShortVBar, VBarCache};
+
+        let short = ShortVBar {
+            y_on: 3,
+            pixel_count: 3,
+            pixels: vec![
+                1, 2, 3, // the one row that fits
+                4, 5, 6, // beyond the band
+                7, 8, 9, // beyond the band
+            ],
+        };
+
+        let full = VBarCache::reconstruct_full_vbar(&short, 4, 10, 20, 30);
+
+        assert_eq!(full.pixels.len(), 4 * 3, "a four-row band stays four rows");
+        assert_eq!(&full.pixels[0..9], &[10, 20, 30, 10, 20, 30, 10, 20, 30]);
+        assert_eq!(&full.pixels[9..12], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn clearcodec_nscodec_subregion_is_decoded_instead_of_silently_skipped() {
+        use ironrdp_graphics::clearcodec::ClearCodecDecoder;
+
+        // A 1x1 NSCodec bitmap: four one-byte raw Y/Co/Cg/A planes. With CLL=1,
+        // Y=100, Co=10 and Cg=-5 reconstruct to BGR=(95,95,115).
+        let mut nscodec = Vec::new();
+        for _ in 0..4 {
+            nscodec.extend_from_slice(&1u32.to_le_bytes());
+        }
+        nscodec.extend_from_slice(&[1, 0, 0, 0]); // CLL, no subsampling, reserved
+        nscodec.extend_from_slice(&[100, 10, 251, 200]);
+
+        let mut subcodec = Vec::new();
+        subcodec.extend_from_slice(&0u16.to_le_bytes()); // x
+        subcodec.extend_from_slice(&0u16.to_le_bytes()); // y
+        subcodec.extend_from_slice(&1u16.to_le_bytes()); // width
+        subcodec.extend_from_slice(&1u16.to_le_bytes()); // height
+        subcodec.extend_from_slice(&u32::try_from(nscodec.len()).unwrap().to_le_bytes());
+        subcodec.push(1); // NSCodec
+        subcodec.extend_from_slice(&nscodec);
+
+        let mut clear = vec![0, 0]; // flags, sequence
+        clear.extend_from_slice(&0u32.to_le_bytes()); // residual bytes
+        clear.extend_from_slice(&0u32.to_le_bytes()); // band bytes
+        clear.extend_from_slice(&u32::try_from(subcodec.len()).unwrap().to_le_bytes());
+        clear.extend_from_slice(&subcodec);
+
+        let decoded = ClearCodecDecoder::new().decode(&clear, 1, 1).unwrap();
+        assert_eq!(decoded, [95, 95, 115, 200]);
+    }
+
+    #[test]
+    fn clearcodec_nscodec_rle_planes_expand_to_the_declared_bitmap() {
+        use ironrdp_graphics::clearcodec::ClearCodecDecoder;
+
+        // Nine identical bytes encode as a five-byte run followed by the mandatory raw
+        // four-byte tail: value, value, run-minus-two, then four raw bytes.
+        let plane = |value: u8| [value, value, 3, value, value, value, value];
+        let planes = [plane(100), plane(10), plane(251), plane(200)];
+        let mut nscodec = Vec::new();
+        for plane in &planes {
+            nscodec.extend_from_slice(&u32::try_from(plane.len()).unwrap().to_le_bytes());
+        }
+        nscodec.extend_from_slice(&[1, 0, 0, 0]);
+        for plane in &planes {
+            nscodec.extend_from_slice(plane);
+        }
+
+        let mut subcodec = Vec::new();
+        subcodec.extend_from_slice(&0u16.to_le_bytes());
+        subcodec.extend_from_slice(&0u16.to_le_bytes());
+        subcodec.extend_from_slice(&3u16.to_le_bytes());
+        subcodec.extend_from_slice(&3u16.to_le_bytes());
+        subcodec.extend_from_slice(&u32::try_from(nscodec.len()).unwrap().to_le_bytes());
+        subcodec.push(1);
+        subcodec.extend_from_slice(&nscodec);
+
+        let mut clear = vec![0, 0];
+        clear.extend_from_slice(&0u32.to_le_bytes());
+        clear.extend_from_slice(&0u32.to_le_bytes());
+        clear.extend_from_slice(&u32::try_from(subcodec.len()).unwrap().to_le_bytes());
+        clear.extend_from_slice(&subcodec);
+
+        let decoded = ClearCodecDecoder::new().decode(&clear, 3, 3).unwrap();
+        assert_eq!(decoded, [95, 95, 115, 200].repeat(9));
+    }
+
     /// A single-entry RLEX palette still uses ONE stop-index bit, not zero.
     ///
     /// FreeRDP computes `numBits = CLEAR_LOG2_FLOOR[paletteCount - 1] + 1`, and
@@ -1487,7 +1634,9 @@ mod tests {
     #[test]
     fn srl_state_persists_across_reads() {
         use ironrdp_graphics::progressive::SrlReader;
-        let data = [0b1000_1000u8, 0b1000_1000u8];
+        // Two complete symbols: +1 (`1001`), then -1 (`111`). Restarting before the
+        // second call would read +1 again.
+        let data = [0b1001_1110u8];
         let mut shared = SrlReader::new(&data);
         let first = shared.read(3);
         let second = shared.read(3);
@@ -1498,11 +1647,7 @@ mod tests {
             first,
             "a fresh reader sees the same first symbol"
         );
-        assert_ne!(
-            (first, second),
-            (first, first),
-            "the second read must continue the stream, not restart it"
-        );
+        assert_eq!((first, second), (1, -1));
     }
 
     /// The RFX YCbCr->RGB conversion, pinned against hand-computed values.

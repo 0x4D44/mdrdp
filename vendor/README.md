@@ -52,6 +52,22 @@ auto-reconnect cookie, which blocks proving session resumption in P2b. That one 
 larger change and a decision about whether to carry it — see
 `wrk_docs/2026.08.14 - RESEARCH - downstream unknowns for P2b, P2c, P3a and P7.md`.
 
+## `ironrdp-egfx` 0.3.0 — `ResetGraphics` preserves surfaces
+
+The published client clears its private offscreen-surface table whenever it receives
+`RDPGFX_RESET_GRAPHICS_PDU`. MS-RDPEGFX 3.3.5.14 says the client must resize the Graphics
+Output Buffer; it does not delete offscreen surfaces or bitmap-cache entries. Those have
+their own `DeleteSurface` and `EvictCacheEntry` commands.
+
+Windows 11 exercises this distinction immediately. Quench sent 260 `CacheToSurface`
+references after a reset without refilling those slots. Clearing mdrdp's cache dropped all
+260 regions; retaining the spec-defined state paints them. The vendored client keeps its
+surface metadata too, so a later map or delete still reaches mdrdp's handler.
+
+The intended difference from the published crate is the removal of `self.surfaces.clear()`
+in `src/client.rs::handle_reset_graphics`. Remove this patch once a released IronRDP version
+preserves surfaces across `ResetGraphics`.
+
 ## `ironrdp-graphics` 0.9.0 — RFX Progressive `quality` is a level, not an index
 
 An unmodified copy of the published crate plus one change, applied identically to the
@@ -262,6 +278,29 @@ rendered as opaque grey blocks around the text and buttons.
 `gfx::apply_wire_to_surface1` extracts the destination rect and swaps it to BGRA first —
 the surface stores RGBA and this decoder works in BGRA, so seeding without the swap would
 leave every uncovered pixel with red and blue exchanged.
+
+## `ironrdp-graphics` 0.9.0 — ClearCodec NSCodec subregions are decoded
+
+The published ClearCodec decoder parses `SubcodecId::NsCodec` and then does nothing. The
+outer command still returns success, so the client reports zero decode errors while every
+NSCodec rectangle keeps stale pixels. Quench uses those rectangles for text and controls in
+Windows first-run setup; the result was several grey horizontal bands across an otherwise
+correct screen.
+
+`src/clearcodec/nscodec.rs` implements the four-plane header, bounded RLE expansion,
+optional chroma subsampling, color-loss recovery, and YCoCg-to-BGRA reconstruction. A
+captured 448x448 ClearCodec command was split into residual, band, and subcodec combinations
+and decoded through both implementations. Every combination now matches FreeRDP 3.27.1
+byte-for-byte. `clearcodec_nscodec_subregion_is_decoded_instead_of_silently_skipped` and
+`clearcodec_nscodec_rle_planes_expand_to_the_declared_bitmap` pin the raw and RLE paths.
+
+## `ironrdp-graphics` 0.9.0 — short V-bars are clipped to the current band
+
+A cached short V-bar can be replayed with a new vertical offset against a shorter band.
+FreeRDP clips both the leading background and cached pixels to that band's declared height;
+`VBarCache::reconstruct_full_vbar` appended the entire cached run and could paint past
+`y_end`. The reconstructed entry now always contains exactly `band_height` rows. The
+edge case is pinned by `a_short_vbar_replayed_near_the_band_edge_is_clipped_to_the_band`.
 
 ## `ironrdp-graphics` 0.9.0 — RFX_TILE_DIFFERENCE was parsed and then ignored
 

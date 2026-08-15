@@ -259,6 +259,17 @@ impl SurfaceStore {
         self.touch();
     }
 
+    /// Remove one server-selected cache slot.
+    ///
+    /// An eviction command for an already-empty slot is harmless and is not counted as
+    /// displaced content. Reusing an occupied slot remains an eviction too.
+    pub fn evict_cache(&mut self, slot: u16) {
+        if self.cache.remove(&slot).is_some() {
+            self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(1);
+            self.touch();
+        }
+    }
+
     pub fn map_to_output(&mut self, id: u16) {
         self.output = Some(id);
         self.touch();

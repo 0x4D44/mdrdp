@@ -1373,19 +1373,6 @@ fn decode_tile_block(
 ) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
     use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
 
-    {
-        let info = match tile_block {
-            ProgressiveTile::Simple(t) => Some(("SIMPLE", t.x_idx, t.y_idx, t.flags)),
-            ProgressiveTile::First(t) => Some(("FIRST", t.x_idx, t.y_idx, t.flags)),
-            ProgressiveTile::Upgrade(_) => None,
-        };
-        if let Some((k, xi, yi, fl)) = info {
-            if yi == 0 && (xi == 10 || xi == 11) {
-                eprintln!("TFLAG tile({xi},{yi}) {k} flags=0x{fl:02x} diff={}", fl & 1);
-            }
-        }
-    }
-
     match tile_block {
         ProgressiveTile::Simple(tile) => {
             let x_idx = tile.x_idx;
@@ -1610,17 +1597,16 @@ mod tests {
     /// on their FIRST symbol — after that the shared one has advanced.
     #[test]
     fn srl_state_persists_across_reads() {
-        let data = [0b1000_1000u8, 0b1000_1000u8];
+        // Two complete symbols in one byte: +1 (`1001`), then -1 (`111`). A reader
+        // restarted for the second call would decode +1 again.
+        let data = [0b1001_1110u8];
         let mut shared = SrlReader::new(&data);
         let first = shared.read(3);
         let second = shared.read(3);
 
         let mut fresh = SrlReader::new(&data);
         assert_eq!(fresh.read(3), first);
-        assert_ne!(
-            second, 0,
-            "the second read must continue the stream, not restart it"
-        );
+        assert_eq!((first, second), (1, -1));
     }
 
     use super::*;
@@ -1845,6 +1831,7 @@ mod tests {
         decode_upgrade_pass(
             &srl_data,
             &raw_data,
+            &ComponentCodecQuant::LOSSLESS,
             &prev_prog_quant,
             &curr_prog_quant,
             false,

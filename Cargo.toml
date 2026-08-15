@@ -37,6 +37,8 @@ zeroize = "1.9.0"
 [patch.crates-io]
 # See vendor/README.md — one flag, without which EGFX never opens.
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
+# ResetGraphics resizes the output buffer; it does not destroy offscreen surfaces.
+ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
 # See vendor/README.md — RFX Progressive `quality` is a level, not a table index.
 ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 # See vendor/README.md — ClearCodec short-V-bar yOn/yOff were transposed.

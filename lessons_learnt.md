@@ -9,6 +9,12 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- A codec no-op can report success while leaving stale pixels; diff output (`clearcodec::decode_subcodec_region`).
+  ClearCodec's NSCodec branch parsed the region and returned `Ok(())` without painting it,
+  so every health counter was zero while horizontal bands stayed visibly stale. Splitting
+  one live command by layer and comparing each decoded buffer with FreeRDP isolated the
+  subcodec layer, then proved the completed decoder byte-for-byte.
+
 - macOS Cmd+Q calls AppKit `terminate:` → `exit(0)` inside winit's `run()`; clean-up must live in `ApplicationHandler::exiting` (`window::SessionWindow::on_exit`).
   winit installs a default menu whose Quit item is bound to `terminate:`, and it does not
   implement `applicationShouldTerminate:`, so AppKit takes NSTerminateNow. `run_app` never

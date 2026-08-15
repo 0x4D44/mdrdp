@@ -26,9 +26,11 @@ use mdrdp::audio::{AudioPlayback, AudioRing, AudioStatsHandle, RdpsndBackend};
 use mdrdp::clipboard::{ArboardClipboard, clipboard_channel};
 use mdrdp::connect::{Channels, ConnectOptions, establish};
 use mdrdp::favourites::{Favourite, Favourites, WindowSize};
-use mdrdp::gfx::GfxHandler;
+use mdrdp::gfx::{GfxHandler, GfxStatsHandle};
 use mdrdp::input::InputEvent;
 use mdrdp::launcher;
+use mdrdp::metrics::{ResourceMetrics, SessionMetricsReport};
+use mdrdp::process_metrics::{ProcessSnapshot, snapshot as process_snapshot};
 use mdrdp::session::{self, SessionServices};
 use mdrdp::stats::StatsHandle;
 use mdrdp::surface::SurfaceStore;
@@ -52,6 +54,7 @@ fn usage() -> &'static str {
      --duration <secs>      disconnect cleanly after N seconds (for scripted runs)\n  \
      --password-stdin       read the password from stdin instead of the keychain\n  \
      --screenshot <file>    write the final frame to a BMP (session pixels on disk)\n  \
+     --metrics-json <file>  write a redacted session metrics report as JSON\n  \
      --capture-failures DIR dump undecodable tiles for offline debugging\n\n\
      Flags override whatever the chosen favourite specifies."
 }
@@ -93,6 +96,52 @@ struct Target {
     fullscreen: bool,
 }
 
+fn session_end_state(end: &session::SessionEnd) -> &'static str {
+    match end {
+        session::SessionEnd::Graceful => "graceful",
+        session::SessionEnd::WindowClosed => "window_closed",
+        session::SessionEnd::Failed(_) => "failed",
+    }
+}
+
+fn resource_metrics(
+    start: ProcessSnapshot,
+    end: ProcessSnapshot,
+    elapsed_ms: u64,
+) -> Option<ResourceMetrics> {
+    Some(ResourceMetrics::new(
+        end.user_cpu_ms?.saturating_sub(start.user_cpu_ms?),
+        end.system_cpu_ms?.saturating_sub(start.system_cpu_ms?),
+        end.peak_resident_bytes?,
+        elapsed_ms,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_session_metrics(
+    path: &str,
+    started: std::time::Instant,
+    resource_start: ProcessSnapshot,
+    end: &session::SessionEnd,
+    stats: &StatsHandle,
+    gfx: &GfxStatsHandle,
+    audio: &AudioStatsHandle,
+    joined_channels: &[String],
+) -> std::io::Result<()> {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let resources = resource_metrics(resource_start, process_snapshot(), elapsed_ms);
+    let report = SessionMetricsReport::new(
+        elapsed_ms,
+        session_end_state(end),
+        &stats.snapshot(),
+        &gfx.snapshot(),
+        &audio.snapshot(),
+        joined_channels.iter().cloned(),
+        resources,
+    );
+    mdrdp::metrics::write_report(std::path::Path::new(path), &report)
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -124,6 +173,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut capture: Option<String> = None;
     let mut duration: Option<u64> = None;
     let mut screenshot: Option<String> = None;
+    let mut metrics_json: Option<String> = None;
     let mut password_stdin = false;
     let mut list_only = false;
 
@@ -150,6 +200,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--capture-failures" => capture = Some(value()?.clone()),
             "--duration" => duration = Some(value()?.parse()?),
             "--screenshot" => screenshot = Some(value()?.clone()),
+            "--metrics-json" => metrics_json = Some(value()?.clone()),
             "--size" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--size wants WxH, e.g. 1280x800")?;
@@ -324,6 +375,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let session_stats = StatsHandle::new();
     let window = window.with_stats(session_stats.clone());
+    let session_started = std::time::Instant::now();
+    let resource_start = process_snapshot();
 
     // The session handle is shared with the window's exit hook so the disconnect happens
     // exactly once, whichever way the loop ends. On macOS a Cmd+Q makes AppKit call
@@ -331,6 +384,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // simply never happen and the session would be abandoned on the host.
     let session_slot: Arc<Mutex<Option<session::SessionHandle>>> = Arc::new(Mutex::new(None));
     let slot_for_exit = Arc::clone(&session_slot);
+    let metrics_path_for_exit = metrics_json.clone();
+    let stats_for_exit = session_stats.clone();
+    let gfx_for_exit = gfx_stats.clone();
+    let audio_for_exit = audio_stats.clone();
+    let joined_channels_for_exit = established.report.joined_static_channels.clone();
     let window = window.on_exit(move || {
         let handle = slot_for_exit
             .lock()
@@ -339,6 +397,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(handle) = handle {
             let end = handle.shutdown();
             eprintln!("session ended: {end:?}");
+            if let Some(path) = &metrics_path_for_exit {
+                match write_session_metrics(
+                    path,
+                    session_started,
+                    resource_start,
+                    &end,
+                    &stats_for_exit,
+                    &gfx_for_exit,
+                    &audio_for_exit,
+                    &joined_channels_for_exit,
+                ) {
+                    Ok(()) => eprintln!("  metrics: redacted report written to {path}"),
+                    Err(error) => eprintln!("  metrics: could not write {path}: {error}"),
+                }
+            }
         }
     });
     let waker = window.waker();
@@ -479,6 +552,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("    {count:>5}  {reason}");
         }
     }
+    if !s.surface_error_reasons.is_empty() {
+        eprintln!("  surface failures by reason:");
+        for (reason, count) in &s.surface_error_reasons {
+            eprintln!("    {count:>5}  {reason}");
+        }
+    }
     if s.decode_errors > 0 && capture.is_none() {
         eprintln!(
             "  {} tiles failed to decode. Re-run with --capture-failures <dir> to keep \
@@ -575,6 +654,44 @@ fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_documents_the_redacted_metrics_export() {
+        let text = usage();
+        assert!(text.contains("--metrics-json <file>"));
+        assert!(text.contains("redacted"));
+    }
+
+    #[test]
+    fn resource_report_uses_session_cpu_delta_and_process_peak_memory() {
+        let start = ProcessSnapshot {
+            user_cpu_ms: Some(100),
+            system_cpu_ms: Some(40),
+            peak_resident_bytes: Some(1_000),
+        };
+        let end = ProcessSnapshot {
+            user_cpu_ms: Some(260),
+            system_cpu_ms: Some(80),
+            peak_resident_bytes: Some(2_000),
+        };
+        let resource = resource_metrics(start, end, 1_000).expect("all counters available");
+        assert_eq!(resource.user_cpu_ms, 160);
+        assert_eq!(resource.system_cpu_ms, 40);
+        assert_eq!(resource.peak_resident_bytes, 2_000);
+        assert_eq!(resource.average_cpu_percent, Some(20.0));
+    }
+
+    #[test]
+    fn session_end_state_never_serialises_an_error_detail() {
+        assert_eq!(
+            session_end_state(&session::SessionEnd::Graceful),
+            "graceful"
+        );
+        assert_eq!(
+            session_end_state(&session::SessionEnd::WindowClosed),
+            "window_closed"
+        );
+    }
 
     fn temper() -> Favourite {
         Favourite {
