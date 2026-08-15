@@ -54,3 +54,27 @@ Out-of-scope observations. A separate human-invoked review triages these.
   `clear_decompress_glyph_data` (freerdp-ref/clear.c:929+), and the residual/bands
   compositing order. Note the blocks predate the rlex fix — they are visible in the
   earlier `run2.png` capture too, so they are a separate defect from the decode errors.
+
+- [ ] 2026-08-15: ONE progressive tile renders wrong — grid (11, 0), i.e. pixels
+  x 704-767, y 0-63. Consistently ~+21 R, +11 G, -5 B against its neighbours (deviation
+  exactly 38 in every capture). Everything else on screen is correct.
+  Reproduce: `mdrdp quench --user ano --password-stdin --duration 14 --screenshot f.bmp`,
+  then compare the mean colour of 64px tile 11 in row 0 against tiles 10 and 12.
+  **Ruled out by experiment, do not repeat:**
+  1. *Upgrade passes* — skipping every TILE_UPGRADE leaves the deviation at 39. It comes
+     from the first pass.
+  2. *The bitmap cache* — skipping every CacheToSurface leaves it at exactly 38.
+  3. *Tile state contamination* — decoding the same tile data into a pristine `TileState`
+     and comparing reconstructions gives a mean absolute difference of 0.00, so our decode
+     is deterministic and carries nothing across frames.
+  4. *Content dependence* — the artefact sits at the same tile with the same deviation
+     across two completely different Spotlight wallpapers, while the tile's colour tracks
+     the wallpaper. So it decodes real content, consistently, but wrongly.
+  Note the tile's FIRST-pass chroma is unusually short (cr = 6 bytes where its neighbour
+  has 17-20), which is the most promising lead: a short RLGR chroma stream may be
+  mis-decoded. The workflow's RLGR comparison found only an ENCODER divergence
+  (UP_GR vs UQ_GR) and judged the decoder to match, so that would need re-checking
+  specifically for short/exhausted streams.
+  **Blocked on a reference capture**: settling whether tile 11 is wrong or merely
+  different needs FreeRDP's output for the same frame, and screencapture returns black
+  while the Mac is locked.
