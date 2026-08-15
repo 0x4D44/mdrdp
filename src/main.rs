@@ -157,14 +157,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         i += 2;
     }
 
-    let config_path = Favourites::default_path()
+    let config_path = Favourites::default_path();
+    let config_path_display = config_path
+        .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "(no config directory)".to_owned());
 
     // A malformed favourites file is reported, never silently treated as empty — the
     // list is the user's data and quietly losing it is worse than refusing to start.
     // With an explicit target on the command line we can still proceed without it.
-    let favourites = match Favourites::load() {
+    let favourites_result = match &config_path {
+        Ok(path) => Favourites::load_from(path),
+        Err(_) => Favourites::load(),
+    };
+    let mut favourites = match favourites_result {
         Ok(f) => f,
         Err(e) if positional.is_some() => {
             eprintln!("warning: could not read favourites ({e}); treating the argument as a host");
@@ -175,7 +181,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if list_only {
         if favourites.is_empty() {
-            println!("no favourites yet — add them in {config_path}");
+            println!("no favourites yet — open mdrdp to add one ({config_path_display})");
         } else {
             for f in favourites.iter() {
                 let account = f.username.as_deref().unwrap_or("(no account)");
@@ -193,9 +199,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The launcher stays open so several sessions can be started, which `run_app_on_demand`
     // supports directly: each `pick` is an orthogonal run of the same event loop.
     if positional.is_none() {
+        let config_path = config_path?;
         let mut event_loop = SessionWindow::event_loop()?;
         loop {
-            match launcher::pick(&mut event_loop, &favourites, &config_path)? {
+            match launcher::pick(&mut event_loop, &mut favourites, &config_path)? {
                 Some(f) => spawn_session(&f.name)?,
                 // Closing the launcher without choosing is a normal way to quit.
                 None => return Ok(()),

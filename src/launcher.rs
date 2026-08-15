@@ -15,18 +15,22 @@
 //! opening a window; only the winit plumbing is untested, and it is deliberately thin.
 
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{Window, WindowId};
 
-use crate::favourites::{Favourite, Favourites};
+use crate::favourites::{Favourite, Favourites, FavouritesError};
 use crate::ui::font;
+use crate::ui::form::{
+    FormAction, FormField, FormLayout, KeyAction as FormKeyAction, NewConnectionForm, Rect,
+};
 use crate::ui::list::{DoubleClick, KeyAction, ListView, Row};
 use crate::window::{SessionEvent, WindowError};
 
@@ -36,6 +40,8 @@ const DOUBLE_CLICK_MS: u64 = 400;
 const BG: u32 = 0x0018_1818;
 const HEADING: u32 = 0x00ff_ffff;
 const HINT: u32 = 0x0090_9090;
+const NEW_BUTTON_WIDTH: i32 = 144;
+const NEW_BUTTON_HEIGHT: i32 = 28;
 
 /// Where each part of the launcher window sits, in pixels.
 ///
@@ -76,6 +82,16 @@ impl Layout {
         let available = height - self.header_h - self.footer_h;
         (self.pad, y, self.width - self.pad * 2, available.max(0))
     }
+
+    /// Mouse target for the visible New Connection action in the header.
+    pub fn new_button_rect(&self, width: i32) -> Rect {
+        Rect::new(
+            (width - self.pad - NEW_BUTTON_WIDTH).max(self.pad),
+            10,
+            NEW_BUTTON_WIDTH,
+            NEW_BUTTON_HEIGHT,
+        )
+    }
 }
 
 /// Turn saved favourites into list rows.
@@ -103,6 +119,21 @@ fn subtitle_for(f: &Favourite) -> String {
     }
 }
 
+/// Add and atomically persist one connection without changing the in-memory list unless
+/// the on-disk replace succeeds. A full disk or unwritable directory therefore leaves the
+/// launcher showing exactly the durable state it started with.
+fn persist_new_connection(
+    favourites: &mut Favourites,
+    favourite: Favourite,
+    path: &Path,
+) -> Result<(), FavouritesError> {
+    let mut updated = favourites.clone();
+    updated.add(favourite)?;
+    updated.save_to(path)?;
+    *favourites = updated;
+    Ok(())
+}
+
 /// Show the launcher and return the chosen favourite, or `None` if the user closed it.
 ///
 /// Borrows the process's single event loop rather than making one. winit permits exactly
@@ -113,8 +144,8 @@ fn subtitle_for(f: &Favourite) -> String {
 /// launched.
 pub fn pick(
     event_loop: &mut EventLoop<SessionEvent>,
-    favourites: &Favourites,
-    config_path: &str,
+    favourites: &mut Favourites,
+    config_path: &Path,
 ) -> Result<Option<Favourite>, WindowError> {
     event_loop.set_control_flow(ControlFlow::Wait);
 
@@ -142,7 +173,9 @@ pub fn pick(
         chosen: None,
         failure: None,
         config_path: config_path.to_owned(),
-        empty: favourites.is_empty(),
+        favourites: favourites.clone(),
+        form: None,
+        modifiers: ModifiersState::empty(),
     };
 
     event_loop
@@ -152,7 +185,8 @@ pub fn pick(
     if let Some(e) = app.failure.take() {
         return Err(e);
     }
-    Ok(app.chosen.and_then(|i| favourites.iter().nth(i).cloned()))
+    *favourites = app.favourites;
+    Ok(app.chosen)
 }
 
 struct LauncherApp {
@@ -164,10 +198,12 @@ struct LauncherApp {
     double: DoubleClick,
     started: std::time::Instant,
     cursor: PhysicalPosition<f64>,
-    chosen: Option<usize>,
+    chosen: Option<Favourite>,
     failure: Option<WindowError>,
-    config_path: String,
-    empty: bool,
+    config_path: PathBuf,
+    favourites: Favourites,
+    form: Option<NewConnectionForm>,
+    modifiers: ModifiersState,
 }
 
 impl LauncherApp {
@@ -177,8 +213,57 @@ impl LauncherApp {
 
     /// Accept the current selection and close.
     fn confirm(&mut self, event_loop: &ActiveEventLoop, index: usize) {
-        self.chosen = Some(index);
-        event_loop.exit();
+        if let Some(favourite) = self.favourites.iter().nth(index).cloned() {
+            self.chosen = Some(favourite);
+            event_loop.exit();
+        }
+    }
+
+    fn open_form(&mut self) {
+        self.form = Some(NewConnectionForm::new());
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn cancel_form(&mut self) {
+        self.form = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn apply_form_action(&mut self, action: FormAction) {
+        match action {
+            FormAction::None => {}
+            FormAction::Cancelled => self.cancel_form(),
+            FormAction::Submitted(favourite) => {
+                match persist_new_connection(&mut self.favourites, favourite, &self.config_path) {
+                    Ok(()) => {
+                        self.list.set_rows(rows_for(&self.favourites));
+                        self.list.selected = self.favourites.len().checked_sub(1);
+                        self.form = None;
+                    }
+                    Err(error) => {
+                        if let Some(form) = self.form.as_mut() {
+                            form.error = Some(error.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn submit_form(&mut self) {
+        let action = self
+            .form
+            .as_mut()
+            .map(|form| form.handle_key(FormKeyAction::Submit))
+            .unwrap_or(FormAction::None);
+        self.apply_form_action(action);
     }
 
     fn redraw(&mut self) {
@@ -199,11 +284,19 @@ impl LauncherApp {
         let (bw, bh) = (size.width as usize, size.height as usize);
         buf.fill(BG);
 
+        if let Some(form) = self.form.as_mut() {
+            form.layout = FormLayout::for_window(size.width as i32, size.height as i32);
+            form.draw(&mut buf, bw, bh);
+            window.pre_present_notify();
+            let _ = buf.present();
+            return;
+        }
+
         font::draw_text(&mut buf, bw, bh, self.layout.pad, 12, "mdrdp", HEADING);
-        let hint = if self.empty {
-            "no saved connections yet"
+        let hint = if self.favourites.is_empty() {
+            "no saved connections yet  ·  choose New connection"
         } else {
-            "double-click to connect  ·  enter to open  ·  esc to quit"
+            "double-click to connect  ·  enter to open  ·  N to add"
         };
         font::draw_text(
             &mut buf,
@@ -215,9 +308,18 @@ impl LauncherApp {
             HINT,
         );
 
-        if self.empty {
-            // An empty list with no explanation looks like a bug. Say where the file is
-            // so the fix is obvious without reading any documentation.
+        let button = self.layout.new_button_rect(size.width as i32);
+        font::draw_text(
+            &mut buf,
+            bw,
+            bh,
+            button.x + 8,
+            button.y + 7,
+            "New connection",
+            HEADING,
+        );
+
+        if self.favourites.is_empty() {
             let y = self.layout.header_h + 8;
             font::draw_text(
                 &mut buf,
@@ -225,17 +327,8 @@ impl LauncherApp {
                 bh,
                 self.layout.pad,
                 y,
-                "add one by editing:",
+                "Create a saved connection entirely in this window.",
                 HINT,
-            );
-            font::draw_text(
-                &mut buf,
-                bw,
-                bh,
-                self.layout.pad,
-                y + font::CHAR_H + 4,
-                &self.config_path,
-                HEADING,
             );
         } else {
             self.list.draw(&mut buf, bw, bh);
@@ -248,7 +341,7 @@ impl LauncherApp {
             bh,
             self.layout.pad,
             footer_y,
-            &self.config_path,
+            &self.config_path.display().to_string(),
             HINT,
         );
 
@@ -313,6 +406,9 @@ impl ApplicationHandler<SessionEvent> for LauncherApp {
                 self.list.y = y;
                 self.list.width = w;
                 self.list.visible_height = h;
+                if let Some(form) = self.form.as_mut() {
+                    form.layout = FormLayout::for_window(size.width as i32, size.height as i32);
+                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -320,6 +416,9 @@ impl ApplicationHandler<SessionEvent> for LauncherApp {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
+                if self.form.is_some() {
+                    return;
+                }
                 let before = self.list.hover;
                 self.list.update_hover(position.x as i32, position.y as i32);
                 // Only repaint when the highlight actually moved: the cursor generates a
@@ -337,6 +436,33 @@ impl ApplicationHandler<SessionEvent> for LauncherApp {
                 ..
             } => {
                 let (x, y) = (self.cursor.x as i32, self.cursor.y as i32);
+                if let Some(field) = self.form.as_mut().and_then(|form| form.focus_at(x, y)) {
+                    match field {
+                        FormField::SessionMode => {
+                            if let Some(form) = self.form.as_mut() {
+                                form.handle_key(FormKeyAction::ToggleMode);
+                            }
+                        }
+                        FormField::Save => self.submit_form(),
+                        FormField::Cancel => self.cancel_form(),
+                        _ => {
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                let window_width = self
+                    .window
+                    .as_ref()
+                    .map(|window| window.inner_size().width as i32)
+                    .unwrap_or(self.layout.width);
+                if self.layout.new_button_rect(window_width).contains(x, y) {
+                    self.open_form();
+                    return;
+                }
                 if let Some(row) = self.list.row_at(x, y) {
                     self.list.selected = Some(row);
                     let now = self.now_ms();
@@ -350,7 +476,62 @@ impl ApplicationHandler<SessionEvent> for LauncherApp {
                 }
             }
 
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if self.form.is_some() {
+                    let focus = self.form.as_ref().map(|form| form.focus);
+                    let action = match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => Some(FormKeyAction::Cancel),
+                        Key::Named(NamedKey::Tab) if self.modifiers.shift_key() => {
+                            Some(FormKeyAction::ShiftTab)
+                        }
+                        Key::Named(NamedKey::Tab) => Some(FormKeyAction::Tab),
+                        Key::Named(NamedKey::Backspace) => Some(FormKeyAction::Backspace),
+                        Key::Named(NamedKey::Enter) => match focus {
+                            Some(FormField::SessionMode) => Some(FormKeyAction::ToggleMode),
+                            Some(FormField::Cancel) => Some(FormKeyAction::Cancel),
+                            _ => Some(FormKeyAction::Submit),
+                        },
+                        Key::Character(text)
+                            if focus == Some(FormField::SessionMode) && text.as_str() == " " =>
+                        {
+                            Some(FormKeyAction::ToggleMode)
+                        }
+                        _ => None,
+                    };
+                    if let Some(action) = action {
+                        let result = self
+                            .form
+                            .as_mut()
+                            .map(|form| form.handle_key(action))
+                            .unwrap_or(FormAction::None);
+                        self.apply_form_action(result);
+                        return;
+                    }
+
+                    if !self.modifiers.super_key()
+                        && !self.modifiers.control_key()
+                        && !self.modifiers.alt_key()
+                        && let Key::Character(text) = &event.logical_key
+                    {
+                        for ch in text.chars().filter(|ch| !ch.is_control()) {
+                            if let Some(form) = self.form.as_mut() {
+                                form.handle_key(FormKeyAction::Character(ch));
+                            }
+                        }
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+
+                if matches!(&event.logical_key, Key::Character(text) if text.eq_ignore_ascii_case("n"))
+                {
+                    self.open_form();
+                    return;
+                }
                 let action = match event.logical_key {
                     Key::Named(NamedKey::ArrowUp) => Some(KeyAction::Up),
                     Key::Named(NamedKey::ArrowDown) => Some(KeyAction::Down),
@@ -381,6 +562,18 @@ impl ApplicationHandler<SessionEvent> for LauncherApp {
 mod tests {
     use super::*;
     use crate::favourites::Favourite;
+
+    fn tempdir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "mdrdp-launcher-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create launcher test directory");
+        path
+    }
 
     fn favourites() -> Favourites {
         let mut f = Favourites::default();
@@ -516,5 +709,55 @@ mod tests {
         let (_, _, _, before) = l.list_rect(l.height);
         let (_, _, _, after) = l.list_rect(l.height + 200);
         assert_eq!(after - before, 200);
+    }
+
+    #[test]
+    fn new_connection_is_durable_before_the_launcher_list_changes() {
+        let dir = tempdir("persist");
+        let path = dir.join("favourites.toml");
+        let mut favourites = Favourites::default();
+        let mut candidate = Favourite::new("Quench", "quench");
+        candidate.username = Some("test-user".to_owned());
+
+        persist_new_connection(&mut favourites, candidate.clone(), &path).expect("save");
+
+        assert_eq!(favourites.iter().next(), Some(&candidate));
+        assert_eq!(
+            Favourites::load_from(&path)
+                .expect("reload after a process restart")
+                .iter()
+                .next(),
+            Some(&candidate)
+        );
+
+        std::fs::remove_file(&path).expect("remove test favourites");
+        std::fs::remove_dir(&dir).expect("remove launcher test directory");
+    }
+
+    #[test]
+    fn failed_persistence_does_not_show_an_entry_that_will_vanish_on_restart() {
+        let dir = tempdir("failure");
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"block create_dir_all").expect("create blocker");
+        let path = blocker.join("favourites.toml");
+        let mut favourites = Favourites::default();
+
+        let error =
+            persist_new_connection(&mut favourites, Favourite::new("Unsaved", "host"), &path)
+                .expect_err("a file cannot be used as a parent directory");
+
+        assert!(matches!(error, FavouritesError::Io(_)));
+        assert!(favourites.is_empty(), "memory must remain equal to disk");
+        std::fs::remove_file(&blocker).expect("remove blocker");
+        std::fs::remove_dir(&dir).expect("remove launcher test directory");
+    }
+
+    #[test]
+    fn new_connection_mouse_target_is_half_open() {
+        let layout = Layout::default();
+        let button = layout.new_button_rect(layout.width);
+        assert!(button.contains(button.x, button.y));
+        assert!(button.contains(button.x + button.width - 1, button.y));
+        assert!(!button.contains(button.x + button.width, button.y));
     }
 }
