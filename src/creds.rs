@@ -115,6 +115,25 @@ pub fn lookup_or_prompt(account: &str) -> Result<Secret, CredsError> {
     }
 }
 
+/// Read a password from standard input, for scripted and unattended runs.
+///
+/// This is the `docker login --password-stdin` pattern, and it exists because the two
+/// alternatives are worse: an argument is visible in `ps` and lands in shell history, and
+/// an environment variable is inherited by every child process. Stdin is neither.
+///
+/// It still never touches a config file and is never written anywhere. Intended for a
+/// throwaway development credential against a test box; the keychain remains the store
+/// for anything real.
+pub fn from_stdin() -> Result<Secret, CredsError> {
+    use std::io::Read as _;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| CredsError::NoPassword(format!("could not read stdin: {e}")))?;
+    // A trailing newline is what `echo` adds and is never part of the password.
+    secret_from_typed(buf.trim_end_matches(['\n', '\r']).to_owned())
+}
+
 /// Read a password from the terminal with echo disabled.
 ///
 /// Reads from the tty rather than stdin so it still works when stdin is a pipe, and fails

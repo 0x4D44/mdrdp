@@ -170,6 +170,28 @@ fn ms(d: Duration) -> f64 {
     (d.as_micros() as f64) / 1000.0
 }
 
+/// Static channels worth naming in a report.
+///
+/// `ChannelName` keeps its bytes private and implements no `Display`, so a name cannot be
+/// read back out of one — only compared. This is the list we compare against.
+const KNOWN_CHANNELS: &[&str] = &[
+    "drdynvc", "cliprdr", "rdpsnd", "rdpdr", "ainput", "echo", "rail",
+];
+
+/// Render a channel name for humans, and for `contains`-style checks.
+///
+/// The obvious `format!("{:?}", name)` yields `ChannelName { inner: [100, 114, ...] }`,
+/// which is unreadable *and* silently defeats any comparison against a plain name — a
+/// check for "cliprdr" against that string can never match, so the client reports the
+/// clipboard as unavailable on a server that joined it perfectly well.
+pub fn channel_label(name: &ironrdp_svc::pdu::gcc::ChannelName) -> String {
+    KNOWN_CHANNELS
+        .iter()
+        .find(|known| ironrdp_svc::pdu::gcc::ChannelName::from_utf8(known).as_ref() == Some(name))
+        .map(|known| (*known).to_owned())
+        .unwrap_or_else(|| format!("{name:?}"))
+}
+
 /// Build the active stage once. It owns the static channel set, so it cannot be built
 /// twice from one `ConnectionResult` — and both observation and shutdown need it.
 fn build_active_stage(
@@ -311,6 +333,15 @@ pub fn establish(
         cliprdr,
         rdpsnd,
     } = channels;
+    // Read before `rdpsnd` is moved into the channel set below.
+    //
+    // This drives the Client Info PDU's INFO_NOAUDIOPLAYBACK flag, and the polarity is
+    // easy to get backwards: the connector sets NO_AUDIO_PLAYBACK when this is *false*,
+    // and MS-RDPBCGR 2.2.1.11.1.1 defines that flag as "audio redirection MUST NOT take
+    // place". Leaving it false while registering RDPSND joins the channel and then tells
+    // the server never to use it — the server obliges, no Wave PDU ever arrives, and the
+    // feature looks present while producing permanent silence.
+    let wants_audio = rdpsnd.is_some();
     let mut trace = Trace::new();
     let target = format!("{}:{}", opts.host, opts.port);
 
@@ -344,7 +375,7 @@ pub fn establish(
         alternate_shell: String::new(),
         work_dir: String::new(),
         autologon: false,
-        enable_audio_playback: false,
+        enable_audio_playback: wants_audio,
         performance_flags: ironrdp::pdu::rdp::client_info::PerformanceFlags::default(),
         desktop_scale_factor: 0,
         license_cache: None,
@@ -501,7 +532,7 @@ pub fn establish(
     let joined_static_channels: Vec<String> = result
         .static_channels
         .iter()
-        .map(|(id, channel)| format!("{:?} (id {:?})", channel.channel_name(), id))
+        .map(|(_id, channel)| channel_label(&channel.channel_name()))
         .collect();
     let stage = build_active_stage(result);
 
@@ -560,4 +591,23 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
     let shutdown = send_shutdown(&established.stage, &mut established.framed);
     report.graceful_shutdown = shutdown.is_ok();
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_known_channel_renders_as_its_name_not_its_bytes() {
+        let cliprdr = ironrdp_svc::pdu::gcc::ChannelName::from_utf8("cliprdr").unwrap();
+        let label = super::channel_label(&cliprdr);
+        assert_eq!(label, "cliprdr");
+        assert!(!label.contains("inner"), "got {label}");
+    }
+
+    #[test]
+    fn an_unknown_channel_still_renders_something_rather_than_nothing() {
+        let odd = ironrdp_svc::pdu::gcc::ChannelName::from_utf8("weird").unwrap();
+        let label = super::channel_label(&odd);
+        assert!(!label.is_empty());
+        assert_ne!(label, "cliprdr");
+    }
 }

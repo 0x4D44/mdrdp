@@ -48,6 +48,12 @@ pub struct SessionServices {
     /// `None` when the clipboard channel was not negotiated.
     pub clipboard: Option<ClipboardBridge>,
     pub stats: StatsHandle,
+    /// The graphics counters, so the overlay can show decode failures and stale regions.
+    ///
+    /// Without this the overlay's STALE line is unreachable: those counters live in the
+    /// EGFX handler, which is moved into the connector and unreachable afterwards, so
+    /// nothing was ever copying them across and the overlay silently reported zero.
+    pub gfx: Option<crate::gfx::GfxStatsHandle>,
 }
 
 /// Why the session ended.
@@ -137,6 +143,18 @@ fn run(
     // Windows host, and they accumulate until it stops accepting logons.
     let _ = send_shutdown(&established.stage, &mut established.framed);
 
+    // Tell the window the session is over — but ONLY when the session ended on its own.
+    //
+    // If `stop` is set, the window is already tearing down and is blocked in `join()`
+    // waiting for this very thread (see `SessionWindow::on_exit`). Posting to the event
+    // loop proxy from here would then be a thread waking a loop that is waiting on it:
+    // a deadlock that hangs the process on every exit, which is worse than the frozen
+    // window this call exists to prevent, because a hung process gets killed and a
+    // killed process never sends the Shutdown Request at all.
+    if !stop.load(Ordering::Relaxed) {
+        waker.close();
+    }
+
     outcome
 }
 
@@ -155,6 +173,10 @@ fn pump(
     // When input went out with no resulting paint seen yet. The gap between the two is
     // the round trip the latency requirement is about.
     let mut input_sent_at: Option<Instant> = None;
+    // Accumulated locally and flushed when the picture changes: taking the stats lock on
+    // every PDU would put a mutex in the hottest path in the client for a counter nobody
+    // reads more than a few times a second.
+    let mut bytes_since_flush: u64 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -190,11 +212,20 @@ fn pump(
                 ) =>
             {
                 // Quiet link. Normal — this is how the loop yields to the input queue.
-                notify_if_painted(store, waker, last_generation, services, &mut input_sent_at);
+                notify_if_painted(
+                    store,
+                    waker,
+                    last_generation,
+                    services,
+                    &mut input_sent_at,
+                    &mut bytes_since_flush,
+                );
                 continue;
             }
             Err(e) => return SessionEnd::Failed(ConnectError::Io(e)),
         };
+
+        bytes_since_flush = bytes_since_flush.saturating_add(payload.len() as u64);
 
         let outputs = match established.stage.process(image, action, &payload) {
             Ok(outputs) => outputs,
@@ -217,7 +248,14 @@ fn pump(
             }
         }
 
-        notify_if_painted(store, waker, last_generation, services, &mut input_sent_at);
+        notify_if_painted(
+            store,
+            waker,
+            last_generation,
+            services,
+            &mut input_sent_at,
+            &mut bytes_since_flush,
+        );
     }
 }
 
@@ -274,6 +312,7 @@ fn notify_if_painted(
     last: &mut u64,
     services: &SessionServices,
     input_sent_at: &mut Option<Instant>,
+    bytes_since_flush: &mut u64,
 ) {
     let Ok(guard) = store.lock() else {
         return;
@@ -296,11 +335,21 @@ fn notify_if_painted(
         let micros = u32::try_from(sent.elapsed().as_micros()).unwrap_or(u32::MAX);
         services.stats.update(|s| s.latency.record(micros));
     }
+    // The graphics counters live in the EGFX handler, which the connector owns; copy the
+    // ones the overlay reports so its STALE line reflects reality rather than a constant
+    // zero. A snapshot is cheap and this runs only when the picture actually changed.
+    let gfx = services.gfx.as_ref().map(|g| g.snapshot());
     services.stats.update(|s| {
         s.frames = s.frames.saturating_add(1);
         s.cache = cache;
+        s.bytes_in = s.bytes_in.saturating_add(*bytes_since_flush);
+        if let Some(gfx) = gfx {
+            s.decode_errors = gfx.decode_errors;
+            s.undecoded_regions = gfx.undecoded_regions;
+        }
     });
 
+    *bytes_since_flush = 0;
     waker.damaged();
 }
 

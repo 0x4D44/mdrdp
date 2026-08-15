@@ -29,21 +29,31 @@
 //! * [`AudioPlayback`] — owns the cpal `Stream`. Its callback does one thing: pull from
 //!   the ring into the device's buffer.
 //!
-//! ## Known limitation: `format_no` ordering
+//! ## `format_no` resolution: why we only ever advertise one format
 //!
-//! [`Wave2Pdu::format_no`] is documented as an index into the *Client Audio Formats*
-//! array — the list we send back after negotiation. But `Rdpsnd::client_formats`
-//! (upstream, not something this module can change) builds that list via
-//! `HashSet::intersection` over our [`candidate_formats`] and the server's offer, and
-//! `HashSet` iteration order is not insertion-order and is not guaranteed stable across
-//! runs. This module resolves `format_no` by indexing into the *same* `Vec` returned from
-//! [`RdpsndBackend`]'s `get_formats()`, which is the only ordering available to us from
-//! this side of the trait — but it is not provably the order the crate put on the wire.
-//! Every format we advertise is one we can actually play (see [`is_playable`]), so a
-//! mismatch here cannot panic or misbehave catastrophically; the worst case is a wrong
-//! sample rate or channel count assumed for one stream, which is an audible artifact, not
-//! a crash. This could not be verified without a live server logging the actual
-//! `wFormatNo` values it sends — see the test report for what was and was not checked.
+//! [`Wave2Pdu::format_no`] indexes into the *Client Audio Formats* array — the list
+//! actually sent to the server after negotiation. That list is built by
+//! `Rdpsnd::client_formats` (upstream, in `ironrdp_rdpsnd::client`, not something this
+//! module can change) as a `HashSet::intersection` of what [`RdpsndBackend::get_formats`]
+//! returns and the server's offer, collected into a `Vec` in `HashSet` iteration order —
+//! order that is not insertion order and is not stable across runs (`HashSet`'s default
+//! hasher is randomly seeded per process). `RdpsndClientHandler` (the full trait: `get_flags`,
+//! `get_formats`, `wave`, `set_volume`, `set_pitch`, `close`) gives this module no callback
+//! that reports the negotiated list, its order, or even the server's offer — `wave()`
+//! receives a bare `usize`. There is therefore no honest way, from this side of the trait,
+//! to resolve an index into a list of two or more candidate entries; doing so would be a
+//! guess dressed up as a lookup, and a previous version of this module did exactly that by
+//! indexing [`candidate_formats`] — silently playing the wrong rate and channel count for
+//! an entire session whenever the guess was wrong.
+//!
+//! The fix: [`RdpsndBackend::get_formats`] returns **at most one** entry (see
+//! [`negotiated_format`]). `HashSet::intersection` of a singleton set can itself contain at
+//! most one element, so if the server accepts our one format, `format_no` can only ever
+//! legitimately be `0` — there is no ordering left to get wrong. If the server does not
+//! offer that format, the intersection is empty and the server has nothing to send us: a
+//! real capability gap, not a resolution bug, and it fails safe (no audio) rather than
+//! unsafe (audio at the wrong rate). Any `format_no` other than `0` is therefore refused
+//! and the packet dropped — see `wave()`.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -142,6 +152,27 @@ pub fn choose_format(offered: &[AudioFormat]) -> Result<AudioFormat, NoUsableFor
         .cloned()
         .max_by_key(|f| (f.n_samples_per_sec, f.n_channels))
         .ok_or(NoUsableFormat)
+}
+
+/// The single format [`RdpsndBackend`] advertises via `get_formats()` — see the module
+/// docs for why exactly one entry, never [`candidate_formats`]'s full four, is the only
+/// size this can safely be.
+///
+/// Prefers the device's own native rate/channel count when that already happens to be one
+/// of [`SUPPORTED_SAMPLE_RATES`] x [`SUPPORTED_CHANNELS`] (no resampling needed at all);
+/// falls back to 48000Hz at the device's channel count — a rate the vast majority of RDP
+/// hosts offer — when the device's native rate is something else entirely (e.g. a
+/// professional interface running at 96000Hz). `device.n_channels` is always 1 or 2 by the
+/// time this is called: [`AudioPlayback::start`]'s success path rejects any device
+/// reporting otherwise, and its failure-fallback path hardcodes 48000/stereo — both are
+/// already playable, so the fallback branch here is always reachable and always valid.
+fn negotiated_format(device: AudioFormatSummary) -> AudioFormat {
+    let native = pcm_format(device.sample_rate, device.channels);
+    if is_playable(&native) {
+        native
+    } else {
+        pcm_format(48_000, device.channels)
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -278,7 +309,10 @@ pub struct AudioStats {
     /// removed the OLDEST sample, never the newest — see [`AudioRing`].
     pub overruns: u64,
     /// Device-callback invocations that needed at least one sample the ring buffer did
-    /// not have, and were filled with silence instead.
+    /// not have, and were filled with silence instead — counted only from the moment real
+    /// audio has flowed at least once. Silence before the first sample ever arrives (the
+    /// device opens and starts pulling before the RDP session even exists) is expected,
+    /// not a glitch, and is not counted.
     pub underruns: u64,
     /// Audio-device failures observed (open failure, runtime device error). The session
     /// keeps running without audio when this is non-zero; see [`AudioPlayback`].
@@ -335,6 +369,10 @@ pub const RING_BUFFER_MS: u64 = 200;
 struct RingBuf {
     samples: VecDeque<f32>,
     capacity: usize,
+    /// Latches to `true` the first time [`push`](Self::push) receives real samples.
+    /// Distinguishes "audio has never arrived yet" from "audio arrived and then the ring
+    /// ran dry" — only the latter is a real underrun. See [`pop_into`](Self::pop_into).
+    has_flowed: bool,
 }
 
 impl RingBuf {
@@ -345,6 +383,7 @@ impl RingBuf {
         Self {
             samples: VecDeque::with_capacity(capacity),
             capacity,
+            has_flowed: false,
         }
     }
 
@@ -355,6 +394,9 @@ impl RingBuf {
     /// completeness for a remote desktop, so when the network is outrunning the device we
     /// want the buffer to hold what's about to be played, not what already fell behind.
     fn push(&mut self, incoming: &[f32]) -> u64 {
+        if !incoming.is_empty() {
+            self.has_flowed = true;
+        }
         let mut dropped = 0u64;
         for &s in incoming {
             if self.samples.len() >= self.capacity {
@@ -368,7 +410,12 @@ impl RingBuf {
 
     /// Fill `out` from the buffer. Any samples the buffer cannot supply are left at
     /// silence (`0.0`) — repeating the last buffer instead would produce an audible buzz,
-    /// which is the one thing worse than a gap. Returns whether any silence was needed.
+    /// which is the one thing worse than a gap. Returns whether this pull is a genuine
+    /// underrun: silence was needed **and** real audio has flowed at least once before.
+    /// Silence pulled before the first sample ever arrives is not an underrun — nothing was
+    /// expected yet (the cpal callback starts pulling the instant the device opens, which
+    /// is before the RDP session even exists — see `AudioPlayback::start`); once audio has
+    /// flowed, every later empty pull is a real gap the user would hear.
     fn pop_into(&mut self, out: &mut [f32]) -> bool {
         let mut had_gap = false;
         for slot in out.iter_mut() {
@@ -380,7 +427,7 @@ impl RingBuf {
                 }
             };
         }
-        had_gap
+        had_gap && self.has_flowed
     }
 }
 
@@ -435,11 +482,15 @@ impl AudioRing {
     }
 
     /// Consumer side: called from the cpal realtime callback. Fills `out` fully, using
-    /// silence for anything the buffer could not supply. `O(out.len())`, no allocation, no
-    /// syscalls, and the lock is held only across that same deque work.
+    /// silence for anything the buffer could not supply. Counts an underrun only once real
+    /// audio has flowed at least once — see [`RingBuf::pop_into`] — so the device opening
+    /// and pulling from an empty ring before the RDP session has sent a single sample
+    /// (which happens on every session start) does not inflate the counter.
+    /// `O(out.len())`, no allocation, no syscalls, and the lock is held only across that
+    /// same deque work.
     pub fn pop_into(&self, out: &mut [f32]) {
-        let had_gap = self.lock().pop_into(out);
-        if had_gap {
+        let is_underrun = self.lock().pop_into(out);
+        if is_underrun {
             self.stats
                 .note(|s| s.underruns = s.underruns.saturating_add(1));
         }
@@ -473,9 +524,9 @@ impl AudioRing {
 /// server gets a dropped packet and a counter, never a crash or a stall.
 #[derive(Debug)]
 pub struct RdpsndBackend {
-    /// What we advertise via `get_formats()`. Also what `wave()` indexes `format_no`
-    /// into — see the module docs for why that indexing is a best-effort assumption, not
-    /// a proven-correct one.
+    /// What we advertise via `get_formats()` — and, because it holds at most one entry
+    /// (see [`negotiated_format`]), also the only list `wave()` can honestly resolve
+    /// `format_no` against. See the module docs for why a single entry is required.
     formats: Vec<AudioFormat>,
     ring: AudioRing,
     stats: AudioStatsHandle,
@@ -488,7 +539,27 @@ impl RdpsndBackend {
     /// to target instead of a guess.
     pub fn new(ring: AudioRing, stats: AudioStatsHandle, device: AudioFormatSummary) -> Self {
         Self {
-            formats: candidate_formats(),
+            formats: vec![negotiated_format(device)],
+            ring,
+            stats,
+            device,
+        }
+    }
+
+    /// Test-only escape hatch: construct with an explicit advertised list, bypassing the
+    /// singleton [`negotiated_format`] derivation `new()` uses. Exists so tests can pin
+    /// `wave()`'s index resolution against a list that is deliberately *not*
+    /// [`candidate_formats`] and *not* what `new()` would derive — proving resolution reads
+    /// whatever list this struct actually holds, not a hardcoded fallback.
+    #[cfg(test)]
+    fn with_formats(
+        formats: Vec<AudioFormat>,
+        ring: AudioRing,
+        stats: AudioStatsHandle,
+        device: AudioFormatSummary,
+    ) -> Self {
+        Self {
+            formats,
             ring,
             stats,
             device,
@@ -506,12 +577,16 @@ impl RdpsndClientHandler for RdpsndBackend {
             .note(|s| s.packets_received = s.packets_received.saturating_add(1));
 
         let Some(fmt) = self.formats.get(format_no).filter(|f| is_playable(f)) else {
-            // Either an out-of-range index or (should never happen, since every entry in
-            // `formats` is playable by construction) a format we cannot play. Either way:
-            // drop this one packet and keep going. Logged at debug, not warn — a single
-            // stray index is not actionable and must not spam per-packet.
+            // `self.formats` holds at most one entry (see `negotiated_format`), so any
+            // `format_no != 0` is unresolvable by construction — not a guess we decline to
+            // make, a genuine "the server referenced something we never sent". Silence is
+            // the only honest response: playing *something* here would mean picking an
+            // arbitrary sample rate/channel count, exactly the bug this module used to
+            // have. Logged at debug, not warn — a single stray index is not actionable and
+            // must not spam per-packet.
             debug!(
                 format_no,
+                formats_len = self.formats.len(),
                 "rdpsnd: wave for unresolvable format index; dropping packet"
             );
             return;
@@ -1030,11 +1105,50 @@ mod tests {
     #[test]
     fn repeated_underruns_each_count_once_per_callback_not_per_missing_sample() {
         let (ring, stats) = ring(8);
+        ring.push(&[1.0]); // audio must have flowed at least once for underruns to count
         let mut out = [1.0f32; 4];
-        ring.pop_into(&mut out); // fully empty: one underrun event
-        ring.pop_into(&mut out); // still empty: a second underrun event
+        ring.pop_into(&mut out); // 1 real sample + 3 gap slots: one underrun event
+        ring.pop_into(&mut out); // fully empty: a second underrun event
         assert_eq!(out, [0.0; 4]);
         assert_eq!(stats.snapshot().underruns, 2);
+    }
+
+    #[test]
+    fn underruns_are_not_counted_before_any_audio_has_ever_flowed() {
+        // Mirrors AudioPlayback::start(): cpal's callback starts pulling from the ring the
+        // instant the device opens, which is before the RDP session has sent a single
+        // Wave2 packet — often before the connection even exists. That pre-connection
+        // silence is expected, not a glitch, and must not inflate the counter (defect 2:
+        // ~94 phantom underruns/sec at 48kHz/512-frame buffers, forever, even on a session
+        // where audio worked perfectly).
+        let (ring, stats) = ring(8);
+        let mut out = [3.0f32; 4];
+        for _ in 0..50 {
+            ring.pop_into(&mut out);
+        }
+        assert_eq!(out, [0.0; 4], "still filled with silence");
+        assert_eq!(
+            stats.snapshot().underruns,
+            0,
+            "silence before any audio ever arrived must not count as an underrun"
+        );
+    }
+
+    #[test]
+    fn underruns_are_counted_once_audio_has_flowed_and_the_ring_runs_dry_mid_stream() {
+        let (ring, stats) = ring(8);
+        ring.push(&[1.0, 2.0]); // audio has now genuinely flowed
+
+        let mut out = [0.0f32; 2];
+        ring.pop_into(&mut out); // drains exactly what was pushed: no gap
+        assert_eq!(stats.snapshot().underruns, 0, "an exact drain is not a gap");
+
+        ring.pop_into(&mut out); // ring is now empty: a real, audible underrun
+        assert_eq!(
+            stats.snapshot().underruns,
+            1,
+            "running dry after audio has flowed must be counted"
+        );
     }
 
     #[test]
@@ -1065,23 +1179,108 @@ mod tests {
     }
 
     #[test]
-    fn get_formats_advertises_only_playable_pcm_formats() {
+    fn get_formats_advertises_exactly_one_playable_format() {
+        // Exactly one, never candidate_formats()'s full four: HashSet::intersection of a
+        // singleton set can itself have at most one element, which is what makes
+        // format_no resolution provable rather than a guess. See the module docs.
         let (backend, _ring, _stats) = backend(device_native());
-        for fmt in backend.get_formats() {
-            assert!(is_playable(fmt));
-        }
-        assert_eq!(backend.get_formats().len(), 4);
+        let formats = backend.get_formats();
+        assert_eq!(
+            formats.len(),
+            1,
+            "advertising more than one format reintroduces the HashSet ordering ambiguity"
+        );
+        assert!(is_playable(&formats[0]));
+        assert_eq!(formats[0].n_samples_per_sec, 48_000);
+        assert_eq!(formats[0].n_channels, 2);
+    }
+
+    #[test]
+    fn wave_resolves_format_no_against_the_negotiated_list_not_candidate_formats() {
+        // The historical bug: wave() indexed `candidate_formats()` — our own fixed
+        // 4-entry list — instead of whatever list was actually negotiated/sent. This
+        // fixture is built so index 1 means something different in each list: in
+        // `candidate_formats()`, index 1 is 44100Hz/stereo; here, deliberately, it is
+        // 48000Hz/stereo. If `wave()` ever regresses to indexing `candidate_formats()`
+        // again, this test must fail by resolving the wrong rate.
+        let negotiated = vec![pcm_format(44_100, 1), pcm_format(48_000, 2)];
+        assert_ne!(
+            negotiated[1],
+            candidate_formats()[1],
+            "fixture must diverge from candidate_formats() at this index or the test proves nothing"
+        );
+
+        let stats = AudioStatsHandle::new();
+        let ring = AudioRing::with_capacity(4096, stats.clone());
+        let device = device_native(); // 48000/2 — matches negotiated[1] exactly: no remap/resample
+        let mut backend =
+            RdpsndBackend::with_formats(negotiated, ring.clone(), stats.clone(), device);
+
+        // Two distinguishable stereo frames.
+        let pcm: Vec<u8> = [1000_i16, -1000, 2000, -2000]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        backend.wave(1, 0, Cow::Borrowed(&pcm));
+
+        let mut out = [0.0f32; 4];
+        ring.pop_into(&mut out);
+        // Format matches the device exactly (48000/2), so this must be an unaltered
+        // passthrough. Resolving to candidate_formats()[1] (44100/stereo) instead would
+        // trigger a resample here, which would NOT reproduce the input bit-for-bit.
+        let expected = pcm16_le_to_f32(&pcm);
+        assert_eq!(
+            out.to_vec(),
+            expected,
+            "index 1 must resolve to negotiated[1] (48000/stereo), unaltered"
+        );
+
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.current_format,
+            Some(AudioFormatSummary {
+                sample_rate: 48_000,
+                channels: 2,
+                bits_per_sample: 16
+            }),
+            "must report the negotiated format actually used, not candidate_formats()'s"
+        );
+    }
+
+    #[test]
+    fn wave_with_an_index_past_the_negotiated_list_is_dropped_not_guessed() {
+        // A negotiated list of exactly one entry (as `new()` always produces). format_no=1
+        // is precisely the shape of the original bug: a small, valid-looking index that
+        // used to resolve into candidate_formats()'s second entry instead of being
+        // recognised as unresolvable.
+        let negotiated = vec![pcm_format(44_100, 1)];
+        let stats = AudioStatsHandle::new();
+        let ring = AudioRing::with_capacity(4096, stats.clone());
+        let mut backend =
+            RdpsndBackend::with_formats(negotiated, ring.clone(), stats.clone(), device_native());
+
+        backend.wave(1, 0, Cow::Borrowed(&[1, 2, 3, 4]));
+
+        let mut out = [7.0f32; 4];
+        ring.pop_into(&mut out);
+        assert_eq!(
+            out, [0.0; 4],
+            "an unresolvable index must never produce played audio"
+        );
+        assert_eq!(stats.snapshot().bytes_played, 0);
+        assert_eq!(stats.snapshot().current_format, None);
     }
 
     #[test]
     fn wave_for_a_format_matching_the_device_queues_samples_unchanged() {
         let (mut backend, ring, stats) = backend(device_native());
-        // format index 3 is (48000, 2) per candidate_formats' nested-loop order.
+        // new() always negotiates a singleton, so index 0 is the only valid format_no.
         let format_no = backend
             .get_formats()
             .iter()
             .position(|f| f.n_samples_per_sec == 48_000 && f.n_channels == 2)
             .expect("48000/stereo must be advertised");
+        assert_eq!(format_no, 0);
 
         let pcm: Vec<u8> = [100_i16, -100, 200, -200]
             .iter()
@@ -1110,19 +1309,23 @@ mod tests {
     }
 
     #[test]
-    fn wave_duplicates_mono_into_a_stereo_device_target() {
-        let (mut backend, ring, _stats) = backend(device_native());
-        let format_no = backend
-            .get_formats()
-            .iter()
-            .position(|f| f.n_samples_per_sec == 48_000 && f.n_channels == 1)
-            .expect("48000/mono must be advertised");
+    fn wave_remaps_a_negotiated_mono_format_into_a_stereo_device_target() {
+        // Under the singleton design, `new()` always negotiates a format whose channel
+        // count already matches the device (see `negotiated_format`), so a mono-wire/
+        // stereo-device mismatch can no longer arise on the live path — but the
+        // remap_channels wiring inside wave() must still be correct if it is ever fed a
+        // mismatched entry, so this pins it directly via `with_formats`.
+        let negotiated = vec![pcm_format(48_000, 1)];
+        let stats = AudioStatsHandle::new();
+        let ring = AudioRing::with_capacity(4096, stats.clone());
+        let mut backend =
+            RdpsndBackend::with_formats(negotiated, ring.clone(), stats.clone(), device_native());
 
         let pcm: Vec<u8> = [1000_i16, 2000]
             .iter()
             .flat_map(|s| s.to_le_bytes())
             .collect();
-        backend.wave(format_no, 0, Cow::Borrowed(&pcm));
+        backend.wave(0, 0, Cow::Borrowed(&pcm));
 
         let mut out = [0.0f32; 4];
         ring.pop_into(&mut out);

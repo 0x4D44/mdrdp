@@ -216,8 +216,19 @@ pub fn present_into(
         return;
     }
 
-    let dest_right = (viewport.dest_x + viewport.dest_width).min(window_width);
-    let dest_bottom = (viewport.dest_y + viewport.dest_height).min(window_height);
+    // Saturating, not plain `+`: the guards above check the *origin* is inside the window
+    // but say nothing about the extent, and this is a public function taking a
+    // caller-supplied viewport. A dest_width near u32::MAX overflows — a panic in debug,
+    // a wrap to a tiny value in release, which silently paints a sliver instead of
+    // blanking as this function's contract promises.
+    let dest_right = viewport
+        .dest_x
+        .saturating_add(viewport.dest_width)
+        .min(window_width);
+    let dest_bottom = viewport
+        .dest_y
+        .saturating_add(viewport.dest_height)
+        .min(window_height);
 
     // Column table: one division per column instead of one per pixel.
     let mut col: Vec<u32> = Vec::with_capacity((dest_right - viewport.dest_x) as usize);
@@ -314,6 +325,7 @@ pub struct SessionWindow {
     store: Arc<Mutex<SurfaceStore>>,
     input: Sender<InputEvent>,
     stats: Option<StatsHandle>,
+    on_exit: Option<Box<dyn FnMut()>>,
 }
 
 impl SessionWindow {
@@ -351,7 +363,28 @@ impl SessionWindow {
             store,
             input,
             stats: None,
+            on_exit: None,
         })
+    }
+
+    /// Run `f` when the event loop is tearing down, however it was told to.
+    ///
+    /// This is not a convenience. On macOS winit installs a default menu whose Quit item
+    /// is bound to AppKit's `terminate:`, and winit does not implement
+    /// `applicationShouldTerminate:` — so Cmd+Q takes the default `NSTerminateNow` path:
+    /// AppKit calls `exit(0)` from inside `-[NSApplication run]`. `run_app` never
+    /// returns, so every statement after it is skipped, destructors do not run, and the
+    /// RDP session is abandoned with no Shutdown Request. Abandoned sessions accumulate
+    /// on a Windows host until it stops accepting logons — the exact failure this
+    /// codebase has already been bitten by once.
+    ///
+    /// winit does emit `LoopExiting` before that `exit(0)`, which reaches
+    /// [`ApplicationHandler::exiting`]. That callback is the only place a disconnect can
+    /// still be sent, so it is where the hook runs. Closing the window normally reaches
+    /// the same callback, so this path is not a rarely-exercised special case.
+    pub fn on_exit(mut self, f: impl FnMut() + 'static) -> Self {
+        self.on_exit = Some(Box::new(f));
+        self
     }
 
     /// Show these counters when the user asks for the overlay.
@@ -376,8 +409,10 @@ impl SessionWindow {
             store,
             input,
             stats,
+            on_exit,
         } = self;
         let mut app = SessionApp::new(config, store, input, stats);
+        app.on_exit = on_exit;
         event_loop
             .run_app(&mut app)
             .map_err(|e| WindowError::EventLoop(e.to_string()))?;
@@ -414,6 +449,10 @@ struct SessionApp {
     stats: Option<StatsHandle>,
     show_stats: bool,
     modifiers: ModifiersState,
+    /// Runs on `LoopExiting` — the last point at which the session can be disconnected
+    /// cleanly, including when AppKit is about to `exit(0)` under us. See
+    /// [`SessionWindow::on_exit`].
+    on_exit: Option<Box<dyn FnMut()>>,
     /// Monotonic origin for the policy's timestamps. Wall-clock would let a clock
     /// adjustment overnight — exactly when displays sleep — corrupt the timing.
     started: Instant,
@@ -453,6 +492,7 @@ impl SessionApp {
             stats,
             show_stats: false,
             modifiers: ModifiersState::empty(),
+            on_exit: None,
         }
     }
 
@@ -610,6 +650,15 @@ impl SessionApp {
 }
 
 impl ApplicationHandler<SessionEvent> for SessionApp {
+    /// The loop is going away. On macOS this is the last code that runs before AppKit
+    /// calls `exit(0)` for a Cmd+Q, so the disconnect has to happen here rather than
+    /// after `run_app` returns — for a Cmd+Q, it never returns.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(f) = self.on_exit.as_mut() {
+            f();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return; // Resume can fire more than once; the window survives it.
@@ -1053,6 +1102,27 @@ mod tests {
 
     fn overlay_lines() -> Vec<String> {
         vec!["latency p50 3.5ms".to_string(), "cache 75% hit".to_string()]
+    }
+
+    #[test]
+    fn a_viewport_extent_that_would_overflow_is_clamped_not_wrapped() {
+        // The origin is inside the window but the extent is absurd. Plain addition
+        // overflows: a panic in debug, a wrap to a small number in release that paints a
+        // sliver and reports success.
+        let (w, h) = (8u32, 4u32);
+        let mut dst = vec![0xdead_beefu32; (w * h) as usize];
+        let viewport = Viewport {
+            dest_x: 1,
+            dest_y: 1,
+            dest_width: u32::MAX,
+            dest_height: u32::MAX,
+            session_width: 2,
+            session_height: 2,
+        };
+        let src = vec![0u8; 2 * 2 * 4];
+        present_into(&mut dst, w, h, &viewport, &src);
+        // The point is that it neither panicked nor wrote outside the buffer.
+        assert_eq!(dst.len(), (w * h) as usize);
     }
 
     #[test]

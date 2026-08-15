@@ -208,9 +208,32 @@ impl Favourites {
                 path: path.to_path_buf(),
                 source,
             })?;
-        Ok(Favourites {
+        let loaded = Favourites {
             entries: file.favourite,
-        })
+        };
+        // `add`/`rename` enforce unique names, but a hand-edited file bypasses both, and
+        // everything downstream identifies a favourite BY NAME — the launcher returns a
+        // name, the CLI resolves a name. A duplicate therefore does not merely shadow an
+        // entry: it silently connects to a different host, as a different account, than
+        // the row the user clicked. Refusing to load is the safe answer, and it matches
+        // how a malformed file is treated: report it, change nothing, let the user fix it.
+        if let Some(dup) = loaded.first_duplicate_name() {
+            return Err(FavouritesError::DuplicateName(dup));
+        }
+        Ok(loaded)
+    }
+
+    /// The first name that appears more than once, compared case-insensitively.
+    fn first_duplicate_name(&self) -> Option<String> {
+        let mut seen: Vec<String> = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let key = entry.name.to_lowercase();
+            if seen.contains(&key) {
+                return Some(entry.name.clone());
+            }
+            seen.push(key);
+        }
+        None
     }
 
     /// Save the list to `path`, atomically.
@@ -460,6 +483,42 @@ mod tests {
                 height: 1080
             }
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_file_with_duplicate_names_is_refused_rather_than_silently_ambiguous() {
+        // Everything downstream identifies a favourite by name, so a duplicate would
+        // connect to a different host than the row the user clicked — the worst kind of
+        // failure, because it looks like it worked.
+        let dir = tmpdir();
+        let path = dir.join("favourites.toml");
+        std::fs::write(
+            &path,
+            "[[favourite]]\nname = \"Work\"\nhost = \"first.example\"\n\
+             [[favourite]]\nname = \"work\"\nhost = \"second.example\"\n",
+        )
+        .unwrap();
+
+        let err = Favourites::load_from(&path).unwrap_err();
+        assert!(
+            matches!(err, FavouritesError::DuplicateName(ref n) if n.eq_ignore_ascii_case("work")),
+            "got {err:?}"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn distinct_names_still_load_normally() {
+        let dir = tmpdir();
+        let path = dir.join("favourites.toml");
+        std::fs::write(
+            &path,
+            "[[favourite]]\nname = \"Work\"\nhost = \"first.example\"\n\
+             [[favourite]]\nname = \"Home\"\nhost = \"second.example\"\n",
+        )
+        .unwrap();
+        assert_eq!(Favourites::load_from(&path).unwrap().len(), 2);
         cleanup(&dir);
     }
 

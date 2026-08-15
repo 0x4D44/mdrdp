@@ -48,6 +48,8 @@ fn usage() -> &'static str {
      --domain <d>           Windows domain\n  \
      --size WxH             session resolution, e.g. 1920x1080\n  \
      --list                 print saved favourites and exit\n  \
+     --duration <secs>      disconnect cleanly after N seconds (for scripted runs)\n  \
+     --password-stdin       read the password from stdin instead of the keychain\n  \
      --capture-failures DIR dump undecodable tiles for offline debugging\n\n\
      Flags override whatever the chosen favourite specifies."
 }
@@ -75,6 +77,14 @@ struct Target {
     host: String,
     port: u16,
     user: String,
+    /// Which keychain entry holds the password.
+    ///
+    /// Separate from `user` because they are genuinely different strings: `temper` wants
+    /// the bare UPN `user@example.com` as the logon name — IronRDP rejects
+    /// `MicrosoftAccount\\user@example.com` outright as a "mixed username
+    /// format" — while the keychain entry may be filed under either. Forcing one to equal
+    /// the other makes a working credential unreachable.
+    keychain_account: String,
     domain: Option<String>,
     size: (u16, u16),
 }
@@ -87,16 +97,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let positional = args.first().filter(|h| !h.starts_with("--")).cloned();
+    // `--` ends the options, so a favourite whose name looks like a flag is still usable
+    // as a target. `spawn_session` always passes it, because a name is user data and may
+    // legitimately begin with a dash.
+    let (positional, args): (Option<String>, Vec<String>) =
+        if args.first().is_some_and(|a| a == "--") {
+            (args.get(1).cloned(), args.iter().skip(2).cloned().collect())
+        } else {
+            let p = args.first().filter(|h| !h.starts_with("--")).cloned();
+            let rest: Vec<String> = if p.is_some() {
+                args.iter().skip(1).cloned().collect()
+            } else {
+                args.clone()
+            };
+            (p, rest)
+        };
 
     let mut user: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut domain: Option<String> = None;
     let mut size: Option<(u16, u16)> = None;
     let mut capture: Option<String> = None;
+    let mut duration: Option<u64> = None;
+    let mut password_stdin = false;
     let mut list_only = false;
 
-    let mut i = usize::from(positional.is_some());
+    let mut i = 0usize;
     while i < args.len() {
         let value = || -> Result<&String, String> {
             args.get(i + 1)
@@ -108,10 +134,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 continue;
             }
+            "--password-stdin" => {
+                password_stdin = true;
+                i += 1;
+                continue;
+            }
             "--user" => user = Some(value()?.clone()),
             "--port" => port = Some(value()?.parse()?),
             "--domain" => domain = Some(value()?.clone()),
             "--capture-failures" => capture = Some(value()?.clone()),
+            "--duration" => duration = Some(value()?.parse()?),
             "--size" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--size wants WxH, e.g. 1280x800")?;
@@ -176,7 +208,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // rather than after a connection has been established and a logon spent.
     let event_loop = SessionWindow::event_loop()?;
 
-    let secret = mdrdp::creds::lookup_or_prompt(&target.user)?;
+    // Stdin beats the keychain when asked for: a scripted run must not depend on a
+    // keychain that can prompt, and must never be answered by an interactive prompt
+    // nobody is there to see.
+    let secret = if password_stdin {
+        mdrdp::creds::from_stdin()?
+    } else {
+        mdrdp::creds::lookup_or_prompt(&target.keychain_account)?
+    };
 
     let store = Arc::new(Mutex::new(SurfaceStore::new()));
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
@@ -271,14 +310,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let session_stats = StatsHandle::new();
     let window = window.with_stats(session_stats.clone());
+
+    // The session handle is shared with the window's exit hook so the disconnect happens
+    // exactly once, whichever way the loop ends. On macOS a Cmd+Q makes AppKit call
+    // `exit(0)` from inside `run()`, so a disconnect written after `run()` returns would
+    // simply never happen and the session would be abandoned on the host.
+    let session_slot: Arc<Mutex<Option<session::SessionHandle>>> = Arc::new(Mutex::new(None));
+    let slot_for_exit = Arc::clone(&session_slot);
+    let window = window.on_exit(move || {
+        let handle = slot_for_exit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
+            let end = handle.shutdown();
+            eprintln!("session ended: {end:?}");
+        }
+    });
     let waker = window.waker();
 
-    let clipboard_joined = established
+    // Which redirections are actually live. Worth printing every time: "the clipboard
+    // isn't working" and "the clipboard channel never joined" are different problems with
+    // the same symptom, and this is the one line that tells them apart.
+    eprintln!(
+        "channels: {}",
+        if established.report.joined_static_channels.is_empty() {
+            "(none)".to_owned()
+        } else {
+            established.report.joined_static_channels.join(", ")
+        }
+    );
+    if !established
         .report
         .joined_static_channels
         .iter()
-        .any(|c| c.eq_ignore_ascii_case("cliprdr"));
-    if !clipboard_joined {
+        .any(|c| c.eq_ignore_ascii_case("cliprdr"))
+    {
         eprintln!("note: the server did not join CLIPRDR — clipboard sharing is unavailable");
     }
 
@@ -290,8 +357,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         SessionServices {
             clipboard: Some(clipboard_bridge),
             stats: session_stats.clone(),
+            gfx: Some(gfx_stats.clone()),
         },
     );
+
+    // A scripted run must end the way a user closing the window does — through the
+    // waker, so the session thread still sends a Shutdown Request. Killing the process
+    // instead abandons the socket, and abandoned sessions accumulate on the Windows host
+    // until it stops accepting logons.
+    if let Some(secs) = duration {
+        let closer = window.waker();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            closer.close();
+        });
+    }
+
+    *session_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
 
     let window_result = window.run();
 
@@ -302,14 +386,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Window gone: disconnect properly rather than dropping the socket, which would
     // leave a session alive on the host.
-    let end = session.shutdown();
+    // `None` here means the exit hook already disconnected — the Cmd+Q path.
+    let end = session_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .map(|h| h.shutdown());
     let s = gfx_stats.snapshot();
     let cache = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .cache_stats();
+    if let Some(end) = end {
+        eprintln!("session ended: {end:?}");
+    }
     eprintln!(
-        "session ended: {end:?}\n  frames {}  decode errors {}  undecoded regions {}\n  codecs {:?}",
+        "  frames {}  decode errors {}  undecoded regions {}\n  codecs {:?}",
         s.frames_completed, s.decode_errors, s.undecoded_regions, s.codec_ids_seen
     );
     match (cache.hit_rate(), cache.byte_savings()) {
@@ -324,11 +416,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => eprintln!("  bitmap cache: never used by this server"),
     }
     let audio = audio_stats.snapshot();
-    if audio.packets_received > 0 {
-        eprintln!(
-            "  audio: {} packets, {} dropped to overrun, {} underruns",
-            audio.packets_received, audio.overruns, audio.underruns
-        );
+    // Printed unconditionally. Reporting only when packets arrived hides the single most
+    // important case — the channel was joined and the server sent nothing — which is
+    // exactly what a wrong NO_AUDIO_PLAYBACK flag looks like, and it looks identical to
+    // "nothing was playing" if the line is suppressed.
+    match audio.current_format {
+        Some(fmt) => eprintln!(
+            "  audio: {} packets at {} Hz/{}ch, {} dropped to overrun, {} underruns",
+            audio.packets_received, fmt.sample_rate, fmt.channels, audio.overruns, audio.underruns
+        ),
+        None => eprintln!("  audio: server negotiated no format (no audio was sent this session)"),
+    }
+    if !s.decode_error_reasons.is_empty() {
+        eprintln!("  decode failures by reason:");
+        let mut reasons: Vec<_> = s.decode_error_reasons.iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(a.1));
+        for (reason, count) in reasons.iter().take(5) {
+            eprintln!("    {count:>5}  {reason}");
+        }
     }
     if s.decode_errors > 0 && capture.is_none() {
         eprintln!(
@@ -357,6 +462,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn spawn_session(name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own path: {e}"))?;
     std::process::Command::new(&exe)
+        // `--` first: a favourite legitimately named "--list" would otherwise be re-parsed
+        // by the child as a flag rather than as the target to connect to.
+        .arg("--")
         .arg(name)
         .spawn()
         .map(|_| ())
@@ -397,8 +505,14 @@ fn reconcile(
         _ => DEFAULT_SIZE,
     });
 
+    let keychain_account = chosen
+        .as_ref()
+        .and_then(|f| f.keychain_account.clone())
+        .unwrap_or_else(|| user.clone());
+
     Ok(Target {
         host,
+        keychain_account,
         port: port
             .or_else(|| chosen.as_ref().map(|f| f.port))
             .unwrap_or(mdrdp::favourites::DEFAULT_PORT),
@@ -489,6 +603,36 @@ mod tests {
     fn a_host_with_no_account_anywhere_is_an_error_not_a_guess() {
         let err = reconcile(Some("box".into()), None, None, None, None, None).unwrap_err();
         assert!(err.contains("no account for box"), "got: {err}");
+    }
+
+    #[test]
+    fn the_keychain_account_can_differ_from_the_logon_name() {
+        // These are genuinely different strings on temper: IronRDP rejects a username
+        // that mixes a Domain\\ prefix with a UPN suffix ("mixed username format"), so the
+        // logon name must be the bare UPN — while the keychain entry may be filed under
+        // the prefixed form. Tying them together makes a working credential unreachable.
+        let f = Favourite {
+            username: Some("user@example.com".into()),
+            keychain_account: Some("MicrosoftAccount\\user@example.com".into()),
+            ..Favourite::new("Temper", "temper")
+        };
+        let t = reconcile(Some("Temper".into()), Some(f), None, None, None, None).unwrap();
+        assert_eq!(t.user, "user@example.com", "what we log on as");
+        assert_eq!(
+            t.keychain_account, "MicrosoftAccount\\user@example.com",
+            "where the password is stored"
+        );
+    }
+
+    #[test]
+    fn the_keychain_account_defaults_to_the_logon_name() {
+        let f = Favourite {
+            username: Some("someone@example.com".into()),
+            keychain_account: None,
+            ..Favourite::new("Plain", "host")
+        };
+        let t = reconcile(Some("Plain".into()), Some(f), None, None, None, None).unwrap();
+        assert_eq!(t.keychain_account, t.user, "one name unless told otherwise");
     }
 
     #[test]

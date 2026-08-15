@@ -52,6 +52,20 @@ pub const DEFAULT_PASTE_TIMEOUT_MS: u64 = 5_000;
 /// the hazard documented at `CliprdrBackend::on_format_list_response`.
 const MAX_ADVERTISE_ATTEMPTS: u8 = 3;
 
+/// Cap on how many bytes of clipboard text [`content_fingerprint`] will hash.
+///
+/// Text at or under this size is fingerprinted exactly as before (every byte hashed) — no
+/// behaviour change for realistic clipboard content: a URL, a paragraph, a code snippet,
+/// even a sizeable spreadsheet selection. Above the cap, only the first
+/// `HASH_PREFIX_CAP_BYTES` bytes are hashed and the *full* byte length is folded into the
+/// same digest, so the cost of every poll is bounded by this constant no matter how large
+/// the payload on the clipboard gets.
+///
+/// At SHA-256's ~1-2 GB/s (the figure that made the original bug real: a 100 MB payload
+/// cost 50-100 ms per poll), 256 KiB costs roughly 0.1-0.3 ms — negligible next to the
+/// 250 ms poll cadence and the session pump's 5 ms read slice (`session::READ_SLICE`).
+const HASH_PREFIX_CAP_BYTES: usize = 256 * 1024;
+
 /// Raw clipboard events forwarded from [`ClipboardBackend`] to [`ClipboardBridge`].
 ///
 /// Each variant mirrors a [`CliprdrBackend`] callback (or, for [`Self::AdvertiseRequested`],
@@ -271,10 +285,11 @@ pub struct ClipboardBridge {
     remote_formats: Vec<ClipboardFormat>,
     paste_state: PasteState,
     advertise_state: AdvertiseState,
-    /// Hash of the last clipboard text we either wrote (from the remote) or advertised (from
-    /// local content). Lets `poll_local_change` detect genuinely new local content, and stops
-    /// remote-origin text from being advertised straight back — the advertise-loop hazard.
-    last_seen_hash: Option<[u8; 32]>,
+    /// Fingerprint ([`content_fingerprint`]) of the last clipboard text we either wrote (from
+    /// the remote) or advertised (from local content). Lets `poll_local_change` detect
+    /// genuinely new local content, and stops remote-origin text from being advertised
+    /// straight back — the advertise-loop hazard.
+    last_seen_fingerprint: Option<[u8; 32]>,
     paste_timeout_ms: u64,
 }
 
@@ -300,7 +315,7 @@ pub fn clipboard_channel_with_clock(
         remote_formats: Vec::new(),
         paste_state: PasteState::Idle,
         advertise_state: AdvertiseState::Idle,
-        last_seen_hash: None,
+        last_seen_fingerprint: None,
         paste_timeout_ms: DEFAULT_PASTE_TIMEOUT_MS,
     };
     (backend, bridge)
@@ -362,8 +377,16 @@ impl ClipboardBridge {
     /// clipboard-change notification.
     ///
     /// Text we just *wrote* here from the remote is not re-advertised: [`Self::pump`] updates
-    /// `last_seen_hash` whenever it writes remote data locally, so this sees "no change" for
-    /// exactly that content.
+    /// `last_seen_fingerprint` whenever it writes remote data locally, so this sees "no
+    /// change" for exactly that content.
+    ///
+    /// Change detection is a [`content_fingerprint`], not a full hash: cost is bounded by
+    /// [`HASH_PREFIX_CAP_BYTES`] regardless of how large the clipboard payload is, so a
+    /// multi-hundred-MB clipboard costs the same per poll as a one-line copy. The `get_text`
+    /// call itself (an OS IPC round trip plus allocating the whole payload) still happens
+    /// every poll — `arboard` has no cheaper "did it change" signal to check first (no
+    /// `NSPasteboard.changeCount` equivalent is exposed) — but that cost no longer compounds
+    /// with an O(size) hash on top of it.
     pub fn poll_local_change(&mut self) {
         let text = match self.os.get_text() {
             Ok(text) => text,
@@ -373,11 +396,11 @@ impl ClipboardBridge {
             }
         };
 
-        let hash = content_hash(&text);
-        if self.last_seen_hash == Some(hash) {
+        let fingerprint = content_fingerprint(&text);
+        if self.last_seen_fingerprint == Some(fingerprint) {
             return;
         }
-        self.last_seen_hash = Some(hash);
+        self.last_seen_fingerprint = Some(fingerprint);
 
         if text.is_empty() {
             return;
@@ -557,7 +580,7 @@ impl ClipboardBridge {
             Ok(()) => {
                 // Remember what we just wrote so poll_local_change doesn't loop it straight
                 // back to the remote as if the user had copied it locally.
-                self.last_seen_hash = Some(content_hash(&text));
+                self.last_seen_fingerprint = Some(content_fingerprint(&text));
             }
             Err(error) => {
                 warn!(%error, "failed to write remote clipboard data to the OS clipboard")
@@ -586,8 +609,36 @@ fn best_text_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
     }
 }
 
-fn content_hash(text: &str) -> [u8; 32] {
-    let digest = Sha256::digest(text.as_bytes());
+/// Size-bounded fingerprint of clipboard text: a SHA-256 over at most the first
+/// [`HASH_PREFIX_CAP_BYTES`] bytes of `text`, with the *full* byte length folded into the
+/// same digest.
+///
+/// For text at or under the cap this is exactly equivalent to hashing the whole payload —
+/// no behaviour change from the old full-hash for realistic clipboard content. Above the
+/// cap, two different payloads of the same total length that share the same first
+/// `HASH_PREFIX_CAP_BYTES` bytes are indistinguishable to this fingerprint: a local edit
+/// that only changes content past the prefix, without changing the total length, will not
+/// be detected as a new copy.
+///
+/// This is an accepted trade, not an oversight: it only bites clipboard content larger than
+/// the cap that shares a huge common prefix and an unchanged length — a narrow case — and
+/// the alternative is hashing every byte on every ~250ms poll for as long as that payload
+/// sits on the clipboard, which is the latency-degrading defect this fingerprint exists to
+/// fix. See the tests `single_poll_of_a_huge_payload_only_hashes_the_bounded_prefix`,
+/// `repeated_polls_of_unchanged_huge_payload_cost_a_constant_capped_amount_each_time`, and
+/// `a_tail_only_change_past_the_prefix_cap_with_unchanged_length_is_not_detected`.
+fn content_fingerprint(text: &str) -> [u8; 32] {
+    let bytes = text.as_bytes();
+    let prefix_len = bytes.len().min(HASH_PREFIX_CAP_BYTES);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes[..prefix_len]);
+    hasher.update((bytes.len() as u64).to_le_bytes());
+
+    #[cfg(test)]
+    tests::HASHED_BYTES.with(|cell| cell.set(cell.get() + prefix_len));
+
+    let digest = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
@@ -620,6 +671,7 @@ fn decode_ansi_text(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -630,11 +682,30 @@ mod tests {
 
     use super::*;
 
+    thread_local! {
+        /// Total bytes fed to the hasher inside [`content_fingerprint`], across every call
+        /// made on the current test thread. `cargo test` runs each `#[test]` fn on its own
+        /// thread by default, so this is effectively per-test despite being `thread_local`
+        /// rather than per-instance — see [`reset_hashed_bytes`] / [`hashed_bytes`].
+        pub(crate) static HASHED_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn reset_hashed_bytes() {
+        HASHED_BYTES.with(|cell| cell.set(0));
+    }
+
+    fn hashed_bytes() -> usize {
+        HASHED_BYTES.with(|cell| cell.get())
+    }
+
     #[derive(Default)]
     struct FakeClipboardState {
         text: Option<String>,
         fail_next_get: bool,
         fail_next_set: bool,
+        /// How many times [`OsClipboard::get_text`] was called — the observable proxy for
+        /// the "IPC round trip + full allocation" cost `poll_local_change` pays every poll.
+        get_text_calls: usize,
     }
 
     struct FakeOsClipboard(Arc<Mutex<FakeClipboardState>>);
@@ -642,6 +713,7 @@ mod tests {
     impl OsClipboard for FakeOsClipboard {
         fn get_text(&mut self) -> Result<String, String> {
             let mut state = self.0.lock().unwrap();
+            state.get_text_calls += 1;
             if state.fail_next_get {
                 state.fail_next_get = false;
                 return Err("fake read failure".to_string());
@@ -1001,6 +1073,130 @@ mod tests {
         assert!(
             msgs.is_empty(),
             "must not loop the remote's own content back to it"
+        );
+    }
+
+    /// Representative of the defect report's "100 MB log tail" / "big spreadsheet region" —
+    /// picked smaller only so the test suite stays fast; it is still ~80x the hash cap, so
+    /// nothing about the assertions below depends on the exact multiple.
+    const LARGE_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
+
+    #[test]
+    fn single_poll_of_a_huge_payload_only_hashes_the_bounded_prefix() {
+        // This is the regression test for the reported defect: before the fix,
+        // `content_hash` ran SHA-256 over the *entire* payload every poll — 50-100 ms for
+        // 100 MB. One poll of a huge payload must now hash exactly the bounded prefix, not
+        // a byte more, regardless of how large the payload actually is.
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+
+        state.lock().unwrap().text = Some("x".repeat(LARGE_PAYLOAD_BYTES));
+        reset_hashed_bytes();
+
+        bridge.poll_local_change();
+
+        assert_eq!(
+            hashed_bytes(),
+            HASH_PREFIX_CAP_BYTES,
+            "a single poll must hash exactly the bounded prefix cap, not the full \
+             {LARGE_PAYLOAD_BYTES}-byte payload"
+        );
+        // And the change is still correctly detected and advertised.
+        let msgs = bridge.pump(&mut cliprdr);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "a genuine large local copy must still be advertised"
+        );
+    }
+
+    #[test]
+    fn repeated_polls_of_unchanged_huge_payload_cost_a_constant_capped_amount_each_time() {
+        // The actual defect scenario: the same huge payload sits on the clipboard across
+        // many poll ticks (a copy that just stays there while the session keeps running).
+        // Before the fix, every one of those ticks re-hashed the whole payload — 50-100 ms
+        // apiece, compounding for as long as the content sat on the clipboard. Each
+        // "nothing changed" poll after the first must now cost exactly the capped amount,
+        // never the full payload size, and never zero (detection must stay live).
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+
+        state.lock().unwrap().text = Some("y".repeat(LARGE_PAYLOAD_BYTES));
+        bridge.poll_local_change(); // baseline poll: establishes last_seen_fingerprint
+        bridge.pump(&mut cliprdr); // drain the resulting advertise
+
+        reset_hashed_bytes();
+        let get_text_calls_before = state.lock().unwrap().get_text_calls;
+
+        const REPEAT_POLLS: usize = 10;
+        for _ in 0..REPEAT_POLLS {
+            bridge.poll_local_change();
+        }
+
+        let msgs = bridge.pump(&mut cliprdr);
+        assert!(
+            msgs.is_empty(),
+            "content never changed; none of the {REPEAT_POLLS} repeat polls may advertise"
+        );
+        assert_eq!(
+            hashed_bytes(),
+            REPEAT_POLLS * HASH_PREFIX_CAP_BYTES,
+            "each unchanged poll must cost exactly the capped amount — not the \
+             {LARGE_PAYLOAD_BYTES}-byte payload, and not zero (detection must stay live)"
+        );
+        let get_text_calls_after = state.lock().unwrap().get_text_calls;
+        assert_eq!(
+            get_text_calls_after - get_text_calls_before,
+            REPEAT_POLLS,
+            "get_text must still be called on every poll — bounding the hash must not \
+             disable change detection"
+        );
+    }
+
+    #[test]
+    fn a_tail_only_change_past_the_prefix_cap_with_unchanged_length_is_not_detected() {
+        // Documents the accepted trade-off of a bounded-prefix fingerprint: two payloads of
+        // the same length that share the same first HASH_PREFIX_CAP_BYTES bytes are
+        // indistinguishable to it. This only bites content larger than the cap that shares
+        // a huge common prefix and keeps the same total length — accepted because the
+        // alternative is the unbounded full-payload hash this fix exists to remove.
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+
+        let shared_prefix = "p".repeat(HASH_PREFIX_CAP_BYTES);
+        let payload_a = format!("{shared_prefix}AAAA");
+        let payload_b = format!("{shared_prefix}BBBB"); // same length, differs only past the cap
+        assert_eq!(payload_a.len(), payload_b.len());
+
+        state.lock().unwrap().text = Some(payload_a);
+        bridge.poll_local_change();
+        bridge.pump(&mut cliprdr); // drain the first advertise
+
+        state.lock().unwrap().text = Some(payload_b);
+        bridge.poll_local_change();
+        let msgs = bridge.pump(&mut cliprdr);
+        assert!(
+            msgs.is_empty(),
+            "documented limitation: a same-length change entirely past the prefix cap is \
+             not detected by this fingerprint"
+        );
+
+        // Sanity check on the other side of that trade-off: a change that alters the
+        // *length* is still always detected, even past the cap, because the length is
+        // folded into the fingerprint alongside the prefix.
+        state.lock().unwrap().text = Some(format!("{shared_prefix}BBBBB"));
+        bridge.poll_local_change();
+        let msgs = bridge.pump(&mut cliprdr);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "a length change past the cap must still be detected"
         );
     }
 

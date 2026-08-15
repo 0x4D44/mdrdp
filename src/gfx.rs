@@ -64,6 +64,12 @@ pub struct GfxStats {
     pub codec_ids_seen: BTreeMap<String, u64>,
     /// ClearCodec decodes that failed. Each one is a region that was not painted.
     pub decode_errors: u64,
+    /// Why they failed, tallied by reason.
+    ///
+    /// A count alone cannot distinguish one systematic fault from a scattering of
+    /// unrelated ones, and that difference decides whether you go and fix a decoder or go
+    /// looking for a corrupt stream.
+    pub decode_error_reasons: BTreeMap<String, u64>,
     /// Store operations refused (unknown surface, unknown cache slot, short source) or
     /// declined by us as out of range. Also a not-painted region.
     pub surface_errors: u64,
@@ -260,15 +266,20 @@ impl GfxHandler {
             .decode(&pdu.bitmap_data, dest.width(), dest.height())
         {
             Ok(pixels) => pixels,
-            Err(_) => {
+            Err(e) => {
                 self.capture
                     .record(dest.width(), dest.height(), &pdu.bitmap_data);
-                // The error carries protocol field names, not pixels, but there is
-                // nothing here a counter does not already say. One dropped tile is a
-                // smear the next frame repaints; an error returned to the DVC processor
-                // would end the session.
-                self.stats
-                    .note(|s| s.decode_errors = s.decode_errors.saturating_add(1));
+                // The reason is recorded, not just the count. A bare counter said "177
+                // tiles failed" and left no way to tell one cause from a hundred; the
+                // error text carries protocol field names, never pixels, so it is safe
+                // to keep. The tally is by reason so a single dominant fault is obvious.
+                let reason = e.to_string();
+                self.stats.note(|s| {
+                    s.decode_errors = s.decode_errors.saturating_add(1);
+                    *s.decode_error_reasons.entry(reason).or_insert(0) += 1;
+                });
+                // One dropped tile is a smear the next frame repaints; an error returned
+                // to the DVC processor would end the session.
                 return;
             }
         };

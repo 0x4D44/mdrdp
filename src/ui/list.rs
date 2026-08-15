@@ -230,15 +230,23 @@ impl ListView {
     /// Draw every visible row's background and text into `buf`. Fully clipped, like
     /// [`font::draw_text`] — an out-of-range origin or a too-small buffer just means
     /// less (or nothing) gets drawn, never a panic.
+    ///
+    /// Every row is additionally clipped to the list's own viewport band
+    /// `[self.y, self.y + self.visible_height)`, not just the buffer bounds: a row
+    /// that is only partially inside the viewport (the top row after a scroll, or the
+    /// bottom row when the content doesn't divide evenly) must not paint outside the
+    /// list, over whatever else is drawn on screen. This keeps `draw` consistent with
+    /// [`ListView::row_at`], which already clamps hit-testing to the same band.
     pub fn draw(&self, buf: &mut [u32], buf_w: usize, buf_h: usize) {
         if self.row_height <= 0 || self.rows.is_empty() {
             return;
         }
+        let viewport_top = self.y;
         let viewport_bottom = self.y + self.visible_height;
         for (i, row) in self.rows.iter().enumerate() {
             let row_top = self.y + (i as i32 * self.row_height) - self.scroll;
             let row_bottom = row_top + self.row_height;
-            if row_bottom <= self.y || row_top >= viewport_bottom {
+            if row_bottom <= viewport_top || row_top >= viewport_bottom {
                 continue; // fully outside the viewport
             }
             let bg = if self.selected == Some(i) {
@@ -248,42 +256,55 @@ impl ListView {
             } else {
                 self.colours.bg_normal
             };
-            fill_rect(
-                buf,
-                buf_w,
-                buf_h,
-                (self.x, row_top, self.width, self.row_height),
-                bg,
-            );
+            // Intersect the row's rectangle with the viewport band before filling —
+            // a partial row must only paint the slice of itself actually inside the
+            // list, not its full `row_height` (that's the bug this guards against).
+            let fill_top = row_top.max(viewport_top);
+            let fill_bottom = row_bottom.min(viewport_bottom);
+            if fill_bottom > fill_top {
+                fill_rect(
+                    buf,
+                    buf_w,
+                    buf_h,
+                    (self.x, fill_top, self.width, fill_bottom - fill_top),
+                    bg,
+                );
+            }
 
             let text_y = row_top + (self.row_height - CHAR_H) / 2;
             let text_x = self.x + TEXT_PAD_X;
             if let Some(sub) = &row.subtitle {
                 let label_y = text_y - CHAR_H / 2;
                 let sub_y = text_y + CHAR_H / 2;
-                font::draw_text(
+                draw_text_clipped(
                     buf,
                     buf_w,
                     buf_h,
+                    viewport_top,
+                    viewport_bottom,
                     text_x,
                     label_y,
                     &row.label,
                     self.colours.text,
                 );
-                font::draw_text(
+                draw_text_clipped(
                     buf,
                     buf_w,
                     buf_h,
+                    viewport_top,
+                    viewport_bottom,
                     text_x,
                     sub_y,
                     sub,
                     self.colours.subtitle_text,
                 );
             } else {
-                font::draw_text(
+                draw_text_clipped(
                     buf,
                     buf_w,
                     buf_h,
+                    viewport_top,
+                    viewport_bottom,
                     text_x,
                     text_y,
                     &row.label,
@@ -292,6 +313,52 @@ impl ListView {
             }
         }
     }
+}
+
+/// Draw `s` clipped not only to the buffer bounds (which [`font::draw_text`] already
+/// does on its own) but to an arbitrary vertical band `[clip_top, clip_bottom)` —
+/// used so a row that is only partially inside the list's viewport has its glyph
+/// rows truncated at the viewport edge instead of spilling past it.
+///
+/// `font::draw_text` only knows how to clip against `y < 0` and `y >= buf_h`, i.e. a
+/// band that starts at zero. To clip against an arbitrary `clip_top` too, this hands
+/// it a sub-slice of `buf` starting at row `clip_top`: real row `clip_top` becomes
+/// virtual row `0`, so `font::draw_text`'s own `y < 0` check now clips everything
+/// above `clip_top`, and a shrunk virtual `buf_h` makes its `y >= buf_h` check clip
+/// everything at or past `clip_bottom`.
+#[allow(clippy::too_many_arguments)]
+fn draw_text_clipped(
+    buf: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    clip_top: i32,
+    clip_bottom: i32,
+    x: i32,
+    y: i32,
+    s: &str,
+    colour: u32,
+) {
+    let clip_top = clip_top.max(0);
+    let clip_bottom = clip_bottom.min(buf_h as i32);
+    if buf_w == 0 || clip_bottom <= clip_top {
+        return;
+    }
+    let Some(offset) = (clip_top as usize).checked_mul(buf_w) else {
+        return;
+    };
+    if offset >= buf.len() {
+        return;
+    }
+    let virtual_h = (clip_bottom - clip_top) as usize;
+    font::draw_text(
+        &mut buf[offset..],
+        buf_w,
+        virtual_h,
+        x,
+        y - clip_top,
+        s,
+        colour,
+    );
 }
 
 /// Fill an axis-aligned rectangle, clipped against the buffer bounds. Shared by
@@ -559,5 +626,149 @@ mod tests {
         lv.set_rows(rows(2));
         assert_eq!(lv.selected, Some(1)); // clamped to last valid index
         assert_eq!(lv.hover, None); // hover just drops out of range
+    }
+
+    // --- draw() clips rows to the list's own viewport, not just the framebuffer ---
+
+    /// Build the exact repro from the adversarial review: the launcher's real list
+    /// geometry, 13 rows, then 13 `select_down`s (what ArrowDown does) — this lands
+    /// on the last row and scrolls to `scroll == 20`, leaving row 0 spanning real
+    /// y `[36, 80)`: 20px above the viewport top (`y == 56`) and 24px inside it.
+    fn repro_geometry() -> ListView {
+        let mut lv = ListView::new(16, 56, 528, 552, 44);
+        lv.set_rows(rows(13));
+        for _ in 0..13 {
+            lv.select_down();
+        }
+        assert_eq!(
+            lv.scroll, 20,
+            "test assumes this exact scroll from the repro"
+        );
+        lv
+    }
+
+    const SENTINEL: u32 = 0x00ab_cdef;
+
+    #[test]
+    fn draw_clips_top_partial_row_to_the_viewport_not_the_framebuffer() {
+        let lv = repro_geometry();
+        let buf_w = 560usize;
+        let buf_h = 624usize;
+        let mut buf = vec![SENTINEL; buf_w * buf_h];
+        lv.draw(&mut buf, buf_w, buf_h);
+
+        // Nothing above the viewport top (the header band, y < 56) may have been
+        // touched, anywhere across row 0's horizontal span — this is exactly the
+        // band the launcher's "double-click to connect" hint lives in.
+        for y in 0..lv.y {
+            for x in [lv.x, lv.x + 10, lv.x + lv.width / 2, lv.x + lv.width - 1] {
+                let idx = y as usize * buf_w + x as usize;
+                assert_eq!(
+                    buf[idx], SENTINEL,
+                    "pixel ({x},{y}) above the viewport (y < {}) was painted",
+                    lv.y
+                );
+            }
+        }
+        // The visible sliver of row 0 (y in [56, 80)) must still be painted with its
+        // background colour — the fix must not degrade into "draw nothing".
+        let visible_idx = (lv.y as usize) * buf_w + (lv.x as usize + 10);
+        assert_eq!(buf[visible_idx], lv.colours.bg_normal);
+    }
+
+    #[test]
+    fn draw_clips_bottom_partial_row_to_the_viewport_not_the_framebuffer() {
+        // viewport is y in [0, 50), row_height 20: row 2 spans [40, 60), so only
+        // [40, 50) of it should ever be painted.
+        let mut lv = ListView::new(0, 0, 100, 50, 20);
+        lv.set_rows(rows(5));
+        let buf_w = 100usize;
+        let buf_h = 80usize; // extra rows below the viewport to catch any spill
+        let mut buf = vec![SENTINEL; buf_w * buf_h];
+        lv.draw(&mut buf, buf_w, buf_h);
+
+        let viewport_bottom = lv.y + lv.visible_height; // 50
+        for y in viewport_bottom..buf_h as i32 {
+            for x in [0i32, 25, 50, 99] {
+                let idx = y as usize * buf_w + x as usize;
+                assert_eq!(
+                    buf[idx], SENTINEL,
+                    "pixel ({x},{y}) below the viewport (y >= {viewport_bottom}) was painted"
+                );
+            }
+        }
+        // The visible sliver of row 2 (y in [40, 50)) must still be painted.
+        let idx = 45usize * buf_w + 10usize;
+        assert_eq!(buf[idx], lv.colours.bg_normal);
+    }
+
+    #[test]
+    fn draw_and_row_at_agree_on_which_pixels_belong_to_the_list() {
+        let lv = repro_geometry();
+        let buf_w = 560usize;
+        let buf_h = 624usize;
+        let mut buf = vec![SENTINEL; buf_w * buf_h];
+        lv.draw(&mut buf, buf_w, buf_h);
+
+        // Sample a grid spanning well beyond the list's own extent in every
+        // direction, including the partial-row bands above/below the viewport.
+        let xs: Vec<i32> = (0..buf_w as i32).step_by(7).collect();
+        let ys: Vec<i32> = (0..buf_h as i32).step_by(3).collect();
+        for &py in &ys {
+            for &px in &xs {
+                let painted = buf[py as usize * buf_w + px as usize] != SENTINEL;
+                let hit = lv.row_at(px, py).is_some();
+                assert_eq!(
+                    painted, hit,
+                    "draw/row_at disagree at ({px},{py}): painted={painted}, row_at={hit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draw_paints_exactly_the_row_that_row_at_reports() {
+        let buf_w = 560usize;
+        let buf_h = 624usize;
+        // Probe: the visible sliver of the clipped top row, a fully interior row,
+        // a point in row 0's own clipped-off sliver just above the viewport (the
+        // exact spill band from the defect: y in [36, 56)), a point further above
+        // the viewport, and a point below the viewport entirely.
+        let points = [(300, 60), (300, 300), (300, 45), (300, 20), (300, 620)];
+        for (px, py) in points {
+            let lv = repro_geometry();
+            let hit = lv.row_at(px, py);
+            for idx in 0..lv.rows.len() {
+                let mut lv = repro_geometry();
+                lv.selected = Some(idx);
+                lv.hover = None;
+                let mut buf = vec![SENTINEL; buf_w * buf_h];
+                lv.draw(&mut buf, buf_w, buf_h);
+                let painted_selected =
+                    buf[py as usize * buf_w + px as usize] == lv.colours.bg_selected;
+                assert_eq!(
+                    painted_selected,
+                    hit == Some(idx),
+                    "point ({px},{py}) row_at={hit:?}, selected idx={idx}, painted_selected={painted_selected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draw_still_renders_every_row_when_the_list_fully_fits_the_viewport() {
+        // Viewport (200px) is taller than the content (5 rows * 20px = 100px), so
+        // every row is fully visible and none of them should be clipped.
+        let mut lv = ListView::new(0, 0, 100, 200, 20);
+        lv.set_rows(rows(5));
+        let buf_w = 100usize;
+        let buf_h = 200usize;
+        let mut buf = vec![SENTINEL; buf_w * buf_h];
+        lv.draw(&mut buf, buf_w, buf_h);
+        for i in 0..5 {
+            let y = i * 20 + 10; // mid-row, away from the glyph baseline
+            let idx = y * buf_w + 90; // right side of the row, clear of the label
+            assert_eq!(buf[idx], lv.colours.bg_normal, "row {i} was not painted");
+        }
     }
 }
