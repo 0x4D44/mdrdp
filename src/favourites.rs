@@ -401,6 +401,31 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A Windows account name contains a backslash, which TOML basic strings treat as an
+    /// escape. A literal (single-quoted) string is the correct way to write one, and this
+    /// pins that the documented form actually survives the parser — getting it wrong
+    /// yields either a parse error or, worse, a silently mangled account name that fails
+    /// the logon for no visible reason.
+    #[test]
+    fn a_domain_qualified_account_with_a_backslash_round_trips() {
+        let dir = tmpdir();
+        let path = dir.join("favourites.toml");
+        std::fs::write(
+            &path,
+            "[[favourite]]\nname = \"Temper\"\nhost = \"temper\"\n\
+             username = 'MicrosoftAccount\\user@example.com'\n",
+        )
+        .unwrap();
+
+        let loaded = Favourites::load_from(&path).expect("literal string must parse");
+        assert_eq!(
+            loaded.iter().next().unwrap().username.as_deref(),
+            Some("MicrosoftAccount\\user@example.com"),
+            "the backslash must survive verbatim"
+        );
+        cleanup(&dir);
+    }
+
     /// The exact snippet published in README.md must parse.
     ///
     /// Documentation that does not round-trip through the real parser is how a user's
