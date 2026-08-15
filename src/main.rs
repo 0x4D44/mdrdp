@@ -50,6 +50,7 @@ fn usage() -> &'static str {
      --list                 print saved favourites and exit\n  \
      --duration <secs>      disconnect cleanly after N seconds (for scripted runs)\n  \
      --password-stdin       read the password from stdin instead of the keychain\n  \
+     --screenshot <file>    write the final frame to a BMP (session pixels on disk)\n  \
      --capture-failures DIR dump undecodable tiles for offline debugging\n\n\
      Flags override whatever the chosen favourite specifies."
 }
@@ -119,6 +120,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut size: Option<(u16, u16)> = None;
     let mut capture: Option<String> = None;
     let mut duration: Option<u64> = None;
+    let mut screenshot: Option<String> = None;
     let mut password_stdin = false;
     let mut list_only = false;
 
@@ -144,6 +146,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--domain" => domain = Some(value()?.clone()),
             "--capture-failures" => capture = Some(value()?.clone()),
             "--duration" => duration = Some(value()?.parse()?),
+            "--screenshot" => screenshot = Some(value()?.clone()),
             "--size" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--size wants WxH, e.g. 1280x800")?;
@@ -386,6 +389,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Window gone: disconnect properly rather than dropping the socket, which would
     // leave a session alive on the host.
+    // Before tearing anything down: what was actually on screen? Every other signal this
+    // client emits can look healthy while the surface holds garbage, so a frame on disk is
+    // the only evidence that the decode path produced a picture rather than a plausible
+    // set of counters.
+    if let Some(path) = &screenshot {
+        let captured = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .output_surface()
+            .map(|s| (s.width, s.height, s.pixels().to_vec()));
+        match captured {
+            Some((w, h, pixels)) => {
+                match mdrdp::screenshot::write_bmp(std::path::Path::new(path), w, h, &pixels) {
+                    Ok(()) => eprintln!("  screenshot: {w}x{h} written to {path}"),
+                    Err(e) => eprintln!("  screenshot: could not write {path}: {e}"),
+                }
+            }
+            None => eprintln!("  screenshot: no surface was ever mapped to output"),
+        }
+    }
+
     // `None` here means the exit hook already disconnected — the Cmd+Q path.
     let end = session_slot
         .lock()
@@ -401,11 +425,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("session ended: {end:?}");
     }
     eprintln!(
-        "  frames {}  decode errors {}  undecoded regions {}  surface errors {}\n  codecs {:?}",
+        "  frames {}  decode errors {}  undecoded regions {}  surface errors {}\n  \
+         surfaces +{} -{}  reset {:?}  unhandled pdus {}\n  codecs {:?}",
         s.frames_completed,
         s.decode_errors,
         s.undecoded_regions,
         s.surface_errors,
+        s.surfaces_created,
+        s.surfaces_deleted,
+        s.reset_graphics,
+        s.unhandled_pdus,
         s.codec_ids_seen
     );
     match (cache.hit_rate(), cache.byte_savings()) {

@@ -13,6 +13,7 @@ pub mod gfx;
 pub mod input;
 pub mod launcher;
 pub mod probe;
+pub mod screenshot;
 pub mod session;
 pub mod stagelog;
 pub mod stats;

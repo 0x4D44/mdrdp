@@ -545,6 +545,41 @@ impl GraphicsPipelineHandler for GfxHandler {
         self.with_store(|store| store.map_to_output(surface_id));
     }
 
+    /// `MapSurfaceToScaledOutput` — the same job as [`Self::on_surface_mapped`].
+    ///
+    /// A server may map a surface with any of four PDUs, and each one is dispatched by
+    /// `ironrdp-egfx` to its OWN defaulted trait method. Implementing only
+    /// `on_surface_mapped` therefore leaves the other three as silent no-ops: the session
+    /// connects, decodes frames, reports healthy counters — and shows a black window,
+    /// because nothing is ever mapped to output. That is what this client did against a
+    /// real server, and no counter could see it, because a defaulted trait method never
+    /// reaches `on_unhandled_pdu`.
+    ///
+    /// The scale factor is ignored on purpose: the renderer letterboxes the surface into
+    /// the window itself, so the only thing the store needs is *which* surface is visible.
+    fn on_map_surface_to_scaled_output(
+        &mut self,
+        pdu: &ironrdp_egfx::pdu::MapSurfaceToScaledOutputPdu,
+    ) {
+        self.with_store(|store| store.map_to_output(pdu.surface_id));
+    }
+
+    /// `MapSurfaceToWindow` — see [`Self::on_map_surface_to_scaled_output`].
+    ///
+    /// Per-window mapping belongs to RemoteApp/RAIL, which is out of scope; treating it
+    /// as "this surface is the visible one" is still better than showing nothing.
+    fn on_map_surface_to_window(&mut self, pdu: &ironrdp_egfx::pdu::MapSurfaceToWindowPdu) {
+        self.with_store(|store| store.map_to_output(pdu.surface_id));
+    }
+
+    /// `MapSurfaceToScaledWindow` — see [`Self::on_map_surface_to_scaled_output`].
+    fn on_map_surface_to_scaled_window(
+        &mut self,
+        pdu: &ironrdp_egfx::pdu::MapSurfaceToScaledWindowPdu,
+    ) {
+        self.with_store(|store| store.map_to_output(pdu.surface_id));
+    }
+
     /// Bitmaps the upstream client decoded itself (uncompressed, and AVC420 if a decoder
     /// is ever configured). Already RGBA by that API's contract, so it is blitted as-is.
     fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
@@ -1073,6 +1108,74 @@ mod tests {
             generation_before,
             "counting must not mutate the store"
         );
+    }
+
+    /// EVERY mapping PDU must end with a surface on screen.
+    ///
+    /// This is the regression for the bug that made the client show a black window
+    /// against a real server. `ironrdp-egfx` dispatches each of the four map PDUs to its
+    /// OWN defaulted trait method, so implementing `on_surface_mapped` alone leaves the
+    /// other three as silent no-ops — and silent is exact: they never reach
+    /// `on_unhandled_pdu`, so `unhandled_pdus` stays 0 and every other counter looks
+    /// healthy while nothing is displayed.
+    ///
+    /// The older test below covers the raw `on_unhandled_pdu` arm, which upstream never
+    /// takes; it passed throughout and proved nothing about real behaviour.
+    #[test]
+    fn every_map_surface_pdu_results_in_something_on_screen() {
+        use ironrdp_egfx::pdu::{
+            MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu,
+        };
+
+        // Each closure exercises one of the four callbacks on a fresh handler.
+        type Map = (&'static str, fn(&mut GfxHandler));
+        let cases: [Map; 4] = [
+            ("MapSurfaceToOutput", |h| h.on_surface_mapped(7, 0, 0)),
+            ("MapSurfaceToScaledOutput", |h| {
+                h.on_map_surface_to_scaled_output(&MapSurfaceToScaledOutputPdu {
+                    surface_id: 7,
+                    output_origin_x: 0,
+                    output_origin_y: 0,
+                    target_width: 800,
+                    target_height: 600,
+                })
+            }),
+            ("MapSurfaceToWindow", |h| {
+                h.on_map_surface_to_window(&MapSurfaceToWindowPdu {
+                    surface_id: 7,
+                    window_id: 1,
+                    mapped_width: 800,
+                    mapped_height: 600,
+                })
+            }),
+            ("MapSurfaceToScaledWindow", |h| {
+                h.on_map_surface_to_scaled_window(&MapSurfaceToScaledWindowPdu {
+                    surface_id: 7,
+                    window_id: 1,
+                    mapped_width: 800,
+                    mapped_height: 600,
+                    target_width: 800,
+                    target_height: 600,
+                })
+            }),
+        ];
+
+        for (name, apply) in cases {
+            let store = store();
+            store.lock().unwrap().create(7, 4, 4);
+            let mut handler = GfxHandler::new(Arc::clone(&store));
+            assert!(
+                store.lock().unwrap().output_surface().is_none(),
+                "{name}: nothing should be mapped before the PDU"
+            );
+
+            apply(&mut handler);
+
+            assert!(
+                store.lock().unwrap().output_surface().is_some(),
+                "{name} left nothing mapped to output — the window would render black"
+            );
+        }
     }
 
     #[test]

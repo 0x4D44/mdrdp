@@ -55,6 +55,7 @@ mdrdp temper --user ACCOUNT    # connect to a host directly
 mdrdp --list                   # print saved favourites
 mdrdp <host> --password-stdin  # read the password from stdin (scripting/CI)
 mdrdp <host> --duration 30     # disconnect cleanly after N seconds
+mdrdp <host> --screenshot f.bmp  # write the final frame to a file
 ```
 
 Command-line flags override whatever the favourite specifies.
@@ -94,8 +95,12 @@ measure, and the two disagree exactly when the cache is not earning its keep.
 ## What does not work yet
 
 - **RFX Progressive decodes only partially.** It is wired up and working, but on a real
-  server some frames still fail with `missing CONTEXT block`; those regions stay stale
-  rather than wrong, and are counted and reported by reason at session end.
+  server some frames still fail with `missing CONTEXT block`. Those regions are simply not
+  painted, which on a photographic wallpaper shows as large black areas; they are counted
+  and reported by reason at session end.
+- **ClearCodec fails on most tiles when the desktop is busy** — an upstream parse failure
+  in the v-bar path starves the decoder's caches and every later tile referencing them
+  fails too. Text and UI regions that do decode render correctly.
 - **Fullscreen is not a real fullscreen mode**, just a default resolution.
 - No drive redirection, multi-monitor, RemoteApp/RAIL, smart-card, or microphone.
 - Favourites are edited by hand; there is no add/remove UI.
@@ -103,7 +108,9 @@ measure, and the two disagree exactly when the cache is not earning its keep.
 ## Honest status
 
 Verified against real Windows hosts: connect, graphics, the bitmap cache, the graceful
-disconnect, and that the CLIPRDR / RDPSND / DRDYNVC channels all join. A session prints
+disconnect, and that the CLIPRDR / RDPSND / DRDYNVC channels all join. The remote desktop
+genuinely renders — `--screenshot` writes the presented frame so that claim can be checked
+rather than taken on trust. A session prints
 which channels are live, so "the clipboard isn't working" and "the clipboard channel
 never joined" are distinguishable.
 
