@@ -66,9 +66,16 @@ pub fn decode_rlex(data: &[u8]) -> DecodeResult<RlexData> {
     }
 
     // Compute bit widths
+    // mdrdp patch: a single-entry palette still uses ONE stop-index bit, not zero.
+    //
+    // FreeRDP computes `numBits = CLEAR_LOG2_FLOOR[paletteCount - 1] + 1`, and
+    // CLEAR_LOG2_FLOOR[0] is 0, so paletteCount == 1 gives numBits = 1. Treating it as 0
+    // bits sent the decode down a different path that read ONE byte per segment instead
+    // of the two the format always carries (the packed index/depth byte, then the run
+    // length), so roughly twice as many segments were produced and the region overran
+    // with "rlex: suite exceeds region pixel count".
     let stop_index_bits = if palette_count <= 1 {
-        // Edge case: only 1 palette entry
-        0
+        1
     } else {
         bit_length(u32::from(palette_count - 1))
     };
@@ -78,17 +85,12 @@ pub fn decode_rlex(data: &[u8]) -> DecodeResult<RlexData> {
     let mut segments = Vec::new();
     let remaining = src.len();
 
-    if stop_index_bits == 0 {
-        // Single palette entry: no stop/suite bits, only run lengths
-        // Each byte is a run length factor for palette[0]
-        decode_single_palette_segments(&mut src, &mut segments)?;
-    } else {
-        decode_multi_palette_segments(remaining, &mut src, stop_index_bits, suite_depth_bits, &mut segments)?;
-    }
+    decode_multi_palette_segments(remaining, &mut src, stop_index_bits, suite_depth_bits, &mut segments)?;
 
     Ok(RlexData { palette, segments })
 }
 
+#[allow(dead_code)] // unreachable since a 1-entry palette uses 1 stop bit
 fn decode_single_palette_segments(src: &mut ReadCursor<'_>, segments: &mut Vec<RlexSegment>) -> DecodeResult<()> {
     while !src.is_empty() {
         let run_length = decode_run_length(src)?;

@@ -42,3 +42,15 @@ Out-of-scope observations. A separate human-invoked review triages these.
   `clear_decompress_subcode_rlex` (freerdp-ref/clear.c:151-300), noting that FreeRDP bounds
   its loop by the declared `bitmapDataByteCount` and writes `runLengthFactor` pixels of
   `palette[startIndex]` followed by `suiteDepth + 1` pixels stepping the palette.
+
+- [ ] 2026-08-15: ClearCodec regions paint GREY BLOCKS over the desktop, and the logon UI
+  renders washed out — while the decoder reports zero errors, so this is silent corruption
+  rather than a failure. Visible in
+  `/private/tmp/claude-501/-Users-md-language-mdrdp/a29dcc5c-d861-42a3-9b63-aebfd65f8fd8/rlex.png`;
+  reproduce with `mdrdp quench --user ano --password-stdin --duration 12 --screenshot f.bmp`.
+  The RFX Progressive wallpaper behind them is correct, so this is confined to the
+  ClearCodec composite. Not yet investigated: the glyph cache path
+  (`vendor/ironrdp-graphics/src/clearcodec/mod.rs`, `glyph_cache.rs`) against FreeRDP's
+  `clear_decompress_glyph_data` (freerdp-ref/clear.c:929+), and the residual/bands
+  compositing order. Note the blocks predate the rlex fix — they are visible in the
+  earlier `run2.png` capture too, so they are a separate defect from the decode errors.

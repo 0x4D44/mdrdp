@@ -1252,6 +1252,35 @@ mod tests {
         assert_eq!(t(-1_000_000), i16::MIN);
     }
 
+    /// A single-entry RLEX palette still uses ONE stop-index bit, not zero.
+    ///
+    /// FreeRDP computes `numBits = CLEAR_LOG2_FLOOR[paletteCount - 1] + 1`, and
+    /// CLEAR_LOG2_FLOOR[0] is 0, so a one-colour palette gives numBits = 1. Treating it as
+    /// zero bits took a different parsing path that read ONE byte per segment instead of
+    /// the two the format always carries — the packed index/depth byte, then the run
+    /// length — so twice as many segments were produced and the region overran with
+    /// "rlex: suite exceeds region pixel count".
+    ///
+    /// Here the payload is: paletteCount = 1, one BGR colour, then a single segment whose
+    /// packed byte is 0 (stopIndex 0, suiteDepth 0) and whose run length is 5.
+    #[test]
+    fn rlex_single_entry_palette_reads_two_bytes_per_segment() {
+        use ironrdp::pdu::codecs::clearcodec::decode_rlex;
+
+        let data = [1u8, 0x10, 0x20, 0x30, 0x00, 0x05];
+        let rlex = decode_rlex(&data).expect("a one-colour palette must decode");
+
+        assert_eq!(rlex.palette.len(), 1);
+        assert_eq!(
+            rlex.segments.len(),
+            1,
+            "two bytes is ONE segment; reading a byte at a time yields two"
+        );
+        assert_eq!(rlex.segments[0].run_length, 5);
+        assert_eq!(rlex.segments[0].start_index, 0);
+        assert_eq!(rlex.segments[0].stop_index, 0);
+    }
+
     /// ClearCodec SHORT_VBAR_CACHE_MISS: yOn is the LOW 8 bits, yOff is bits 13:8.
     ///
     /// The two were transposed — yOn was read from bits 13:6 and yOff from bits 5:0. That

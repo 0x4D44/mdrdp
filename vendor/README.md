@@ -229,3 +229,18 @@ After the fix that error no longer occurs at all.
 Pinned by `clearcodec_short_vbar_takes_y_on_from_the_low_byte` in `src/gfx.rs`, which
 decodes a band whose word is `(20 << 8) | 10`. Restoring the transposition makes it fail
 with the production error verbatim: `shortVBarYOff < shortVBarYOn`.
+
+## `ironrdp-pdu` 0.9.0 — a one-colour RLEX palette still uses one stop-index bit
+
+`src/codecs/clearcodec/rlex.rs` special-cased `palette_count <= 1` to **zero** stop-index
+bits and took a separate parsing path that read one byte per segment. FreeRDP computes
+`numBits = CLEAR_LOG2_FLOOR[paletteCount - 1] + 1`, and `CLEAR_LOG2_FLOOR[0]` is 0, so a
+one-colour palette gives **numBits = 1** and the normal two-bytes-per-segment path.
+
+Reading a byte at a time produced roughly twice as many segments as the region had room
+for, and the tile was rejected with `rlex: suite exceeds region pixel count`. With the fix
+a live session decodes 10 ClearCodec commands and 6 progressive commands with **zero**
+decode errors, zero undecoded regions and zero surface errors.
+
+Pinned by `rlex_single_entry_palette_reads_two_bytes_per_segment` in `src/gfx.rs`;
+restoring the special case turns one segment into two.
