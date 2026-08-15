@@ -38,6 +38,7 @@ use ironrdp_egfx::pdu::{
     SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface1Pdu,
 };
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
+use ironrdp_graphics::progressive::ProgressiveDecoder;
 use serde::Serialize;
 
 use crate::surface::{Rect, SurfaceStore};
@@ -50,6 +51,26 @@ use crate::surface::{Rect, SurfaceStore};
 /// column on every tile, which reads as a faint grid over the whole desktop.
 pub fn rect_from_egfx(rect: &ExclusiveRectangle) -> Rect {
     Rect::new(rect.left, rect.top, rect.right, rect.bottom)
+}
+
+/// Side of a progressive tile, in pixels. MS-RDPRFX fixes the tile grid at 64x64.
+pub const PROGRESSIVE_TILE: u16 = 64;
+
+/// Where a progressive tile lands on its surface.
+///
+/// The decoder reports a tile by GRID index, not by pixel position, so this multiply is
+/// the only thing standing between a correct frame and one where every tile is in the
+/// wrong place — a failure that looks like corruption rather than like a bug in a
+/// coordinate conversion.
+pub fn progressive_tile_rect(x_idx: u16, y_idx: u16) -> Rect {
+    let left = x_idx.saturating_mul(PROGRESSIVE_TILE);
+    let top = y_idx.saturating_mul(PROGRESSIVE_TILE);
+    Rect::new(
+        left,
+        top,
+        left.saturating_add(PROGRESSIVE_TILE),
+        top.saturating_add(PROGRESSIVE_TILE),
+    )
 }
 
 /// What the graphics pipeline did, in counters the caller can poll cheaply.
@@ -167,6 +188,13 @@ pub struct GfxHandler {
     store: Arc<Mutex<SurfaceStore>>,
     /// One instance for the session — see the module docs.
     decoder: ClearCodecDecoder,
+    /// RFX Progressive, also one per session.
+    ///
+    /// It keeps per-context tile state: a progressive frame refines tiles an earlier
+    /// frame established, so a decoder rebuilt per PDU would decode the first pass and
+    /// then reject or corrupt every refinement — the same reason the ClearCodec decoder
+    /// is long-lived.
+    progressive: ProgressiveDecoder,
     stats: GfxStatsHandle,
     /// Surfaces we have mirrored into the store. `ResetGraphics` implicitly destroys all
     /// surfaces (MS-RDPEGFX 3.3.5.14), and `SurfaceStore` has no bulk clear, so we need
@@ -196,6 +224,7 @@ impl GfxHandler {
         Self {
             store,
             decoder: ClearCodecDecoder::new(),
+            progressive: ProgressiveDecoder::new(),
             stats: GfxStatsHandle::new(),
             live_surfaces: HashSet::new(),
             cache_dims: HashMap::new(),
@@ -240,6 +269,62 @@ impl GfxHandler {
         self.stats.note(|s| {
             *s.codec_ids_seen.entry(name.to_owned()).or_insert(0) += 1;
         });
+    }
+
+    /// Decode an RFX Progressive frame and blit every tile it updated.
+    ///
+    /// `ironrdp-graphics` carries a complete progressive decoder; like ClearCodec it is
+    /// simply not wired into the client's decode path, so this is the seam. Without it a
+    /// progressive region is counted and dropped, which shows on screen as part of the
+    /// desktop frozen at whatever it last contained — the silent staleness the visibility
+    /// requirement exists to surface.
+    ///
+    /// The decoder needs the *surface* dimensions to size its tile grid, not the region's,
+    /// so a surface we do not know about cannot be decoded into.
+    fn apply_wire_to_surface2(&mut self, pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
+        let surface_id = pdu.surface_id;
+        let Some((width, height)) =
+            self.with_store(|store| store.get(surface_id).map(|s| (s.width, s.height)))
+        else {
+            // The server referenced a surface we never created. Counted as a store error
+            // rather than a decode error: nothing was wrong with the bytes.
+            self.stats
+                .note(|s| s.surface_errors = s.surface_errors.saturating_add(1));
+            return;
+        };
+
+        let tiles = match self.progressive.decode_bitmap(
+            pdu.codec_context_id,
+            width,
+            height,
+            &pdu.bitmap_data,
+        ) {
+            Ok(tiles) => tiles,
+            Err(e) => {
+                // Still stale — the region did not get painted — so it is counted the same
+                // way an undecodable region always was, but now with a reason attached.
+                let reason = e.to_string();
+                self.stats.note(|s| {
+                    s.undecoded_regions = s.undecoded_regions.saturating_add(1);
+                    *s.decode_error_reasons.entry(reason).or_insert(0) += 1;
+                });
+                return;
+            }
+        };
+
+        for tile in tiles {
+            let rect = progressive_tile_rect(tile.x_idx, tile.y_idx);
+            // `pixels` is a full 64x64 RGBA tile, so the source stride is the tile side
+            // even when the destination is clipped at the surface edge. Passing the
+            // clipped width instead shears the tile — the same trap `blit_rgba` documents.
+            let result = self.with_store(|store| {
+                store.blit_rgba(surface_id, rect, &tile.pixels, PROGRESSIVE_TILE)
+            });
+            if result.is_err() {
+                self.stats
+                    .note(|s| s.surface_errors = s.surface_errors.saturating_add(1));
+            }
+        }
     }
 
     /// Decode a ClearCodec tile and blit it into its surface.
@@ -516,10 +601,9 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// is P3a's remaining work. Counting it at least makes it visible instead of silent.
     fn on_wire_to_surface2(&mut self, pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
         let name = format!("WireToSurface2/{:?}", pdu.codec_id);
-        self.stats.note(|s| {
-            *s.codec_ids_seen.entry(name).or_insert(0) += 1;
-            s.undecoded_regions = s.undecoded_regions.saturating_add(1);
-        });
+        self.stats
+            .note(|s| *s.codec_ids_seen.entry(name).or_insert(0) += 1);
+        self.apply_wire_to_surface2(pdu);
     }
 
     fn on_unhandled_pdu(&mut self, pdu: &GfxPdu) {
@@ -534,12 +618,10 @@ impl GraphicsPipelineHandler for GfxHandler {
                 self.with_store(|store| store.map_to_output(id));
             }
             GfxPdu::WireToSurface2(p) => {
-                // RFX Progressive. Not decoded yet; counted so the mix is visible.
                 let name = format!("WireToSurface2/{:?}", p.codec_id);
-                self.stats.note(|s| {
-                    *s.codec_ids_seen.entry(name).or_insert(0) += 1;
-                    s.unhandled_pdus = s.unhandled_pdus.saturating_add(1);
-                });
+                self.stats
+                    .note(|s| *s.codec_ids_seen.entry(name).or_insert(0) += 1);
+                self.apply_wire_to_surface2(p);
             }
             _ => self
                 .stats
@@ -682,8 +764,48 @@ mod tests {
             s.codec_ids_seen
         );
         assert_eq!(
-            s.undecoded_regions, 1,
-            "and flagged as a region we cannot yet paint"
+            s.surface_errors, 1,
+            "a surface we never created is a store problem, not a codec one"
+        );
+        assert_eq!(
+            s.undecoded_regions, 0,
+            "nothing was wrong with the bytes, so this is not an undecodable region"
+        );
+    }
+
+    #[test]
+    fn a_progressive_stream_we_cannot_decode_is_counted_with_its_reason() {
+        // The region stays stale either way, but "we could not decode it" and "we do not
+        // have that surface" are different problems, and the reason tally is what makes a
+        // systematic decoder fault distinguishable from a scattering of unrelated ones.
+        let store = store();
+        store
+            .lock()
+            .unwrap()
+            .create(1, PROGRESSIVE_TILE, PROGRESSIVE_TILE);
+        let mut handler = GfxHandler::new(store);
+
+        let pdu = ironrdp_egfx::pdu::WireToSurface2Pdu {
+            surface_id: 1,
+            codec_context_id: 0,
+            codec_id: ironrdp_egfx::pdu::Codec2Type::RemoteFxProgressive,
+            pixel_format: ironrdp_egfx::pdu::PixelFormat::XRgb,
+            // Not a progressive stream. The decoder must refuse it rather than paint.
+            bitmap_data: vec![0u8; 8],
+        };
+        handler.on_wire_to_surface2(&pdu);
+
+        let s = handler.stats().snapshot();
+        assert_eq!(s.undecoded_regions, 1, "the region was not painted");
+        assert_eq!(
+            s.surface_errors, 0,
+            "the surface was fine; the bytes were not"
+        );
+        assert_eq!(
+            s.decode_error_reasons.values().sum::<u64>(),
+            1,
+            "the reason must be recorded, not just the count: {:?}",
+            s.decode_error_reasons
         );
     }
 
@@ -985,6 +1107,41 @@ mod tests {
         assert_eq!(stats.unhandled_pdus, 1);
         assert_eq!(stats.decode_errors, 0, "we never fed it to the decoder");
         assert_eq!(pixel_at(&store, 1, 0, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_progressive_tile_lands_at_its_grid_position() {
+        // Grid indices, not pixels. Hand-computed: tile (0,0) is the origin, tile (2,3)
+        // starts at (128, 192) and is one tile wide and tall.
+        assert_eq!(progressive_tile_rect(0, 0), Rect::new(0, 0, 64, 64));
+        let r = progressive_tile_rect(2, 3);
+        assert_eq!(r, Rect::new(128, 192, 192, 256));
+        assert_eq!(r.width(), PROGRESSIVE_TILE);
+        assert_eq!(r.height(), PROGRESSIVE_TILE);
+    }
+
+    #[test]
+    fn adjacent_progressive_tiles_touch_without_overlapping_or_gapping() {
+        // Exclusive rectangles: tile n's right edge is tile n+1's left edge. A ±1 here is
+        // a one-pixel seam or a one-pixel double-draw across the whole desktop.
+        let a = progressive_tile_rect(0, 0);
+        let b = progressive_tile_rect(1, 0);
+        assert_eq!(a.right, b.left);
+        let c = progressive_tile_rect(0, 1);
+        assert_eq!(a.bottom, c.top);
+    }
+
+    #[test]
+    fn a_progressive_tile_at_the_far_edge_of_the_grid_does_not_wrap() {
+        // u16 grid indices near the top of the range must saturate rather than wrap into
+        // the top-left corner, which would paint far-edge tiles over the wrong region.
+        let r = progressive_tile_rect(u16::MAX, u16::MAX);
+        assert_eq!(r.left, u16::MAX);
+        assert_eq!(r.right, u16::MAX);
+        assert!(
+            r.is_empty(),
+            "a saturated tile paints nothing rather than wrapping"
+        );
     }
 
     #[test]

@@ -53,6 +53,8 @@ mdrdp                          # favourites launcher — double-click to connect
 mdrdp Temper                   # connect to a saved favourite by name
 mdrdp temper --user ACCOUNT    # connect to a host directly
 mdrdp --list                   # print saved favourites
+mdrdp <host> --password-stdin  # read the password from stdin (scripting/CI)
+mdrdp <host> --duration 30     # disconnect cleanly after N seconds
 ```
 
 Command-line flags override whatever the favourite specifies.
@@ -82,7 +84,7 @@ measure, and the two disagree exactly when the cache is not earning its keep.
 ## What works
 
 - Connect over NLA/CredSSP with trust-on-first-use certificate pinning
-- EGFX graphics (ClearCodec), keyboard, mouse and scroll
+- EGFX graphics (ClearCodec, and RFX Progressive in part), keyboard, mouse and scroll
 - Favourites launcher, saved as TOML and written atomically
 - Clipboard text in both directions, with explicit timeouts so it cannot wedge
 - Audio playback (PCM 16-bit, 44.1/48kHz, mono or stereo)
@@ -91,8 +93,9 @@ measure, and the two disagree exactly when the cache is not earning its keep.
 
 ## What does not work yet
 
-- **RFX Progressive is not decoded.** Regions in that codec are counted and reported at
-  session end, and those parts of the desktop will be stale rather than wrong.
+- **RFX Progressive decodes only partially.** It is wired up and working, but on a real
+  server some frames still fail with `missing CONTEXT block`; those regions stay stale
+  rather than wrong, and are counted and reported by reason at session end.
 - **Fullscreen is not a real fullscreen mode**, just a default resolution.
 - No drive redirection, multi-monitor, RemoteApp/RAIL, smart-card, or microphone.
 - Favourites are edited by hand; there is no add/remove UI.

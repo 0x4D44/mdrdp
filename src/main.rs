@@ -401,8 +401,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("session ended: {end:?}");
     }
     eprintln!(
-        "  frames {}  decode errors {}  undecoded regions {}\n  codecs {:?}",
-        s.frames_completed, s.decode_errors, s.undecoded_regions, s.codec_ids_seen
+        "  frames {}  decode errors {}  undecoded regions {}  surface errors {}\n  codecs {:?}",
+        s.frames_completed,
+        s.decode_errors,
+        s.undecoded_regions,
+        s.surface_errors,
+        s.codec_ids_seen
     );
     match (cache.hit_rate(), cache.byte_savings()) {
         (Some(hit), Some(saved)) => eprintln!(
