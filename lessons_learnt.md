@@ -9,6 +9,31 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- macOS Cmd+Q calls AppKit `terminate:` → `exit(0)` inside winit's `run()`; clean-up must live in `ApplicationHandler::exiting` (`window::SessionWindow::on_exit`).
+  winit installs a default menu whose Quit item is bound to `terminate:`, and it does not
+  implement `applicationShouldTerminate:`, so AppKit takes NSTerminateNow. `run_app` never
+  returns and every statement after it — including an RDP disconnect — is skipped, along
+  with all destructors. winit does emit `LoopExiting` first, so `exiting()` is the only
+  place left to disconnect. Beware the follow-on deadlock: a worker thread posting to the
+  event-loop proxy while the main thread joins that worker inside `exiting()` hangs.
+
+- ironrdp ships decoders it never wires into the client: ClearCodec AND RFX Progressive both live in `ironrdp-graphics` (`gfx::apply_wire_to_surface2`).
+  `ironrdp-graphics::progressive::ProgressiveDecoder` is complete, with a doc comment
+  showing the exact `WireToSurface2Pdu` call, and `ironrdp-pdu::codecs::rfx::progressive`
+  parses the block stream. Before assuming a codec is "our work", grep the graphics crate
+  — the decode may already exist and need only a seam.
+
+- `enable_audio_playback: false` SETS `INFO_NOAUDIOPLAYBACK`, and upstream's field doc states the polarity backwards (`connect::establish`).
+  MS-RDPBCGR defines that flag as "audio redirection MUST NOT take place". Leaving the
+  field false while registering RDPSND joins the channel and then tells the server never
+  to use it: the server obliges, no Wave PDU ever arrives, and audio looks wired up while
+  producing permanent silence.
+
+- Counting a failure without its reason hides whether one fault or a hundred are at work (`gfx::GfxStats::decode_error_reasons`).
+  "179 tiles failed to decode" was unactionable; tallying by reason immediately showed 84
+  primary parse failures starving the v-bar and glyph caches and causing 92 cascade
+  failures — one bug, not four.
+
 - winit permits ONE EventLoop per process; reuse it via `run_app_on_demand` (`window::SessionWindow::event_loop`).
   `EventLoopBuilder::build` sets a process-global `EVENT_LOOP_CREATED` flag and every later
   build returns `EventLoopError::RecreationAttempt` (reset only on web). A launcher window

@@ -102,11 +102,20 @@ measure, and the two disagree exactly when the cache is not earning its keep.
 
 ## Honest status
 
-The connection path has been exercised against a real Windows 11 host. The features
-added most recently — clipboard, audio, the geometry policy and the overlay — are
-covered by unit tests and mutation checks, but **have not been exercised against a live
-server**. In particular no audio has been heard and no clipboard round trip has been
-observed end to end. Treat the first real session as the test.
+Verified against real Windows hosts: connect, graphics, the bitmap cache, the graceful
+disconnect, and that the CLIPRDR / RDPSND / DRDYNVC channels all join. A session prints
+which channels are live, so "the clipboard isn't working" and "the clipboard channel
+never joined" are distinguishable.
+
+Still unproven, and worth saying plainly:
+
+- **No audio has been heard.** The channel joins and the client no longer tells the
+  server to suppress audio, but the test box negotiated no format, so playback has never
+  actually run.
+- **No clipboard round trip has been observed.** The channel joins and the state machine
+  is covered by tests, including the two-consecutive-cycles case, but no text has been
+  copied across a live session.
+- Some RFX Progressive frames still fail to decode (see above).
 
 ## Building
 
