@@ -303,7 +303,12 @@ impl GfxHandler {
             Err(e) => {
                 // Still stale — the region did not get painted — so it is counted the same
                 // way an undecodable region always was, but now with a reason attached.
-                let reason = e.to_string();
+                //
+                // The context id is part of the reason on purpose: "missing CONTEXT block"
+                // means the very first frame for a context arrived without one, so knowing
+                // WHICH contexts fail distinguishes "the server opened a context we never
+                // saw established" from "we lose the context we did establish".
+                let reason = format!("ctx {}: {}", pdu.codec_context_id, e);
                 self.stats.note(|s| {
                     s.undecoded_regions = s.undecoded_regions.saturating_add(1);
                     *s.decode_error_reasons.entry(reason).or_insert(0) += 1;
