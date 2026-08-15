@@ -287,6 +287,15 @@ pub struct AudioStats {
     /// keeps running without audio when this is non-zero; see [`AudioPlayback`].
     pub device_errors: u64,
     pub current_format: Option<AudioFormatSummary>,
+    /// How many formats went out in the most recent Client Audio Formats PDU, or `None`
+    /// if no format exchange ever completed on either transport.
+    ///
+    /// This is the only counter that separates "the server never opened an audio channel"
+    /// from "it opened one and nothing happened to be playing". `current_format` cannot:
+    /// it is set by [`RdpsndBackend::wave`], so it stays `None` through a perfectly
+    /// healthy silent session, and reading a negotiation failure out of it would attribute
+    /// a fault to a stage that was never measured.
+    pub negotiated_formats: Option<usize>,
 }
 
 /// A cloneable read/write handle on a shared [`AudioStats`].
@@ -570,6 +579,10 @@ impl RdpsndClientHandler for RdpsndBackend {
     fn set_negotiated_formats(&mut self, formats: &[AudioFormat]) {
         self.negotiated_formats.clear();
         self.negotiated_formats.extend_from_slice(formats);
+        // Recorded even when empty: "we exchanged formats and shared none" is a different
+        // diagnosis from "no audio channel ever opened", and the report must not merge them.
+        self.stats
+            .note(|s| s.negotiated_formats = Some(formats.len()));
     }
 
     fn wave(&mut self, format_no: usize, _ts: u32, data: Cow<'_, [u8]>) {
@@ -1042,6 +1055,60 @@ mod tests {
                 channels: 2,
                 bits_per_sample: 16
             })
+        );
+    }
+
+    #[test]
+    fn a_silent_session_reports_the_negotiation_that_did_happen() {
+        // The reporting bug this pins: `current_format` is only set when a wave plays, so
+        // a healthy session with nothing playing on the remote desktop looked identical to
+        // a server that never opened an audio channel — and the report called both
+        // "negotiated no format".
+        let stats = AudioStatsHandle::new();
+        let ring = AudioRing::with_capacity(4096, stats.clone());
+        let mut listener = DynamicRdpsndListener::new(ring, stats.clone(), device_native());
+        let mut channel = listener.create(1).unwrap();
+
+        assert_eq!(
+            stats.snapshot().negotiated_formats,
+            None,
+            "nothing has been exchanged yet, so nothing may be claimed"
+        );
+
+        let server = ServerAudioOutputPdu::AudioFormat(ServerAudioFormatPdu {
+            version: Version::V8,
+            formats: vec![pcm_format(48_000, 2), pcm_format(44_100, 1)],
+        });
+        channel.process(1, &encode_vec(&server).unwrap()).unwrap();
+
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.negotiated_formats,
+            Some(2),
+            "the exchange completed and must be visible even though nothing played"
+        );
+        assert_eq!(snap.current_format, None, "no wave played");
+        assert_eq!(snap.packets_received, 0);
+    }
+
+    #[test]
+    fn an_exchange_sharing_no_format_is_distinguishable_from_no_exchange_at_all() {
+        let stats = AudioStatsHandle::new();
+        let ring = AudioRing::with_capacity(4096, stats.clone());
+        let mut listener = DynamicRdpsndListener::new(ring, stats.clone(), device_native());
+        let mut channel = listener.create(1).unwrap();
+
+        // Compressed-only offer: we advertise PCM, so the intersection is empty.
+        let server = ServerAudioOutputPdu::AudioFormat(ServerAudioFormatPdu {
+            version: Version::V8,
+            formats: vec![compressed_format(WaveFormat::ADPCM)],
+        });
+        channel.process(1, &encode_vec(&server).unwrap()).unwrap();
+
+        assert_eq!(
+            stats.snapshot().negotiated_formats,
+            Some(0),
+            "an empty intersection is a real capability gap, not an absent exchange"
         );
     }
 

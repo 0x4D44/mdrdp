@@ -9,6 +9,12 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- A counter written only on success cannot diagnose failure (`audio::AudioStats::negotiated_formats`).
+  `current_format` is set when a wave plays, so a silent-but-healthy session left it `None`
+  and the report printed "server negotiated no format" — blaming a stage it had never
+  measured, and hiding the difference between "no audio channel opened" and "nothing was
+  playing". Record that a stage happened separately from what it produced.
+
 - Windows gates AUDIO_PLAYBACK_DVC on RDPDR presence; attach a no-device backend (`connect::establish`).
   Quench suppressed every audio DVC for mdrdp and the current upstream IronRDP viewer,
   despite both advertising playback and joining static RDPSND. Adding protocol-correct
