@@ -120,7 +120,8 @@ leave a plausible-looking partial report.
 
 Verified against real Windows hosts: NLA/TLS connect, ClearCodec/RFX Progressive and
 uncompressed graphics, the bitmap cache, fixed-resolution windows, graceful disconnect,
-and CLIPRDR/RDPSND/DRDYNVC channel joins. A 35-second optimized Quench run at 1920x1080
+desktop input, two-way clipboard transfer, and CLIPRDR/RDPSND/DRDYNVC channel joins. A
+35-second optimized Quench run at 1920x1080
 ended gracefully with zero decode, undecoded-region, surface, cache-miss, or unhandled-PDU
 errors. All 1,021 bitmap-cache lookups hit. The redacted report measured 0.57% average CPU
 and 169 MiB peak resident memory for that short idle first-run screen; it is a smoke result,
@@ -135,13 +136,15 @@ comparison on the same host measured mean absolute error 4.3/255 with a detail r
 
 Still unproven, and worth saying plainly:
 
-- **No live audio has been heard yet.** The test box has not sent an audio format. Format
-  negotiation, conversion, buffering, and fail-safe device loss are covered by tests.
-- **No live clipboard round trip has been observed yet.** Unicode, empty, large, rapid,
-  image, timeout, and recovery paths are covered by deterministic protocol tests.
-- Quench is currently paused in Windows first-run privacy setup. The unattended macOS
-  session cannot inject synthetic input through the host's accessibility policy, so full
-  desktop input/clipboard/audio acceptance remains pending on that external screen.
+- **No live audio has been heard yet.** Quench's Windows Audio service runs and its playback
+  redirection policy is unconfigured, but RDPSND has not negotiated a format with this
+  client. Format conversion, buffering, and fail-safe device loss are covered by tests.
+- **Clipboard soak and induced live timeout recovery remain unproven.** Quench round trips
+  Unicode text, empty text, a 1 MiB payload, rapid changes, and a 1920x1080 image in both
+  directions. Deterministic protocol tests cover timeout recovery.
+- Quench's Windows first-run flow is complete. Direct RDP scancodes exercised the same input
+  channel as the real window and reached the full desktop; macOS Accessibility policy still
+  prevents unattended host-generated UI input.
 
 ## Building
 

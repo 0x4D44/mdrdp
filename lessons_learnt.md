@@ -9,6 +9,13 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- CLIPRDR polling can beat Monitor Ready; defer and serialize FormatList PDUs (`clipboard::advertise`).
+  The local 250 ms poll started before the server's initialization request and sent a
+  FormatList that Windows silently ignored. Later rapid changes could also race multiple
+  lists while one acknowledgement was outstanding. Holding the current content until
+  Monitor Ready, then coalescing changes behind the one in-flight exchange, made the latest
+  clipboard value deterministic on Quench.
+
 - A codec no-op can report success while leaving stale pixels; diff output (`clearcodec::decode_subcodec_region`).
   ClearCodec's NSCodec branch parsed the region and returned `Ok(())` without painting it,
   so every health counter was zero while horizontal bands stayed visibly stale. Splitting

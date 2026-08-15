@@ -82,6 +82,8 @@ const HASH_PREFIX_CAP_BYTES: usize = 256 * 1024;
 pub enum ClipboardAction {
     /// We should (re-)advertise our current clipboard formats to the remote.
     AdvertiseRequested,
+    /// IronRDP received Monitor Ready and now requires the initialization format list.
+    ProtocolFormatListRequested,
     /// The remote acknowledged or rejected our last format-list advertise.
     FormatListAcked(bool),
     /// The remote's clipboard changed; these are the formats it now offers.
@@ -255,7 +257,7 @@ enum PasteState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdvertiseState {
     Idle,
-    Pending { attempt: u8 },
+    Pending { attempt: u8, resend_requested: bool },
     Confirmed,
 }
 
@@ -299,7 +301,7 @@ impl CliprdrBackend for ClipboardBackend {
     }
 
     fn on_request_format_list(&mut self) {
-        self.send(ClipboardAction::AdvertiseRequested);
+        self.send(ClipboardAction::ProtocolFormatListRequested);
     }
 
     fn on_format_list_response(&mut self, ok: bool) {
@@ -348,6 +350,9 @@ pub struct ClipboardBridge {
     remote_formats: Vec<ClipboardFormat>,
     paste_state: PasteState,
     advertise_state: AdvertiseState,
+    /// Local polling starts before CLIPRDR's Monitor Ready handshake can complete. Sending
+    /// before this request makes IronRDP emit initialization PDUs out of protocol order.
+    initial_format_list_requested: bool,
     /// Fingerprint ([`content_fingerprint`]) of the last clipboard content we either wrote
     /// (from the remote) or observed locally. This stops remote-origin content from being
     /// advertised straight back — the advertise-loop hazard.
@@ -377,6 +382,7 @@ pub fn clipboard_channel_with_clock(
         remote_formats: Vec::new(),
         paste_state: PasteState::Idle,
         advertise_state: AdvertiseState::Idle,
+        initial_format_list_requested: false,
         last_seen_fingerprint: None,
         paste_timeout_ms: DEFAULT_PASTE_TIMEOUT_MS,
     };
@@ -413,6 +419,7 @@ impl ClipboardBridge {
         while self.next_action().is_some() {}
         self.paste_state = PasteState::Idle;
         self.advertise_state = AdvertiseState::Idle;
+        self.initial_format_list_requested = false;
     }
 
     /// Resets any paste request that has been pending too long back to `Idle`, so the next
@@ -483,6 +490,10 @@ impl ClipboardBridge {
     ) {
         match action {
             ClipboardAction::AdvertiseRequested => self.advertise(cliprdr, out),
+            ClipboardAction::ProtocolFormatListRequested => {
+                self.initial_format_list_requested = true;
+                self.advertise(cliprdr, out);
+            }
             ClipboardAction::FormatListAcked(ok) => self.handle_format_list_acked(ok, cliprdr, out),
             ClipboardAction::RemoteCopy(formats) => self.handle_remote_copy(formats, cliprdr, out),
             ClipboardAction::LocalDataRequested(format) => {
@@ -499,8 +510,21 @@ impl ClipboardBridge {
         cliprdr: &mut Cliprdr<R>,
         out: &mut Vec<CliprdrSvcMessages<R>>,
     ) {
-        self.advertise_state = AdvertiseState::Pending { attempt: 0 };
-        self.send_advertise(cliprdr, out);
+        if !self.initial_format_list_requested {
+            return;
+        }
+        if let AdvertiseState::Pending { attempt, .. } = self.advertise_state {
+            self.advertise_state = AdvertiseState::Pending {
+                attempt,
+                resend_requested: true,
+            };
+        } else {
+            self.advertise_state = AdvertiseState::Pending {
+                attempt: 0,
+                resend_requested: false,
+            };
+            self.send_advertise(cliprdr, out);
+        }
     }
 
     fn send_advertise<R: Role>(
@@ -532,14 +556,36 @@ impl ClipboardBridge {
         cliprdr: &mut Cliprdr<R>,
         out: &mut Vec<CliprdrSvcMessages<R>>,
     ) {
+        // An acknowledgement is itself proof that the protocol requested and received an
+        // initial list. This keeps synthetic ready-client tests faithful too.
+        self.initial_format_list_requested = true;
         match self.advertise_state {
-            AdvertiseState::Pending { .. } if ok => {
+            AdvertiseState::Pending {
+                resend_requested: true,
+                ..
+            } => {
+                // Only one FormatList exchange may be in flight. A local change that
+                // arrived meanwhile supersedes both this response and its retry count.
+                self.advertise_state = AdvertiseState::Pending {
+                    attempt: 0,
+                    resend_requested: false,
+                };
+                self.send_advertise(cliprdr, out);
+            }
+            AdvertiseState::Pending {
+                resend_requested: false,
+                ..
+            } if ok => {
                 self.advertise_state = AdvertiseState::Confirmed;
             }
-            AdvertiseState::Pending { attempt } => {
+            AdvertiseState::Pending {
+                attempt,
+                resend_requested: false,
+            } => {
                 if attempt + 1 < MAX_ADVERTISE_ATTEMPTS {
                     self.advertise_state = AdvertiseState::Pending {
                         attempt: attempt + 1,
+                        resend_requested: false,
                     };
                     debug!(
                         attempt = attempt + 1,
@@ -1212,6 +1258,8 @@ mod tests {
         bridge.poll_local_change();
         bridge.discard_pending();
 
+        // A newly available channel starts a fresh Monitor Ready handshake.
+        backend_mut(&mut cliprdr).on_request_format_list();
         state.lock().unwrap().text = Some("second".to_string());
         bridge.poll_local_change();
         assert!(
@@ -1546,7 +1594,10 @@ mod tests {
         bridge.pump(&mut cliprdr);
         assert_eq!(
             bridge.advertise_state,
-            AdvertiseState::Pending { attempt: 0 }
+            AdvertiseState::Pending {
+                attempt: 0,
+                resend_requested: false,
+            }
         );
 
         backend_mut(&mut cliprdr).on_format_list_response(false);
@@ -1554,7 +1605,10 @@ mod tests {
         assert_eq!(msgs.len(), 1, "first rejection should retry");
         assert_eq!(
             bridge.advertise_state,
-            AdvertiseState::Pending { attempt: 1 }
+            AdvertiseState::Pending {
+                attempt: 1,
+                resend_requested: false,
+            }
         );
 
         backend_mut(&mut cliprdr).on_format_list_response(false);
@@ -1562,7 +1616,10 @@ mod tests {
         assert_eq!(msgs.len(), 1, "second rejection should retry");
         assert_eq!(
             bridge.advertise_state,
-            AdvertiseState::Pending { attempt: 2 }
+            AdvertiseState::Pending {
+                attempt: 2,
+                resend_requested: false,
+            }
         );
 
         backend_mut(&mut cliprdr).on_format_list_response(false);
@@ -1679,7 +1736,10 @@ mod tests {
         );
         assert_eq!(
             bridge.advertise_state,
-            AdvertiseState::Pending { attempt: 0 }
+            AdvertiseState::Pending {
+                attempt: 0,
+                resend_requested: false,
+            }
         );
 
         // Polling again with unchanged content must not re-advertise.
@@ -1688,6 +1748,69 @@ mod tests {
         assert!(
             msgs.is_empty(),
             "unchanged content must not be re-advertised on every poll"
+        );
+    }
+
+    #[test]
+    fn rapid_local_changes_wait_for_the_in_flight_advertise_then_send_the_latest() {
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+
+        state.lock().unwrap().text = Some("zero".to_string());
+        bridge.poll_local_change();
+        assert_eq!(bridge.pump(&mut cliprdr).len(), 1);
+
+        // Windows allows one FormatList exchange at a time. These changes happen before
+        // the first acknowledgement, so they must coalesce rather than race two more PDUs.
+        state.lock().unwrap().text = Some("one".to_string());
+        bridge.poll_local_change();
+        state.lock().unwrap().text = Some("two (latest)".to_string());
+        bridge.poll_local_change();
+        assert!(
+            bridge.pump(&mut cliprdr).is_empty(),
+            "an in-flight advertise must serialize later local changes"
+        );
+
+        backend_mut(&mut cliprdr).on_format_list_response(true);
+        assert_eq!(
+            bridge.pump(&mut cliprdr).len(),
+            1,
+            "the acknowledgement must release one coalesced latest advertise"
+        );
+        backend_mut(&mut cliprdr).on_format_list_response(true);
+        bridge.pump(&mut cliprdr);
+
+        backend_mut(&mut cliprdr).on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        match only_pdu(bridge.pump(&mut cliprdr)) {
+            ClipboardPdu::FormatDataResponse(response) => {
+                assert_eq!(decode_utf16le_text(response.data()), "two (latest)");
+            }
+            other => panic!("unexpected pdu variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_poll_waits_for_the_protocols_initial_format_list_request() {
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = CliprdrClient::new(Box::new(backend));
+
+        state.lock().unwrap().text = Some("copied before Monitor Ready".to_string());
+        bridge.poll_local_change();
+        assert!(
+            bridge.pump(&mut cliprdr).is_empty(),
+            "a local poll must not send initialization PDUs before Monitor Ready"
+        );
+
+        backend_mut(&mut cliprdr).on_request_format_list();
+        assert_eq!(
+            bridge.pump(&mut cliprdr).len(),
+            1,
+            "the protocol request must release one advertise with current content"
         );
     }
 
@@ -1816,6 +1939,8 @@ mod tests {
         state.lock().unwrap().text = Some(payload_a);
         bridge.poll_local_change();
         bridge.pump(&mut cliprdr); // drain the first advertise
+        backend_mut(&mut cliprdr).on_format_list_response(true);
+        bridge.pump(&mut cliprdr); // complete the one allowed in-flight exchange
 
         state.lock().unwrap().text = Some(payload_b);
         bridge.poll_local_change();
