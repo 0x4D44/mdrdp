@@ -45,6 +45,28 @@ impl ClearCodecDecoder {
     /// `0xFF` unconditionally. Callers that need to preserve alpha across the
     /// network must transport it separately.
     pub fn decode(&mut self, data: &[u8], width: u16, height: u16) -> DecodeResult<Vec<u8>> {
+        self.decode_over(data, width, height, None)
+    }
+
+    /// Decode, compositing over `existing` rather than over black.
+    ///
+    /// mdrdp patch: ClearCodec's three layers do not have to cover the whole tile.
+    /// FreeRDP composites straight into the destination surface, so any pixel a layer
+    /// does not write keeps what was already on screen. Decoding into a zeroed buffer and
+    /// then blitting the whole tile paints BLACK over exactly those pixels — a tile
+    /// carrying a small subcodec region wipes the rest of its rectangle. Measured on a
+    /// live session: both ClearCodec tiles in a frame decoded to a mean of (0,0,0),
+    /// producing a black rectangle over the wallpaper.
+    ///
+    /// `existing` must be `width * height * 4` RGBA bytes; anything else is ignored and
+    /// the decode falls back to black, which is the old behaviour.
+    pub fn decode_over(
+        &mut self,
+        data: &[u8],
+        width: u16,
+        height: u16,
+        existing: Option<Vec<u8>>,
+    ) -> DecodeResult<Vec<u8>> {
         let mut src = ReadCursor::new(data);
         let stream = ClearCodecBitmapStream::decode(&mut src)?;
 
@@ -99,8 +121,12 @@ impl ClearCodecDecoder {
             ));
         }
 
-        // Decode composite payload
-        let mut output = vec![0u8; pixel_count * 4];
+        // Decode composite payload, over whatever is already on screen where the layers
+        // do not reach.
+        let mut output = match existing {
+            Some(buf) if buf.len() == pixel_count * 4 => buf,
+            _ => vec![0u8; pixel_count * 4],
+        };
 
         if let Some(ref composite) = stream.composite {
             self.decode_composite(composite, &mut output, width, height)?;

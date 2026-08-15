@@ -244,3 +244,21 @@ decode errors, zero undecoded regions and zero surface errors.
 
 Pinned by `rlex_single_entry_palette_reads_two_bytes_per_segment` in `src/gfx.rs`;
 restoring the special case turns one segment into two.
+
+## `ironrdp-graphics` 0.9.0 — ClearCodec must composite over the destination, not over black
+
+`ClearCodecDecoder::decode` allocated a zeroed buffer and composited the residual, bands
+and subcodec layers into it. Those layers do not have to cover the whole tile: FreeRDP
+composites straight into the destination surface, so any pixel a layer does not write
+keeps what is already on screen. Decoding over black and then blitting the whole tile
+paints BLACK over exactly those pixels.
+
+Measured on a live session: both ClearCodec tiles in a frame decoded to a mean of
+(0,0,0) — a black rectangle over the wallpaper — and the logon dialog's translucent panel
+rendered as opaque grey blocks around the text and buttons.
+
+`decode_over` takes the destination's current content as the starting buffer;
+`decode` still exists and passes `None`, which is the old behaviour. The caller in
+`gfx::apply_wire_to_surface1` extracts the destination rect and swaps it to BGRA first —
+the surface stores RGBA and this decoder works in BGRA, so seeding without the swap would
+leave every uncovered pixel with red and blue exchanged.

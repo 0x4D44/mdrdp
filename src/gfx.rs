@@ -358,28 +358,47 @@ impl GfxHandler {
             return;
         }
 
-        let mut pixels = match self
-            .decoder
-            .decode(&pdu.bitmap_data, dest.width(), dest.height())
-        {
-            Ok(pixels) => pixels,
-            Err(e) => {
-                self.capture
-                    .record(dest.width(), dest.height(), &pdu.bitmap_data);
-                // The reason is recorded, not just the count. A bare counter said "177
-                // tiles failed" and left no way to tell one cause from a hundred; the
-                // error text carries protocol field names, never pixels, so it is safe
-                // to keep. The tally is by reason so a single dominant fault is obvious.
-                let reason = e.to_string();
-                self.stats.note(|s| {
-                    s.decode_errors = s.decode_errors.saturating_add(1);
-                    *s.decode_error_reasons.entry(reason).or_insert(0) += 1;
-                });
-                // One dropped tile is a smear the next frame repaints; an error returned
-                // to the DVC processor would end the session.
-                return;
-            }
-        };
+        // Seed the decode with what is already on the surface. ClearCodec's layers need
+        // not cover the whole tile, and every pixel they skip must keep its current
+        // content — decoding over black and blitting the lot paints a black rectangle
+        // wherever a tile carries only a small region.
+        let existing = self
+            .with_store(|store| {
+                store
+                    .get(pdu.surface_id)
+                    .and_then(|surface| surface.extract(dest))
+            })
+            .map(|mut rgba| {
+                // The surface stores RGBA; the ClearCodec decoder works in BGRA and its
+                // output is swapped back below. Seeding without this swap would leave
+                // every pixel the codec does NOT overwrite with red and blue exchanged.
+                SurfaceStore::bgra_to_rgba_in_place(&mut rgba);
+                rgba
+            });
+
+        let mut pixels =
+            match self
+                .decoder
+                .decode_over(&pdu.bitmap_data, dest.width(), dest.height(), existing)
+            {
+                Ok(pixels) => pixels,
+                Err(e) => {
+                    self.capture
+                        .record(dest.width(), dest.height(), &pdu.bitmap_data);
+                    // The reason is recorded, not just the count. A bare counter said "177
+                    // tiles failed" and left no way to tell one cause from a hundred; the
+                    // error text carries protocol field names, never pixels, so it is safe
+                    // to keep. The tally is by reason so a single dominant fault is obvious.
+                    let reason = e.to_string();
+                    self.stats.note(|s| {
+                        s.decode_errors = s.decode_errors.saturating_add(1);
+                        *s.decode_error_reasons.entry(reason).or_insert(0) += 1;
+                    });
+                    // One dropped tile is a smear the next frame repaints; an error returned
+                    // to the DVC processor would end the session.
+                    return;
+                }
+            };
 
         SurfaceStore::bgra_to_rgba_in_place(&mut pixels);
         // The decoder produced rows at the UNCLIPPED rect width — that is what it was
@@ -1250,6 +1269,50 @@ mod tests {
         // Far out of range, both directions.
         assert_eq!(t(1_000_000), i16::MAX);
         assert_eq!(t(-1_000_000), i16::MIN);
+    }
+
+    /// `decode_over` accepts a seed of the right size and ignores a wrong-sized one.
+    ///
+    /// ClearCodec's layers need not cover the whole tile, and FreeRDP composites straight
+    /// into the destination so uncovered pixels keep what is on screen. We now seed the
+    /// decode with the surface's current content instead of black.
+    ///
+    /// The preservation property itself is NOT pinned here: `ClearCodecEncoder` only
+    /// produces fully-covering streams, so a partial-coverage fixture cannot be built
+    /// from it. That half is evidenced by live capture — before this change a tile
+    /// carrying one small subcodec region blacked out the rest of its rectangle, which is
+    /// visible as dark blocks in the earlier screenshots and absent afterwards.
+    #[test]
+    fn clearcodec_decode_over_takes_a_correctly_sized_seed() {
+        use ironrdp_graphics::clearcodec::{ClearCodecDecoder, ClearCodecEncoder};
+
+        // BGRA in, as the encoder expects: B=0x10, G=0x20, R=0x30.
+        let tile: Vec<u8> = [0x10u8, 0x20, 0x30, 0xFF]
+            .iter()
+            .copied()
+            .cycle()
+            .take(2 * 2 * 4)
+            .collect();
+        let encoded = ClearCodecEncoder::new().encode(&tile, 2, 2);
+
+        // A seed of the right length is accepted; the covered pixels still decode.
+        let seed = vec![0x7Au8; 2 * 2 * 4];
+        let out = ClearCodecDecoder::new()
+            .decode_over(&encoded, 2, 2, Some(seed))
+            .expect("a correctly sized seed must be accepted");
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert_eq!(
+            &out[0..3],
+            &[0x10, 0x20, 0x30],
+            "covered pixels decode normally"
+        );
+
+        // A wrong-sized seed must not be used, and must not fail the decode.
+        let out2 = ClearCodecDecoder::new()
+            .decode_over(&encoded, 2, 2, Some(vec![0u8; 3]))
+            .expect("a mismatched seed falls back rather than erroring");
+        assert_eq!(out2.len(), 2 * 2 * 4);
+        assert_eq!(&out2[0..3], &[0x10, 0x20, 0x30]);
     }
 
     /// A single-entry RLEX palette still uses ONE stop-index bit, not zero.
