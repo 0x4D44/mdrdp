@@ -24,6 +24,7 @@
 use std::num::NonZeroU32;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -33,6 +34,7 @@ use winit::window::{Window, WindowId};
 
 use crate::input::{self, InputEvent, PointerMap};
 use crate::surface::SurfaceStore;
+use crate::window_policy::{Geometry, WindowPolicy};
 
 /// What the caller must decide before a window exists.
 #[derive(Debug, Clone)]
@@ -266,16 +268,31 @@ pub struct SessionWindow {
 impl SessionWindow {
     /// Build the event loop. **Must be called on the main thread** — winit requires it on
     /// macOS and Windows alike.
-    pub fn new(
-        config: WindowConfig,
-        store: Arc<Mutex<SurfaceStore>>,
-        input: Sender<InputEvent>,
-    ) -> Result<Self, WindowError> {
+    ///
+    /// There is exactly one event loop per process: winit sets a global flag on the first
+    /// build and every later one fails with `RecreationAttempt`. Anything else that needs
+    /// a window — the favourites launcher — must therefore run on *this* loop, which is
+    /// why [`event_loop`](Self::event_loop) exists rather than each screen making its own.
+    pub fn event_loop() -> Result<EventLoop<SessionEvent>, WindowError> {
         let event_loop = EventLoop::<SessionEvent>::with_user_event()
             .build()
             .map_err(|e| WindowError::EventLoop(e.to_string()))?;
         // Wait, not Poll: nothing here is animated, so the loop should sleep until the
         // OS or a producer has something to say.
+        event_loop.set_control_flow(ControlFlow::Wait);
+        Ok(event_loop)
+    }
+
+    /// Bind a window to the process's event loop.
+    ///
+    /// Takes the loop rather than building one so the launcher can have run on it first;
+    /// see [`event_loop`](Self::event_loop).
+    pub fn new(
+        event_loop: EventLoop<SessionEvent>,
+        config: WindowConfig,
+        store: Arc<Mutex<SurfaceStore>>,
+        input: Sender<InputEvent>,
+    ) -> Result<Self, WindowError> {
         event_loop.set_control_flow(ControlFlow::Wait);
         Ok(SessionWindow {
             event_loop,
@@ -329,6 +346,11 @@ struct SessionApp {
     failure: Option<WindowError>,
     /// Consecutive failed presents; reset by any successful one.
     present_failures: u32,
+    /// Tells a resize the user asked for from one the system imposed.
+    policy: WindowPolicy,
+    /// Monotonic origin for the policy's timestamps. Wall-clock would let a clock
+    /// adjustment overnight — exactly when displays sleep — corrupt the timing.
+    started: Instant,
 }
 
 impl SessionApp {
@@ -343,6 +365,10 @@ impl SessionApp {
             config.session_width,
             config.session_height,
         );
+        let policy = WindowPolicy::new(Geometry::new(
+            u32::from(config.session_width),
+            u32::from(config.session_height),
+        ));
         SessionApp {
             present_failures: 0,
             config,
@@ -355,6 +381,37 @@ impl SessionApp {
             cursor: None,
             presented: None,
             failure: None,
+            policy,
+            started: Instant::now(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Consult the geometry policy about a size, and ask for it back if the policy judges
+    /// that the system rather than the user chose it.
+    ///
+    /// Requesting is all we can do — every platform is free to ignore it, which is why the
+    /// policy bounds its attempts rather than looping until the sizes agree.
+    fn hold_geometry(&mut self, actual: Geometry) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let monitor = window
+            .current_monitor()
+            .map(|m| Geometry::new(m.size().width, m.size().height));
+        let now = self.now_ms();
+        if let Some(target) = self.policy.on_resize(actual, now, monitor) {
+            tracing::debug!(
+                actual_w = actual.width,
+                actual_h = actual.height,
+                target_w = target.width,
+                target_h = target.height,
+                "restoring window geometry after a display change"
+            );
+            let _ = window.request_inner_size(PhysicalSize::new(target.width, target.height));
         }
     }
 
@@ -531,9 +588,34 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                     self.viewport.session_width,
                     self.viewport.session_height,
                 );
+                self.hold_geometry(Geometry::new(size.width, size.height));
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+            }
+
+            // A screen locking or a monitor powering down shows up here. Both platforms
+            // rearrange windows around these moments, so the policy uses them to read the
+            // resizes that follow as the system's doing rather than the user's.
+            WindowEvent::Occluded(occluded) => {
+                let now = self.now_ms();
+                self.policy.note_occluded(occluded, now);
+                // Becoming visible is the first moment anything can actually be fixed:
+                // the size may have been changed while the screen was off, and no further
+                // `Resized` is guaranteed to arrive to prompt us.
+                if !occluded && let Some(window) = self.window.clone() {
+                    let size = window.inner_size();
+                    self.hold_geometry(Geometry::new(size.width, size.height));
+                    window.request_redraw();
+                }
+            }
+
+            // A monitor swap or a move between displays of different density. The window
+            // keeps its logical size and changes physical size, which the policy must not
+            // mistake for the user resizing.
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let now = self.now_ms();
+                self.policy.note_display_event(now);
             }
 
             WindowEvent::KeyboardInput {

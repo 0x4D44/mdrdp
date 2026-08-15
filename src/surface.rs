@@ -16,6 +16,8 @@
 
 use std::collections::HashMap;
 
+use crate::stats::CacheStats;
+
 /// Bytes per pixel, everywhere in this module.
 pub const BPP: usize = 4;
 
@@ -98,14 +100,18 @@ impl Surface {
     /// Reading clipped rows at the clipped stride shears the image diagonally and
     /// reports no error at all, so the stride is an explicit argument rather than
     /// something inferred.
+    ///
+    /// Returns the number of bytes actually written — after clipping, which is what the
+    /// cache-effectiveness accounting needs. The requested rectangle would overcount
+    /// every blit that overhangs the surface.
     pub fn blit_rgba(
         &mut self,
         dest: Rect,
         src: &[u8],
         src_stride_px: u16,
-    ) -> Result<(), SurfaceError> {
+    ) -> Result<usize, SurfaceError> {
         let Some(clipped) = dest.clip_to(self.width, self.height) else {
-            return Ok(());
+            return Ok(0);
         };
         let stride_bytes = src_stride_px as usize * BPP;
         let row_bytes = clipped.width() as usize * BPP;
@@ -131,7 +137,7 @@ impl Surface {
             self.pixels[dst_off..dst_off + row_bytes]
                 .copy_from_slice(&src[src_off..src_off + row_bytes]);
         }
-        Ok(())
+        Ok(row_bytes * clipped.height() as usize)
     }
 
     /// Fill a rectangle with one RGBA colour.
@@ -202,11 +208,23 @@ pub struct SurfaceStore {
     /// Bumped on every mutation, so a presenter can tell "changed" from "unchanged"
     /// without comparing buffers.
     generation: u64,
+    /// Cache effectiveness, counted where the cache is actually used. Counting it here
+    /// rather than in the EGFX handler means it measures what reached the pixels, not
+    /// what the protocol asked for.
+    cache_stats: CacheStats,
 }
 
 impl SurfaceStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cache hits, misses and the bytes behind them.
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            entries: self.cache.len() as u64,
+            ..self.cache_stats
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -262,7 +280,10 @@ impl SurfaceStore {
             .surfaces
             .get_mut(&id)
             .ok_or(SurfaceError::NoSuchSurface(id))?;
-        surface.blit_rgba(dest, src, src_stride_px)?;
+        // This is the wire path — pixels a decoder produced. `cache_to_surface` blits
+        // through `Surface` directly, so cached pixels are not counted twice here.
+        let written = surface.blit_rgba(dest, src, src_stride_px)?;
+        self.cache_stats.bytes_from_wire += written as u64;
         self.touch();
         Ok(())
     }
@@ -338,7 +359,8 @@ impl SurfaceStore {
         let Some(pixels) = surface.extract(clipped) else {
             return Ok(());
         };
-        self.cache.insert(
+        self.cache_stats.bytes_stored += pixels.len() as u64;
+        let replaced = self.cache.insert(
             slot,
             CacheEntry {
                 width: clipped.width(),
@@ -346,6 +368,11 @@ impl SurfaceStore {
                 pixels,
             },
         );
+        if replaced.is_some() {
+            // The server reused a slot: the old bitmap is gone. Worth seeing, because a
+            // high eviction count against a low hit rate means the cache is thrashing.
+            self.cache_stats.evictions += 1;
+        }
         self.touch();
         Ok(())
     }
@@ -356,15 +383,18 @@ impl SurfaceStore {
         dest_id: u16,
         dest_points: &[(u16, u16)],
     ) -> Result<(), SurfaceError> {
-        let entry = self
-            .cache
-            .get(&slot)
-            .ok_or(SurfaceError::NoSuchCacheSlot(slot))?
-            .clone();
+        let Some(entry) = self.cache.get(&slot).cloned() else {
+            // A slot the server believes it filled and we do not have. Every one of these
+            // is a region that will not be painted, so it is counted rather than only
+            // returned — the caller may well treat the error as survivable.
+            self.cache_stats.misses += 1;
+            return Err(SurfaceError::NoSuchCacheSlot(slot));
+        };
         let dest = self
             .surfaces
             .get_mut(&dest_id)
             .ok_or(SurfaceError::NoSuchSurface(dest_id))?;
+        let mut served = 0usize;
         for (x, y) in dest_points {
             let rect = Rect::new(
                 *x,
@@ -372,8 +402,12 @@ impl SurfaceStore {
                 x.saturating_add(entry.width),
                 y.saturating_add(entry.height),
             );
-            dest.blit_rgba(rect, &entry.pixels, entry.width)?;
+            served += dest.blit_rgba(rect, &entry.pixels, entry.width)?;
         }
+        // One hit per destination painted, not per PDU: a single command that stamps a
+        // cached tile in twelve places saved twelve regions' worth of wire traffic.
+        self.cache_stats.hits += dest_points.len() as u64;
+        self.cache_stats.bytes_served += served as u64;
         self.touch();
         Ok(())
     }
@@ -591,5 +625,118 @@ mod tests {
         let mut buf = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
         SurfaceStore::bgra_to_rgba_in_place(&mut buf);
         assert_eq!(buf, vec![3, 2, 1, 4, 7, 6, 5, 8]);
+    }
+
+    /// A store with one 8x8 surface holding a 2x2 red square at the origin.
+    fn store_with_cached_square() -> SurfaceStore {
+        let mut store = SurfaceStore::new();
+        store.create(1, 8, 8);
+        store.create(2, 8, 8);
+        store
+            .blit_rgba(1, Rect::new(0, 0, 2, 2), &solid(2, 2, RED), 2)
+            .unwrap();
+        store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 7).unwrap();
+        store
+    }
+
+    #[test]
+    fn a_cache_hit_counts_one_per_destination_and_the_bytes_it_painted() {
+        let mut store = store_with_cached_square();
+        let before = store.cache_stats();
+        assert_eq!(before.hits, 0);
+
+        // One command, three destinations: three regions that did not need the wire.
+        store
+            .cache_to_surface(7, 2, &[(0, 0), (2, 0), (4, 0)])
+            .unwrap();
+
+        let s = store.cache_stats();
+        assert_eq!(s.hits, 3, "one hit per destination painted");
+        assert_eq!(s.misses, 0);
+        // 3 squares x 2x2 pixels x 4 bytes.
+        assert_eq!(s.bytes_served, 3 * 2 * 2 * BPP as u64);
+    }
+
+    #[test]
+    fn a_missing_slot_is_counted_as_a_miss_and_not_silently_dropped() {
+        let mut store = store_with_cached_square();
+        let err = store.cache_to_surface(99, 2, &[(0, 0)]).unwrap_err();
+        assert!(matches!(err, SurfaceError::NoSuchCacheSlot(99)));
+
+        let s = store.cache_stats();
+        assert_eq!(s.misses, 1);
+        assert_eq!(s.hits, 0, "a miss must not also count as a hit");
+        assert_eq!(s.bytes_served, 0);
+    }
+
+    #[test]
+    fn cached_pixels_are_not_also_counted_as_wire_bytes() {
+        // The double-count guard: `cache_to_surface` blits through `Surface` directly, so
+        // if it ever routes through `SurfaceStore::blit_rgba` the saving would be counted
+        // as both served-from-cache and arrived-from-wire, and the effectiveness ratio
+        // would silently become meaningless.
+        let mut store = store_with_cached_square();
+        let wire_after_setup = store.cache_stats().bytes_from_wire;
+        // Setup blitted one 2x2 square from the wire.
+        assert_eq!(wire_after_setup, 2 * 2 * BPP as u64);
+
+        store.cache_to_surface(7, 2, &[(0, 0), (4, 4)]).unwrap();
+
+        let s = store.cache_stats();
+        assert_eq!(
+            s.bytes_from_wire, wire_after_setup,
+            "painting from the cache must not add wire bytes"
+        );
+        assert_eq!(s.bytes_served, 2 * 2 * 2 * BPP as u64);
+    }
+
+    #[test]
+    fn a_blit_that_overhangs_the_surface_counts_only_what_landed() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 4, 4);
+        // Ask to paint 4x4 at (2,2): only the bottom-right 2x2 is inside the surface.
+        store
+            .blit_rgba(1, Rect::new(2, 2, 6, 6), &solid(4, 4, BLUE), 4)
+            .unwrap();
+        assert_eq!(
+            store.cache_stats().bytes_from_wire,
+            2 * 2 * BPP as u64,
+            "the requested 4x4 would overcount by four times"
+        );
+    }
+
+    #[test]
+    fn reusing_a_slot_counts_an_eviction_but_a_fresh_slot_does_not() {
+        let mut store = store_with_cached_square();
+        assert_eq!(
+            store.cache_stats().evictions,
+            0,
+            "first fill is not an evict"
+        );
+
+        store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 7).unwrap();
+        assert_eq!(store.cache_stats().evictions, 1, "slot 7 was overwritten");
+
+        store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 8).unwrap();
+        assert_eq!(
+            store.cache_stats().evictions,
+            1,
+            "a different slot displaces nothing"
+        );
+        assert_eq!(store.cache_stats().entries, 2);
+    }
+
+    #[test]
+    fn clearing_the_cache_empties_the_entry_count_but_keeps_the_history() {
+        let mut store = store_with_cached_square();
+        store.cache_to_surface(7, 2, &[(0, 0)]).unwrap();
+        store.clear_cache();
+
+        let s = store.cache_stats();
+        assert_eq!(s.entries, 0, "nothing is cached any more");
+        assert_eq!(
+            s.hits, 1,
+            "but what the cache did for us this session still happened"
+        );
     }
 }
