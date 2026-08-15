@@ -401,6 +401,43 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// The exact snippet published in README.md must parse.
+    ///
+    /// Documentation that does not round-trip through the real parser is how a user's
+    /// first five minutes get spent debugging our example instead of their connection.
+    #[test]
+    fn the_readme_example_parses() {
+        let readme = include_str!("../README.md");
+        let example = readme
+            .split("```toml")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("README should contain a toml example block");
+
+        let dir = tmpdir();
+        let path = dir.join("favourites.toml");
+        std::fs::write(&path, example).unwrap();
+
+        let loaded = Favourites::load_from(&path).expect("the README example must parse");
+        assert_eq!(
+            loaded.len(),
+            1,
+            "example should define exactly one favourite"
+        );
+        let f = loaded.iter().next().unwrap();
+        assert_eq!(f.name, "Temper");
+        assert_eq!(f.host, "temper");
+        assert_eq!(f.port, 3389);
+        assert_eq!(
+            f.window_size,
+            WindowSize::Explicit {
+                width: 1920,
+                height: 1080
+            }
+        );
+        cleanup(&dir);
+    }
+
     #[test]
     fn missing_file_yields_empty_list_not_error() {
         let dir = tmpdir();

@@ -9,6 +9,27 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- winit permits ONE EventLoop per process; reuse it via `run_app_on_demand` (`window::SessionWindow::event_loop`).
+  `EventLoopBuilder::build` sets a process-global `EVENT_LOOP_CREATED` flag and every later
+  build returns `EventLoopError::RecreationAttempt` (reset only on web). A launcher window
+  followed by a session window is therefore two loops and fails — at the worst possible
+  moment, right after the user picks a favourite. `run_app_on_demand` takes `&mut self` and
+  is documented for exactly this: orthogonal runs, no window state carried across. Supported
+  on macOS and Windows; not on iOS or web.
+
+- CLIPRDR and RDPSND are *static* channels — register before the MCS join or never (`connect::Channels`).
+  There is no API to add a static virtual channel to a live session, so the decision to
+  support clipboard or audio has to be made before connecting. This is why the audio device
+  is opened *before* the connection: if no output device exists we must not join the channel
+  at all, since joining and then discarding every wave gives the server every reason to
+  believe audio is working while the user hears silence.
+
+- Counting non-black pixels cannot prove a widget drew text when its rows paint a background (`launcher.rs` tests).
+  A list widget fills each row with a background colour, so "non-zero pixel count > N" passes
+  a full buffer even when not one glyph was rendered. The oracle has to match the *text*
+  colour specifically. Same family as the all-fields-identical fixture trap: an assertion
+  that cannot distinguish the failure from the success is not a test.
+
 - An RDP client that abandons the socket leaves a live disconnected session on the host; call `graceful_shutdown` (`connect::disconnect_gracefully`).
   Our connect binary reached capability exchange and exited. Windows keeps disconnected
   sessions alive, so roughly twenty test connects in an evening ended with the host

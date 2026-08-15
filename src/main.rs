@@ -7,14 +7,18 @@
 //! The password comes from the OS keychain (service `mdrdp`, account `<user>`); it is
 //! never an argument, an environment variable, or a log line.
 //!
-//! Ordering here is not arbitrary:
+//! With no target named, this process is the launcher: it shows the favourites picker
+//! and spawns a *child process* per chosen favourite rather than connecting itself. One
+//! OS process per session is the decided architecture — it buys crash isolation and
+//! independent clipboard state, so one wedged session cannot take down another.
 //!
-//! 1. Build the process's one event loop first — winit allows exactly one, and both the
-//!    launcher and the session window need it.
-//! 2. Run the launcher on it, if there is a choice to make.
-//! 3. Connect — the server reports the desktop size and the window is built to it.
-//! 4. Build the session window on the **main thread**; winit requires that.
-//! 5. Only then spawn the session thread, which needs the window's waker.
+//! In a session process the ordering is not arbitrary:
+//!
+//! 1. Build the event loop first — winit allows exactly one per process, and building it
+//!    up front means a headless machine fails before a logon is spent.
+//! 2. Connect — the server reports the desktop size and the window is built to it.
+//! 3. Build the session window on the **main thread**; winit requires that.
+//! 4. Only then spawn the session thread, which needs the window's waker.
 
 use ironrdp::connector::DesktopSize;
 use mdrdp::audio::{AudioPlayback, AudioRing, AudioStatsHandle, RdpsndBackend};
@@ -146,21 +150,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // One event loop for the whole process: the launcher runs on it, then the session
-    // window does. Building it up front also means a headless machine fails here, with a
-    // clear message, rather than after a connection has been established.
-    let mut event_loop = SessionWindow::event_loop()?;
+    // With no target named, this process is the launcher and never connects: it spawns
+    // one child process per chosen favourite. That is the decided architecture (see
+    // CLAUDE.md) and it buys crash isolation and independent clipboard state per session
+    // for free — a wedged channel in one session cannot take down another.
+    //
+    // The launcher stays open so several sessions can be started, which `run_app_on_demand`
+    // supports directly: each `pick` is an orthogonal run of the same event loop.
+    if positional.is_none() {
+        let mut event_loop = SessionWindow::event_loop()?;
+        loop {
+            match launcher::pick(&mut event_loop, &favourites, &config_path)? {
+                Some(f) => spawn_session(&f.name)?,
+                // Closing the launcher without choosing is a normal way to quit.
+                None => return Ok(()),
+            }
+        }
+    }
 
-    let chosen: Option<Favourite> = match &positional {
-        Some(name) => favourites.resolve(name).cloned(),
-        None => match launcher::pick(&mut event_loop, &favourites, &config_path)? {
-            Some(f) => Some(f),
-            // Closing the launcher without choosing is a normal way to quit.
-            None => return Ok(()),
-        },
-    };
+    let positional = positional.expect("the launcher path returned above");
+    let chosen = favourites.resolve(&positional).cloned();
+    let target = reconcile(Some(positional), chosen, user, port, domain, size)?;
 
-    let target = reconcile(positional, chosen, user, port, domain, size)?;
+    // Built before connecting so a headless machine fails here, with a clear message,
+    // rather than after a connection has been established and a logon spent.
+    let event_loop = SessionWindow::event_loop()?;
 
     let secret = mdrdp::creds::lookup(&target.user)?;
 
@@ -333,6 +347,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     window_result?;
     Ok(())
+}
+
+/// Launch a session for `name` in its own process.
+///
+/// Re-executes this binary rather than connecting in-process, so a session that wedges,
+/// panics, or is killed takes nothing else with it. The child is left running when the
+/// launcher exits: closing the picker should not tear down desktops it opened.
+fn spawn_session(name: &str) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find own path: {e}"))?;
+    std::process::Command::new(&exe)
+        .arg(name)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not start a session for {name:?}: {e}"))
 }
 
 /// Reconcile a favourite with command-line flags. Flags always win.

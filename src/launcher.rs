@@ -105,11 +105,12 @@ fn subtitle_for(f: &Favourite) -> String {
 
 /// Show the launcher and return the chosen favourite, or `None` if the user closed it.
 ///
-/// Borrows the process's single event loop rather than making one — winit permits only
-/// one per process, and the session window needs it next. `run_app_on_demand` is the
-/// supported way to hand the same loop to a second, orthogonal window afterwards; a
-/// second `EventLoop::new()` would fail with `RecreationAttempt` at exactly the moment
-/// the user picked a favourite.
+/// Borrows the process's single event loop rather than making one. winit permits exactly
+/// one `EventLoop` per process — `build` sets a global flag and every later call returns
+/// `RecreationAttempt` — so the launcher cannot make its own each time it is shown.
+/// `run_app_on_demand` is the supported way to re-run one loop for successive, orthogonal
+/// windows, which is what lets the caller show the picker again after each session is
+/// launched.
 pub fn pick(
     event_loop: &mut EventLoop<SessionEvent>,
     favourites: &Favourites,
