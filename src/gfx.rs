@@ -293,8 +293,15 @@ impl GfxHandler {
             return;
         };
 
+        // Keyed by SURFACE, not by codec context.
+        //
+        // `ProgressiveDecoder` keeps a separate tile grid per `codec_context_id`, but
+        // Windows rotates the context id for one surface while continuing to send
+        // *refinement* passes. Keyed by context, a refinement lands on an empty grid and
+        // reconstructs from partial coefficients. Progressive tile state belongs to the
+        // surface being refined, so the surface id is the key.
         let tiles = match self.progressive.decode_bitmap(
-            pdu.codec_context_id,
+            u32::from(surface_id),
             width,
             height,
             &pdu.bitmap_data,
