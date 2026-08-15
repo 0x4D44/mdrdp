@@ -17,7 +17,7 @@
 //! cost is irrelevant, and an exact number is one less thing to disbelieve when a
 //! measurement looks surprising.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// How many recent samples the rolling window holds.
@@ -184,6 +184,8 @@ pub struct SessionStats {
     pub bytes_in: u64,
     pub decode_errors: u64,
     pub undecoded_regions: u64,
+    /// Surface codec identifiers and the number of updates observed for each.
+    pub codecs: BTreeMap<String, u64>,
 }
 
 impl SessionStats {
@@ -200,10 +202,11 @@ impl SessionStats {
         match self.latency.recent() {
             Some(p) => {
                 lines.push(format!(
-                    "latency  p50 {:.1}ms  p95 {:.1}ms  p99 {:.1}ms",
+                    "latency  p50 {:.1}ms  p95 {:.1}ms  p99 {:.1}ms  max {:.1}ms",
                     ms(p.p50),
                     ms(p.p95),
-                    ms(p.p99)
+                    ms(p.p99),
+                    ms(self.latency.max())
                 ));
                 match self.latency.drift_us() {
                     Some(d) if d > 0 => lines.push(format!(
@@ -243,6 +246,16 @@ impl SessionStats {
             self.frames,
             bytes_human(self.bytes_in)
         ));
+        let codecs = if self.codecs.is_empty() {
+            "no surface updates yet".to_owned()
+        } else {
+            self.codecs
+                .iter()
+                .map(|(name, count)| format!("{}:{count}", display_codec_name(name)))
+                .collect::<Vec<_>>()
+                .join("  ")
+        };
+        lines.push(format!("codec    {codecs}"));
 
         // Only shown when non-zero: a permanent line of zeroes trains the eye to skip it,
         // and these two are exactly the numbers that must not be skipped.
@@ -253,6 +266,13 @@ impl SessionStats {
             ));
         }
         lines
+    }
+}
+
+fn display_codec_name(name: &str) -> &str {
+    match name.strip_prefix("WireToSurface2/").unwrap_or(name) {
+        "RemoteFxProgressive" => "RFX Progressive",
+        other => other,
     }
 }
 
@@ -467,13 +487,19 @@ mod tests {
         };
         s.frames = 42;
         s.bytes_in = 2 * 1024 * 1024;
+        s.codecs.insert("ClearCodec".to_owned(), 17);
+        s.codecs
+            .insert("WireToSurface2/RemoteFxProgressive".to_owned(), 3);
 
         let text = s.overlay_lines().join("\n");
         assert!(text.contains("p50 3.5ms"), "got:\n{text}");
+        assert!(text.contains("max 3.5ms"), "got:\n{text}");
         assert!(text.contains("drift +2.5ms"), "got:\n{text}");
         assert!(text.contains("75% hit"), "got:\n{text}");
         assert!(text.contains("75% of pixels"), "got:\n{text}");
         assert!(text.contains("2.0MiB"), "got:\n{text}");
+        assert!(text.contains("ClearCodec:17"), "got:\n{text}");
+        assert!(text.contains("RFX Progressive:3"), "got:\n{text}");
     }
 
     #[test]
@@ -493,6 +519,7 @@ mod tests {
         // No panic, no NaN, no "0%" implying a measured zero.
         let text = lines.join("\n");
         assert!(!text.contains("NaN"), "got:\n{text}");
+        assert!(text.contains("codec    no surface updates yet"));
     }
 
     #[test]

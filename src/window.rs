@@ -31,7 +31,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::input::{self, InputEvent, PointerMap};
 use crate::stats::StatsHandle;
@@ -43,9 +43,12 @@ use crate::window_policy::{Geometry, WindowPolicy};
 #[derive(Debug, Clone)]
 pub struct WindowConfig {
     pub title: String,
-    /// Session pixels. The window opens at this size and never forces it back.
+    /// Fixed session pixels. A windowed window opens at this size; fullscreen keeps these
+    /// dimensions for the remote desktop while the window fills its monitor.
     pub session_width: u16,
     pub session_height: u16,
+    /// Open the window borderless fullscreen on its current monitor.
+    pub fullscreen: bool,
 }
 
 impl WindowConfig {
@@ -54,7 +57,14 @@ impl WindowConfig {
             title: title.into(),
             session_width,
             session_height,
+            fullscreen: false,
         }
+    }
+
+    /// Set whether the window should open borderless fullscreen.
+    pub fn with_fullscreen(mut self, fullscreen: bool) -> Self {
+        self.fullscreen = fullscreen;
+        self
     }
 }
 
@@ -426,6 +436,17 @@ impl SessionWindow {
 type SbContext = softbuffer::Context<Arc<Window>>;
 type SbSurface = softbuffer::Surface<Arc<Window>, Arc<Window>>;
 
+fn window_attributes(config: &WindowConfig) -> WindowAttributes {
+    Window::default_attributes()
+        .with_title(config.title.clone())
+        .with_inner_size(PhysicalSize::new(
+            u32::from(config.session_width),
+            u32::from(config.session_height),
+        ))
+        .with_fullscreen(config.fullscreen.then_some(Fullscreen::Borderless(None)))
+        .with_decorations(!config.fullscreen)
+}
+
 struct SessionApp {
     config: WindowConfig,
     store: Arc<Mutex<SurfaceStore>>,
@@ -664,12 +685,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             return; // Resume can fire more than once; the window survives it.
         }
 
-        let attributes = Window::default_attributes()
-            .with_title(self.config.title.clone())
-            .with_inner_size(PhysicalSize::new(
-                u32::from(self.config.session_width),
-                u32::from(self.config.session_height),
-            ));
+        let attributes = window_attributes(&self.config);
 
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),
@@ -842,6 +858,34 @@ mod tests {
 
     fn rgb(colour: [u8; 4]) -> u32 {
         (u32::from(colour[0]) << 16) | (u32::from(colour[1]) << 8) | u32::from(colour[2])
+    }
+
+    #[test]
+    fn fullscreen_config_builds_a_borderless_fullscreen_window() {
+        let config = WindowConfig::new("fullscreen", 1600, 900).with_fullscreen(true);
+        let attributes = window_attributes(&config);
+
+        assert_eq!(
+            attributes.fullscreen,
+            Some(Fullscreen::Borderless(None)),
+            "fullscreen must be requested when the config opts in"
+        );
+        assert!(
+            !attributes.decorations,
+            "fullscreen must not have window chrome"
+        );
+    }
+
+    #[test]
+    fn default_window_config_stays_windowed_and_decorated() {
+        let config = WindowConfig::new("windowed", 1280, 800);
+        let attributes = window_attributes(&config);
+
+        assert_eq!(attributes.fullscreen, None);
+        assert!(
+            attributes.decorations,
+            "existing windowed behavior stays unchanged"
+        );
     }
 
     // --- viewport -------------------------------------------------------------------

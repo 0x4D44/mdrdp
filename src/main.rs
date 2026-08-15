@@ -88,6 +88,8 @@ struct Target {
     keychain_account: String,
     domain: Option<String>,
     size: (u16, u16),
+    /// Whether the session window should open borderless fullscreen.
+    fullscreen: bool,
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -314,7 +316,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             format!("mdrdp — {}", target.host),
             desktop.width,
             desktop.height,
-        ),
+        )
+        .with_fullscreen(target.fullscreen),
         Arc::clone(&store),
         input_tx,
     )?;
@@ -540,6 +543,11 @@ fn reconcile(
             )
         })?;
 
+    let fullscreen = size.is_none()
+        && matches!(
+            chosen.as_ref().map(|f| f.window_size),
+            Some(WindowSize::Fullscreen)
+        );
     let size = size.unwrap_or_else(|| match chosen.as_ref().map(|f| f.window_size) {
         Some(WindowSize::Explicit { width, height }) => (width, height),
         _ => DEFAULT_SIZE,
@@ -559,6 +567,7 @@ fn reconcile(
         user,
         domain: domain.or_else(|| chosen.as_ref().and_then(|f| f.domain.clone())),
         size,
+        fullscreen,
     })
 }
 
@@ -598,6 +607,7 @@ mod tests {
         assert_eq!(t.domain.as_deref(), Some("SAVED"));
         assert_eq!(t.port, 4000);
         assert_eq!(t.size, (1280, 800));
+        assert!(!t.fullscreen, "an explicit favourite size stays windowed");
     }
 
     #[test]
@@ -636,6 +646,7 @@ mod tests {
         assert_eq!(t.host, "192.0.2.50");
         assert_eq!(t.port, mdrdp::favourites::DEFAULT_PORT);
         assert_eq!(t.size, DEFAULT_SIZE);
+        assert!(!t.fullscreen, "direct hosts stay windowed");
         assert_eq!(t.domain, None);
     }
 
@@ -692,5 +703,33 @@ mod tests {
             t.size, DEFAULT_SIZE,
             "fullscreen cannot be resolved to pixels before a window exists"
         );
+        assert!(
+            t.fullscreen,
+            "fullscreen intent must reach the session window"
+        );
+    }
+
+    #[test]
+    fn a_size_override_forces_a_fullscreen_favourite_to_stay_windowed() {
+        let f = Favourite {
+            username: Some("fullscreen-user".into()),
+            window_size: WindowSize::Fullscreen,
+            ..Favourite::new("Fullscreen", "fullscreen.local")
+        };
+        let t = reconcile(
+            Some("Fullscreen".into()),
+            Some(f),
+            None,
+            None,
+            None,
+            Some((1366, 768)),
+        )
+        .unwrap();
+        assert_eq!(
+            t.size,
+            (1366, 768),
+            "the flag still controls session resolution"
+        );
+        assert!(!t.fullscreen, "an explicit size means a windowed session");
     }
 }

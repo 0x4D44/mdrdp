@@ -346,6 +346,7 @@ fn notify_if_painted(
         if let Some(gfx) = gfx {
             s.decode_errors = gfx.decode_errors;
             s.undecoded_regions = gfx.undecoded_regions;
+            s.codecs = gfx.codec_ids_seen;
         }
     });
 
