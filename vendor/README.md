@@ -135,3 +135,47 @@ diff -r ~/.cargo/registry/src/*/ironrdp-graphics-0.9.0/src vendor/ironrdp-graphi
 ```
 
 should show only the two `mdrdp patch:` blocks.
+
+## `ironrdp-graphics` 0.9.0 — the RFX Progressive upgrade pass was wrong in five ways
+
+`decode_upgrade_pass` and the SRL reader are ported from FreeRDP's
+`progressive_rfx_upgrade_component` / `progressive_rfx_upgrade_block` /
+`progressive_rfx_srl_read`.
+
+This matters more than it sounds: the server sends **two upgrade passes for every first
+pass** (measured on quench: 2040 UPGRADE tiles to 1020 FIRST), so a broken upgrade path
+discards two thirds of the picture data and leaves the image at coarse first-pass quality.
+
+The five defects, each confirmed against the C:
+
+1. **The shift omitted the base quantiser.** FreeRDP shifts a refinement by
+   `(baseQuant + progQuant) - 1`; we shifted by the progressive term alone, leaving every
+   refinement `2^(base-1)` — typically 32x — too small. The first pass was already
+   correct, because `dequantize_component_ccq` (`<< q-1`) and `progressive_dequantize`
+   (`<< bitPos`) compose to the same total; only the upgrade path was short.
+2. **Both bitstreams restarted at every band.** FreeRDP attaches ONE raw stream and ONE
+   SRL stream per component and lets all ten bands consume from where the last stopped.
+   We re-created both per band, so every band after HL1 re-read HL1's bits.
+3. **LL3 was routed through SRL.** FreeRDP clears `nonLL` for LL3 and reads it entirely
+   from the raw stream, never consulting the sign array. Routing it through SRL consumed a
+   symbol the encoder never wrote and skipped raw bits it did.
+4. **SRL `kp` started at 0 instead of 8**, so the first symbol of every component used
+   k = 0 instead of k = 1 — a divergence on the very first bit.
+5. **SRL magnitudes used the wrong code.** FreeRDP uses a bounded unary count (start at 1,
+   stop at `(1 << numBits) - 1`); ours used a Golomb-Rice quotient plus remainder bits,
+   giving both a different value and a different bit consumption. The `mode` latch, which
+   forces a unary symbol after an escape-signalled short run, was also missing.
+
+Measured on quench, same wallpaper both runs (luma MAE between the two captures: 0.6, so
+this is a genuine A/B rather than two different Spotlight images):
+
+| | base quant omitted | corrected |
+|---|---|---|
+| sharpness (Laplacian variance) | 64.5 | **77.7** |
+
+That is a 20% increase in high-frequency detail — the refinement passes finally
+contributing instead of being scaled into irrelevance.
+
+Tests live in `src/gfx.rs` (`srl_*`), hand-traced from the C bit by bit. `SrlReader` is
+`pub` purely so they can reach it: the vendored crate is not a workspace member, so its
+own `#[cfg(test)]` module cannot be run by `cargo test`.

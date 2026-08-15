@@ -108,6 +108,7 @@ pub fn decode_first_pass(
 pub fn decode_upgrade_pass(
     srl_data: &[u8],
     raw_data: &[u8],
+    base_quant: &ComponentCodecQuant,
     prev_prog_quant: &ComponentCodecQuant,
     curr_prog_quant: &ComponentCodecQuant,
     use_reduce_extrapolate: bool,
@@ -119,63 +120,139 @@ pub fn decode_upgrade_pass(
 
     let bands = get_band_layout(use_reduce_extrapolate);
 
-    for (band_idx, band) in bands.iter().enumerate() {
-        let prev_bit_pos = prev_prog_quant.for_band(band_idx);
-        let curr_bit_pos = curr_prog_quant.for_band(band_idx);
+    // mdrdp patch: ONE raw stream and ONE SRL reader for the whole component.
+    //
+    // Both streams run continuously across all ten bands — FreeRDP attaches them once in
+    // progressive_rfx_upgrade_component and lets every band consume from where the last
+    // one stopped. Re-creating them per band, as this did, makes every band after HL1
+    // re-read HL1's bits, so nine tenths of a refinement pass decodes garbage.
+    let mut raw = RawBitReader::new(raw_data);
+    let mut srl = SrlReader::new(srl_data);
 
-        // Number of raw bits per coefficient in this band
+    for (band_idx, band) in bands.iter().enumerate() {
+        // mdrdp patch: bit positions are base quant + progressive quant.
+        //
+        // The shift applied to a refinement is (bitPos - 1), the SAME total the first
+        // pass applies via dequantize_component_ccq + progressive_dequantize. Shifting by
+        // the progressive term alone left every refinement 2^(base-1) times too small —
+        // typically 32x — so upgrade passes contributed essentially nothing and the image
+        // stayed at first-pass quality.
+        let base = u32::from(base_quant.for_band(band_idx));
+        let prev_bit_pos = base + u32::from(prev_prog_quant.for_band(band_idx));
+        let curr_bit_pos = base + u32::from(curr_prog_quant.for_band(band_idx));
+
         let num_bits = prev_bit_pos.saturating_sub(curr_bit_pos);
         if num_bits == 0 {
             continue;
         }
+        let shift = curr_bit_pos.saturating_sub(1);
 
-        // Count zero-DAS positions in this band (for SRL decode)
-        let zero_count = band_zero_count(sign, band);
-
-        // SRL decode for zero-DAS positions
-        let srl_values = srl::decode_srl(srl_data, zero_count, num_bits);
-
-        // Apply upgrade values to this band
-        let mut srl_idx = 0;
-        let mut raw_reader = RawBitReader::new(raw_data);
+        // LL3 is the last band, and is NOT sign-coded: FreeRDP clears `nonLL` for it and
+        // reads every coefficient from the raw stream, never consulting the sign array or
+        // touching the SRL stream. Routing it through SRL desynchronises both streams for
+        // everything that follows.
+        let non_ll = band_idx != bands.len() - 1;
 
         for i in 0..band.count() {
-            let coeff_idx = band.offset + i;
-            let is_ll3 = band_idx == 9;
+            let idx = band.offset + i;
 
-            if sign[coeff_idx] == SIGN_ZERO {
-                // Zero-DAS: get value from SRL stream
-                let value = if srl_idx < srl_values.len() {
-                    srl_values[srl_idx]
-                } else {
-                    0
-                };
-                srl_idx += 1;
-
-                if value != 0 {
-                    // Coefficient transitions from zero to non-zero
-                    let shifted = i32::from(value) << i32::from(curr_bit_pos);
-                    coefficients[coeff_idx] = clamp_i16(shifted);
-                    sign[coeff_idx] = if value > 0 { SIGN_POSITIVE } else { SIGN_NEGATIVE };
-                }
+            let input: i32 = if !non_ll {
+                i32::from(raw.read_bits(num_bits) as i32 as i16)
+            } else if sign[idx] == SIGN_POSITIVE {
+                i32::from(raw.read_bits(num_bits) as i32 as i16)
+            } else if sign[idx] == SIGN_NEGATIVE {
+                -i32::from(raw.read_bits(num_bits) as i32 as i16)
             } else {
-                // Non-zero DAS: read raw magnitude bits
-                let raw_mag = raw_reader.read_bits(u32::from(num_bits));
-
-                if raw_mag != 0 {
-                    // raw_mag fits in i32 (at most 2^15 from bit stream)
-                    let mag_i32 = i32::try_from(raw_mag).unwrap_or(i32::MAX);
-                    let shifted = mag_i32 << i32::from(curr_bit_pos);
-                    if is_ll3 || sign[coeff_idx] == SIGN_POSITIVE {
-                        // LL3 is always positive; positive DAS adds
-                        coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) + shifted);
-                    } else {
-                        // Negative DAS subtracts
-                        coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) - shifted);
-                    }
+                let value = srl.read(num_bits);
+                if value > 0 {
+                    sign[idx] = SIGN_POSITIVE;
+                } else if value < 0 {
+                    sign[idx] = SIGN_NEGATIVE;
                 }
+                i32::from(value)
+            };
+
+            let val = input << shift;
+            coefficients[idx] = clamp_i16(i32::from(coefficients[idx]) + val);
+        }
+    }
+}
+
+/// SRL reader for progressive upgrade passes.
+///
+/// mdrdp patch: replaces a Golomb-Rice quotient/remainder decoder that did not match the
+/// wire format. Ported from FreeRDP's `progressive_rfx_srl_read`
+/// (libfreerdp/codec/progressive.c). The differences that mattered:
+///
+/// * `kp` starts at **8**, not 0, so the first symbol uses k = 1;
+/// * there is a `mode` latch — after an escape-signalled short run the next symbol is
+///   unary, rather than another zero-run bit;
+/// * magnitudes are a **bounded unary** count (start at 1, stop at `(1 << numBits) - 1`),
+///   not a quotient plus remainder bits;
+/// * the state and the bitstream persist across every band of a component.
+pub struct SrlReader<'a> {
+    bits: RawBitReader<'a>,
+    kp: u32,
+    mode: u32,
+    nz: i32,
+}
+
+impl<'a> SrlReader<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            bits: RawBitReader::new(data),
+            kp: 8,
+            mode: 0,
+            nz: 0,
+        }
+    }
+
+    pub fn read(&mut self, num_bits: u32) -> i16 {
+        if self.nz > 0 {
+            self.nz -= 1;
+            return 0;
+        }
+
+        let k = self.kp / 8;
+
+        if self.mode == 0 {
+            if !self.bits.read_bit() {
+                // '0': a full run of (1 << k) zeros.
+                self.nz = 1i32 << k;
+                self.kp = (self.kp + 4).min(80);
+                self.nz -= 1;
+                return 0;
+            }
+            // '1': a short run, its length in the next k bits, then unary next.
+            self.nz = 0;
+            self.mode = 1;
+            if k > 0 {
+                self.nz = self.bits.read_bits(k) as i32;
+            }
+            if self.nz != 0 {
+                self.nz -= 1;
+                return 0;
             }
         }
+
+        self.mode = 0;
+        let negative = self.bits.read_bit();
+        self.kp = self.kp.saturating_sub(6);
+
+        if num_bits == 1 {
+            return if negative { -1 } else { 1 };
+        }
+
+        let mut mag: u32 = 1;
+        let max = (1u32 << num_bits) - 1;
+        while mag < max {
+            if self.bits.read_bit() {
+                break;
+            }
+            mag += 1;
+        }
+        let mag = i16::try_from(mag).unwrap_or(i16::MAX);
+        if negative { -mag } else { mag }
     }
 }
 
@@ -541,6 +618,7 @@ fn ll3_offset(use_reduce_extrapolate: bool) -> usize {
 }
 
 /// Count zero-DAS positions within a band.
+#[allow(dead_code)] // superseded by the streaming SrlReader
 fn band_zero_count(sign: &[i8], band: &BandInfo) -> usize {
     let start = band.offset;
     let end = start + band.count();
@@ -776,6 +854,7 @@ impl TileState {
         &mut self,
         srl_data: [&[u8]; 3],
         raw_data: [&[u8]; 3],
+        base_quants: [ComponentCodecQuant; 3],
         prog_quants: [ComponentCodecQuant; 3],
         quality: u8,
     ) {
@@ -785,6 +864,7 @@ impl TileState {
             decode_upgrade_pass(
                 srl_data[c],
                 raw_data[c],
+                &base_quants[c],
                 &prev_prog_quant[c],
                 &prog_quants[c],
                 self.use_reduce_extrapolate,
@@ -1333,6 +1413,20 @@ fn decode_tile_block(
                 return Ok(Vec::new());
             }
 
+            // The base quantiser for this tile. The upgrade shift is
+            // (base + prog - 1) per band, so the base values are required here — the
+            // previous code never looked them up and silently shifted by the progressive
+            // term alone.
+            let q_y = usize::from(tile.quant_idx_y);
+            let q_cb = usize::from(tile.quant_idx_cb);
+            let q_cr = usize::from(tile.quant_idx_cr);
+            if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
+                return Err(ProgressiveDecodeError::InvalidQuantIndex {
+                    index: q_y.max(q_cb).max(q_cr),
+                    table_len: quant_vals.len(),
+                });
+            }
+
             // mdrdp patch: `quality` is a quality LEVEL, not an index.
             //
             // MS-RDPRFX defines it as 0 (minimum) to 0xFF, where 0xFF means full quality
@@ -1366,6 +1460,9 @@ fn decode_tile_block(
             tile_state.decode_upgrade(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
+                // The BASE quant, which the upgrade shift needs and which was previously
+                // never passed in at all.
+                [quant_vals[q_y], quant_vals[q_cb], quant_vals[q_cr]],
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
                 tile.quality,
             );
@@ -1391,6 +1488,51 @@ impl Default for ProgressiveDecoder {
 #[cfg(test)]
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 mod tests {
+
+    /// A leading `0` means a run of `1 << k` zeros, and with kp = 8 that k is 1.
+    ///
+    /// So the first TWO reads return zero from a single bit, and only the third consults
+    /// the stream again. With kp = 0 the run would be `1 << 0` = one zero, and the second
+    /// read would consume a bit that FreeRDP does not — the divergence starts on the very
+    /// first symbol of every component.
+    #[test]
+    fn srl_zero_run_length_follows_kp_starting_at_eight() {
+        let data = [0b0100_0000u8];
+        let mut srl = SrlReader::new(&data);
+        assert_eq!(srl.read(3), 0, "first of the run");
+        assert_eq!(srl.read(3), 0, "second of the run, consuming no further bit");
+        // The run of two is now exhausted; the next symbol reads the stream again. The
+        // next bit is 1 (escape), so this is no longer part of the zero run.
+        assert_ne!(srl.read(3), 0, "the run is over, so a value must be decoded");
+    }
+
+    /// `num_bits == 1` is the degenerate case: sign only, magnitude always 1.
+    #[test]
+    fn srl_with_one_bit_returns_plus_or_minus_one() {
+        // escape, run length 0, then sign = 1 (negative).
+        let data = [0b1010_0000u8];
+        let mut srl = SrlReader::new(&data);
+        assert_eq!(srl.read(1), -1);
+    }
+
+    /// The reader is stateful across calls, which is what lets one stream serve all ten
+    /// bands of a component. Two independent readers over the same bytes must agree only
+    /// on their FIRST symbol — after that the shared one has advanced.
+    #[test]
+    fn srl_state_persists_across_reads() {
+        let data = [0b1000_1000u8, 0b1000_1000u8];
+        let mut shared = SrlReader::new(&data);
+        let first = shared.read(3);
+        let second = shared.read(3);
+
+        let mut fresh = SrlReader::new(&data);
+        assert_eq!(fresh.read(3), first);
+        assert_ne!(
+            second, 0,
+            "the second read must continue the stream, not restart it"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -1224,6 +1224,76 @@ mod tests {
         assert_eq!(pixel_at(&store, 1, 0, 0), [0, 0, 0, 0]);
     }
 
+    /// The SRL reader, hand-traced from FreeRDP's `progressive_rfx_srl_read`.
+    ///
+    /// For `data = 0b1000_1000` and num_bits = 3:
+    ///   bit 1 = 1  -> escape; the next symbol is unary; k = kp / 8 = 8 / 8 = 1
+    ///   bit 2 = 0  -> short-run length 0, so fall through to unary
+    ///   bit 3 = 0  -> sign bit, positive; kp := 8 - 6 = 2
+    ///   mag starts at 1, max = (1 << 3) - 1 = 7
+    ///   bit 4 = 0  -> mag := 2
+    ///   bit 5 = 1  -> stop
+    /// giving +2, having consumed exactly five bits.
+    ///
+    /// The previous implementation started kp at 0 (so k = 0, and bit 2 was never read)
+    /// and decoded magnitudes as a Golomb-Rice quotient plus remainder bits — a different
+    /// value AND a different bit count, which desynchronised the stream for every
+    /// coefficient after it.
+    #[test]
+    fn srl_reads_a_bounded_unary_magnitude() {
+        use ironrdp_graphics::progressive::SrlReader;
+        let data = [0b1000_1000u8];
+        let mut srl = SrlReader::new(&data);
+        assert_eq!(srl.read(3), 2);
+    }
+
+    /// A leading `0` is a run of `1 << k` zeros, and with kp starting at 8 that k is 1.
+    ///
+    /// So the first TWO reads come from one bit. With kp = 0 the run would be a single
+    /// zero and the second read would consume a bit FreeRDP does not — the streams
+    /// diverge on the very first symbol of every component.
+    #[test]
+    fn srl_zero_run_length_follows_kp_starting_at_eight() {
+        use ironrdp_graphics::progressive::SrlReader;
+        let data = [0b0100_0000u8];
+        let mut srl = SrlReader::new(&data);
+        assert_eq!(srl.read(3), 0, "first zero of the run");
+        assert_eq!(srl.read(3), 0, "second zero, consuming no further bit");
+    }
+
+    /// num_bits == 1 is the degenerate case: a sign bit, magnitude always 1.
+    #[test]
+    fn srl_with_one_bit_returns_plus_or_minus_one() {
+        use ironrdp_graphics::progressive::SrlReader;
+        // escape, run length 0, then sign = 1 (negative).
+        let data = [0b1010_0000u8];
+        let mut srl = SrlReader::new(&data);
+        assert_eq!(srl.read(1), -1);
+    }
+
+    /// The reader is stateful, which is what lets ONE stream serve all ten bands of a
+    /// component. A fresh reader restarts; a shared one must not.
+    #[test]
+    fn srl_state_persists_across_reads() {
+        use ironrdp_graphics::progressive::SrlReader;
+        let data = [0b1000_1000u8, 0b1000_1000u8];
+        let mut shared = SrlReader::new(&data);
+        let first = shared.read(3);
+        let second = shared.read(3);
+
+        let mut fresh = SrlReader::new(&data);
+        assert_eq!(
+            fresh.read(3),
+            first,
+            "a fresh reader sees the same first symbol"
+        );
+        assert_ne!(
+            (first, second),
+            (first, first),
+            "the second read must continue the stream, not restart it"
+        );
+    }
+
     /// The RFX YCbCr->RGB conversion, pinned against hand-computed values.
     ///
     /// Every expected value below is worked out by hand from FreeRDP's formula, not read
