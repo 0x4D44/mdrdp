@@ -24,9 +24,10 @@
 //! mutex) keeps the anti-wedge invariants easy to see in one place: every state has an
 //! explicit path back to `Idle`, and nothing here can block on the network.
 //!
-//! Scope is text only: `CF_UNICODETEXT` is what we advertise and prefer; `CF_TEXT` is
-//! accepted inbound as a fallback. File formats get safe no-op handling.
+//! Text is preferred when present. Otherwise the bridge uses standard uncompressed `CF_DIB`
+//! bitmap data, with strict size checks around every decode and encode operation.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -47,12 +48,17 @@ use tracing::{debug, trace, warn};
 /// returning to `Idle`. A stuck "pending" flag with no way back is the classic wedge.
 pub const DEFAULT_PASTE_TIMEOUT_MS: u64 = 5_000;
 
+/// Keep malformed remote clipboard data from forcing a large allocation or expensive decode.
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Bounded retries for a rejected format-list advertise (MS-RDPECLIP allows the remote to
 /// reject transiently, e.g. its window wasn't focused). Small and bounded on purpose: see
 /// the hazard documented at `CliprdrBackend::on_format_list_response`.
 const MAX_ADVERTISE_ATTEMPTS: u8 = 3;
 
-/// Cap on how many bytes of clipboard text [`content_fingerprint`] will hash.
+/// Cap on how many bytes of clipboard content [`content_fingerprint`] will hash.
 ///
 /// Text at or under this size is fingerprinted exactly as before (every byte hashed) — no
 /// behaviour change for realistic clipboard content: a URL, a paragraph, a code snippet,
@@ -74,7 +80,7 @@ const HASH_PREFIX_CAP_BYTES: usize = 256 * 1024;
 /// [`Cliprdr`] instance; the backend that produces them does no interpretation at all.
 #[derive(Debug)]
 pub enum ClipboardAction {
-    /// We should (re-)advertise our current text formats to the remote.
+    /// We should (re-)advertise our current clipboard formats to the remote.
     AdvertiseRequested,
     /// The remote acknowledged or rejected our last format-list advertise.
     FormatListAcked(bool),
@@ -86,14 +92,24 @@ pub enum ClipboardAction {
     RemoteDataReceived(OwnedFormatDataResponse),
 }
 
+/// Content visible through the OS clipboard. The image bytes are RGBA, row-major, top-down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardContent {
+    Text(String),
+    Image {
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    },
+}
+
 /// Abstracts OS clipboard access so the state machine can be tested without touching the
 /// real pasteboard.
 pub trait OsClipboard: Send {
-    /// Reads the current clipboard text. Errs if there is no text content or the OS
-    /// clipboard could not be accessed.
-    fn get_text(&mut self) -> Result<String, String>;
-    /// Writes text to the clipboard, replacing its current content.
-    fn set_text(&mut self, text: String) -> Result<(), String>;
+    /// Reads current clipboard content, preferring text when the platform exposes both.
+    fn get_content(&mut self) -> Result<ClipboardContent, String>;
+    /// Replaces the clipboard with text or RGBA image content.
+    fn set_content(&mut self, content: ClipboardContent) -> Result<(), String>;
 }
 
 /// Real [`OsClipboard`] backed by `arboard`.
@@ -126,20 +142,67 @@ impl Default for ArboardClipboard {
 }
 
 impl OsClipboard for ArboardClipboard {
-    fn get_text(&mut self) -> Result<String, String> {
+    fn get_content(&mut self) -> Result<ClipboardContent, String> {
         let clipboard = self.ensure()?;
         match clipboard.get_text() {
-            Ok(text) => Ok(text),
+            Ok(text) => Ok(ClipboardContent::Text(text)),
             Err(error) => {
-                self.inner = None;
-                Err(error.to_string())
+                // A non-text clipboard is expected when the user copied an image. Keep the
+                // handle alive and try arboard's native image conversion before giving up.
+                match clipboard.get_image() {
+                    Ok(image) => {
+                        let width = image.width;
+                        let height = image.height;
+                        let rgba = image.bytes.into_owned();
+                        if width == 0
+                            || height == 0
+                            || width > MAX_IMAGE_DIMENSION as usize
+                            || height > MAX_IMAGE_DIMENSION as usize
+                            || u64::try_from(width)
+                                .ok()
+                                .and_then(|w| {
+                                    u64::try_from(height).ok().and_then(|h| w.checked_mul(h))
+                                })
+                                .is_none_or(|pixels| pixels > MAX_IMAGE_PIXELS)
+                            || rgba.len()
+                                != width
+                                    .checked_mul(height)
+                                    .and_then(|pixels| pixels.checked_mul(4))
+                                    .unwrap_or(usize::MAX)
+                        {
+                            self.inner = None;
+                            return Err("clipboard image exceeds safe size limits".to_string());
+                        }
+                        Ok(ClipboardContent::Image {
+                            width,
+                            height,
+                            rgba,
+                        })
+                    }
+                    Err(image_error) => {
+                        self.inner = None;
+                        Err(format!("{error}; image read failed: {image_error}"))
+                    }
+                }
             }
         }
     }
 
-    fn set_text(&mut self, text: String) -> Result<(), String> {
+    fn set_content(&mut self, content: ClipboardContent) -> Result<(), String> {
         let clipboard = self.ensure()?;
-        match clipboard.set_text(text) {
+        let result = match content {
+            ClipboardContent::Text(text) => clipboard.set_text(text),
+            ClipboardContent::Image {
+                width,
+                height,
+                rgba,
+            } => clipboard.set_image(arboard::ImageData {
+                width,
+                height,
+                bytes: Cow::Owned(rgba),
+            }),
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.inner = None;
@@ -285,10 +348,9 @@ pub struct ClipboardBridge {
     remote_formats: Vec<ClipboardFormat>,
     paste_state: PasteState,
     advertise_state: AdvertiseState,
-    /// Fingerprint ([`content_fingerprint`]) of the last clipboard text we either wrote (from
-    /// the remote) or advertised (from local content). Lets `poll_local_change` detect
-    /// genuinely new local content, and stops remote-origin text from being advertised
-    /// straight back — the advertise-loop hazard.
+    /// Fingerprint ([`content_fingerprint`]) of the last clipboard content we either wrote
+    /// (from the remote) or observed locally. This stops remote-origin content from being
+    /// advertised straight back — the advertise-loop hazard.
     last_seen_fingerprint: Option<[u8; 32]>,
     paste_timeout_ms: u64,
 }
@@ -372,8 +434,8 @@ impl ClipboardBridge {
         }
     }
 
-    /// Checks whether the OS clipboard's text content has changed since we last saw it, and
-    /// if so, queues an advertise. Call on a timer (~250ms) — the OS gives no cross-platform
+    /// Checks whether the OS clipboard content has changed since we last saw it, and if so,
+    /// queues an advertise. Call on a timer (~250ms) — the OS gives no cross-platform
     /// clipboard-change notification.
     ///
     /// Text we just *wrote* here from the remote is not re-advertised: [`Self::pump`] updates
@@ -382,29 +444,26 @@ impl ClipboardBridge {
     ///
     /// Change detection is a [`content_fingerprint`], not a full hash: cost is bounded by
     /// [`HASH_PREFIX_CAP_BYTES`] regardless of how large the clipboard payload is, so a
-    /// multi-hundred-MB clipboard costs the same per poll as a one-line copy. The `get_text`
+    /// multi-hundred-MB clipboard costs the same per poll as a one-line copy. The clipboard read
     /// call itself (an OS IPC round trip plus allocating the whole payload) still happens
     /// every poll — `arboard` has no cheaper "did it change" signal to check first (no
     /// `NSPasteboard.changeCount` equivalent is exposed) — but that cost no longer compounds
     /// with an O(size) hash on top of it.
     pub fn poll_local_change(&mut self) {
-        let text = match self.os.get_text() {
-            Ok(text) => text,
+        let content = match self.os.get_content() {
+            Ok(content) => content,
             Err(error) => {
                 trace!(%error, "poll_local_change: OS clipboard read failed");
                 return;
             }
         };
 
-        let fingerprint = content_fingerprint(&text);
+        let fingerprint = content_fingerprint(&content);
         if self.last_seen_fingerprint == Some(fingerprint) {
             return;
         }
         self.last_seen_fingerprint = Some(fingerprint);
 
-        if text.is_empty() {
-            return;
-        }
         self.local_pending
             .push_back(ClipboardAction::AdvertiseRequested);
     }
@@ -449,7 +508,16 @@ impl ClipboardBridge {
         cliprdr: &mut Cliprdr<R>,
         out: &mut Vec<CliprdrSvcMessages<R>>,
     ) {
-        match cliprdr.initiate_copy(&text_formats()) {
+        let formats = match self.os.get_content() {
+            Ok(ClipboardContent::Text(_)) => text_formats(),
+            Ok(ClipboardContent::Image { .. }) => image_formats(),
+            Err(error) => {
+                warn!(%error, "failed to read OS clipboard for format-list advertise");
+                self.advertise_state = AdvertiseState::Idle;
+                return;
+            }
+        };
+        match cliprdr.initiate_copy(&formats) {
             Ok(messages) => out.push(messages),
             Err(error) => {
                 warn!(%error, "failed to encode clipboard format-list advertise; giving up for now");
@@ -506,8 +574,8 @@ impl ClipboardBridge {
     ) {
         self.remote_formats = formats;
 
-        let Some(format) = best_text_format(&self.remote_formats) else {
-            debug!("remote copy offered no supported text format");
+        let Some(format) = best_content_format(&self.remote_formats) else {
+            debug!("remote copy offered no supported clipboard format");
             self.paste_state = PasteState::Idle;
             return;
         };
@@ -533,12 +601,25 @@ impl ClipboardBridge {
     ) {
         // A dropped response is what wedges the remote's paste: every branch below submits
         // something, even on failure.
-        let response = match self.os.get_text() {
-            Ok(text) if format == ClipboardFormatId::CF_UNICODETEXT => {
+        let response = match self.os.get_content() {
+            Ok(ClipboardContent::Text(text)) if format == ClipboardFormatId::CF_UNICODETEXT => {
                 OwnedFormatDataResponse::new_unicode_string(&text)
             }
-            Ok(text) if format == ClipboardFormatId::CF_TEXT => {
+            Ok(ClipboardContent::Text(text)) if format == ClipboardFormatId::CF_TEXT => {
                 OwnedFormatDataResponse::new_string(&text)
+            }
+            Ok(ClipboardContent::Image {
+                width,
+                height,
+                rgba,
+            }) if format == ClipboardFormatId::CF_DIB || format == ClipboardFormatId::CF_DIBV5 => {
+                match encode_dib(width, height, &rgba) {
+                    Ok(data) => OwnedFormatDataResponse::new_data(data),
+                    Err(error) => {
+                        warn!(%error, "failed to encode local clipboard image; sending error response");
+                        OwnedFormatDataResponse::new_error()
+                    }
+                }
             }
             Ok(_) => {
                 debug!(?format, "remote requested an unsupported clipboard format");
@@ -570,17 +651,32 @@ impl ClipboardBridge {
             return;
         }
 
-        let text = if format == ClipboardFormatId::CF_UNICODETEXT {
-            decode_utf16le_text(response.data())
+        let content = if format == ClipboardFormatId::CF_UNICODETEXT {
+            ClipboardContent::Text(decode_utf16le_text(response.data()))
+        } else if format == ClipboardFormatId::CF_TEXT {
+            ClipboardContent::Text(decode_ansi_text(response.data()))
+        } else if format == ClipboardFormatId::CF_DIB || format == ClipboardFormatId::CF_DIBV5 {
+            match decode_dib(response.data()) {
+                Ok((width, height, rgba)) => ClipboardContent::Image {
+                    width,
+                    height,
+                    rgba,
+                },
+                Err(error) => {
+                    warn!(%error, "failed to decode remote clipboard image");
+                    return;
+                }
+            }
         } else {
-            decode_ansi_text(response.data())
+            debug!(?format, "received unsupported clipboard format");
+            return;
         };
 
-        match self.os.set_text(text.clone()) {
+        match self.os.set_content(content.clone()) {
             Ok(()) => {
                 // Remember what we just wrote so poll_local_change doesn't loop it straight
                 // back to the remote as if the user had copied it locally.
-                self.last_seen_fingerprint = Some(content_fingerprint(&text));
+                self.last_seen_fingerprint = Some(content_fingerprint(&content));
             }
             Err(error) => {
                 warn!(%error, "failed to write remote clipboard data to the OS clipboard")
@@ -593,7 +689,11 @@ fn text_formats() -> Vec<ClipboardFormat> {
     vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
 }
 
-fn best_text_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
+fn image_formats() -> Vec<ClipboardFormat> {
+    vec![ClipboardFormat::new(ClipboardFormatId::CF_DIB)]
+}
+
+fn best_content_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
     if formats
         .iter()
         .any(|format| format.id() == ClipboardFormatId::CF_UNICODETEXT)
@@ -604,13 +704,23 @@ fn best_text_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
         .any(|format| format.id() == ClipboardFormatId::CF_TEXT)
     {
         Some(ClipboardFormatId::CF_TEXT)
+    } else if formats
+        .iter()
+        .any(|format| format.id() == ClipboardFormatId::CF_DIB)
+    {
+        Some(ClipboardFormatId::CF_DIB)
+    } else if formats
+        .iter()
+        .any(|format| format.id() == ClipboardFormatId::CF_DIBV5)
+    {
+        Some(ClipboardFormatId::CF_DIBV5)
     } else {
         None
     }
 }
 
-/// Size-bounded fingerprint of clipboard text: a SHA-256 over at most the first
-/// [`HASH_PREFIX_CAP_BYTES`] bytes of `text`, with the *full* byte length folded into the
+/// Size-bounded fingerprint of clipboard content: a SHA-256 over at most the first
+/// [`HASH_PREFIX_CAP_BYTES`] bytes, with the full byte length and content kind folded into the
 /// same digest.
 ///
 /// For text at or under the cap this is exactly equivalent to hashing the whole payload —
@@ -627,11 +737,21 @@ fn best_text_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
 /// fix. See the tests `single_poll_of_a_huge_payload_only_hashes_the_bounded_prefix`,
 /// `repeated_polls_of_unchanged_huge_payload_cost_a_constant_capped_amount_each_time`, and
 /// `a_tail_only_change_past_the_prefix_cap_with_unchanged_length_is_not_detected`.
-fn content_fingerprint(text: &str) -> [u8; 32] {
-    let bytes = text.as_bytes();
+fn content_fingerprint(content: &ClipboardContent) -> [u8; 32] {
+    let (tag, bytes, width, height) = match content {
+        ClipboardContent::Text(text) => (b"text".as_slice(), text.as_bytes(), 0, 0),
+        ClipboardContent::Image {
+            width,
+            height,
+            rgba,
+        } => (b"image".as_slice(), rgba.as_slice(), *width, *height),
+    };
     let prefix_len = bytes.len().min(HASH_PREFIX_CAP_BYTES);
 
     let mut hasher = Sha256::new();
+    hasher.update(tag);
+    hasher.update((width as u64).to_le_bytes());
+    hasher.update((height as u64).to_le_bytes());
     hasher.update(&bytes[..prefix_len]);
     hasher.update((bytes.len() as u64).to_le_bytes());
 
@@ -669,6 +789,269 @@ fn decode_ansi_text(bytes: &[u8]) -> String {
     bytes[..end].iter().map(|&byte| byte as char).collect()
 }
 
+/// Encodes a top-down RGBA image as a 32-bit `CF_DIB` (`BITMAPV5HEADER`, `BI_BITFIELDS`).
+/// Explicit channel masks make alpha semantics unambiguous to clients that preserve it.
+fn encode_dib(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    validate_image_dimensions(width, height, rgba.len())?;
+    let pixel_bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "clipboard image dimensions overflow".to_string())?;
+    const DIB_HEADER_SIZE: usize = 124;
+    let total = DIB_HEADER_SIZE
+        .checked_add(pixel_bytes)
+        .ok_or_else(|| "clipboard image is too large".to_string())?;
+    if total > MAX_IMAGE_BYTES {
+        return Err("clipboard image exceeds safe size limits".to_string());
+    }
+
+    let width_i32 = i32::try_from(width).map_err(|_| "clipboard image is too wide".to_string())?;
+    let height_i32 =
+        i32::try_from(height).map_err(|_| "clipboard image is too tall".to_string())?;
+    let negative_height = height_i32
+        .checked_neg()
+        .ok_or_else(|| "clipboard image height is invalid".to_string())?;
+    let image_size =
+        u32::try_from(pixel_bytes).map_err(|_| "clipboard image is too large".to_string())?;
+
+    let mut out = vec![0u8; total];
+    put_u32(&mut out, 0, DIB_HEADER_SIZE as u32);
+    put_i32(&mut out, 4, width_i32);
+    put_i32(&mut out, 8, negative_height);
+    put_u16(&mut out, 12, 1);
+    put_u16(&mut out, 14, 32);
+    put_u32(&mut out, 16, 3); // BI_BITFIELDS
+    put_u32(&mut out, 20, image_size);
+    put_u32(&mut out, 40, 0x00ff_0000); // red mask
+    put_u32(&mut out, 44, 0x0000_ff00); // green mask
+    put_u32(&mut out, 48, 0x0000_00ff); // blue mask
+    put_u32(&mut out, 52, 0xff00_0000); // alpha mask
+    put_u32(&mut out, 56, 0x7352_4742); // LCS_sRGB
+
+    for (source, destination) in rgba
+        .chunks_exact(4)
+        .zip(out[DIB_HEADER_SIZE..].chunks_exact_mut(4))
+    {
+        destination[0] = source[2]; // B
+        destination[1] = source[1]; // G
+        destination[2] = source[0]; // R
+        destination[3] = source[3]; // A (ignored by older Windows consumers)
+    }
+    Ok(out)
+}
+
+/// Decodes the safe, uncompressed subset of `CF_DIB` used by Windows and common desktop
+/// applications. The result is RGBA, row-major, top-down.
+fn decode_dib(data: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
+    if data.len() > MAX_IMAGE_BYTES {
+        return Err("remote clipboard image exceeds safe size limits".to_string());
+    }
+    if data.len() < 40 {
+        return Err("remote clipboard image has a truncated DIB header".to_string());
+    }
+    let header_size =
+        usize::try_from(get_u32(data, 0)?).map_err(|_| "invalid DIB header".to_string())?;
+    if !(40..=124).contains(&header_size) || header_size > data.len() {
+        return Err("remote clipboard image has an unsupported DIB header".to_string());
+    }
+    let width = get_i32(data, 4)?;
+    let height = get_i32(data, 8)?;
+    if width <= 0 || height == 0 || height == i32::MIN {
+        return Err("remote clipboard image has invalid dimensions".to_string());
+    }
+    let width =
+        usize::try_from(width).map_err(|_| "remote clipboard image is too wide".to_string())?;
+    let top_down = height < 0;
+    let height_abs = height.unsigned_abs();
+    let height = usize::try_from(height_abs)
+        .map_err(|_| "remote clipboard image is too tall".to_string())?;
+    let planes = get_u16(data, 12)?;
+    let bits_per_pixel = get_u16(data, 14)?;
+    let compression = get_u32(data, 16)?;
+    if planes != 1 || !matches!(bits_per_pixel, 24 | 32) {
+        return Err("remote clipboard image uses an unsupported pixel format".to_string());
+    }
+    if compression != 0 && !(compression == 3 && bits_per_pixel == 32) {
+        return Err("remote clipboard image uses unsupported compression".to_string());
+    }
+    let row_bytes = width
+        .checked_mul(usize::from(bits_per_pixel) / 8)
+        .and_then(|bytes| bytes.checked_add(3))
+        .map(|bytes| bytes & !3)
+        .ok_or_else(|| "remote clipboard image dimensions overflow".to_string())?;
+    let pixel_bytes = row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| "remote clipboard image dimensions overflow".to_string())?;
+    validate_image_dimensions(
+        width,
+        height,
+        width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .unwrap_or(usize::MAX),
+    )?;
+
+    let pixel_offset = if compression == 3 && header_size == 40 {
+        52usize
+    } else {
+        header_size
+    };
+    let pixel_end = pixel_offset
+        .checked_add(pixel_bytes)
+        .ok_or_else(|| "remote clipboard image dimensions overflow".to_string())?;
+    if pixel_offset > data.len() || pixel_end > data.len() {
+        return Err("remote clipboard image pixel data is truncated".to_string());
+    }
+
+    let (r_mask, g_mask, b_mask, a_mask) = if compression == 3 {
+        let mask_offset = 40;
+        let r = get_u32(data, mask_offset)?;
+        let g = get_u32(data, mask_offset + 4)?;
+        let b = get_u32(data, mask_offset + 8)?;
+        let a = if header_size >= 56 {
+            get_u32(data, mask_offset + 12)?
+        } else {
+            0
+        };
+        validate_masks(r, g, b, a)?;
+        (r, g, b, a)
+    } else {
+        (0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0)
+    };
+
+    let output_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "remote clipboard image dimensions overflow".to_string())?;
+    let mut rgba = vec![0u8; output_len];
+    for source_row in 0..height {
+        let destination_row = if top_down {
+            source_row
+        } else {
+            height - 1 - source_row
+        };
+        let row_start = pixel_offset + source_row * row_bytes;
+        for x in 0..width {
+            let source = row_start + x * (usize::from(bits_per_pixel) / 8);
+            let pixel = u32::from_le_bytes([
+                data[source],
+                data[source + 1],
+                data[source + 2],
+                if bits_per_pixel == 32 {
+                    data[source + 3]
+                } else {
+                    0
+                },
+            ]);
+            let destination = (destination_row * width + x) * 4;
+            if compression == 0 {
+                rgba[destination] = data[source + 2];
+                rgba[destination + 1] = data[source + 1];
+                rgba[destination + 2] = data[source];
+                rgba[destination + 3] = 255;
+            } else {
+                rgba[destination] = mask_component(pixel, r_mask);
+                rgba[destination + 1] = mask_component(pixel, g_mask);
+                rgba[destination + 2] = mask_component(pixel, b_mask);
+                rgba[destination + 3] = if a_mask == 0 {
+                    255
+                } else {
+                    mask_component(pixel, a_mask)
+                };
+            }
+        }
+    }
+    Ok((width, height, rgba))
+}
+
+fn validate_image_dimensions(width: usize, height: usize, rgba_len: usize) -> Result<(), String> {
+    if width == 0
+        || height == 0
+        || width > MAX_IMAGE_DIMENSION as usize
+        || height > MAX_IMAGE_DIMENSION as usize
+    {
+        return Err("clipboard image exceeds safe size limits".to_string());
+    }
+    let pixels = u64::try_from(width)
+        .ok()
+        .and_then(|w| u64::try_from(height).ok().map(|h| w.saturating_mul(h)))
+        .ok_or_else(|| "clipboard image dimensions overflow".to_string())?;
+    if pixels > MAX_IMAGE_PIXELS
+        || rgba_len
+            != usize::try_from(pixels)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(4)
+    {
+        return Err("clipboard image exceeds safe size limits".to_string());
+    }
+    Ok(())
+}
+
+fn validate_masks(r: u32, g: u32, b: u32, a: u32) -> Result<(), String> {
+    if r == 0
+        || g == 0
+        || b == 0
+        || (r & g) != 0
+        || (r & b) != 0
+        || (g & b) != 0
+        || (a & (r | g | b)) != 0
+    {
+        return Err("remote clipboard image has invalid channel masks".to_string());
+    }
+    Ok(())
+}
+
+fn mask_component(value: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    let bits = mask.count_ones();
+    let component = (value & mask) >> shift;
+    let max = if bits == 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    };
+    ((u64::from(component) * 255 + u64::from(max) / 2) / u64::from(max.max(1))) as u8
+}
+
+fn get_u16(data: &[u8], offset: usize) -> Result<u16, String> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| "invalid DIB header".to_string())?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or_else(|| "remote clipboard image has a truncated DIB header".to_string())?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn get_u32(data: &[u8], offset: usize) -> Result<u32, String> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| "invalid DIB header".to_string())?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or_else(|| "remote clipboard image has a truncated DIB header".to_string())?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn get_i32(data: &[u8], offset: usize) -> Result<i32, String> {
+    Ok(i32::from_le_bytes(get_u32(data, offset)?.to_le_bytes()))
+}
+
+fn put_u16(data: &mut [u8], offset: usize, value: u16) {
+    data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+    data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_i32(data: &mut [u8], offset: usize, value: i32) {
+    put_u32(data, offset, value as u32);
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -701,9 +1084,10 @@ mod tests {
     #[derive(Default)]
     struct FakeClipboardState {
         text: Option<String>,
+        image: Option<(usize, usize, Vec<u8>)>,
         fail_next_get: bool,
         fail_next_set: bool,
-        /// How many times [`OsClipboard::get_text`] was called — the observable proxy for
+        /// How many times the clipboard content was read — the observable proxy for
         /// the "IPC round trip + full allocation" cost `poll_local_change` pays every poll.
         get_text_calls: usize,
     }
@@ -711,26 +1095,48 @@ mod tests {
     struct FakeOsClipboard(Arc<Mutex<FakeClipboardState>>);
 
     impl OsClipboard for FakeOsClipboard {
-        fn get_text(&mut self) -> Result<String, String> {
+        fn get_content(&mut self) -> Result<ClipboardContent, String> {
             let mut state = self.0.lock().unwrap();
             state.get_text_calls += 1;
             if state.fail_next_get {
                 state.fail_next_get = false;
                 return Err("fake read failure".to_string());
             }
-            state
-                .text
-                .clone()
-                .ok_or_else(|| "fake clipboard is empty".to_string())
+            if let Some(text) = state.text.clone() {
+                Ok(ClipboardContent::Text(text))
+            } else if let Some((width, height, rgba)) = state.image.clone() {
+                Ok(ClipboardContent::Image {
+                    width,
+                    height,
+                    rgba,
+                })
+            } else {
+                // An empty text clipboard is still a valid clipboard value and must be
+                // advertised, rather than treated as an inaccessible pasteboard.
+                Ok(ClipboardContent::Text(String::new()))
+            }
         }
 
-        fn set_text(&mut self, text: String) -> Result<(), String> {
+        fn set_content(&mut self, content: ClipboardContent) -> Result<(), String> {
             let mut state = self.0.lock().unwrap();
             if state.fail_next_set {
                 state.fail_next_set = false;
                 return Err("fake write failure".to_string());
             }
-            state.text = Some(text);
+            match content {
+                ClipboardContent::Text(text) => {
+                    state.text = Some(text);
+                    state.image = None;
+                }
+                ClipboardContent::Image {
+                    width,
+                    height,
+                    rgba,
+                } => {
+                    state.text = None;
+                    state.image = Some((width, height, rgba));
+                }
+            }
             Ok(())
         }
     }
@@ -840,6 +1246,225 @@ mod tests {
             }
             other => panic!("unexpected pdu variant: {other:?}"),
         }
+    }
+
+    fn only_format_ids(msgs: Vec<CliprdrSvcMessages<Client>>) -> Vec<ClipboardFormatId> {
+        let mut svc_messages: Vec<SvcMessage> = Vec::new();
+        for group in msgs {
+            svc_messages.extend(Vec::<SvcMessage>::from(group));
+        }
+        assert_eq!(svc_messages.len(), 1, "expected exactly one wire PDU");
+        let bytes = svc_messages[0]
+            .encode_unframed_pdu()
+            .expect("encode wire PDU");
+        let mut cursor = ReadCursor::new(&bytes);
+        match ClipboardPdu::decode(&mut cursor).expect("decode wire PDU") {
+            ClipboardPdu::FormatList(list) => list
+                .get_formats(true)
+                .expect("decode advertised format list")
+                .into_iter()
+                .map(|format| format.id())
+                .collect(),
+            other => panic!("unexpected pdu variant: {other:?}"),
+        }
+    }
+
+    fn test_image() -> (usize, usize, Vec<u8>) {
+        (
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, // red, green
+                0, 255, 0, 128, // blue, white
+                0, 0, 255, 255, 255, 255, 255, 0,
+            ],
+        )
+    }
+
+    #[test]
+    fn empty_local_text_is_advertised_and_served_as_empty_unicode() {
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+
+        // Empty is valid text, not an inaccessible clipboard.
+        state.lock().unwrap().text = Some(String::new());
+        backend_mut(&mut cliprdr).on_request_format_list();
+        let formats = only_format_ids(bridge.pump(&mut cliprdr));
+        assert_eq!(formats, vec![ClipboardFormatId::CF_UNICODETEXT]);
+
+        backend_mut(&mut cliprdr).on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        match only_pdu(bridge.pump(&mut cliprdr)) {
+            ClipboardPdu::FormatDataResponse(response) => {
+                assert!(!response.is_error());
+                assert_eq!(response.data(), &[0, 0]);
+            }
+            other => panic!("unexpected pdu variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_is_advertised_when_no_text_exists_and_unicode_still_wins() {
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        let image = test_image();
+        state.lock().unwrap().image = Some(image.clone());
+
+        backend_mut(&mut cliprdr).on_request_format_list();
+        assert_eq!(
+            only_format_ids(bridge.pump(&mut cliprdr)),
+            vec![ClipboardFormatId::CF_DIB]
+        );
+
+        // If both are offered, text remains the stable preferred format.
+        backend_mut(&mut cliprdr).on_remote_copy(&[
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+            unicode_format(),
+        ]);
+        let msgs = bridge.pump(&mut cliprdr);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            bridge.paste_state,
+            PasteState::Requested {
+                format: ClipboardFormatId::CF_UNICODETEXT,
+                requested_at_ms: 0
+            }
+        );
+    }
+
+    #[test]
+    fn exact_2x2_rgba_local_wire_and_decode_round_trip() {
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        let image = test_image();
+        state.lock().unwrap().image = Some(image.clone());
+
+        backend_mut(&mut cliprdr).on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_DIB,
+        });
+        let wire = match only_pdu(bridge.pump(&mut cliprdr)) {
+            ClipboardPdu::FormatDataResponse(response) => response.data().to_vec(),
+            other => panic!("unexpected pdu variant: {other:?}"),
+        };
+        assert_eq!(
+            get_u32(&wire, 56).expect("V5 color space"),
+            0x7352_4742,
+            "BITMAPV5HEADER must declare sRGB rather than zeroed calibrated-RGB metadata"
+        );
+        assert_eq!(decode_dib(&wire).expect("decode local DIB"), image);
+    }
+
+    #[test]
+    fn ordinary_32_bit_bi_rgb_dib_treats_reserved_byte_as_opaque() {
+        let mut dib = vec![0u8; 44];
+        put_u32(&mut dib, 0, 40);
+        put_i32(&mut dib, 4, 1);
+        put_i32(&mut dib, 8, -1);
+        put_u16(&mut dib, 12, 1);
+        put_u16(&mut dib, 14, 32);
+        // B, G, R, reserved byte. BI_RGB does not declare an alpha channel.
+        dib[40..44].copy_from_slice(&[3, 2, 1, 0]);
+        assert_eq!(
+            decode_dib(&dib).expect("decode BI_RGB"),
+            (1, 1, vec![1, 2, 3, 255])
+        );
+    }
+
+    #[test]
+    fn remote_image_is_written_to_os_and_not_looped_back() {
+        let (state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        let image = test_image();
+        let wire = encode_dib(image.0, image.1, &image.2).expect("encode test DIB");
+
+        backend_mut(&mut cliprdr)
+            .on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIB)]);
+        assert_eq!(bridge.pump(&mut cliprdr).len(), 1);
+        backend_mut(&mut cliprdr).on_format_data_response(FormatDataResponse::new_data(wire));
+        bridge.pump(&mut cliprdr);
+
+        assert_eq!(state.lock().unwrap().image, Some(image));
+        bridge.poll_local_change();
+        assert!(bridge.pump(&mut cliprdr).is_empty());
+    }
+
+    #[test]
+    fn malformed_remote_image_is_rejected_and_next_copy_recovers() {
+        let (_state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+
+        backend_mut(&mut cliprdr)
+            .on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIB)]);
+        assert_eq!(bridge.pump(&mut cliprdr).len(), 1);
+        backend_mut(&mut cliprdr)
+            .on_format_data_response(FormatDataResponse::new_data(vec![1, 2, 3]));
+        bridge.pump(&mut cliprdr);
+        assert_eq!(bridge.paste_state, PasteState::Idle);
+
+        backend_mut(&mut cliprdr).on_remote_copy(&[unicode_format()]);
+        assert_eq!(bridge.pump(&mut cliprdr).len(), 1);
+    }
+
+    #[test]
+    fn oversized_remote_image_is_rejected_without_allocating_pixels() {
+        let (_state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+
+        let mut oversized = vec![0u8; 40];
+        put_u32(&mut oversized, 0, 40);
+        put_i32(&mut oversized, 4, (MAX_IMAGE_DIMENSION + 1) as i32);
+        put_i32(&mut oversized, 8, 1);
+        put_u16(&mut oversized, 12, 1);
+        put_u16(&mut oversized, 14, 32);
+        backend_mut(&mut cliprdr)
+            .on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIB)]);
+        assert_eq!(bridge.pump(&mut cliprdr).len(), 1);
+        backend_mut(&mut cliprdr).on_format_data_response(FormatDataResponse::new_data(oversized));
+        bridge.pump(&mut cliprdr);
+        assert_eq!(bridge.paste_state, PasteState::Idle);
+
+        backend_mut(&mut cliprdr).on_remote_copy(&[unicode_format()]);
+        assert_eq!(bridge.pump(&mut cliprdr).len(), 1);
+    }
+
+    #[test]
+    fn image_fingerprint_is_content_sensitive_and_bounded() {
+        let (width, height, rgba) = test_image();
+        let same = ClipboardContent::Image {
+            width,
+            height,
+            rgba: rgba.clone(),
+        };
+        let mut changed_rgba = rgba;
+        changed_rgba[0] ^= 1;
+        let changed = ClipboardContent::Image {
+            width,
+            height,
+            rgba: changed_rgba,
+        };
+        assert_eq!(content_fingerprint(&same), content_fingerprint(&same));
+        assert_ne!(content_fingerprint(&same), content_fingerprint(&changed));
+        reset_hashed_bytes();
+        let huge = ClipboardContent::Image {
+            width: 1,
+            height: LARGE_PAYLOAD_BYTES / 4,
+            rgba: vec![0; LARGE_PAYLOAD_BYTES],
+        };
+        let _ = content_fingerprint(&huge);
+        assert_eq!(hashed_bytes(), HASH_PREFIX_CAP_BYTES);
     }
 
     #[test]
@@ -1021,6 +1646,20 @@ mod tests {
             }
             other => panic!("unexpected pdu: {other:?}"),
         }
+
+        // A malformed local image follows the same anti-wedge rule: answer the request with
+        // an explicit error instead of leaving the remote waiting forever.
+        state.lock().unwrap().image = Some((2, 2, vec![0, 1, 2]));
+        backend_mut(&mut cliprdr).on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_DIB,
+        });
+        let msgs = bridge.pump(&mut cliprdr);
+        match only_pdu(msgs) {
+            ClipboardPdu::FormatDataResponse(response) => {
+                assert!(response.is_error());
+            }
+            other => panic!("unexpected pdu: {other:?}"),
+        }
     }
 
     #[test]
@@ -1152,7 +1791,7 @@ mod tests {
         assert_eq!(
             get_text_calls_after - get_text_calls_before,
             REPEAT_POLLS,
-            "get_text must still be called on every poll — bounding the hash must not \
+            "clipboard content must still be read on every poll — bounding the hash must not \
              disable change detection"
         );
     }

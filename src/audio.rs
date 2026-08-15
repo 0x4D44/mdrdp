@@ -58,6 +58,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -440,6 +441,9 @@ impl RingBuf {
 pub struct AudioRing {
     buf: Arc<Mutex<RingBuf>>,
     stats: AudioStatsHandle,
+    /// Shared gate latched off by a fatal cpal stream error. Producers then stop decoding
+    /// and queuing packets while the callback emits silence, leaving the RDP session alive.
+    enabled: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for AudioRing {
@@ -456,6 +460,7 @@ impl AudioRing {
         Self {
             buf: Arc::new(Mutex::new(RingBuf::new(capacity_samples))),
             stats,
+            enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -474,11 +479,25 @@ impl AudioRing {
         if incoming.is_empty() {
             return;
         }
-        let dropped = self.lock().push(incoming);
+        if !self.is_enabled() {
+            return;
+        }
+        let mut guard = self.lock();
+        // Re-check after taking the lock: a device error may have disabled the gate while
+        // this producer was waiting, and no samples may survive that transition.
+        if !self.is_enabled() {
+            return;
+        }
+        let dropped = guard.push(incoming);
         if dropped > 0 {
             self.stats
                 .note(|s| s.overruns = s.overruns.saturating_add(dropped));
         }
+    }
+
+    /// Permanently stop playback for this ring after a fatal device error.
+    fn disable(&self) {
+        self.enabled.store(false, Ordering::Release);
     }
 
     /// Consumer side: called from the cpal realtime callback. Fills `out` fully, using
@@ -489,6 +508,10 @@ impl AudioRing {
     /// `O(out.len())`, no allocation, no syscalls, and the lock is held only across that
     /// same deque work.
     pub fn pop_into(&self, out: &mut [f32]) {
+        if !self.is_enabled() {
+            out.fill(0.0);
+            return;
+        }
         let is_underrun = self.lock().pop_into(out);
         if is_underrun {
             self.stats
@@ -510,6 +533,10 @@ impl AudioRing {
         self.buf
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
     }
 }
 
@@ -575,6 +602,13 @@ impl RdpsndClientHandler for RdpsndBackend {
     fn wave(&mut self, format_no: usize, _ts: u32, data: Cow<'_, [u8]>) {
         self.stats
             .note(|s| s.packets_received = s.packets_received.saturating_add(1));
+
+        // A runtime device error is terminal for this stream. Keep acknowledging packets
+        // through the normal callback path so the RDP session survives, but do not spend
+        // CPU decoding audio that can no longer be played or queue it behind silence.
+        if !self.ring.is_enabled() {
+            return;
+        }
 
         let Some(fmt) = self.formats.get(format_no).filter(|f| is_playable(f)) else {
             // `self.formats` holds at most one entry (see `negotiated_format`), so any
@@ -654,6 +688,8 @@ impl RdpsndClientHandler for RdpsndBackend {
 pub struct AudioPlayback {
     // Held only to keep the stream alive; dropping it stops playback. Never read.
     _stream: Option<cpal::Stream>,
+    /// The same gate the stream's error callback latches off on a fatal device error.
+    ring: AudioRing,
     format: AudioFormatSummary,
 }
 
@@ -668,17 +704,19 @@ impl AudioPlayback {
         match try_start(&ring, &stats) {
             Ok((stream, format)) => Self {
                 _stream: Some(stream),
+                ring,
                 format,
             },
             Err(reason) => {
                 error!(%reason, "rdpsnd: no usable audio output device; session continues without audio");
                 stats.note(|s| s.device_errors = s.device_errors.saturating_add(1));
+                ring.disable();
                 Self {
                     _stream: None,
-                    // A placeholder so RdpsndBackend still has *a* target format to
-                    // convert to; with no stream, that audio is simply never played, and
-                    // the ring absorbs it as continuous overruns rather than the network
-                    // thread stalling anywhere.
+                    ring,
+                    // A placeholder for callers that inspect the format. `is_active()` is
+                    // false, so the live path does not register RDPSND; the disabled ring
+                    // also rejects late packets from tests or alternate callers.
                     format: AudioFormatSummary {
                         sample_rate: 48_000,
                         channels: 2,
@@ -694,9 +732,10 @@ impl AudioPlayback {
         self.format
     }
 
-    /// Whether a real device stream is running. `false` after a device failure.
+    /// Whether a real device stream is running. Becomes `false` after a runtime device
+    /// failure, even before cpal drops the stream handle.
     pub fn is_active(&self) -> bool {
-        self._stream.is_some()
+        self._stream.is_some() && self.ring.is_enabled()
     }
 }
 
@@ -718,6 +757,7 @@ fn try_start(
 
     let ring_cb = ring.clone();
     let err_stats = stats.clone();
+    let err_ring = ring.clone();
     let stream = device
         .build_output_stream(
             &stream_config,
@@ -725,11 +765,11 @@ fn try_start(
                 ring_cb.pop_into(out);
             },
             move |err| {
-                // Runs on cpal's own error path (e.g. the device was unplugged). Counted,
-                // not fatal, and logged once per occurrence rather than per audio frame —
-                // this callback fires at most a handful of times per real failure, not per
-                // sample.
+                // Runs on cpal's own error path (e.g. the device was unplugged). Count and
+                // latch the shared gate: the session remains alive, but no later wave can
+                // keep filling a ring whose device has gone away.
                 error!(%err, "rdpsnd: audio device error");
+                err_ring.disable();
                 err_stats.note(|s| s.device_errors = s.device_errors.saturating_add(1));
             },
             None,
@@ -1306,6 +1346,27 @@ mod tests {
                 bits_per_sample: 16
             })
         );
+    }
+
+    #[test]
+    fn a_disabled_playback_ring_rejects_late_wave_packets() {
+        let (mut backend, ring, stats) = backend(device_native());
+        ring.disable();
+
+        let pcm: Vec<u8> = [100_i16, -100]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        backend.wave(0, 0, Cow::Borrowed(&pcm));
+
+        let mut out = [7.0f32; 2];
+        ring.pop_into(&mut out);
+        assert_eq!(
+            out, [0.0; 2],
+            "late packets must not enter a failed playback ring"
+        );
+        assert_eq!(stats.snapshot().packets_received, 1);
+        assert_eq!(stats.snapshot().bytes_played, 0);
     }
 
     #[test]
