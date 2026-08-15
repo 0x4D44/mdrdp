@@ -31,3 +31,14 @@ Out-of-scope observations. A separate human-invoked review triages these.
   (`sdl-freerdp`, not `xfreerdp`) or Microsoft's client and diff against ours. Without
   ground truth each change merely moves the corruption around — which is precisely what
   all three attempts above did.
+
+- [ ] 2026-08-15: ClearCodec RLEX subcodec still fails with `rlex: suite exceeds region
+  pixel count` (`~/language/mdrdp/vendor/ironrdp-graphics/src/clearcodec/mod.rs:323`).
+  Ruled out already: the segment bit extraction matches FreeRDP
+  (`stop_index = packed & stop_mask`, `suite_depth = (packed >> stop_index_bits) & depth_mask`,
+  `start_index = stop_index - suite_depth`), the variable-length run-length decode matches,
+  and `remaining` being ignored is harmless because it equals the cursor length. So the
+  overrun is in pixel accounting or in how much data reaches `decode_rlex`. Compare against
+  `clear_decompress_subcode_rlex` (freerdp-ref/clear.c:151-300), noting that FreeRDP bounds
+  its loop by the declared `bitmapDataByteCount` and writes `runLengthFactor` pixels of
+  `palette[startIndex]` followed by `suiteDepth + 1` pixels stepping the palette.

@@ -195,3 +195,37 @@ the RFX_PROGRESSIVE_REGION flags as well as in CONTEXT, and FreeRDP reads the re
 the context's value to every region, so a dissenting region would decode with both the
 wrong band layout and the wrong inverse transform. Latent on this server — every region
 here agrees with the context — but wrong by construction.
+
+## `ironrdp-pdu` 0.9.0 — ClearCodec short-V-bar yOn/yOff were transposed
+
+`src/codecs/clearcodec/bands.rs`, SHORT_VBAR_CACHE_MISS, read the two fields the wrong way
+round:
+
+```rust
+let y_on  = first_word >> 6;     // was: bits 13:6
+let y_off = first_word & 0x3F;   // was: bits 5:0
+```
+
+MS-RDPEGFX 2.2.4.1.1.2.1.1.3 puts **yOn in the low 8 bits** and **yOff in bits 13:8**,
+which is how FreeRDP reads it (libfreerdp/codec/clear.c):
+
+```c
+vBarYOn  = (vBarHeader & 0xFF);
+vBarYOff = ((vBarHeader >> 8) & 0x3F);
+```
+
+### Why it mattered so much
+
+Under the old reading `y_on` ranges to 255 while `y_off` caps at 63, so the `yOff < yOn`
+validity check fires for **any** yOn above 63 and the tile is rejected outright. Measured
+against a live Windows host: 84 of 222 ClearCodec commands failed here directly, and
+because the v-bars those tiles would have cached never existed, a further 92 later tiles
+failed with "V-bar cache miss on hit" or "glyph cache miss on hit". Roughly 90% of
+ClearCodec tiles were lost to this single transposition — text and UI regions simply not
+painted.
+
+After the fix that error no longer occurs at all.
+
+Pinned by `clearcodec_short_vbar_takes_y_on_from_the_low_byte` in `src/gfx.rs`, which
+decodes a band whose word is `(20 << 8) | 10`. Restoring the transposition makes it fail
+with the production error verbatim: `shortVBarYOff < shortVBarYOn`.

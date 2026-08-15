@@ -1252,6 +1252,44 @@ mod tests {
         assert_eq!(t(-1_000_000), i16::MIN);
     }
 
+    /// ClearCodec SHORT_VBAR_CACHE_MISS: yOn is the LOW 8 bits, yOff is bits 13:8.
+    ///
+    /// The two were transposed — yOn was read from bits 13:6 and yOff from bits 5:0. That
+    /// makes yOn range to 255 while yOff caps at 63, so the `yOff < yOn` validity check
+    /// fires for any yOn above 63 and the tile is rejected outright. Against a live host
+    /// that rejected 84 of 222 ClearCodec commands, and the v-bars those tiles would have
+    /// cached never existed, so a further 92 failed later with "cache miss on hit".
+    ///
+    /// This word encodes yOn = 10, yOff = 20 as FreeRDP reads it
+    /// (libfreerdp/codec/clear.c): `(20 << 8) | 10` = 0x140A. Under the old reading it
+    /// decodes as yOn = 80, yOff = 10 — and is refused.
+    #[test]
+    fn clearcodec_short_vbar_takes_y_on_from_the_low_byte() {
+        use ironrdp::pdu::codecs::clearcodec::decode_bands_layer;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u16.to_le_bytes()); // xStart
+        data.extend_from_slice(&0u16.to_le_bytes()); // xEnd  -> one v-bar
+        data.extend_from_slice(&0u16.to_le_bytes()); // yStart
+        data.extend_from_slice(&51u16.to_le_bytes()); // yEnd -> band height 52
+        data.extend_from_slice(&[0x11, 0x22, 0x33]); // background cb, cg, cr
+        data.extend_from_slice(&0x140Au16.to_le_bytes()); // SHORT_VBAR_CACHE_MISS
+        data.extend_from_slice(&[0x40u8; 30]); // (20 - 10) pixels * 3 bytes
+
+        let bands = decode_bands_layer(&data).expect("the band must decode");
+        assert_eq!(bands.len(), 1);
+        assert_eq!(bands[0].vbars.len(), 1);
+
+        match &bands[0].vbars[0] {
+            ironrdp::pdu::codecs::clearcodec::VBar::ShortCacheMiss(m) => {
+                assert_eq!(m.y_on, 10, "yOn comes from the low 8 bits");
+                assert_eq!(m.y_off_delta, 10, "yOff (20) - yOn (10)");
+                assert_eq!(m.pixel_data.len(), 30);
+            }
+            other => panic!("expected a short cache miss, got {other:?}"),
+        }
+    }
+
     /// The SRL reader, hand-traced from FreeRDP's `progressive_rfx_srl_read`.
     ///
     /// For `data = 0b1000_1000` and num_bits = 3:
