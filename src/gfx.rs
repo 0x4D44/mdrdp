@@ -1382,6 +1382,66 @@ mod tests {
         }
     }
 
+    /// A tile flagged RFX_TILE_DIFFERENCE carries a DELTA, and must be ADDED to the
+    /// coefficients already held — not replace them.
+    ///
+    /// FreeRDP does this with `add_16s_inplace(buffer, current, ...)` inside
+    /// `progressive_rfx_dwt_2d_decode` when `coeffDiff` is set. We overwrote instead, so
+    /// such a tile discarded everything the earlier passes had built.
+    ///
+    /// Only a few tiles per frame carry the flag, which is why it surfaced as exactly one
+    /// wrong tile on an otherwise correct screen: in a captured frame, tile (11,0) had
+    /// flags=0x01 while its neighbour had 0x00, and that single tile was visibly offset.
+    #[test]
+    fn a_difference_tile_adds_to_the_retained_coefficients() {
+        use ironrdp::pdu::codecs::rfx::progressive::ComponentCodecQuant;
+        use ironrdp_graphics::progressive::{TileState, encode_first_pass};
+
+        // A quantiser the encoder and decoder agree on, and a recognisable ramp so a
+        // replace and an add cannot look alike.
+        let quant = ComponentCodecQuant::LOSSLESS;
+        let mut coeffs = [0i16; 4096];
+        for (i, c) in coeffs.iter_mut().enumerate() {
+            *c = ((i % 7) as i16) - 3;
+        }
+        let mut encoded = vec![0u8; 32768];
+        let len =
+            encode_first_pass(&mut coeffs, &mut encoded, &quant, &quant, true).expect("encode");
+        let data = &encoded[..len];
+
+        // Baseline: a normal (non-difference) first pass.
+        let mut plain = TileState::new();
+        plain
+            .decode_first(
+                [data; 3],
+                [&quant; 3],
+                [quant; 3],
+                [0; 3],
+                0xFF,
+                true,
+                false,
+            )
+            .expect("decode");
+        let baseline = plain.coefficients[0];
+
+        // Same tile decoded again as a DIFFERENCE on top of that state.
+        plain
+            .decode_first([data; 3], [&quant; 3], [quant; 3], [0; 3], 0xFF, true, true)
+            .expect("decode");
+
+        let doubled: Vec<i16> = baseline.iter().map(|v| v.wrapping_add(*v)).collect();
+        assert_eq!(
+            &plain.coefficients[0][..],
+            &doubled[..],
+            "a difference tile must add to what was already there"
+        );
+        assert_ne!(
+            &plain.coefficients[0][..],
+            &baseline[..],
+            "and must not simply replace it"
+        );
+    }
+
     /// The SRL reader, hand-traced from FreeRDP's `progressive_rfx_srl_read`.
     ///
     /// For `data = 0b1000_1000` and num_bits = 3:

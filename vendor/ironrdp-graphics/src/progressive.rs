@@ -75,11 +75,20 @@ pub fn decode_first_pass(
     // Step 2: LL3 differential decoding (reverse delta encoding on last subband)
     crate::subband_reconstruction::decode(&mut coefficients[ll3_offset(use_reduce_extrapolate)..]);
 
-    // Step 3: Base dequantization (shift left by quant - 1)
-    dequantize_component_ccq(coefficients, base_quant, use_reduce_extrapolate);
-
-    // Step 4: Progressive dequantization (shift left by BitPos)
-    progressive_dequantize(coefficients, prog_quant, use_reduce_extrapolate);
+    // Steps 3 and 4, as ONE shift per band.
+    //
+    // mdrdp patch: this was two passes — `<< (quant - 1)` then `<< bitPos` — with
+    // DIFFERENT overflow behaviour in each. The base pass wrapped (a plain `i16 <<`)
+    // while the progressive pass saturated (`clamp_i16`), and it also shifted the
+    // magnitude and reapplied the sign rather than shifting the value.
+    //
+    // FreeRDP applies a single shift of `quant + prog - 1` per band and wraps:
+    // `(INT16)(((UINT32)val << sh) & 0xFFFF)` (general_lShiftC_16s, prim_shift.c). One
+    // wrapping shift and two shifts with a clamp between them only agree while nothing
+    // overflows, so the two implementations diverged on exactly those tiles whose
+    // coefficients are large — which is why a single tile could render wrong while every
+    // other tile on screen was right.
+    dequantize_bands(coefficients, base_quant, prog_quant, use_reduce_extrapolate);
 
     // Step 5: Capture sign state for DAS
     capture_sign(coefficients, sign);
@@ -264,6 +273,7 @@ impl<'a> SrlReader<'a> {
 ///
 /// For non-LL3 bands, this shifts the absolute value (preserving sign).
 /// For LL3, this is a simple left shift (floor toward negative infinity).
+#[allow(dead_code)] // superseded by dequantize_bands; kept for the encoder path
 fn progressive_dequantize(coefficients: &mut [i16], prog_quant: &ComponentCodecQuant, use_reduce_extrapolate: bool) {
     let bands = get_band_layout(use_reduce_extrapolate);
 
@@ -536,6 +546,7 @@ pub fn rgba_to_ycbcr(pixels: &[u8], y_out: &mut [i16], cb_out: &mut [i16], cr_ou
 ///
 /// Each band is shifted left by `(quant_value - 1)`. Uses `for_band()` to map
 /// band indices to quant values, which handles the progressive nibble ordering.
+#[allow(dead_code)] // superseded by dequantize_bands; kept for the encoder path
 fn dequantize_component_ccq(coefficients: &mut [i16], quant: &ComponentCodecQuant, use_reduce_extrapolate: bool) {
     let bands = get_band_layout(use_reduce_extrapolate);
 
@@ -548,6 +559,35 @@ fn dequantize_component_ccq(coefficients: &mut [i16], quant: &ComponentCodecQuan
             for coeff in &mut coefficients[start..end] {
                 *coeff <<= factor;
             }
+        }
+    }
+}
+
+/// Apply the combined base + progressive dequantisation shift, one band at a time.
+///
+/// Mirrors FreeRDP: `shift = quant + prog - 1` per band, applied with a wrapping 16-bit
+/// left shift. A shift of 16 or more is refused there; we skip the band, which leaves the
+/// coefficients untouched rather than zeroing a band on a malformed quant table.
+fn dequantize_bands(
+    coefficients: &mut [i16],
+    base_quant: &ComponentCodecQuant,
+    prog_quant: &ComponentCodecQuant,
+    use_reduce_extrapolate: bool,
+) {
+    let bands = get_band_layout(use_reduce_extrapolate);
+
+    for (band_idx, band) in bands.iter().enumerate() {
+        let shift = u32::from(base_quant.for_band(band_idx))
+            .saturating_add(u32::from(prog_quant.for_band(band_idx)))
+            .saturating_sub(1);
+        if shift == 0 || shift >= 16 {
+            continue;
+        }
+        let start = band.offset;
+        let end = start + band.count();
+        for coeff in &mut coefficients[start..end] {
+            // Wrapping, keeping the low 16 bits — FreeRDP's `& 0xFFFF`.
+            *coeff = ((*coeff as u16) << shift) as i16;
         }
     }
 }
@@ -819,12 +859,26 @@ impl TileState {
         quant_idx: [u8; 3],
         quality: u8,
         use_reduce_extrapolate: bool,
+        is_difference: bool,
     ) -> Result<(), RlgrError> {
+        // mdrdp patch: honour RFX_TILE_DIFFERENCE.
+        //
+        // A tile flagged as a difference carries a DELTA against the coefficients already
+        // held for it, not a replacement. FreeRDP adds the two — `add_16s_inplace(buffer,
+        // current, ...)` inside progressive_rfx_dwt_2d_decode when coeffDiff is set — and
+        // we overwrote instead, so such a tile discarded everything the earlier passes had
+        // built and rendered visibly offset from its neighbours.
+        //
+        // Only a few tiles per frame carry the flag, which is why this surfaced as exactly
+        // ONE wrong tile on an otherwise perfect screen: in the captured frame, tile
+        // (11,0) had flags=0x01 while tile (10,0) had 0x00.
+        let previous = is_difference.then_some(self.coefficients);
+
         self.pass = 1;
         self.quality = quality;
         self.quant_idx = quant_idx;
         self.use_reduce_extrapolate = use_reduce_extrapolate;
-        self.is_difference = false;
+        self.is_difference = is_difference;
         self.prog_quant = prog_quants;
 
         for c in 0..3 {
@@ -836,6 +890,14 @@ impl TileState {
                 &mut self.coefficients[c],
                 &mut self.sign[c],
             )?;
+        }
+
+        if let Some(previous) = previous {
+            for c in 0..3 {
+                for (coeff, old) in self.coefficients[c].iter_mut().zip(previous[c].iter()) {
+                    *coeff = coeff.wrapping_add(*old);
+                }
+            }
         }
 
         Ok(())
@@ -1091,6 +1153,10 @@ pub fn rfx_ycbcr_to_rgb(y: i16, cb: i16, cr: i16) -> (u8, u8, u8) {
 /// slot = 2 MiB of pointer storage per surface before any tile is populated.
 pub const MAX_SURFACE_DIM: u16 = 32768;
 
+/// Tile flag: the tile carries a delta against the coefficients already held, not a
+/// replacement (MS-RDPRFX RFX_TILE_DIFFERENCE).
+pub const RFX_TILE_DIFFERENCE: u8 = 0x01;
+
 /// Error type for progressive decoding operations.
 #[derive(Debug)]
 pub enum ProgressiveDecodeError {
@@ -1307,6 +1373,19 @@ fn decode_tile_block(
 ) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
     use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
 
+    {
+        let info = match tile_block {
+            ProgressiveTile::Simple(t) => Some(("SIMPLE", t.x_idx, t.y_idx, t.flags)),
+            ProgressiveTile::First(t) => Some(("FIRST", t.x_idx, t.y_idx, t.flags)),
+            ProgressiveTile::Upgrade(_) => None,
+        };
+        if let Some((k, xi, yi, fl)) = info {
+            if yi == 0 && (xi == 10 || xi == 11) {
+                eprintln!("TFLAG tile({xi},{yi}) {k} flags=0x{fl:02x} diff={}", fl & 1);
+            }
+        }
+    }
+
     match tile_block {
         ProgressiveTile::Simple(tile) => {
             let x_idx = tile.x_idx;
@@ -1337,6 +1416,7 @@ fn decode_tile_block(
                 [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
                 0xFF, // full quality
                 use_reduce_extrapolate,
+                tile.flags & RFX_TILE_DIFFERENCE != 0,
             )?;
 
             let mut pixels = vec![0u8; 64 * 64 * 4];
@@ -1401,6 +1481,7 @@ fn decode_tile_block(
                 [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
                 tile.quality,
                 use_reduce_extrapolate,
+                tile.flags & RFX_TILE_DIFFERENCE != 0,
             )?;
 
             let mut pixels = vec![0u8; 64 * 64 * 4];

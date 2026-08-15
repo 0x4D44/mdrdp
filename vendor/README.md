@@ -262,3 +262,47 @@ rendered as opaque grey blocks around the text and buttons.
 `gfx::apply_wire_to_surface1` extracts the destination rect and swaps it to BGRA first —
 the surface stores RGBA and this decoder works in BGRA, so seeding without the swap would
 leave every uncovered pixel with red and blue exchanged.
+
+## `ironrdp-graphics` 0.9.0 — RFX_TILE_DIFFERENCE was parsed and then ignored
+
+A tile whose flags carry `RFX_TILE_DIFFERENCE` (0x01) holds a **delta** against the
+coefficients already retained for it, not a replacement. FreeRDP adds the two —
+`prims->add_16s_inplace(buffer, current, ...)` inside `progressive_rfx_dwt_2d_decode`
+when `coeffDiff` is set. `TileState::decode_first` overwrote instead, so such a tile threw
+away everything the earlier passes had built.
+
+Only a few tiles per frame carry the flag, so this surfaced as **exactly one wrong tile**
+on an otherwise perfect screen — in the captured frame, tile (11,0) had `flags=0x01` while
+its neighbour had `0x00`, and that single tile rendered about +21 R, +11 G, -5 B off.
+
+Also in this change: the base and progressive dequantisation are applied as ONE shift of
+`quant + prog - 1` per band, wrapping, matching `general_lShiftC_16s` (prim_shift.c). They
+were two passes with *different* overflow behaviour — the base wrapped, the progressive
+saturated — which can only agree while nothing overflows. This produced no observable
+change on the captured frames and is kept because it is what the reference does.
+
+### Verifying against FreeRDP without a server or a display
+
+Ground truth comes from FreeRDP's own decoder run on the same bytes:
+
+1. Dump the payloads: temporarily write each `WireToSurface2Pdu::bitmap_data` to a file
+   from `gfx::apply_wire_to_surface2`.
+2. Decode them with ours: `cargo run --release --bin progcmp -- frame00.bin ...` prints
+   the mean colour of each 64px tile in row 0.
+3. Decode them with FreeRDP: build a small C harness against the installed library —
+
+```c
+PROGRESSIVE_CONTEXT* ctx = progressive_context_new(FALSE);
+progressive_create_surface_context(ctx, 0, 1920, 1080);
+REGION16 invalid; region16_init(&invalid);
+progressive_decompress(ctx, buf, len, dst, PIXEL_FORMAT_BGRX32, 1920 * 4, 0, 0,
+                       &invalid, 0, frameId);
+```
+
+```
+cc -O2 -o refdec refdec.c $(pkg-config --cflags --libs freerdp3)
+```
+
+With this fix, all 30 row-0 tiles match FreeRDP's output exactly. That comparison is what
+found this bug, after four other hypotheses (upgrade passes, the bitmap cache, tile-state
+contamination, and content dependence) had each been tested and eliminated.
