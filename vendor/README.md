@@ -92,15 +92,41 @@ Measured against `quench` (Windows 11), with the same session and wallpaper:
 The reference is FreeRDP 3.27.1 against the same host and desktop, captured with
 `--screenshot` on our side and `screencapture` on FreeRDP's.
 
-### Still wrong, and not fixed here
+## `ironrdp-graphics` 0.9.0 — RFX luma is scaled by 32, not raw
 
-With this patch every region decodes, but the reconstruction is still not correct: the
-wallpaper comes out as flat saturated blue rather than the reference's smooth gradient.
-The DC term survives and the detail does not, which points at the inverse DWT / subband
-reconstruction rather than at quantisation. Ruled out already: the context-level and
-region-level `reduce_extrapolate` flags (both `true` here, and correctly propagated into
-`TileState`), and tile placement. The next step is a comparison against FreeRDP's
-`progressive.c`, which decodes this exact stream correctly.
+`reconstruct_to_rgba` converted YCbCr to RGB as `y + 128`, using the coefficient directly.
+RFX carries luma scaled by **32** with a DC offset of **4096** (= 128 * 32), so the
+conversion must add 4096 and shift the result right by 5.
+
+Without the scale, every value overflows. The DC term still lands in range, so a tile
+keeps its average colour — but every detail coefficient clips, so a photograph
+reconstructs as a flat block of that average. That is precisely how a Windows wallpaper
+rendered: a flat saturated field where the true image is a smooth gradient.
+
+The conversion is now `rfx_ycbcr_to_rgb`, extracted so it can be pinned by a test, and it
+mirrors FreeRDP's `general_yCbCrToRGB_16s8u_P3AC4R`
+(`libfreerdp/primitives/prim_colors.c`), including its 2^16 fixed-point chroma constants:
+
+```text
+Y = (y + 4096) << 16
+R = ((Cr * 1.402525 * 2^16 + Y) >> 16) >> 5
+G = ((Y - Cb * 0.343730 * 2^16 - Cr * 0.714401 * 2^16) >> 16) >> 5
+B = ((Cb * 1.769905 * 2^16 + Y) >> 16) >> 5
+```
+
+Measured against FreeRDP 3.27.1 on the same host, same wallpaper, captured back to back:
+
+| | before | after |
+|---|---|---|
+| mean absolute error vs reference | — (flat field) | **4.3 / 255** |
+| luma standard deviation | 59.1 (noise) | 21.4 (reference: 20.9) |
+| detail ratio vs reference | — | **1.03** |
+| pure black | 16.6% | **0.0%** (reference 0.0%) |
+
+Tests live in `src/gfx.rs` (`rfx_ycbcr_matches_hand_computed_values`,
+`a_bright_luma_is_scaled_rather_than_clipped`) with every expected value worked out by
+hand from the formula above. Reverting to `+ 128` turns a mid-tone into 255 and makes them
+fail, which is what the old code did to every pixel of a photograph.
 
 ### Keeping it honest
 

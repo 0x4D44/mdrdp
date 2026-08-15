@@ -828,21 +828,28 @@ impl TileState {
             crate::dwt::decode(&mut cr_buf, &mut dwt_temp);
         }
 
-        // YCbCr to RGBA conversion
+        // YCbCr to RGBA conversion.
+        //
+        // mdrdp patch: the DWT output is NOT in 8-bit range.
+        //
+        // RFX carries luma scaled by 32 with a DC offset of 4096 (= 128 * 32), so the
+        // conversion has to add 4096 and shift the result right by 5 — not add 128 and
+        // use the value directly. Without the scale every pixel overflows and clips, and
+        // the tile reconstructs as a flat, saturated block: the average colour survives
+        // (the DC term still lands in range) while all detail is clipped away. That is
+        // exactly what a photographic wallpaper looked like — a flat blue field where the
+        // real image is a smooth gradient.
+        //
+        // Matches FreeRDP's general_yCbCrToRGB_16s8u_P3AC4R (libfreerdp/primitives/
+        // prim_colors.c), which decodes this same stream correctly:
+        //     Y = (y + 4096) << 16;  R = ((CrR + Y) >> 16) >> 5;
+        // The chroma constants are the same 2^16 fixed-point values it uses.
         for i in 0..64 * 64 {
-            let y = i32::from(y_buf[i]) + 128;
-            let cb = i32::from(cb_buf[i]);
-            let cr = i32::from(cr_buf[i]);
-
-            // ITU-R BT.601 YCbCr to RGB conversion
-            let r = y + ((cr * 91881 + 32768) >> 16);
-            let g = y - ((cb * 22554 + cr * 46802 + 32768) >> 16);
-            let b = y + ((cb * 116130 + 32768) >> 16);
-
+            let (r, g, b) = rfx_ycbcr_to_rgb(y_buf[i], cb_buf[i], cr_buf[i]);
             let off = i * 4;
-            pixels[off] = clamp_u8(r);
-            pixels[off + 1] = clamp_u8(g);
-            pixels[off + 2] = clamp_u8(b);
+            pixels[off] = r;
+            pixels[off + 1] = g;
+            pixels[off + 2] = b;
             pixels[off + 3] = 0xFF;
         }
     }
@@ -952,6 +959,46 @@ pub struct DecodedTile {
     pub y_idx: u16,
     /// RGBA pixel data (64x64 = 16384 bytes).
     pub pixels: Vec<u8>,
+}
+
+/// Convert one RFX YCbCr triple to 8-bit RGB.
+///
+/// mdrdp patch: extracted so the arithmetic can be pinned by a test, and corrected.
+///
+/// RFX luma is carried scaled by 32 with a DC offset of 4096 (= 128 * 32), so the
+/// conversion adds 4096 and shifts the result right by 5. The previous code added 128 and
+/// used the value directly, which overflows for anything but near-zero coefficients: the
+/// DC term still landed in range while every detail coefficient clipped, so a photograph
+/// reconstructed as a flat, saturated block of its own average colour.
+///
+/// Mirrors FreeRDP's `general_yCbCrToRGB_16s8u_P3AC4R`
+/// (libfreerdp/primitives/prim_colors.c), which decodes this stream correctly:
+///
+/// ```text
+/// Y = (y + 4096) << 16
+/// R = ((Cr * 1.402525 * 2^16 + Y) >> 16) >> 5
+/// G = ((Y - Cb * 0.343730 * 2^16 - Cr * 0.714401 * 2^16) >> 16) >> 5
+/// B = ((Cb * 1.769905 * 2^16 + Y) >> 16) >> 5
+/// ```
+pub fn rfx_ycbcr_to_rgb(y: i16, cb: i16, cr: i16) -> (u8, u8, u8) {
+    /// 1.402525 * 65536
+    const CR_R: i32 = 91916;
+    /// 0.714401 * 65536
+    const CR_G: i32 = 46820;
+    /// 0.343730 * 65536
+    const CB_G: i32 = 22526;
+    /// 1.769905 * 65536
+    const CB_B: i32 = 115998;
+
+    let y = (i32::from(y) + 4096) << 16;
+    let cb = i32::from(cb);
+    let cr = i32::from(cr);
+
+    let r = ((cr * CR_R + y) >> 16) >> 5;
+    let g = ((y - cb * CB_G - cr * CR_G) >> 16) >> 5;
+    let b = ((cb * CB_B + y) >> 16) >> 5;
+
+    (clamp_u8(r), clamp_u8(g), clamp_u8(b))
 }
 
 /// Per-axis cap on surface dimensions, in pixels.

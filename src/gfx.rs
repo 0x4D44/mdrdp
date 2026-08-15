@@ -1224,6 +1224,53 @@ mod tests {
         assert_eq!(pixel_at(&store, 1, 0, 0), [0, 0, 0, 0]);
     }
 
+    /// The RFX YCbCr->RGB conversion, pinned against hand-computed values.
+    ///
+    /// Every expected value below is worked out by hand from FreeRDP's formula, not read
+    /// off our own implementation — an assertion checked against a constant the code also
+    /// derives can only ever agree with itself.
+    #[test]
+    fn rfx_ycbcr_matches_hand_computed_values() {
+        use ironrdp_graphics::progressive::rfx_ycbcr_to_rgb;
+
+        // Zero coefficients: Y = 4096 << 16, so every channel is 4096 >> 5 = 128.
+        assert_eq!(rfx_ycbcr_to_rgb(0, 0, 0), (128, 128, 128));
+
+        // cr = 1000, by hand:
+        //   R = ((1000*91916 + 4096*65536) >> 16) >> 5 = (360351456 >> 16) >> 5 = 5498 >> 5 = 171
+        //   G = ((268435456 - 1000*46820)   >> 16) >> 5 = (221615456 >> 16) >> 5 = 3381 >> 5 = 105
+        //   B = (268435456 >> 16) >> 5 = 128
+        assert_eq!(rfx_ycbcr_to_rgb(0, 0, 1000), (171, 105, 128));
+    }
+
+    /// The scale is what stops a bright coefficient clipping.
+    ///
+    /// This is the regression for the bug that made every photographic region render as a
+    /// flat block of its own average colour. Without the >> 5, a luma of 4000 becomes
+    /// 4000 + 128 = 4128 and clamps to 255 — as does almost every other coefficient, so
+    /// all detail collapses to the same saturated value. With it, 4000 is a mid-tone.
+    #[test]
+    fn a_bright_luma_is_scaled_rather_than_clipped() {
+        use ironrdp_graphics::progressive::rfx_ycbcr_to_rgb;
+
+        // (4000 + 4096) >> 5 = 8096 >> 5 = 253 — bright, but NOT saturated.
+        assert_eq!(rfx_ycbcr_to_rgb(4000, 0, 0), (253, 253, 253));
+
+        // A mid coefficient must land mid-range, not at the top of it.
+        let (r, _, _) = rfx_ycbcr_to_rgb(2000, 0, 0);
+        assert_eq!(r, 190, "(2000 + 4096) >> 5 = 190");
+        assert!(r < 255, "the old +128 form clipped this to 255");
+    }
+
+    #[test]
+    fn luma_at_the_bottom_of_the_range_is_black_not_wrapped() {
+        use ironrdp_graphics::progressive::rfx_ycbcr_to_rgb;
+        // Y = (-4096 + 4096) << 16 = 0.
+        assert_eq!(rfx_ycbcr_to_rgb(-4096, 0, 0), (0, 0, 0));
+        // Below that must clamp, never wrap to white.
+        assert_eq!(rfx_ycbcr_to_rgb(-8000, 0, 0), (0, 0, 0));
+    }
+
     #[test]
     fn a_progressive_tile_lands_at_its_grid_position() {
         // Grid indices, not pixels. Hand-computed: tile (0,0) is the origin, tile (2,3)
