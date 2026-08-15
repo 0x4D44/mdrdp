@@ -412,13 +412,16 @@ fn dwt_col(
 /// Truncate i32 to i16 (matches the `i32_to_i16_possible_truncation` pattern
 /// in the existing `dwt.rs`). DWT coefficients stay within i16 range for
 /// typical image data; truncation handles rare overflow gracefully.
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    reason = "intentional truncation matching existing DWT convention"
-)]
-fn t(value: i32) -> i16 {
-    value as i16
+/// Narrow a DWT intermediate to `i16`, SATURATING.
+///
+/// mdrdp patch: this truncated (`value as i16`), which wraps. An intermediate that leaves
+/// i16 range then flips sign instead of pinning to the rail — a bright pixel becomes a
+/// dark one — so a single hot coefficient produces speckle that spreads through the
+/// lifting steps into its neighbours. FreeRDP clamps at every one of these sites
+/// (`clampi16`, libfreerdp/codec/progressive.c), and the inverse DWT has ~21 of them.
+#[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "clamped above, so the cast cannot truncate")]
+pub fn t(value: i32) -> i16 {
+    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 // ---------------------------------------------------------------------------

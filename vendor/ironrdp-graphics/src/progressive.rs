@@ -1257,13 +1257,22 @@ impl ProgressiveDecoder {
             let quant_vals = &region.quant_vals;
             let prog_quant_vals = &region.quant_prog_vals;
 
+            // mdrdp patch: the DWT variant is a property of the REGION.
+            //
+            // MS-RDPRFX carries the reduce-extrapolate bit in the RFX_PROGRESSIVE_REGION
+            // flags as well as in the CONTEXT block, and FreeRDP reads the region's
+            // (`region->flags & RFX_DWT_REDUCE_EXTRAPOLATE`, progressive.c:959 and :1366).
+            // Applying the context's value to every region decodes a dissenting region
+            // with the wrong band layout AND the wrong inverse transform.
+            let region_reduce_extrapolate = region.uses_reduce_extrapolate();
+
             for tile_block in &region.tiles {
                 let tiles = decode_tile_block(
                     &mut context.surface,
                     tile_block,
                     quant_vals,
                     prog_quant_vals,
-                    use_reduce_extrapolate,
+                    region_reduce_extrapolate,
                 )?;
                 decoded_tiles.extend(tiles);
             }

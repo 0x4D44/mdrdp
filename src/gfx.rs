@@ -1224,6 +1224,34 @@ mod tests {
         assert_eq!(pixel_at(&store, 1, 0, 0), [0, 0, 0, 0]);
     }
 
+    /// The DWT's i32 -> i16 narrowing must SATURATE, not wrap.
+    ///
+    /// The inverse transform narrows an i32 intermediate to i16 at roughly twenty sites.
+    /// Truncating (`value as i16`) wraps, so a value one past the rail flips sign — a
+    /// bright sample becomes a dark one — and the lifting steps then spread that error
+    /// into its neighbours. FreeRDP clamps at every one of these sites (`clampi16`,
+    /// libfreerdp/codec/progressive.c:591).
+    #[test]
+    fn the_dwt_narrowing_saturates_rather_than_wrapping() {
+        use ironrdp_graphics::dwt_extrapolate::t;
+
+        // In range: unchanged.
+        assert_eq!(t(0), 0);
+        assert_eq!(t(1234), 1234);
+        assert_eq!(t(-1234), -1234);
+        assert_eq!(t(i32::from(i16::MAX)), i16::MAX);
+        assert_eq!(t(i32::from(i16::MIN)), i16::MIN);
+
+        // One past the rail is where wrapping and saturation disagree: `as i16` gives
+        // i16::MIN here, a full sign flip.
+        assert_eq!(t(i32::from(i16::MAX) + 1), i16::MAX);
+        assert_eq!(t(i32::from(i16::MIN) - 1), i16::MIN);
+
+        // Far out of range, both directions.
+        assert_eq!(t(1_000_000), i16::MAX);
+        assert_eq!(t(-1_000_000), i16::MIN);
+    }
+
     /// The SRL reader, hand-traced from FreeRDP's `progressive_rfx_srl_read`.
     ///
     /// For `data = 0b1000_1000` and num_bits = 3:

@@ -179,3 +179,19 @@ contributing instead of being scaled into irrelevance.
 Tests live in `src/gfx.rs` (`srl_*`), hand-traced from the C bit by bit. `SrlReader` is
 `pub` purely so they can reach it: the vendored crate is not a workspace member, so its
 own `#[cfg(test)]` module cannot be run by `cargo test`.
+
+## `ironrdp-graphics` 0.9.0 — two more, found by the same diff
+
+**The inverse DWT narrowed by truncation, not saturation.** `dwt_extrapolate::t` was
+`value as i16`, which wraps: an intermediate one past the rail flips sign, turning a
+bright sample into a dark one, and the lifting steps then spread that error into its
+neighbours. FreeRDP clamps at every one of these ~21 sites (`clampi16`, progressive.c:591).
+Pinned by `the_dwt_narrowing_saturates_rather_than_wrapping` in `src/gfx.rs`; reverting it
+turns 32768 into -32768.
+
+**The DWT variant is chosen per REGION.** MS-RDPRFX carries the reduce-extrapolate bit in
+the RFX_PROGRESSIVE_REGION flags as well as in CONTEXT, and FreeRDP reads the region's
+(`region->flags & RFX_DWT_REDUCE_EXTRAPOLATE`, progressive.c:959 and :1366). We applied
+the context's value to every region, so a dissenting region would decode with both the
+wrong band layout and the wrong inverse transform. Latent on this server — every region
+here agrees with the context — but wrong by construction.
