@@ -8,6 +8,7 @@
 
 use super::font;
 use crate::favourites::{Favourite, WindowSize};
+use zeroize::Zeroize;
 
 /// The values used for a newly created connection.
 pub const DEFAULT_PORT_TEXT: &str = "3389";
@@ -44,6 +45,7 @@ pub enum FormField {
     Host,
     Port,
     Username,
+    Password,
     SessionMode,
     Width,
     Height,
@@ -59,6 +61,7 @@ impl FormField {
                 | Self::Host
                 | Self::Port
                 | Self::Username
+                | Self::Password
                 | Self::Width
                 | Self::Height
         )
@@ -70,6 +73,7 @@ impl FormField {
             Self::Host => "Host",
             Self::Port => "Port",
             Self::Username => "Username",
+            Self::Password => "Password",
             Self::SessionMode => "Session mode",
             Self::Width => "Width",
             Self::Height => "Height",
@@ -119,6 +123,7 @@ pub enum FormError {
     BlankDisplayName,
     BlankHost,
     BlankUsername,
+    BlankPassword,
     InvalidPort,
     PortOutOfRange,
     InvalidWidth,
@@ -134,6 +139,7 @@ impl FormError {
             Self::BlankDisplayName => FormField::DisplayName,
             Self::BlankHost => FormField::Host,
             Self::BlankUsername => FormField::Username,
+            Self::BlankPassword => FormField::Password,
             Self::InvalidPort | Self::PortOutOfRange => FormField::Port,
             Self::InvalidWidth | Self::WidthOutOfRange => FormField::Width,
             Self::InvalidHeight | Self::HeightOutOfRange => FormField::Height,
@@ -147,6 +153,7 @@ impl std::fmt::Display for FormError {
             Self::BlankDisplayName => "display name must not be blank",
             Self::BlankHost => "host must not be blank",
             Self::BlankUsername => "username must not be blank",
+            Self::BlankPassword => "password must not be blank",
             Self::InvalidPort => "port must be a whole number from 1 to 65535",
             Self::PortOutOfRange => "port must be between 1 and 65535",
             Self::InvalidWidth => "width must be a whole number from 1 to 65535",
@@ -212,7 +219,7 @@ impl Default for FormLayout {
             x: 0,
             y: 0,
             width: 560,
-            height: 520,
+            height: 580,
             padding: 24,
             label_width: 128,
             field_height: 32,
@@ -253,9 +260,10 @@ impl FormLayout {
             FormField::Host => Some(1),
             FormField::Port => Some(2),
             FormField::Username => Some(3),
-            FormField::SessionMode => Some(4),
-            FormField::Width => Some(5),
-            FormField::Height => Some(6),
+            FormField::Password => Some(4),
+            FormField::SessionMode => Some(5),
+            FormField::Width => Some(6),
+            FormField::Height => Some(7),
             FormField::Save | FormField::Cancel => None,
         };
         if let Some(index) = index {
@@ -305,6 +313,7 @@ impl FormLayout {
             FormField::Host,
             FormField::Port,
             FormField::Username,
+            FormField::Password,
             FormField::SessionMode,
             FormField::Width,
             FormField::Height,
@@ -354,8 +363,50 @@ impl Default for FormColours {
     }
 }
 
+/// Mutable password text owned by the form.
+///
+/// This deliberately does not implement `Clone`; duplicating a password while copying a
+/// form would create another plaintext allocation with an independent lifetime. `Debug`
+/// is redacted for the same reason, and `Drop` wipes the allocation before releasing it.
+struct PasswordBuffer(String);
+
+impl PasswordBuffer {
+    fn new() -> Self {
+        Self(String::new())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn replace(&mut self, value: String) {
+        self.0.zeroize();
+        self.0 = value;
+    }
+
+    fn push(&mut self, ch: char) {
+        self.0.push(ch);
+    }
+
+    fn pop(&mut self) {
+        self.0.pop();
+    }
+}
+
+impl std::fmt::Debug for PasswordBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PasswordBuffer(<redacted>)")
+    }
+}
+
+impl Drop for PasswordBuffer {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// State and renderer for the launcher's New Connection screen.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NewConnectionForm {
     /// Display name shown in the favourites list.
     pub display_name: String,
@@ -363,8 +414,10 @@ pub struct NewConnectionForm {
     pub host: String,
     /// Port as editable text, defaulting to [`DEFAULT_PORT_TEXT`].
     pub port: String,
-    /// Account name used for RDP and, by default, the keychain account key.
+    /// Account name used for RDP and as part of the keychain account key.
     pub username: String,
+    /// Password entered for this session. It never enters a favourite or debug output.
+    password: PasswordBuffer,
     /// Fullscreen or explicit size choice.
     pub session_mode: SessionMode,
     /// Explicit width text. Ignored while [`SessionMode::Fullscreen`] is selected.
@@ -374,7 +427,7 @@ pub struct NewConnectionForm {
     /// The currently selected input or button.
     pub focus: FormField,
     /// Human-readable validation feedback, retained for the renderer after a failed
-    /// submit. It is never a credential and contains no password field.
+    /// submit. It contains no credential text.
     pub error: Option<String>,
     /// Geometry used by hit-testing and rendering.
     pub layout: FormLayout,
@@ -397,6 +450,7 @@ impl NewConnectionForm {
             host: String::new(),
             port: DEFAULT_PORT_TEXT.to_owned(),
             username: String::new(),
+            password: PasswordBuffer::new(),
             session_mode: SessionMode::Fullscreen,
             width: DEFAULT_WIDTH_TEXT.to_owned(),
             height: DEFAULT_HEIGHT_TEXT.to_owned(),
@@ -426,6 +480,11 @@ impl NewConnectionForm {
         self.mouse_focus(x, y)
     }
 
+    /// Borrow the entered password for the launcher-to-keychain hand-off.
+    pub(crate) fn password(&self) -> &str {
+        self.password.as_str()
+    }
+
     /// The current text or mode label for a field. Buttons have no value.
     pub fn value(&self, field: FormField) -> Option<&str> {
         match field {
@@ -433,6 +492,7 @@ impl NewConnectionForm {
             FormField::Host => Some(&self.host),
             FormField::Port => Some(&self.port),
             FormField::Username => Some(&self.username),
+            FormField::Password => Some("<redacted>"),
             FormField::SessionMode => Some(self.session_mode.label()),
             FormField::Width => Some(&self.width),
             FormField::Height => Some(&self.height),
@@ -451,6 +511,11 @@ impl NewConnectionForm {
             FormField::Username => &mut self.username,
             FormField::Width => &mut self.width,
             FormField::Height => &mut self.height,
+            FormField::Password => {
+                self.password.replace(value);
+                self.error = None;
+                return true;
+            }
             FormField::SessionMode | FormField::Save | FormField::Cancel => return false,
         };
         *target = value;
@@ -516,6 +581,10 @@ impl NewConnectionForm {
         if username.is_empty() {
             return self.reject(FormError::BlankUsername);
         }
+        let password = self.password.as_str();
+        if password.is_empty() {
+            return self.reject(FormError::BlankPassword);
+        }
         let port = match parse_port(&self.port, FormField::Port) {
             Ok(value) => value,
             Err(error) => return self.reject(error),
@@ -537,6 +606,7 @@ impl NewConnectionForm {
         };
 
         self.error = None;
+        let keychain_account = format!("{username}@{host}:{port}");
         Ok(Favourite {
             name: name.to_owned(),
             host: host.to_owned(),
@@ -544,7 +614,7 @@ impl NewConnectionForm {
             username: Some(username.to_owned()),
             domain: None,
             window_size,
-            keychain_account: Some(username.to_owned()),
+            keychain_account: Some(keychain_account),
         })
     }
 
@@ -577,6 +647,7 @@ impl NewConnectionForm {
             FormField::Host,
             FormField::Port,
             FormField::Username,
+            FormField::Password,
             FormField::SessionMode,
             FormField::Width,
             FormField::Height,
@@ -618,14 +689,14 @@ impl NewConnectionForm {
                 field.label(),
                 self.colours.label,
             );
-            let value = self.value(field).unwrap_or_default();
+            let value = self.rendered_value(field);
             draw_text_clipped(
                 buf,
                 buf_w,
                 buf_h,
                 rect.x + 8,
                 label_y,
-                value,
+                &value,
                 if disabled {
                     self.colours.muted_text
                 } else {
@@ -697,6 +768,7 @@ impl NewConnectionForm {
             FormField::Host,
             FormField::Port,
             FormField::Username,
+            FormField::Password,
             FormField::SessionMode,
         ];
         if self.session_mode == SessionMode::Explicit {
@@ -716,18 +788,24 @@ impl NewConnectionForm {
     }
 
     fn insert_character(&mut self, ch: char) {
-        let Some(target) = self.text_mut(self.focus) else {
+        if self.focus == FormField::Password {
+            self.password.push(ch);
+        } else if let Some(target) = self.text_mut(self.focus) {
+            target.push(ch);
+        } else {
             return;
-        };
-        target.push(ch);
+        }
         self.error = None;
     }
 
     fn backspace(&mut self) {
-        let Some(target) = self.text_mut(self.focus) else {
+        if self.focus == FormField::Password {
+            self.password.pop();
+        } else if let Some(target) = self.text_mut(self.focus) {
+            target.pop();
+        } else {
             return;
-        };
-        target.pop();
+        }
         self.error = None;
     }
 
@@ -739,8 +817,17 @@ impl NewConnectionForm {
             FormField::Username => Some(&mut self.username),
             FormField::Width => Some(&mut self.width),
             FormField::Height => Some(&mut self.height),
-            FormField::SessionMode | FormField::Save | FormField::Cancel => None,
+            FormField::Password | FormField::SessionMode | FormField::Save | FormField::Cancel => {
+                None
+            }
         }
+    }
+
+    fn rendered_value(&self, field: FormField) -> String {
+        if field == FormField::Password {
+            return "*".repeat(self.password.as_str().chars().count());
+        }
+        self.value(field).unwrap_or_default().to_owned()
     }
 
     fn reject<T>(&mut self, error: FormError) -> Result<T, FormError> {
@@ -855,6 +942,7 @@ mod tests {
         form.host = "rdp.example.test".to_owned();
         form.port = "3391".to_owned();
         form.username = "alice@example.test".to_owned();
+        form.set_value(FormField::Password, "s3cret");
         form
     }
 
@@ -866,6 +954,7 @@ mod tests {
         assert_eq!(form.width, "1920");
         assert_eq!(form.height, "1080");
         assert_eq!(form.focus, FormField::DisplayName);
+        assert_eq!(form.password(), "");
     }
 
     #[test]
@@ -879,7 +968,7 @@ mod tests {
         assert_eq!(favourite.domain, None);
         assert_eq!(
             favourite.keychain_account.as_deref(),
-            Some("alice@example.test")
+            Some("alice@example.test@rdp.example.test:3391")
         );
         assert_eq!(favourite.window_size, WindowSize::Fullscreen);
     }
@@ -946,13 +1035,15 @@ mod tests {
         assert_eq!(form.submit(), Err(FormError::BlankHost));
         form.host = "host".to_owned();
         assert_eq!(form.submit(), Err(FormError::BlankUsername));
+        form.username = "alice".to_owned();
+        assert_eq!(form.submit(), Err(FormError::BlankPassword));
     }
 
     #[test]
     fn tab_and_shift_tab_traverse_active_fields_and_buttons() {
         let mut form = NewConnectionForm::new();
         let mut seen = Vec::new();
-        for _ in 0..7 {
+        for _ in 0..8 {
             form.handle_key(KeyAction::Tab);
             seen.push(form.focus);
         }
@@ -962,6 +1053,7 @@ mod tests {
                 FormField::Host,
                 FormField::Port,
                 FormField::Username,
+                FormField::Password,
                 FormField::SessionMode,
                 FormField::Save,
                 FormField::Cancel,
@@ -987,6 +1079,11 @@ mod tests {
         form.handle_key(KeyAction::Character('d'));
         form.handle_key(KeyAction::Backspace);
         assert_eq!(form.host, "r");
+        form.focus = FormField::Password;
+        form.handle_key(KeyAction::Character('s'));
+        form.handle_key(KeyAction::Character('3'));
+        form.handle_key(KeyAction::Backspace);
+        assert_eq!(form.password(), "s");
         form.focus = FormField::SessionMode;
         form.handle_key(KeyAction::ToggleMode);
         assert_eq!(form.session_mode, SessionMode::Explicit);
@@ -1003,6 +1100,7 @@ mod tests {
             FormField::Host,
             FormField::Port,
             FormField::Username,
+            FormField::Password,
             FormField::SessionMode,
             FormField::Width,
             FormField::Height,
@@ -1050,6 +1148,32 @@ mod tests {
         let mut buf = vec![0u32; 12];
         form.draw(&mut buf, 560, 520);
         assert_eq!(buf.len(), 12);
+    }
+
+    #[test]
+    fn password_is_required_and_never_appears_in_public_values_or_debug() {
+        let mut form = filled_form();
+        let secret = form.password().to_owned();
+        assert_eq!(form.value(FormField::Password), Some("<redacted>"));
+        assert!(
+            !form
+                .value(FormField::Password)
+                .unwrap_or_default()
+                .contains(&secret)
+        );
+        let debug = format!("{form:?}");
+        assert!(!debug.contains(&secret));
+        form.set_value(FormField::Password, "");
+        assert_eq!(form.submit(), Err(FormError::BlankPassword));
+        assert_eq!(form.error_message(), Some("password must not be blank"));
+    }
+
+    #[test]
+    fn password_renderer_uses_one_mask_glyph_per_character() {
+        let mut form = NewConnectionForm::new();
+        form.set_value(FormField::Password, "sëcret");
+        assert_eq!(form.rendered_value(FormField::Password), "******");
+        assert!(!form.rendered_value(FormField::Password).contains("sëcret"));
     }
 
     #[test]

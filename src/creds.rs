@@ -76,6 +76,19 @@ pub fn lookup(account: &str) -> Result<Secret, CredsError> {
     }
 }
 
+/// Store or replace the password for `account` in the platform credential store.
+///
+/// The caller supplies a borrowed value so this function does not retain it. A temporary
+/// [`Secret`] copy is used to ensure the bytes this function owns are wiped on every exit,
+/// including a keyring error.
+pub fn store(account: &str, password: &str) -> Result<(), CredsError> {
+    let secret = secret_from_typed(password.to_owned())?;
+    let entry = keyring::Entry::new(SERVICE, account).map_err(CredsError::Keyring)?;
+    entry
+        .set_password(secret.expose())
+        .map_err(CredsError::Keyring)
+}
+
 /// Fetch the password, falling back to a terminal prompt when the keychain cannot
 /// answer.
 ///
@@ -192,6 +205,12 @@ mod tests {
         let err = secret_from_typed(String::new()).unwrap_err();
         assert!(matches!(err, CredsError::NoPassword(_)));
         assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn an_empty_password_is_rejected_before_keychain_access() {
+        let err = store("account-that-must-not-be-touched", "").unwrap_err();
+        assert!(matches!(err, CredsError::NoPassword(_)));
     }
 
     #[test]

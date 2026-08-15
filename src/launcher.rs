@@ -3,8 +3,9 @@
 //! The requirement this exists for is *"a favourite connect list on the main UI — so I
 //! just double click an icon and get connected to that server"*. So the launcher is what
 //! `mdrdp` shows when it is started with no arguments, and its entire job is to return one
-//! [`Favourite`] to the caller. It knows nothing about RDP: it opens no socket, holds no
-//! credential, and hands back a choice.
+//! [`Favourite`] to the caller. It opens no RDP socket. The one credential edge it owns is
+//! moving a new form's password straight into the OS store before the password-free
+//! favourite is published.
 //!
 //! It is a separate window from the session, opened and closed before the session window
 //! exists. Running both at once would mean two event loops on one thread, which winit does
@@ -26,7 +27,10 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{Window, WindowId};
 
-use crate::favourites::{Favourite, Favourites, FavouritesError};
+use crate::creds;
+#[cfg(test)]
+use crate::favourites::FavouritesError;
+use crate::favourites::{Favourite, Favourites};
 use crate::ui::font;
 use crate::ui::form::{
     FormAction, FormField, FormLayout, KeyAction as FormKeyAction, NewConnectionForm, Rect,
@@ -122,6 +126,7 @@ fn subtitle_for(f: &Favourite) -> String {
 /// Add and atomically persist one connection without changing the in-memory list unless
 /// the on-disk replace succeeds. A full disk or unwritable directory therefore leaves the
 /// launcher showing exactly the durable state it started with.
+#[cfg(test)]
 fn persist_new_connection(
     favourites: &mut Favourites,
     favourite: Favourite,
@@ -130,6 +135,32 @@ fn persist_new_connection(
     let mut updated = favourites.clone();
     updated.add(favourite)?;
     updated.save_to(path)?;
+    *favourites = updated;
+    Ok(())
+}
+
+/// Validate a new favourite, store its password in the OS credential store, then publish
+/// the password-free favourite atomically.
+///
+/// Validation happens before the credential write, so a duplicate or malformed favourite
+/// never touches the keychain. The in-memory list changes only after the durable TOML
+/// replace succeeds. A disk failure can leave a harmless credential entry ready for retry,
+/// but can never leave a visible favourite whose password was not stored.
+fn persist_new_connection_with_credential(
+    favourites: &mut Favourites,
+    favourite: Favourite,
+    password: &str,
+    path: &Path,
+    store: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut updated = favourites.clone();
+    updated.add(favourite.clone()).map_err(|e| e.to_string())?;
+    let account = favourite
+        .keychain_account
+        .as_deref()
+        .ok_or_else(|| "new connection has no credential-store account".to_owned())?;
+    store(account, password).map_err(|e| format!("could not store the password securely: {e}"))?;
+    updated.save_to(path).map_err(|e| e.to_string())?;
     *favourites = updated;
     Ok(())
 }
@@ -238,7 +269,20 @@ impl LauncherApp {
             FormAction::None => {}
             FormAction::Cancelled => self.cancel_form(),
             FormAction::Submitted(favourite) => {
-                match persist_new_connection(&mut self.favourites, favourite, &self.config_path) {
+                let password = self
+                    .form
+                    .as_ref()
+                    .map(NewConnectionForm::password)
+                    .unwrap_or_default();
+                match persist_new_connection_with_credential(
+                    &mut self.favourites,
+                    favourite,
+                    password,
+                    &self.config_path,
+                    |account, password| {
+                        creds::store(account, password).map_err(|error| error.to_string())
+                    },
+                ) {
                     Ok(()) => {
                         self.list.set_rows(rows_for(&self.favourites));
                         self.list.selected = self.favourites.len().checked_sub(1);
@@ -749,6 +793,38 @@ mod tests {
         assert!(matches!(error, FavouritesError::Io(_)));
         assert!(favourites.is_empty(), "memory must remain equal to disk");
         std::fs::remove_file(&blocker).expect("remove blocker");
+        std::fs::remove_dir(&dir).expect("remove launcher test directory");
+    }
+
+    #[test]
+    fn new_connection_stores_the_secret_out_of_band_and_never_in_toml() {
+        let dir = tempdir("credential");
+        let path = dir.join("favourites.toml");
+        let mut favourites = Favourites::default();
+        let mut candidate = Favourite::new("Quench", "quench");
+        candidate.username = Some("test-user".to_owned());
+        candidate.keychain_account = Some("test-user@quench:3389".to_owned());
+        let mut stored = false;
+
+        persist_new_connection_with_credential(
+            &mut favourites,
+            candidate,
+            "never-write-this-secret",
+            &path,
+            |account, password| {
+                assert_eq!(account, "test-user@quench:3389");
+                assert_eq!(password, "never-write-this-secret");
+                stored = true;
+                Ok(())
+            },
+        )
+        .expect("store and save");
+
+        assert!(stored);
+        let disk = std::fs::read_to_string(&path).expect("read persisted favourite");
+        assert!(!disk.contains("never-write-this-secret"));
+        assert_eq!(Favourites::load_from(&path).unwrap().len(), 1);
+        std::fs::remove_file(&path).expect("remove test favourites");
         std::fs::remove_dir(&dir).expect("remove launcher test directory");
     }
 

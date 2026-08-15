@@ -4,8 +4,9 @@
 //!     mdrdp <favourite>              connect to a saved favourite by name
 //!     mdrdp <host> --user <account>  connect to a host directly
 //!
-//! The password comes from the OS keychain (service `mdrdp`, account `<user>`); it is
-//! never an argument, an environment variable, or a log line.
+//! The password comes from the OS keychain (service `mdrdp`; direct CLI account `<user>`,
+//! GUI account `<user>@<host>:<port>`); it is never an argument, an environment variable,
+//! or a log line.
 //!
 //! With no target named, this process is the launcher: it shows the favourites picker
 //! and spawns a *child process* per chosen favourite rather than connecting itself. One
@@ -487,8 +488,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if s.undecoded_regions > 0 {
         eprintln!(
-            "  {} regions arrived in a codec we cannot yet decode (RFX Progressive); \
-             those parts of the desktop will be stale.",
+            "  {} regions arrived in a surface codec without a decoder; \
+             those parts of the desktop will be stale (see the codec list above).",
             s.undecoded_regions
         );
     }

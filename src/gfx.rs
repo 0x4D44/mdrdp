@@ -1,11 +1,9 @@
 //! The EGFX graphics handler: PDUs in, pixels in the [`SurfaceStore`] out.
 //!
-//! `ironrdp-egfx` stops one step short of a picture. It parses every PDU and tracks
-//! surfaces as *metadata*, but it stores no pixels, and it only decodes AVC420 and
-//! uncompressed bitmaps. `temper` sends neither: it sends **ClearCodec**, which
-//! `GraphicsPipelineClient::handle_wire_to_surface1` drops into its `_` arm and forwards
-//! to [`GraphicsPipelineHandler::on_unhandled_pdu`]. That callback is the seam this
-//! module plugs into.
+//! `ironrdp-egfx` parses the wire and tracks surfaces as metadata, but it does not keep the
+//! pixels presented by this client. Uncompressed updates are routed directly, ClearCodec
+//! reaches [`GraphicsPipelineHandler::on_unhandled_pdu`], and RFX Progressive reaches the
+//! dedicated `on_wire_to_surface2` callback. This module turns all three paths into pixels.
 //!
 //! So the division of labour is:
 //!
@@ -96,9 +94,8 @@ pub struct GfxStats {
     pub surface_errors: u64,
     /// PDUs that reached us with no handling of their own.
     pub unhandled_pdus: u64,
-    /// Regions that arrived in a codec we can observe but not yet decode — today, RFX
-    /// Progressive. Non-zero means part of the desktop is stale on screen, which is
-    /// exactly the kind of silent rot the visibility requirement exists to surface.
+    /// Regions that arrived in an observed surface codec for which this client has no
+    /// decoder. Non-zero means part of the desktop is stale on screen.
     pub undecoded_regions: u64,
     pub surfaces_created: u64,
     pub surfaces_deleted: u64,
@@ -139,10 +136,8 @@ impl GfxStatsHandle {
 /// Turns EGFX PDUs into pixels in a shared [`SurfaceStore`].
 /// Where to dump the bytes of a tile the decoder rejected.
 ///
-/// Off unless asked for. The ClearCodec decoder has never been run against a real
-/// server's output and its bands path has no upstream tests, so the first failure is
-/// likely to be the interesting one — and it is far cheaper to debug from the exact
-/// bytes than to try to provoke it again live.
+/// Off unless asked for. The exact rejected bytes make decoder faults reproducible without
+/// another live session.
 ///
 /// **This is session content.** Only the payload of tiles that FAILED to decode is
 /// written, never a successful frame, and only to a path the operator names.
@@ -234,9 +229,7 @@ impl GfxHandler {
 
     /// Dump the bytes of any tile the decoder rejects into `dir`.
     ///
-    /// Writes session content, so it is opt-in and capped. Worth turning on for a first
-    /// run against an unfamiliar server: the ClearCodec bands path has no upstream tests,
-    /// and a captured payload is far cheaper to debug than a failure you must reproduce.
+    /// Writes session content, so it is opt-in and capped.
     #[must_use]
     pub fn capturing_failures_to(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.capture = FailureCapture::to_dir(dir);
