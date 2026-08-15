@@ -151,9 +151,7 @@ pub fn pick(
     if let Some(e) = app.failure.take() {
         return Err(e);
     }
-    Ok(app
-        .chosen
-        .and_then(|i| favourites.iter().nth(i).cloned()))
+    Ok(app.chosen.and_then(|i| favourites.iter().nth(i).cloned()))
 }
 
 struct LauncherApp {
@@ -441,6 +439,56 @@ mod tests {
     #[test]
     fn an_empty_list_yields_no_rows_rather_than_a_placeholder_row() {
         assert!(rows_for(&Favourites::default()).is_empty());
+    }
+
+    /// Render the real list widget with real favourites and check something legible came
+    /// out, dumping it as ASCII art for a human to read under `--nocapture`.
+    ///
+    /// The launcher's own `redraw` needs a window, so it cannot be tested. This exercises
+    /// everything inside it that can be wrong silently — row layout, the font, the
+    /// selected-row highlight — without one.
+    #[test]
+    fn the_favourites_actually_render_into_a_buffer() {
+        let favourites = favourites();
+        let mut list = ListView::new(0, 0, 320, 120, 40);
+        list.set_rows(rows_for(&favourites));
+        list.selected = Some(0);
+
+        let (w, h) = (320usize, 120usize);
+        let mut buf = vec![0u32; w * h];
+        list.draw(&mut buf, w, h);
+
+        // "Ink" means a *text* pixel, not merely a non-black one: every row paints a
+        // background, so counting non-black pixels would report a full buffer even if not
+        // a single glyph were drawn.
+        let colours = list.colours;
+        let is_text = |p: u32| p == colours.text || p == colours.subtitle_text;
+
+        let lit = buf.iter().filter(|&&p| is_text(p)).count();
+        assert!(
+            lit > 200,
+            "only {lit} text pixels — the labels are not reaching the buffer"
+        );
+
+        // Two rows, so the second row's band must carry text too: a bug that draws only
+        // the first row would still pass a whole-buffer count.
+        let second_row_lit = (40..80)
+            .flat_map(|y| (0..w).map(move |x| y * w + x))
+            .filter(|&i| is_text(buf[i]))
+            .count();
+        assert!(
+            second_row_lit > 50,
+            "the second row drew no text ({second_row_lit} pixels)"
+        );
+
+        for y in 0..h {
+            let line: String = (0..w)
+                .map(|x| if is_text(buf[y * w + x]) { '#' } else { '.' })
+                .collect();
+            if line.contains('#') {
+                println!("{}", line.trim_end_matches('.'));
+            }
+        }
     }
 
     #[test]

@@ -17,8 +17,9 @@
 //! 5. Only then spawn the session thread, which needs the window's waker.
 
 use ironrdp::connector::DesktopSize;
+use mdrdp::audio::{AudioPlayback, AudioRing, AudioStatsHandle, RdpsndBackend};
 use mdrdp::clipboard::{ArboardClipboard, clipboard_channel};
-use mdrdp::connect::{ConnectOptions, establish};
+use mdrdp::connect::{Channels, ConnectOptions, establish};
 use mdrdp::favourites::{Favourite, Favourites, WindowSize};
 use mdrdp::gfx::GfxHandler;
 use mdrdp::input::InputEvent;
@@ -182,6 +183,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (clipboard_backend, clipboard_bridge) =
         clipboard_channel(Box::new(ArboardClipboard::new()));
 
+    // Audio. The output stream is opened here and deliberately kept on the main thread for
+    // the life of the window: `cpal::Stream` has thread affinity on some platforms, and
+    // dropping it stops playback. Only the ring and the counters cross to the session
+    // thread, and both are built to be shared.
+    //
+    // The ring is sized from a nominal 48kHz stereo rather than the device's real format,
+    // which is not known until the stream is open. That affects only how many milliseconds
+    // of slack it holds; the conversion below uses the device's actual format.
+    let audio_stats = AudioStatsHandle::new();
+    let audio_ring = AudioRing::for_device(48_000, 2, audio_stats.clone());
+    let playback = AudioPlayback::start(audio_ring.clone(), audio_stats.clone());
+    let rdpsnd = if playback.is_active() {
+        let fmt = playback.format();
+        eprintln!("audio: {} Hz, {} channel(s)", fmt.sample_rate, fmt.channels);
+        Some(
+            Box::new(RdpsndBackend::new(audio_ring, audio_stats.clone(), fmt))
+                as Box<dyn ironrdp_rdpsnd::client::RdpsndClientHandler>,
+        )
+    } else {
+        // Joining the channel and then discarding every wave would give the server every
+        // reason to believe audio works. Better not to claim it.
+        eprintln!("audio: no output device available; continuing without sound");
+        None
+    };
+
     let opts = ConnectOptions {
         host: target.host.clone(),
         port: target.port,
@@ -199,8 +225,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let established = establish(
         &opts,
         &secret,
-        Some(Box::new(handler)),
-        Some(Box::new(clipboard_backend)),
+        Channels {
+            gfx: Some(Box::new(handler)),
+            cliprdr: Some(Box::new(clipboard_backend)),
+            rdpsnd,
+        },
     )?;
     let desktop = established.desktop_size;
     eprintln!(
@@ -252,6 +281,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let window_result = window.run();
 
+    // Stop playback before tearing the session down, so the device is released even if the
+    // disconnect below takes a moment. Explicit because the drop is otherwise invisible,
+    // and an audio stream outliving its session is a confusing thing to debug.
+    drop(playback);
+
     // Window gone: disconnect properly rather than dropping the socket, which would
     // leave a session alive on the host.
     let end = session.shutdown();
@@ -274,6 +308,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cache.evictions
         ),
         _ => eprintln!("  bitmap cache: never used by this server"),
+    }
+    let audio = audio_stats.snapshot();
+    if audio.packets_received > 0 {
+        eprintln!(
+            "  audio: {} packets, {} dropped to overrun, {} underruns",
+            audio.packets_received, audio.overruns, audio.underruns
+        );
     }
     if s.decode_errors > 0 && capture.is_none() {
         eprintln!(

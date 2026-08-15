@@ -280,6 +280,23 @@ pub struct Established {
     pub probe: Option<EgfxProbe>,
 }
 
+/// Optional channel handlers to negotiate with the server.
+///
+/// Bundled because every one of these must be registered *before* the MCS channel join —
+/// none can be added to a live session — so they are all decided at the same moment, and
+/// a growing positional parameter list for them reads badly at every call site.
+#[derive(Default)]
+pub struct Channels {
+    /// EGFX, over the dynamic virtual channel.
+    pub gfx: Option<Box<dyn ironrdp_egfx::client::GraphicsPipelineHandler>>,
+    /// Clipboard sharing.
+    pub cliprdr: Option<Box<dyn ironrdp_cliprdr::backend::CliprdrBackend>>,
+    /// Remote audio playback. Left `None` when no output device could be opened: a client
+    /// that joins the channel and then discards every wave produces silence that looks
+    /// exactly like working audio.
+    pub rdpsnd: Option<Box<dyn ironrdp_rdpsnd::client::RdpsndClientHandler>>,
+}
+
 /// Connect and hand back the live session.
 ///
 /// The caller owns the disconnect from here on — see `send_shutdown`. Dropping the
@@ -287,9 +304,13 @@ pub struct Established {
 pub fn establish(
     opts: &ConnectOptions,
     secret: &Secret,
-    handler: Option<Box<dyn ironrdp_egfx::client::GraphicsPipelineHandler>>,
-    cliprdr: Option<Box<dyn ironrdp_cliprdr::backend::CliprdrBackend>>,
+    channels: Channels,
 ) -> Result<Established, ConnectError> {
+    let Channels {
+        gfx: handler,
+        cliprdr,
+        rdpsnd,
+    } = channels;
     let mut trace = Trace::new();
     let target = format!("{}:{}", opts.host, opts.port);
 
@@ -369,6 +390,11 @@ pub fn establish(
     // do clipboard rather than one that accepts and then ignores it.
     if let Some(backend) = cliprdr {
         connector = connector.with_static_channel(ironrdp_cliprdr::CliprdrClient::new(backend));
+    }
+
+    // RDPSND is static for the same reason as CLIPRDR: registered now or never.
+    if let Some(backend) = rdpsnd {
+        connector = connector.with_static_channel(ironrdp_rdpsnd::client::Rdpsnd::new(backend));
     }
 
     // --- X.224 security negotiation --------------------------------------------
@@ -508,7 +534,7 @@ pub fn establish(
 
 /// Probe form: connect, optionally observe EGFX for a while, then disconnect cleanly.
 pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, ConnectError> {
-    let mut established = establish(opts, secret, None, None)?;
+    let mut established = establish(opts, secret, Channels::default())?;
     let mut report = established.report;
 
     if let Some(budget) = opts.observe_egfx {
