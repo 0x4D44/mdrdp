@@ -120,7 +120,8 @@ leave a plausible-looking partial report.
 
 Verified against real Windows hosts: NLA/TLS connect, ClearCodec/RFX Progressive and
 uncompressed graphics, the bitmap cache, fixed-resolution windows, graceful disconnect,
-desktop input, two-way clipboard transfer, and CLIPRDR/RDPSND/DRDYNVC channel joins. A
+desktop input, two-way clipboard transfer, real audio playback, and
+CLIPRDR/RDPSND/RDPDR/DRDYNVC channel joins. A
 35-second optimized Quench run at 1920x1080
 ended gracefully with zero decode, undecoded-region, surface, cache-miss, or unhandled-PDU
 errors. All 1,021 bitmap-cache lookups hit. The redacted report measured 0.57% average CPU
@@ -136,9 +137,10 @@ comparison on the same host measured mean absolute error 4.3/255 with a detail r
 
 Still unproven, and worth saying plainly:
 
-- **No live audio has been heard yet.** Quench's Windows Audio service runs and its playback
-  redirection policy is unconfigured, but RDPSND has not negotiated a format with this
-  client. Format conversion, buffering, and fail-safe device loss are covered by tests.
+- **Audio has live playback evidence, but not a long soak.** Quench sent 222 packets at
+  44.1 kHz stereo through `AUDIO_PLAYBACK_DVC`. The client converted them to a 48 kHz mono
+  loopback capture measured at -25.3 dB mean and -9.5 dB peak. Unit tests cover all four
+  44.1/48 kHz mono/stereo wire formats, buffering, resampling, and fail-safe device loss.
 - **Clipboard soak and induced live timeout recovery remain unproven.** Quench round trips
   Unicode text, empty text, a 1 MiB payload, rapid changes, and a 1920x1080 image in both
   directions. Deterministic protocol tests cover timeout recovery.

@@ -1,5 +1,20 @@
 # Vendored dependencies
 
+## `ironrdp-rdpsnd` 0.9.0 — stable negotiated format order
+
+Published IronRDP intersects the server and client format sets through a randomly seeded
+`HashSet`, then gives the playback handler only the server's numeric `format_no`. That
+number indexes the shuffled client list sent on the wire, so a handler advertising more
+than one playable format cannot know which rate and channel count the server selected.
+
+The vendored client preserves the handler's advertised order while filtering it against
+the server offer. It also calls the source-compatible `set_negotiated_formats` callback
+with the exact list before sending it. mdrdp resolves every Wave2 index only against that
+reported list and drops an out-of-range index instead of guessing.
+
+Remove this patch when a released `ironrdp-rdpsnd` both preserves the negotiated wire
+order and exposes that exact list to `RdpsndClientHandler`.
+
 ## `ironrdp-connector` 0.10.0 — one line added
 
 An unmodified copy of the published crate plus a **single flag**, in

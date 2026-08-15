@@ -9,6 +9,18 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- Windows gates AUDIO_PLAYBACK_DVC on RDPDR presence; attach a no-device backend (`connect::establish`).
+  Quench suppressed every audio DVC for mdrdp and the current upstream IronRDP viewer,
+  despite both advertising playback and joining static RDPSND. Adding protocol-correct
+  RDPDR with a no-op backend made Windows offer the playback DVC immediately; no drive,
+  printer, port, or smart-card capability was advertised.
+
+- IronRDP one-shot DVC handlers cannot survive Windows close/reopen; use a listener (`audio::DynamicRdpsndListener`).
+  Windows opens AUDIO_PLAYBACK_DVC during setup, closes it, then opens a fresh instance.
+  `attach_dynamic_channel` consumes its processor on the first create, so the second create
+  gets NO_LISTENER. A repeatable `DvcChannelListener` must create a fresh RDPSND state
+  machine over the shared playback ring for every open.
+
 - CLIPRDR polling can beat Monitor Ready; defer and serialize FormatList PDUs (`clipboard::advertise`).
   The local 250 ms poll started before the server's initialization request and sent a
   FormatList that Windows silently ignored. Later rapid changes could also race multiple

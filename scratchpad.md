@@ -2,6 +2,16 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
+- [ ] 2026-08-15: the mandated Windows cross-check no longer runs on this Mac.
+  `cargo check --target x86_64-pc-windows-msvc --all-targets` dies in `ring`'s build
+  script (`cc` targeting windows-msvc cannot find `assert.h`), so the gate
+  `~/language/mdrdp/CLAUDE.md` requires after any platform-facing change is
+  unavailable, not merely unrun. The failure is in a dependency's C build, independent of
+  our own `cfg` usage, so the check cannot currently catch the drift it exists to catch.
+  Fixing it means supplying the MSVC CRT/SDK headers (e.g. `xwin`) or moving the rustls
+  provider off `ring`. Until then say "Windows check UNAVAILABLE", never "clean" — and
+  `~/language/mdrdp/CLAUDE.md`'s "Verified clean as of 2026-08-14" line is stale.
+
 - [ ] 2026-08-15: two nearest-rank percentile implementations —
   `~/language/mdrdp/src/probe/stats.rs:30` (`percentile`, `&[u64]`, f64 fraction) and
   `~/language/mdrdp/src/stats.rs:127` (`nearest_rank`, `&[u32]`, u32 percent).

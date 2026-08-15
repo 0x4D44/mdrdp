@@ -16,6 +16,7 @@ ironrdp-connector = "0.10.0"
 ironrdp-dvc = "0.8.0"
 ironrdp-egfx = "0.3.0"
 ironrdp-graphics = "0.9.0"
+ironrdp-rdpdr = "0.7.0"
 ironrdp-rdpsnd = "0.9.0"
 ironrdp-session = "0.11.0"
 ironrdp-svc = "0.8.0"
@@ -43,3 +44,5 @@ ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
 ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 # See vendor/README.md — ClearCodec short-V-bar yOn/yOff were transposed.
 ironrdp-pdu = { path = "vendor/ironrdp-pdu" }
+# Preserve the client format order and report the exact negotiated list to playback.
+ironrdp-rdpsnd = { path = "vendor/ironrdp-rdpsnd" }

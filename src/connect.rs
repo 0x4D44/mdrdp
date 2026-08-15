@@ -8,6 +8,7 @@
 //! would manufacture exactly the material we are forbidden to keep. Stage name, outcome,
 //! elapsed time and negotiated parameters are the evidence; bytes are not.
 
+use crate::audio::DynamicRdpsndListener;
 use crate::creds::Secret;
 use crate::egfx::{EgfxObservations, EgfxProbe};
 use crate::stagelog::{StageEvent, StageLog};
@@ -313,10 +314,33 @@ pub struct Channels {
     pub gfx: Option<Box<dyn ironrdp_egfx::client::GraphicsPipelineHandler>>,
     /// Clipboard sharing.
     pub cliprdr: Option<Box<dyn ironrdp_cliprdr::backend::CliprdrBackend>>,
-    /// Remote audio playback. Left `None` when no output device could be opened: a client
-    /// that joins the channel and then discards every wave produces silence that looks
-    /// exactly like working audio.
-    pub rdpsnd: Option<Box<dyn ironrdp_rdpsnd::client::RdpsndClientHandler>>,
+    /// Remote audio playback over both classic static RDPSND and the modern
+    /// `AUDIO_PLAYBACK_DVC` transport. Left `None` when no output device could be opened:
+    /// a client that joins either channel and discards every wave produces silence that
+    /// looks exactly like working audio.
+    pub rdpsnd: Option<RdpsndHandlers>,
+}
+
+/// Two handlers backed by the same playback ring, one per RDPSND transport.
+///
+/// Current Windows hosts prefer `AUDIO_PLAYBACK_DVC`; older hosts may only offer the
+/// classic static channel. The protocol PDUs are identical, but each transport owns an
+/// independent IronRDP state machine.
+pub struct RdpsndHandlers {
+    static_channel: Box<dyn ironrdp_rdpsnd::client::RdpsndClientHandler>,
+    dynamic_channel: DynamicRdpsndListener,
+}
+
+impl RdpsndHandlers {
+    pub fn new(
+        static_channel: Box<dyn ironrdp_rdpsnd::client::RdpsndClientHandler>,
+        dynamic_channel: DynamicRdpsndListener,
+    ) -> Self {
+        Self {
+            static_channel,
+            dynamic_channel,
+        }
+    }
 }
 
 /// Connect and hand back the live session.
@@ -395,8 +419,6 @@ pub fn establish(
     let mut connector = ClientConnector::new(config, client_addr);
 
     // The dynamic virtual channel must be registered BEFORE connecting: it is announced
-    // in the MCS Connect Initial GCC network block, so it cannot be added afterwards.
-    // The dynamic virtual channel must be registered BEFORE connecting: it is announced
     // in the MCS Connect Initial GCC network block and cannot be added afterwards.
     let probe = if handler.is_none() {
         opts.observe_egfx.map(|_| EgfxProbe::new())
@@ -409,10 +431,12 @@ pub fn establish(
             (None, Some(p)) => Some(Box::new(p)),
             (None, None) => None,
         };
+    let mut drdynvc = ironrdp_dvc::DrdynvcClient::new();
+    let mut has_dynamic_channel = false;
     if let Some(h) = gfx_handler {
         let graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(h, None);
-        connector = connector
-            .with_static_channel(ironrdp_dvc::DrdynvcClient::new().with_dynamic_channel(graphics));
+        drdynvc.attach_dynamic_channel(graphics);
+        has_dynamic_channel = true;
     }
 
     // CLIPRDR is a *static* channel, so it must be registered before the MCS channel
@@ -423,9 +447,23 @@ pub fn establish(
         connector = connector.with_static_channel(ironrdp_cliprdr::CliprdrClient::new(backend));
     }
 
-    // RDPSND is static for the same reason as CLIPRDR: registered now or never.
-    if let Some(backend) = rdpsnd {
-        connector = connector.with_static_channel(ironrdp_rdpsnd::client::Rdpsnd::new(backend));
+    // Offer both transports. Windows 11 opens AUDIO_PLAYBACK_DVC; the static channel is
+    // retained as a compatibility fallback for older hosts.
+    if let Some(handlers) = rdpsnd {
+        drdynvc.attach_listener(handlers.dynamic_channel);
+        has_dynamic_channel = true;
+        connector = connector
+            .with_static_channel(ironrdp_rdpsnd::client::Rdpsnd::new(handlers.static_channel));
+        // Windows gates AUDIO_PLAYBACK_DVC on the presence of RDPDR, even when the client
+        // redirects no devices. A no-op backend completes the companion-channel handshake
+        // without advertising drives, printers, ports, or smart cards.
+        connector = connector.with_static_channel(ironrdp_rdpdr::Rdpdr::new(
+            Box::new(ironrdp_rdpdr::NoopRdpdrBackend),
+            "mdrdp".to_owned(),
+        ));
+    }
+    if has_dynamic_channel {
+        connector = connector.with_static_channel(drdynvc);
     }
 
     // --- X.224 security negotiation --------------------------------------------

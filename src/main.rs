@@ -22,9 +22,11 @@
 //! 4. Only then spawn the session thread, which needs the window's waker.
 
 use ironrdp::connector::DesktopSize;
-use mdrdp::audio::{AudioPlayback, AudioRing, AudioStatsHandle, RdpsndBackend};
+use mdrdp::audio::{
+    AudioPlayback, AudioRing, AudioStatsHandle, DynamicRdpsndListener, RdpsndBackend,
+};
 use mdrdp::clipboard::{ArboardClipboard, clipboard_channel};
-use mdrdp::connect::{Channels, ConnectOptions, establish};
+use mdrdp::connect::{Channels, ConnectOptions, RdpsndHandlers, establish};
 use mdrdp::favourites::{Favourite, Favourites, WindowSize};
 use mdrdp::gfx::{GfxHandler, GfxStatsHandle};
 use mdrdp::input::InputEvent;
@@ -314,10 +316,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rdpsnd = if playback.is_active() {
         let fmt = playback.format();
         eprintln!("audio: {} Hz, {} channel(s)", fmt.sample_rate, fmt.channels);
-        Some(
-            Box::new(RdpsndBackend::new(audio_ring, audio_stats.clone(), fmt))
-                as Box<dyn ironrdp_rdpsnd::client::RdpsndClientHandler>,
-        )
+        let static_channel = Box::new(RdpsndBackend::new(
+            audio_ring.clone(),
+            audio_stats.clone(),
+            fmt,
+        ));
+        let dynamic_channel = DynamicRdpsndListener::new(audio_ring, audio_stats.clone(), fmt);
+        Some(RdpsndHandlers::new(static_channel, dynamic_channel))
     } else {
         // Joining the channel and then discarding every wave would give the server every
         // reason to believe audio works. Better not to claim it.

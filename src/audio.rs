@@ -29,31 +29,16 @@
 //! * [`AudioPlayback`] — owns the cpal `Stream`. Its callback does one thing: pull from
 //!   the ring into the device's buffer.
 //!
-//! ## `format_no` resolution: why we only ever advertise one format
+//! ## `format_no` resolution
 //!
 //! [`Wave2Pdu::format_no`] indexes into the *Client Audio Formats* array — the list
-//! actually sent to the server after negotiation. That list is built by
-//! `Rdpsnd::client_formats` (upstream, in `ironrdp_rdpsnd::client`, not something this
-//! module can change) as a `HashSet::intersection` of what [`RdpsndBackend::get_formats`]
-//! returns and the server's offer, collected into a `Vec` in `HashSet` iteration order —
-//! order that is not insertion order and is not stable across runs (`HashSet`'s default
-//! hasher is randomly seeded per process). `RdpsndClientHandler` (the full trait: `get_flags`,
-//! `get_formats`, `wave`, `set_volume`, `set_pitch`, `close`) gives this module no callback
-//! that reports the negotiated list, its order, or even the server's offer — `wave()`
-//! receives a bare `usize`. There is therefore no honest way, from this side of the trait,
-//! to resolve an index into a list of two or more candidate entries; doing so would be a
-//! guess dressed up as a lookup, and a previous version of this module did exactly that by
-//! indexing [`candidate_formats`] — silently playing the wrong rate and channel count for
-//! an entire session whenever the guess was wrong.
-//!
-//! The fix: [`RdpsndBackend::get_formats`] returns **at most one** entry (see
-//! [`negotiated_format`]). `HashSet::intersection` of a singleton set can itself contain at
-//! most one element, so if the server accepts our one format, `format_no` can only ever
-//! legitimately be `0` — there is no ordering left to get wrong. If the server does not
-//! offer that format, the intersection is empty and the server has nothing to send us: a
-//! real capability gap, not a resolution bug, and it fails safe (no audio) rather than
-//! unsafe (audio at the wrong rate). Any `format_no` other than `0` is therefore refused
-//! and the packet dropped — see `wave()`.
+//! actually sent to the server after negotiation. Published IronRDP 0.9 built that list
+//! through a randomly ordered `HashSet::intersection` and never reported the result to the
+//! handler, so advertising multiple formats made the index unknowable. The vendored
+//! `ironrdp-rdpsnd` preserves the handler's candidate order and calls
+//! [`RdpsndClientHandler::set_negotiated_formats`] with the exact vector it sends.
+//! [`RdpsndBackend`] retains that vector separately from its four stable capabilities and
+//! resolves every wave against it. An out-of-range index is dropped rather than guessed.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -62,8 +47,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ironrdp::core::{Encode, EncodeResult, WriteCursor, ensure_size, impl_as_any};
+use ironrdp::pdu::{PduResult, encode_err};
+use ironrdp_dvc::{DvcChannelListener, DvcEncode, DvcMessage, DvcProcessor, DynamicChannelId};
 use ironrdp_rdpsnd::client::RdpsndClientHandler;
 use ironrdp_rdpsnd::pdu::{AudioFormat, PitchPdu, VolumePdu, WaveFormat};
+use ironrdp_svc::SvcProcessor as _;
 use serde::Serialize;
 use tracing::{debug, error};
 
@@ -153,27 +142,6 @@ pub fn choose_format(offered: &[AudioFormat]) -> Result<AudioFormat, NoUsableFor
         .cloned()
         .max_by_key(|f| (f.n_samples_per_sec, f.n_channels))
         .ok_or(NoUsableFormat)
-}
-
-/// The single format [`RdpsndBackend`] advertises via `get_formats()` — see the module
-/// docs for why exactly one entry, never [`candidate_formats`]'s full four, is the only
-/// size this can safely be.
-///
-/// Prefers the device's own native rate/channel count when that already happens to be one
-/// of [`SUPPORTED_SAMPLE_RATES`] x [`SUPPORTED_CHANNELS`] (no resampling needed at all);
-/// falls back to 48000Hz at the device's channel count — a rate the vast majority of RDP
-/// hosts offer — when the device's native rate is something else entirely (e.g. a
-/// professional interface running at 96000Hz). `device.n_channels` is always 1 or 2 by the
-/// time this is called: [`AudioPlayback::start`]'s success path rejects any device
-/// reporting otherwise, and its failure-fallback path hardcodes 48000/stereo — both are
-/// already playable, so the fallback branch here is always reachable and always valid.
-fn negotiated_format(device: AudioFormatSummary) -> AudioFormat {
-    let native = pcm_format(device.sample_rate, device.channels);
-    if is_playable(&native) {
-        native
-    } else {
-        pcm_format(48_000, device.channels)
-    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -551,10 +519,11 @@ impl AudioRing {
 /// server gets a dropped packet and a counter, never a crash or a stall.
 #[derive(Debug)]
 pub struct RdpsndBackend {
-    /// What we advertise via `get_formats()` — and, because it holds at most one entry
-    /// (see [`negotiated_format`]), also the only list `wave()` can honestly resolve
-    /// `format_no` against. See the module docs for why a single entry is required.
-    formats: Vec<AudioFormat>,
+    /// Stable capability order advertised on every server-format announcement.
+    candidates: Vec<AudioFormat>,
+    /// Exact intersection sent in the latest Client Audio Formats PDU. `Wave2.format_no`
+    /// indexes this vector, never the broader candidate list.
+    negotiated_formats: Vec<AudioFormat>,
     ring: AudioRing,
     stats: AudioStatsHandle,
     device: AudioFormatSummary,
@@ -566,18 +535,16 @@ impl RdpsndBackend {
     /// to target instead of a guess.
     pub fn new(ring: AudioRing, stats: AudioStatsHandle, device: AudioFormatSummary) -> Self {
         Self {
-            formats: vec![negotiated_format(device)],
+            candidates: candidate_formats(),
+            negotiated_formats: Vec::new(),
             ring,
             stats,
             device,
         }
     }
 
-    /// Test-only escape hatch: construct with an explicit advertised list, bypassing the
-    /// singleton [`negotiated_format`] derivation `new()` uses. Exists so tests can pin
-    /// `wave()`'s index resolution against a list that is deliberately *not*
-    /// [`candidate_formats`] and *not* what `new()` would derive — proving resolution reads
-    /// whatever list this struct actually holds, not a hardcoded fallback.
+    /// Test-only escape hatch: construct with an explicit already-negotiated list. Exists
+    /// so tests can pin `wave()` index resolution independently of the transport callback.
     #[cfg(test)]
     fn with_formats(
         formats: Vec<AudioFormat>,
@@ -586,7 +553,8 @@ impl RdpsndBackend {
         device: AudioFormatSummary,
     ) -> Self {
         Self {
-            formats,
+            candidates: formats.clone(),
+            negotiated_formats: formats,
             ring,
             stats,
             device,
@@ -596,7 +564,12 @@ impl RdpsndBackend {
 
 impl RdpsndClientHandler for RdpsndBackend {
     fn get_formats(&self) -> &[AudioFormat] {
-        &self.formats
+        &self.candidates
+    }
+
+    fn set_negotiated_formats(&mut self, formats: &[AudioFormat]) {
+        self.negotiated_formats.clear();
+        self.negotiated_formats.extend_from_slice(formats);
     }
 
     fn wave(&mut self, format_no: usize, _ts: u32, data: Cow<'_, [u8]>) {
@@ -610,17 +583,17 @@ impl RdpsndClientHandler for RdpsndBackend {
             return;
         }
 
-        let Some(fmt) = self.formats.get(format_no).filter(|f| is_playable(f)) else {
-            // `self.formats` holds at most one entry (see `negotiated_format`), so any
-            // `format_no != 0` is unresolvable by construction — not a guess we decline to
-            // make, a genuine "the server referenced something we never sent". Silence is
-            // the only honest response: playing *something* here would mean picking an
-            // arbitrary sample rate/channel count, exactly the bug this module used to
-            // have. Logged at debug, not warn — a single stray index is not actionable and
-            // must not spam per-packet.
+        let Some(fmt) = self
+            .negotiated_formats
+            .get(format_no)
+            .filter(|f| is_playable(f))
+        else {
+            // A Wave2 index outside the exact list sent on the wire is a protocol fault.
+            // Silence is the only honest response; guessing a candidate would play at the
+            // wrong rate or channel count. Logged at debug to avoid per-packet spam.
             debug!(
                 format_no,
-                formats_len = self.formats.len(),
+                formats_len = self.negotiated_formats.len(),
                 "rdpsnd: wave for unresolvable format index; dropping packet"
             );
             return;
@@ -670,6 +643,121 @@ impl RdpsndClientHandler for RdpsndBackend {
         // `RingBuf` has no targeted clear that isn't itself a lock-and-drain.
         let drained = self.ring.drain_len();
         debug!(drained, "rdpsnd: stream closed");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Modern dynamic RDPSND transport
+// ---------------------------------------------------------------------------------------
+
+/// Carries the existing IronRDP RDPSND state machine over Windows' modern dynamic
+/// `AUDIO_PLAYBACK_DVC` transport.
+///
+/// MS-RDPEA uses the same unframed audio PDUs on both transports. IronRDP 0.9 exposes its
+/// client only as a static-channel processor, so this adapter changes framing only: every
+/// received DVC payload goes through [`ironrdp_rdpsnd::client::Rdpsnd`] unchanged, and its
+/// replies are re-encoded without an SVC header for DRDYNVC to frame.
+#[derive(Debug)]
+pub struct DynamicRdpsnd {
+    inner: Option<ironrdp_rdpsnd::client::Rdpsnd>,
+}
+
+/// Creates a fresh RDPSND state machine each time Windows reopens its playback DVC.
+///
+/// `DrdynvcClient::attach_dynamic_channel` is intentionally single-use. Windows closes
+/// `AUDIO_PLAYBACK_DVC` during desktop setup and opens it again, so audio must use the
+/// repeatable listener API instead.
+#[derive(Debug)]
+pub struct DynamicRdpsndListener {
+    ring: AudioRing,
+    stats: AudioStatsHandle,
+    device: AudioFormatSummary,
+}
+
+impl DynamicRdpsndListener {
+    pub fn new(ring: AudioRing, stats: AudioStatsHandle, device: AudioFormatSummary) -> Self {
+        Self {
+            ring,
+            stats,
+            device,
+        }
+    }
+}
+
+impl DvcChannelListener for DynamicRdpsndListener {
+    fn channel_name(&self) -> &str {
+        DynamicRdpsnd::CHANNEL_NAME
+    }
+
+    fn create(&mut self, _channel_id: DynamicChannelId) -> Option<Box<dyn DvcProcessor>> {
+        let backend = RdpsndBackend::new(self.ring.clone(), self.stats.clone(), self.device);
+        Some(Box::new(DynamicRdpsnd::new(Box::new(backend))))
+    }
+}
+
+impl DynamicRdpsnd {
+    pub const CHANNEL_NAME: &'static str = "AUDIO_PLAYBACK_DVC";
+
+    pub fn new(handler: Box<dyn RdpsndClientHandler>) -> Self {
+        Self {
+            inner: Some(ironrdp_rdpsnd::client::Rdpsnd::new(handler)),
+        }
+    }
+}
+
+impl_as_any!(DynamicRdpsnd);
+
+#[derive(Debug)]
+struct UnframedRdpsndPdu(Vec<u8>);
+
+impl Encode for UnframedRdpsndPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.0.len());
+        dst.write_slice(&self.0);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "UnframedRdpsndPdu"
+    }
+
+    fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl DvcEncode for UnframedRdpsndPdu {}
+
+impl DvcProcessor for DynamicRdpsnd {
+    fn channel_name(&self) -> &str {
+        Self::CHANNEL_NAME
+    }
+
+    fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        Ok(Vec::new())
+    }
+
+    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(Vec::new());
+        };
+
+        inner
+            .process(payload)?
+            .into_iter()
+            .map(|message| {
+                let bytes = message
+                    .encode_unframed_pdu()
+                    .map_err(|error| encode_err!(error))?;
+                Ok(Box::new(UnframedRdpsndPdu(bytes)) as DvcMessage)
+            })
+            .collect()
+    }
+
+    fn close(&mut self, _channel_id: u32) {
+        // Dropping the processor closes playback for this DVC instance. The repeatable
+        // listener creates a fresh processor if Windows reopens the channel.
+        self.inner.take();
     }
 }
 
@@ -821,6 +909,10 @@ fn pick_f32_output_config(device: &cpal::Device) -> Result<(cpal::StreamConfig, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp::core::{Decode as _, encode_vec};
+    use ironrdp_rdpsnd::pdu::{
+        ClientAudioOutputPdu, ServerAudioFormatPdu, ServerAudioOutputPdu, Version,
+    };
 
     fn compressed_format(tag: WaveFormat) -> AudioFormat {
         AudioFormat {
@@ -832,6 +924,125 @@ mod tests {
             bits_per_sample: 16,
             data: None,
         }
+    }
+
+    #[test]
+    fn dynamic_rdpsnd_uses_the_modern_windows_playback_channel_and_replies_unframed() {
+        let stats = AudioStatsHandle::new();
+        let ring = AudioRing::with_capacity(4096, stats.clone());
+        let mut listener = DynamicRdpsndListener::new(ring, stats, device_native());
+        let mut channel = listener.create(9).unwrap();
+
+        assert_eq!(channel.channel_name(), "AUDIO_PLAYBACK_DVC");
+        assert!(channel.start(9).unwrap().is_empty());
+
+        let server = ServerAudioOutputPdu::AudioFormat(ServerAudioFormatPdu {
+            version: Version::V8,
+            formats: vec![pcm_format(48_000, 2)],
+        });
+        let payload = encode_vec(&server).unwrap();
+        let replies = channel.process(9, &payload).unwrap();
+
+        assert_eq!(
+            replies.len(),
+            2,
+            "formats and quality mode must both be returned"
+        );
+        let first = encode_vec(replies[0].as_ref()).unwrap();
+        assert!(matches!(
+            ClientAudioOutputPdu::decode(&mut ironrdp::core::ReadCursor::new(&first)).unwrap(),
+            ClientAudioOutputPdu::AudioFormat(_)
+        ));
+
+        channel.close(9);
+        let mut channel = listener.create(10).unwrap();
+        assert!(channel.start(10).unwrap().is_empty());
+        let replies = channel.process(10, &payload).unwrap();
+        assert_eq!(
+            replies.len(),
+            2,
+            "Windows closes and reopens the dynamic channel during desktop setup"
+        );
+    }
+
+    #[test]
+    fn a_wave_index_resolves_against_the_format_list_actually_put_on_the_wire() {
+        // The whole point of the vendored RDPSND client. Three links must hold at once:
+        // the client sends the intersection in *its own* candidate order, it reports that
+        // exact vector back through `set_negotiated_formats`, and `wave()` indexes that
+        // vector. This drives all three through one DVC instance, so a break in any link
+        // shows up here rather than only against a live host.
+        //
+        // The server's offer is deliberately in the opposite order to `candidate_formats()`
+        // and carries one format we never advertise, so the expected wire list can only be
+        // produced by filtering our order — not by echoing the server's, and not by a
+        // `HashSet` intersection, which randomises order per process and never calls the
+        // callback at all (leaving the negotiated list empty and every wave dropped).
+        let stats = AudioStatsHandle::new();
+        let ring = AudioRing::with_capacity(4096, stats.clone());
+        let mut listener = DynamicRdpsndListener::new(ring.clone(), stats.clone(), device_native());
+        let mut channel = listener.create(1).unwrap();
+
+        let server = ServerAudioOutputPdu::AudioFormat(ServerAudioFormatPdu {
+            version: Version::V8,
+            formats: vec![
+                pcm_format(48_000, 2),
+                compressed_format(WaveFormat::ADPCM),
+                pcm_format(44_100, 1),
+            ],
+        });
+        let replies = channel.process(1, &encode_vec(&server).unwrap()).unwrap();
+
+        let first = encode_vec(replies[0].as_ref()).unwrap();
+        let ClientAudioOutputPdu::AudioFormat(sent) =
+            ClientAudioOutputPdu::decode(&mut ironrdp::core::ReadCursor::new(&first)).unwrap()
+        else {
+            panic!("the first reply must be the Client Audio Formats PDU");
+        };
+        assert_eq!(
+            sent.formats,
+            vec![pcm_format(44_100, 1), pcm_format(48_000, 2)],
+            "the wire list must be our candidate order filtered by the server offer"
+        );
+
+        // Reach Ready so Wave2 is accepted.
+        let training = ServerAudioOutputPdu::Training(ironrdp_rdpsnd::pdu::TrainingPdu {
+            timestamp: 0,
+            data: Vec::new(),
+        });
+        channel.process(1, &encode_vec(&training).unwrap()).unwrap();
+
+        // Index 1 of the wire list is 48000/stereo, which matches the device exactly, so a
+        // correct resolution is a bit-for-bit passthrough. Index 0 (44100/mono) would
+        // resample and upmix instead, and an empty negotiated list would drop the packet.
+        let pcm: Vec<u8> = [1000_i16, -1000, 2000, -2000]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let wave = ServerAudioOutputPdu::Wave2(ironrdp_rdpsnd::pdu::Wave2Pdu {
+            timestamp: 0,
+            format_no: 1,
+            block_no: 0,
+            audio_timestamp: 0,
+            data: Cow::Borrowed(&pcm),
+        });
+        channel.process(1, &encode_vec(&wave).unwrap()).unwrap();
+
+        let mut out = [0.0f32; 4];
+        ring.pop_into(&mut out);
+        assert_eq!(
+            out.to_vec(),
+            pcm16_le_to_f32(&pcm),
+            "format_no must index the list we sent, unaltered at the device's own format"
+        );
+        assert_eq!(
+            stats.snapshot().current_format,
+            Some(AudioFormatSummary {
+                sample_rate: 48_000,
+                channels: 2,
+                bits_per_sample: 16
+            })
+        );
     }
 
     // -- format selection -----------------------------------------------------------
@@ -1206,7 +1417,9 @@ mod tests {
     fn backend(device: AudioFormatSummary) -> (RdpsndBackend, AudioRing, AudioStatsHandle) {
         let stats = AudioStatsHandle::new();
         let ring = AudioRing::with_capacity(4096, stats.clone());
-        let backend = RdpsndBackend::new(ring.clone(), stats.clone(), device);
+        let mut backend = RdpsndBackend::new(ring.clone(), stats.clone(), device);
+        let negotiated = backend.get_formats().to_vec();
+        backend.set_negotiated_formats(&negotiated);
         (backend, ring, stats)
     }
 
@@ -1219,20 +1432,22 @@ mod tests {
     }
 
     #[test]
-    fn get_formats_advertises_exactly_one_playable_format() {
-        // Exactly one, never candidate_formats()'s full four: HashSet::intersection of a
-        // singleton set can itself have at most one element, which is what makes
-        // format_no resolution provable rather than a guess. See the module docs.
+    fn get_formats_advertises_every_playable_pcm_path() {
         let (backend, _ring, _stats) = backend(device_native());
         let formats = backend.get_formats();
-        assert_eq!(
-            formats.len(),
-            1,
-            "advertising more than one format reintroduces the HashSet ordering ambiguity"
-        );
-        assert!(is_playable(&formats[0]));
-        assert_eq!(formats[0].n_samples_per_sec, 48_000);
-        assert_eq!(formats[0].n_channels, 2);
+        assert_eq!(formats, candidate_formats());
+        assert!(formats.iter().all(is_playable));
+    }
+
+    #[test]
+    fn negotiated_format_callback_replaces_candidates_in_the_exact_wire_order() {
+        let (mut backend, _ring, _stats) = backend(device_native());
+        let negotiated = vec![pcm_format(48_000, 2), pcm_format(44_100, 1)];
+
+        backend.set_negotiated_formats(&negotiated);
+
+        assert_eq!(backend.negotiated_formats, negotiated);
+        assert_eq!(backend.get_formats(), candidate_formats());
     }
 
     #[test]
@@ -1289,8 +1504,8 @@ mod tests {
 
     #[test]
     fn wave_with_an_index_past_the_negotiated_list_is_dropped_not_guessed() {
-        // A negotiated list of exactly one entry (as `new()` always produces). format_no=1
-        // is precisely the shape of the original bug: a small, valid-looking index that
+        // A negotiated list of exactly one entry makes format_no=1 precisely the shape of
+        // the original bug: a small, valid-looking index that
         // used to resolve into candidate_formats()'s second entry instead of being
         // recognised as unresolvable.
         let negotiated = vec![pcm_format(44_100, 1)];
@@ -1314,13 +1529,12 @@ mod tests {
     #[test]
     fn wave_for_a_format_matching_the_device_queues_samples_unchanged() {
         let (mut backend, ring, stats) = backend(device_native());
-        // new() always negotiates a singleton, so index 0 is the only valid format_no.
+        // The helper simulates negotiation of all candidates in advertised order.
         let format_no = backend
             .get_formats()
             .iter()
             .position(|f| f.n_samples_per_sec == 48_000 && f.n_channels == 2)
             .expect("48000/stereo must be advertised");
-        assert_eq!(format_no, 0);
 
         let pcm: Vec<u8> = [100_i16, -100, 200, -200]
             .iter()
@@ -1371,11 +1585,8 @@ mod tests {
 
     #[test]
     fn wave_remaps_a_negotiated_mono_format_into_a_stereo_device_target() {
-        // Under the singleton design, `new()` always negotiates a format whose channel
-        // count already matches the device (see `negotiated_format`), so a mono-wire/
-        // stereo-device mismatch can no longer arise on the live path — but the
-        // remap_channels wiring inside wave() must still be correct if it is ever fed a
-        // mismatched entry, so this pins it directly via `with_formats`.
+        // The server may negotiate mono while the selected device is stereo, so this pins
+        // the live remapping path directly via `with_formats`.
         let negotiated = vec![pcm_format(48_000, 1)];
         let stats = AudioStatsHandle::new();
         let ring = AudioRing::with_capacity(4096, stats.clone());
