@@ -381,6 +381,27 @@ impl Favourites {
     /// Rename the favourite currently called `old_name` to `new_name`. Rejects an empty
     /// new name or a collision (case-insensitive) with a *different* existing favourite;
     /// renaming a favourite to a case variant of its own current name is allowed.
+    /// Replace the favourite called `name` with `updated`, keeping its position.
+    ///
+    /// The replacement's name may differ (a rename-in-edit); the usual name rules and
+    /// duplicate check apply against every *other* entry.
+    pub fn update(&mut self, name: &str, updated: Favourite) -> Result<(), FavouritesError> {
+        let index = self
+            .position_ci(name)
+            .ok_or_else(|| FavouritesError::NotFound(name.to_owned()))?;
+        Self::validate(&updated.name, &updated.host, updated.port)?;
+        let clashes = self
+            .entries
+            .iter()
+            .enumerate()
+            .any(|(i, f)| i != index && f.name.eq_ignore_ascii_case(&updated.name));
+        if clashes {
+            return Err(FavouritesError::DuplicateName(updated.name));
+        }
+        self.entries[index] = updated;
+        Ok(())
+    }
+
     pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), FavouritesError> {
         let idx = self
             .entries

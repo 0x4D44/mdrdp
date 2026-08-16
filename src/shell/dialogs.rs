@@ -164,14 +164,14 @@ pub fn progress_fraction(rows: &[StageRow]) -> f32 {
 
 /// Draw the full-window scrim and a §7 dialog frame; `body` fills the content,
 /// `footer` the chrome strip. Returns whatever the closures produce.
-fn dialog<R>(
+fn dialog<B, F>(
     ctx: &egui::Context,
     id: &str,
     width: f32,
     danger: bool,
-    body: impl FnOnce(&mut egui::Ui) -> R,
-    footer: impl FnOnce(&mut egui::Ui) -> R,
-) -> (R, R) {
+    body: impl FnOnce(&mut egui::Ui) -> B,
+    footer: impl FnOnce(&mut egui::Ui) -> F,
+) -> (B, F) {
     // Scrim: swallow clicks so the list below is inert while the dialog is up.
     let screen = ctx.content_rect();
     egui::Area::new(egui::Id::new((id, "scrim")))
@@ -680,6 +680,491 @@ pub fn certificate_changed(ctx: &egui::Context, failure: &ConnectFailure) -> boo
     close || ctx.input(|i| i.key_pressed(egui::Key::Escape))
 }
 
+// --- Edit / Remove / Quit / About ---------------------------------------------------
+
+/// Working state of the Edit connection dialog.
+pub struct EditState {
+    pub original_name: String,
+    pub name: String,
+    pub host: String,
+    pub port: String,
+    pub username: String,
+    pub domain: String,
+    pub fullscreen: bool,
+    pub width: String,
+    pub height: String,
+    /// Whether the stored password row has been flipped to a replacement input.
+    pub replace_password: bool,
+    pub new_password: zeroize::Zeroizing<String>,
+    pub had_stored_password: bool,
+    pub error: Option<String>,
+}
+
+impl EditState {
+    pub fn for_favourite(f: &crate::favourites::Favourite) -> Self {
+        let (fullscreen, width, height) = match f.window_size {
+            crate::favourites::WindowSize::Fullscreen => (true, String::new(), String::new()),
+            crate::favourites::WindowSize::Explicit { width, height } => {
+                (false, width.to_string(), height.to_string())
+            }
+        };
+        EditState {
+            original_name: f.name.clone(),
+            name: f.name.clone(),
+            host: f.host.clone(),
+            port: f.port.to_string(),
+            username: f.username.clone().unwrap_or_default(),
+            domain: f.domain.clone().unwrap_or_default(),
+            fullscreen,
+            width,
+            height,
+            replace_password: false,
+            new_password: zeroize::Zeroizing::new(String::new()),
+            had_stored_password: f.keychain_account.is_some(),
+            error: None,
+        }
+    }
+
+    /// The keychain account key the edited favourite would use.
+    pub fn account_key(&self) -> String {
+        let port = self.port.trim().parse::<u16>().unwrap_or(3389);
+        format!("{}@{}:{}", self.username.trim(), self.host.trim(), port)
+    }
+
+    /// Validate and build the favourite this dialog describes.
+    pub fn build(&self) -> Result<crate::favourites::Favourite, String> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("favourite name must not be empty".to_owned());
+        }
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err("favourite host must not be empty".to_owned());
+        }
+        let port: u16 = if self.port.trim().is_empty() {
+            crate::favourites::DEFAULT_PORT
+        } else {
+            self.port
+                .trim()
+                .parse()
+                .map_err(|_| format!("{:?} is not a port number", self.port.trim()))?
+        };
+        if port == 0 {
+            return Err("favourite port must not be zero".to_owned());
+        }
+        let window_size = if self.fullscreen {
+            crate::favourites::WindowSize::Fullscreen
+        } else {
+            let width: u16 = self
+                .width
+                .trim()
+                .parse()
+                .map_err(|_| format!("{:?} is not a width in pixels", self.width.trim()))?;
+            let height: u16 = self
+                .height
+                .trim()
+                .parse()
+                .map_err(|_| format!("{:?} is not a height in pixels", self.height.trim()))?;
+            crate::favourites::WindowSize::Explicit { width, height }
+        };
+        let username = (!self.username.trim().is_empty()).then(|| self.username.trim().to_owned());
+        let stores_password = self.had_stored_password || !self.new_password.is_empty();
+        Ok(crate::favourites::Favourite {
+            name: name.to_owned(),
+            host: host.to_owned(),
+            port,
+            username,
+            domain: (!self.domain.trim().is_empty()).then(|| self.domain.trim().to_owned()),
+            window_size,
+            keychain_account: stores_password.then(|| self.account_key()),
+            last_used: None, // The caller preserves the original's timestamp.
+        })
+    }
+}
+
+pub enum EditAction {
+    None,
+    /// Save the edited favourite; the replacement password if one was typed.
+    Save(
+        crate::favourites::Favourite,
+        Option<zeroize::Zeroizing<String>>,
+    ),
+    /// Open the Remove confirmation for this favourite.
+    Remove,
+    Cancel,
+}
+
+fn field_row(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [120.0, 20.0],
+            egui::Label::new(
+                RichText::new(label)
+                    .font(theme::sans_medium(11.0))
+                    .color(theme::TEXT_MUTED),
+            ),
+        );
+        ui.add_sized(
+            [width, 30.0],
+            egui::TextEdit::singleline(value).font(theme::mono(13.0)),
+        );
+    });
+}
+
+/// The Edit connection dialog (§7, 560 wide).
+pub fn edit_connection(ctx: &egui::Context, state: &mut EditState) -> EditAction {
+    let (body_action, footer_action) = dialog(
+        ctx,
+        "edit-connection",
+        560.0,
+        false,
+        |ui| {
+            let mut action = EditAction::None;
+            ui.label(
+                RichText::new(format!("Edit {}", state.original_name))
+                    .font(theme::sans_semibold(16.0))
+                    .color(theme::TEXT_PRIMARY),
+            );
+            field_row(ui, "NAME", &mut state.name, 360.0);
+            field_row(ui, "HOST", &mut state.host, 360.0);
+            field_row(ui, "PORT", &mut state.port, 100.0);
+            field_row(ui, "USERNAME", &mut state.username, 360.0);
+            field_row(ui, "DOMAIN", &mut state.domain, 200.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [120.0, 20.0],
+                    egui::Label::new(
+                        RichText::new("DISPLAY")
+                            .font(theme::sans_medium(11.0))
+                            .color(theme::TEXT_MUTED),
+                    ),
+                );
+                if ui
+                    .selectable_label(
+                        state.fullscreen,
+                        RichText::new("Fullscreen").font(theme::sans(12.0)),
+                    )
+                    .clicked()
+                {
+                    state.fullscreen = true;
+                }
+                if ui
+                    .selectable_label(
+                        !state.fullscreen,
+                        RichText::new("Explicit size").font(theme::sans(12.0)),
+                    )
+                    .clicked()
+                {
+                    state.fullscreen = false;
+                }
+                if !state.fullscreen {
+                    ui.add_sized(
+                        [64.0, 26.0],
+                        egui::TextEdit::singleline(&mut state.width).font(theme::mono(12.0)),
+                    );
+                    ui.label(
+                        RichText::new("×")
+                            .font(theme::mono(12.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                    ui.add_sized(
+                        [64.0, 26.0],
+                        egui::TextEdit::singleline(&mut state.height).font(theme::mono(12.0)),
+                    );
+                }
+            });
+            // Password row: reads "stored in keychain" with Replace, per the mock.
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [120.0, 20.0],
+                    egui::Label::new(
+                        RichText::new("PASSWORD")
+                            .font(theme::sans_medium(11.0))
+                            .color(theme::TEXT_MUTED),
+                    ),
+                );
+                if state.replace_password {
+                    ui.add_sized(
+                        [240.0, 30.0],
+                        egui::TextEdit::singleline(&mut *state.new_password)
+                            .password(true)
+                            .font(theme::mono(13.0)),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(if state.had_stored_password {
+                            "stored in keychain"
+                        } else {
+                            "not stored — asked for at connect"
+                        })
+                        .font(theme::mono(12.0))
+                        .color(theme::TEXT_SECONDARY),
+                    );
+                    if widgets::secondary_button(ui, "Replace", 26.0).clicked() {
+                        state.replace_password = true;
+                    }
+                }
+            });
+            ui.label(
+                RichText::new(state.account_key())
+                    .font(theme::mono(11.0))
+                    .color(theme::TEXT_DIM),
+            );
+            if let Some(error) = &state.error {
+                ui.label(
+                    RichText::new(error)
+                        .font(theme::sans(12.0))
+                        .color(theme::DANGER),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if widgets::danger_button(ui, "Remove connection", 30.0).clicked() {
+                    action = EditAction::Remove;
+                }
+            });
+            action
+        },
+        |ui| {
+            let mut click = FooterClick::None;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Renaming the account moves the keychain entry.")
+                        .font(theme::sans(11.0))
+                        .color(theme::TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if widgets::primary_button(ui, "Save", 34.0).clicked() {
+                        click = FooterClick::Save;
+                    }
+                    if widgets::secondary_button(ui, "Cancel", 34.0).clicked() {
+                        click = FooterClick::Cancel;
+                    }
+                });
+            });
+            click
+        },
+    );
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return EditAction::Cancel;
+    }
+    match footer_action {
+        FooterClick::Save => match state.build() {
+            Ok(favourite) => {
+                let password = (!state.new_password.is_empty()).then(|| state.new_password.clone());
+                EditAction::Save(favourite, password)
+            }
+            Err(e) => {
+                state.error = Some(e);
+                EditAction::None
+            }
+        },
+        FooterClick::Cancel => EditAction::Cancel,
+        FooterClick::None => body_action,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterClick {
+    None,
+    Save,
+    Cancel,
+}
+
+/// State of the Remove confirmation (§7, 440 wide).
+pub struct RemoveState {
+    pub name: String,
+    /// The keychain account whose password the checkbox offers to delete.
+    pub account: Option<String>,
+    pub delete_password: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveAction {
+    None,
+    Remove { delete_password: bool },
+    Cancel,
+}
+
+pub fn remove_connection(ctx: &egui::Context, state: &mut RemoveState) -> RemoveAction {
+    let delete_password_now = state.delete_password;
+    let (_, action) = dialog(
+        ctx,
+        "remove-connection",
+        440.0,
+        false,
+        |ui| {
+            ui.label(
+                RichText::new(format!("Remove {}?", state.name))
+                    .font(theme::sans_semibold(16.0))
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new("The entry is removed from favourites.toml.")
+                    .font(theme::sans(12.0))
+                    .color(theme::TEXT_SECONDARY),
+            );
+            if state.account.is_some() {
+                ui.checkbox(
+                    &mut state.delete_password,
+                    RichText::new("Also delete the keychain password")
+                        .font(theme::sans(12.0))
+                        .color(theme::TEXT_SECONDARY),
+                );
+            }
+            RemoveAction::None
+        },
+        |ui| {
+            let mut action = RemoveAction::None;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if widgets::danger_button(ui, "Remove", 34.0).clicked() {
+                    action = RemoveAction::Remove {
+                        delete_password: delete_password_now,
+                    };
+                }
+                if widgets::secondary_button(ui, "Cancel", 34.0).clicked() {
+                    action = RemoveAction::Cancel;
+                }
+            });
+            action
+        },
+    );
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return RemoveAction::Cancel;
+    }
+    action
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitAction {
+    None,
+    QuitAnyway,
+    Cancel,
+}
+
+/// The Quit-with-sessions dialog (§7, 480). Sessions are their own processes and
+/// keep running when the launcher goes; the dialog exists so that is a choice,
+/// not a surprise.
+pub fn quit_with_sessions(ctx: &egui::Context, sessions: &[(String, u32, u64)]) -> QuitAction {
+    let (_, action) = dialog(
+        ctx,
+        "quit-with-sessions",
+        480.0,
+        false,
+        |ui| {
+            ui.label(
+                RichText::new("Quit with sessions running?")
+                    .font(theme::sans_semibold(16.0))
+                    .color(theme::TEXT_PRIMARY),
+            );
+            for (name, pid, uptime_mins) in sessions {
+                ui.horizontal(|ui| {
+                    widgets::status_dot(ui, theme::ACCENT);
+                    ui.label(
+                        RichText::new(format!("{name} · pid {pid} · {uptime_mins}m"))
+                            .font(theme::mono(12.0))
+                            .color(theme::TEXT_SECONDARY),
+                    );
+                });
+            }
+            ui.label(
+                RichText::new(
+                    "Each session is its own process and keeps running; close them from                      their own windows.",
+                )
+                .font(theme::sans(12.0))
+                .color(theme::TEXT_MUTED),
+            );
+            QuitAction::None
+        },
+        |ui| {
+            let mut action = QuitAction::None;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if widgets::danger_button(ui, "Quit anyway", 34.0).clicked() {
+                    action = QuitAction::QuitAnyway;
+                }
+                if widgets::secondary_button(ui, "Cancel", 34.0).clicked() {
+                    action = QuitAction::Cancel;
+                }
+            });
+            action
+        },
+    );
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return QuitAction::Cancel;
+    }
+    action
+}
+
+/// About mdrdp (§7, 440): icon, version, and the rows the spec names.
+pub fn about(ctx: &egui::Context, icon: Option<&egui::TextureHandle>) -> bool {
+    let (_, close) = dialog(
+        ctx,
+        "about-mdrdp",
+        440.0,
+        false,
+        |ui| {
+            ui.vertical_centered(|ui| {
+                if let Some(icon) = icon {
+                    ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+                }
+                ui.label(
+                    RichText::new("mdrdp")
+                        .font(theme::sans_semibold(18.0))
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} {}",
+                        env!("CARGO_PKG_VERSION"),
+                        std::env::consts::OS,
+                        std::env::consts::ARCH
+                    ))
+                    .font(theme::mono(12.0))
+                    .color(theme::TEXT_MUTED),
+                );
+            });
+            ui.add_space(6.0);
+            for (label, value) in [
+                ("Licence", "MIT OR Apache-2.0"),
+                ("Protocol", "IronRDP 0.17"),
+                (
+                    "Vendored",
+                    "ironrdp-connector (one flag, or EGFX never opens)",
+                ),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [90.0, 18.0],
+                        egui::Label::new(
+                            RichText::new(label)
+                                .font(theme::sans(12.0))
+                                .color(theme::TEXT_MUTED),
+                        ),
+                    );
+                    ui.label(
+                        RichText::new(value)
+                            .font(theme::mono(12.0))
+                            .color(theme::TEXT_SECONDARY),
+                    );
+                });
+            }
+            false
+        },
+        |ui| {
+            let mut close = false;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::primary_button(ui, "Close", 34.0).clicked() {
+                    close = true;
+                }
+            });
+            close
+        },
+    );
+    close || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,6 +1191,65 @@ mod tests {
             classify("the server closed the channel"),
             FailureKind::Other
         );
+    }
+
+    #[test]
+    fn the_edit_dialog_builds_the_favourite_it_describes() {
+        let mut state = EditState::for_favourite(&crate::favourites::Favourite {
+            username: Some("alice".into()),
+            domain: Some("CORP".into()),
+            port: 3391,
+            window_size: crate::favourites::WindowSize::Explicit {
+                width: 1600,
+                height: 1000,
+            },
+            keychain_account: Some("alice@quench:3391".into()),
+            ..crate::favourites::Favourite::new("Quench", "quench")
+        });
+        state.name = "Quench 2".into();
+        state.port = "3392".into();
+        let built = state.build().expect("valid");
+        assert_eq!(built.name, "Quench 2");
+        assert_eq!(built.host, "quench");
+        assert_eq!(built.port, 3392);
+        assert_eq!(built.username.as_deref(), Some("alice"));
+        assert_eq!(built.domain.as_deref(), Some("CORP"));
+        assert_eq!(
+            built.window_size,
+            crate::favourites::WindowSize::Explicit {
+                width: 1600,
+                height: 1000
+            }
+        );
+        assert_eq!(
+            built.keychain_account.as_deref(),
+            Some("alice@quench:3392"),
+            "the account key follows the edited host and port"
+        );
+    }
+
+    #[test]
+    fn edit_validation_names_the_field_that_failed() {
+        let mut state = EditState::for_favourite(&crate::favourites::Favourite::new("A", "h"));
+        state.host = "  ".into();
+        assert!(state.build().unwrap_err().contains("host"));
+        state.host = "h".into();
+        state.port = "70000".into();
+        assert!(state.build().unwrap_err().contains("port"));
+        state.port = "0".into();
+        assert!(state.build().unwrap_err().contains("zero"));
+        state.port = String::new();
+        assert_eq!(state.build().unwrap().port, 3389, "blank port is default");
+    }
+
+    #[test]
+    fn an_unstored_password_stays_unstored_unless_replaced() {
+        let state = EditState::for_favourite(&crate::favourites::Favourite::new("A", "h"));
+        assert_eq!(state.build().unwrap().keychain_account, None);
+        let mut replaced = EditState::for_favourite(&crate::favourites::Favourite::new("A", "h"));
+        replaced.username = "u".into();
+        *replaced.new_password = "pw".into();
+        assert!(replaced.build().unwrap().keychain_account.is_some());
     }
 
     #[test]

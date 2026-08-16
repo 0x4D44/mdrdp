@@ -110,6 +110,17 @@ pub fn store(account: &str, password: &str) -> Result<(), CredsError> {
 ///
 /// A missing entry is *not* a prompt case: that is a setup mistake with a known fix, and
 /// [`CredsError::NotFound`] prints it. Only a keychain that errors falls through here.
+/// Remove the stored password for `account`. A missing entry is success — the goal
+/// is "no password stored", and it already isn't.
+pub fn forget(account: &str) -> Result<(), CredsError> {
+    let entry = keyring::Entry::new(SERVICE, account).map_err(CredsError::Keyring)?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(CredsError::Keyring(e)),
+    }
+}
+
 pub fn lookup_or_prompt(account: &str) -> Result<Secret, CredsError> {
     match lookup(account) {
         Ok(secret) => Ok(secret),

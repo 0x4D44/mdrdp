@@ -69,13 +69,15 @@ struct ConnectFlow {
     cert_prompt: Option<dialogs::CertPromptInfo>,
 }
 
-/// Which modal sits over the list, if any. Placeholder variants fill in as their
-/// units land.
+/// Which modal sits over the list, if any.
 enum Modal {
-    /// Settings — arrives with the settings-store unit.
+    /// Settings — pane UI arrives with its unit.
     Settings,
-    /// About — arrives with the dialogs unit.
     About,
+    Edit(dialogs::EditState),
+    Remove(dialogs::RemoveState),
+    /// Confirm quitting while sessions run.
+    Quit,
 }
 
 /// The launcher application state, per the handoff's State section.
@@ -92,6 +94,10 @@ pub struct LauncherApp {
     modal: Option<Modal>,
     connect_flow: Option<ConnectFlow>,
     menu: menus::LauncherMenu,
+    /// The About dialog's icon texture, loaded on first use.
+    about_icon: Option<egui::TextureHandle>,
+    /// Set once the Quit dialog has approved closing over running sessions.
+    allow_close: bool,
 }
 
 impl LauncherApp {
@@ -114,6 +120,106 @@ impl LauncherApp {
             modal: None,
             connect_flow: None,
             menu,
+            about_icon: None,
+            allow_close: false,
+        }
+    }
+
+    /// Open the Edit dialog for the selected favourite.
+    fn open_edit(&mut self) {
+        if let Some(i) = self.selected
+            && let Some(f) = self.favourites.iter().nth(i)
+        {
+            self.modal = Some(Modal::Edit(dialogs::EditState::for_favourite(f)));
+        }
+    }
+
+    fn open_remove(&mut self) {
+        if let Some(i) = self.selected
+            && let Some(f) = self.favourites.iter().nth(i)
+        {
+            self.modal = Some(Modal::Remove(dialogs::RemoveState {
+                name: f.name.clone(),
+                account: f.keychain_account.clone(),
+                delete_password: false,
+            }));
+        }
+    }
+
+    /// Duplicate the selected favourite under a derived name.
+    fn duplicate_selected(&mut self) {
+        let Some(i) = self.selected else { return };
+        let Some(f) = self.favourites.iter().nth(i) else {
+            return;
+        };
+        let mut copy = f.clone();
+        copy.last_used = None;
+        let base = format!("{} copy", copy.name);
+        let mut candidate = base.clone();
+        let mut n = 2;
+        while self.favourites.find(&candidate).is_some() {
+            candidate = format!("{base} {n}");
+            n += 1;
+        }
+        copy.name = candidate;
+        if let Err(e) = self.favourites.add(copy) {
+            eprintln!("could not duplicate: {e}");
+            return;
+        }
+        if let Err(e) = self.favourites.save_to(&self.config_path) {
+            eprintln!("warning: could not save favourites: {e}");
+        }
+    }
+
+    /// Apply a saved edit: favourites entry plus any keychain moves.
+    fn apply_edit(
+        &mut self,
+        original_name: &str,
+        favourite: Favourite,
+        password: Option<zeroize::Zeroizing<String>>,
+    ) {
+        let old_account = self
+            .favourites
+            .find(original_name)
+            .and_then(|f| f.keychain_account.clone());
+        let last_used = self
+            .favourites
+            .find(original_name)
+            .and_then(|f| f.last_used);
+        let new_account = favourite.keychain_account.clone();
+        let mut favourite = favourite;
+        favourite.last_used = last_used;
+        match self.favourites.update(original_name, favourite) {
+            Ok(()) => {
+                if let Err(e) = self.favourites.save_to(&self.config_path) {
+                    eprintln!("warning: could not save favourites: {e}");
+                }
+                // Keychain moves: a typed replacement wins; otherwise a changed
+                // account key migrates the stored password to the new key.
+                match (password, &new_account) {
+                    (Some(p), Some(account)) => {
+                        if let Err(e) = crate::creds::store(account, &p) {
+                            eprintln!("could not store the password: {e}");
+                        }
+                    }
+                    (None, Some(account)) if old_account.as_deref() != Some(account) => {
+                        if let Some(old) = &old_account {
+                            match crate::creds::lookup(old) {
+                                Ok(secret) => {
+                                    if let Err(e) = crate::creds::store(account, secret.expose()) {
+                                        eprintln!("could not move the password: {e}");
+                                    } else if let Err(e) = crate::creds::forget(old) {
+                                        eprintln!("could not remove the old entry: {e}");
+                                    }
+                                }
+                                Err(e) => eprintln!("password not moved: {e}"),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Err(e) => eprintln!("could not save the edit: {e}"),
         }
     }
 
@@ -327,6 +433,22 @@ impl LauncherApp {
                         self.connect(i, ctx);
                     }
                 }
+                Some(menus::MenuAction::Edit) => self.open_edit(),
+                Some(menus::MenuAction::Duplicate) => self.duplicate_selected(),
+                Some(menus::MenuAction::Remove) => self.open_remove(),
+                Some(menus::MenuAction::CopyCommandLine) => {
+                    if let Some(i) = self.selected
+                        && let Some(f) = self.favourites.iter().nth(i)
+                    {
+                        let name = &f.name;
+                        let quoted = if name.contains(char::is_whitespace) {
+                            format!("'{name}'")
+                        } else {
+                            name.clone()
+                        };
+                        ctx.copy_text(format!("mdrdp {quoted}"));
+                    }
+                }
                 Some(menus::MenuAction::CloseWindow) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -437,6 +559,7 @@ impl LauncherApp {
 
     fn connections_page(&mut self, ui: &mut egui::Ui) {
         let mut connect_row: Option<usize> = None;
+        let mut edit_clicked = false;
         egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::BG_WINDOW))
             .show(ui, |ui| {
@@ -471,10 +594,8 @@ impl LauncherApp {
                                 if widgets::primary_button(ui, "New connection", 32.0).clicked() {
                                     self.open_wizard();
                                 }
-                                if widgets::secondary_button(ui, "Edit", 32.0).clicked()
-                                    && self.selected.is_some()
-                                {
-                                    // Edit dialog arrives with the dialogs unit.
+                                if widgets::secondary_button(ui, "Edit", 32.0).clicked() {
+                                    edit_clicked = true;
                                 }
                             });
                         });
@@ -515,6 +636,9 @@ impl LauncherApp {
         if let Some(i) = connect_row {
             let ctx = ui.ctx().clone();
             self.connect(i, &ctx);
+        }
+        if edit_clicked {
+            self.open_edit();
         }
     }
 
@@ -705,6 +829,92 @@ impl LauncherApp {
         }
     }
 
+    fn modal_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.modal.take() else {
+            return;
+        };
+        match &mut modal {
+            Modal::Settings => {
+                self.modal_placeholder(ctx, "Settings");
+            }
+            Modal::About => {
+                if self.about_icon.is_none() {
+                    self.about_icon = about_icon_texture(ctx);
+                }
+                if !dialogs::about(ctx, self.about_icon.as_ref()) {
+                    self.modal = Some(modal);
+                }
+            }
+            Modal::Edit(state) => match dialogs::edit_connection(ctx, state) {
+                dialogs::EditAction::None => self.modal = Some(modal),
+                dialogs::EditAction::Cancel => {}
+                dialogs::EditAction::Remove => {
+                    let name = state.original_name.clone();
+                    let account = self
+                        .favourites
+                        .find(&name)
+                        .and_then(|f| f.keychain_account.clone());
+                    self.modal = Some(Modal::Remove(dialogs::RemoveState {
+                        name,
+                        account,
+                        delete_password: false,
+                    }));
+                }
+                dialogs::EditAction::Save(favourite, password) => {
+                    let original = state.original_name.clone();
+                    self.apply_edit(&original, favourite, password);
+                }
+            },
+            Modal::Remove(state) => match dialogs::remove_connection(ctx, state) {
+                dialogs::RemoveAction::None => self.modal = Some(modal),
+                dialogs::RemoveAction::Cancel => {}
+                dialogs::RemoveAction::Remove { delete_password } => {
+                    match self.favourites.remove(&state.name) {
+                        Ok(removed) => {
+                            if let Err(e) = self.favourites.save_to(&self.config_path) {
+                                eprintln!("warning: could not save favourites: {e}");
+                            }
+                            if delete_password
+                                && let Some(account) = removed.keychain_account
+                                && let Err(e) = crate::creds::forget(&account)
+                            {
+                                eprintln!("could not delete the password: {e}");
+                            }
+                            let len = self.favourites.len();
+                            self.selected = if len == 0 {
+                                None
+                            } else {
+                                Some(self.selected.unwrap_or(0).min(len - 1))
+                            };
+                        }
+                        Err(e) => eprintln!("could not remove: {e}"),
+                    }
+                }
+            },
+            Modal::Quit => {
+                let sessions: Vec<(String, u32, u64)> = self
+                    .running
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.name.clone(),
+                            s.child.id(),
+                            s.started.elapsed().as_secs() / 60,
+                        )
+                    })
+                    .collect();
+                match dialogs::quit_with_sessions(ctx, &sessions) {
+                    dialogs::QuitAction::None => self.modal = Some(modal),
+                    dialogs::QuitAction::Cancel => {}
+                    dialogs::QuitAction::QuitAnyway => {
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+    }
+
     fn modal_placeholder(&mut self, ctx: &egui::Context, title: &str) {
         let close = egui::Area::new(egui::Id::new("modal"))
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
@@ -751,12 +961,18 @@ impl eframe::App for LauncherApp {
         } else {
             self.connections_page(ui);
         }
-        match self.modal {
-            Some(Modal::Settings) => self.modal_placeholder(&ctx, "Settings"),
-            Some(Modal::About) => self.modal_placeholder(&ctx, "About mdrdp"),
-            None => {}
-        }
+        self.modal_ui(&ctx);
         self.connect_flow_ui(&ctx);
+
+        // Closing over running sessions is a choice, not a surprise: intercept the
+        // close, ask, and only pass it through once Quit anyway has said so.
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.running.is_empty()
+            && !self.allow_close
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.modal = Some(Modal::Quit);
+        }
 
         if !self.running.is_empty() {
             // The "connected Xm" captions and liveness pruning need a clock; one
@@ -801,6 +1017,16 @@ pub fn run(
         }),
     )
     .map_err(|e| format!("launcher window failed: {e}"))
+}
+
+/// The About dialog's icon as an egui texture. `None` on decode failure.
+fn about_icon_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let icon = window_icon()?;
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    Some(ctx.load_texture("about-icon", image, egui::TextureOptions::LINEAR))
 }
 
 /// Decode the embedded window icon. `None` on decode failure — cosmetic, never fatal.
@@ -972,6 +1198,10 @@ mod menus {
         About,
         RevealFavourites,
         Connect,
+        Edit,
+        Duplicate,
+        Remove,
+        CopyCommandLine,
         CloseWindow,
     }
 
@@ -1034,7 +1264,18 @@ mod menus {
 
             let connection = Submenu::new("Connection", true);
             let connect = item("Connect", MenuAction::Connect);
-            let _ = connection.append_items(&[&connect]);
+            let edit = item("Edit…", MenuAction::Edit);
+            let duplicate = item("Duplicate", MenuAction::Duplicate);
+            let remove = item("Remove…", MenuAction::Remove);
+            let copy_cli = item("Copy command line", MenuAction::CopyCommandLine);
+            let _ = connection.append_items(&[
+                &connect,
+                &edit,
+                &duplicate,
+                &remove,
+                &PredefinedMenuItem::separator(),
+                &copy_cli,
+            ]);
             let _ = menu.append(&connection);
 
             let view = Submenu::new("View", true);
