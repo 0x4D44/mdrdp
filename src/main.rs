@@ -326,7 +326,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // supports directly: each `pick` is an orthogonal run of the same event loop.
     if positional.is_none() {
         let config_path = config_path?;
-        mdrdp::shell::run(favourites, config_path)?;
+        let default_username = settings
+            .defaults
+            .username
+            .clone()
+            .or_else(|| favourites.default_username().map(str::to_owned));
+        mdrdp::shell::run(favourites, config_path, default_username)?;
         return Ok(());
     }
 

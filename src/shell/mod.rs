@@ -13,6 +13,7 @@
 
 pub mod dialogs;
 pub mod widgets;
+pub mod wizard;
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -77,25 +78,42 @@ pub struct LauncherApp {
     config_path: PathBuf,
     selected: Option<usize>,
     running: Vec<SessionHandle>,
-    /// `Some` while the wizard is the front page or was opened with `N`. The real
-    /// wizard arrives in its own unit; until then this renders a placeholder.
-    wizard: Option<()>,
+    /// `Some` while the wizard is up — the front page on an empty favourites list,
+    /// or opened with `N` / New connection.
+    wizard: Option<wizard::Wizard>,
+    /// Default account from Settings, seeding the wizard's sign-in step.
+    default_username: Option<String>,
     modal: Option<Modal>,
     connect_flow: Option<ConnectFlow>,
     menu: menus::LauncherMenu,
 }
 
 impl LauncherApp {
-    fn new(favourites: Favourites, config_path: PathBuf, menu: menus::LauncherMenu) -> Self {
+    fn new(
+        favourites: Favourites,
+        config_path: PathBuf,
+        default_username: Option<String>,
+        menu: menus::LauncherMenu,
+    ) -> Self {
         LauncherApp {
             selected: if favourites.is_empty() { None } else { Some(0) },
+            // The front page chooses itself: no favourites means the wizard.
+            wizard: favourites
+                .is_empty()
+                .then(|| wizard::Wizard::new(default_username.clone())),
             favourites,
             config_path,
             running: Vec::new(),
-            wizard: None,
+            default_username,
             modal: None,
             connect_flow: None,
             menu,
+        }
+    }
+
+    fn open_wizard(&mut self) {
+        if self.wizard.is_none() {
+            self.wizard = Some(wizard::Wizard::new(self.default_username.clone()));
         }
     }
 
@@ -250,7 +268,7 @@ impl LauncherApp {
     fn handle_menu_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
             match self.menu.action_for(event.id()) {
-                Some(menus::MenuAction::NewConnection) => self.wizard = Some(()),
+                Some(menus::MenuAction::NewConnection) => self.open_wizard(),
                 Some(menus::MenuAction::Settings) => self.modal = Some(Modal::Settings),
                 Some(menus::MenuAction::About) => self.modal = Some(Modal::About),
                 Some(menus::MenuAction::RevealFavourites) => reveal(&self.config_path),
@@ -292,7 +310,7 @@ impl LauncherApp {
             }
         }
         if n {
-            self.wizard = Some(());
+            self.open_wizard();
         }
     }
 
@@ -401,7 +419,7 @@ impl LauncherApp {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
                                 if widgets::primary_button(ui, "New connection", 32.0).clicked() {
-                                    self.wizard = Some(());
+                                    self.open_wizard();
                                 }
                                 if widgets::secondary_button(ui, "Edit", 32.0).clicked()
                                     && self.selected.is_some()
@@ -549,29 +567,89 @@ impl LauncherApp {
     // --- placeholders until their units land ------------------------------------------
 
     fn wizard_page(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default()
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        let outcome = egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::BG_WINDOW))
-            .show(ui, |ui| {
-                ui.add_space(120.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new("Set up a connection")
-                            .font(theme::sans_semibold(24.0))
-                            .color(theme::TEXT_PRIMARY),
-                    );
-                    ui.label(
-                        RichText::new("The wizard is under construction on this branch.")
-                            .font(theme::sans(13.0))
-                            .color(theme::TEXT_MUTED),
-                    );
-                    ui.add_space(16.0);
-                    if widgets::secondary_button(ui, "Back", 38.0).clicked()
-                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
-                    {
-                        self.wizard = None;
+            .show(ui, |ui| wizard.ui(ui))
+            .inner;
+        match outcome {
+            wizard::WizardOutcome::None => {}
+            wizard::WizardOutcome::Cancelled => self.wizard = None,
+            wizard::WizardOutcome::Finished {
+                favourite,
+                save_favourite,
+                password,
+                save_password,
+            } => {
+                self.wizard = None;
+                // Password first: the favourite's keychain_account points at this
+                // entry, so it should exist before anything tries to read it.
+                if save_password && let Some(p) = password {
+                    let account = favourite
+                        .keychain_account
+                        .clone()
+                        .unwrap_or_else(|| favourite.name.clone());
+                    if let Err(e) = crate::creds::store(&account, p.expose()) {
+                        eprintln!("could not store the password: {e}");
                     }
-                });
-            });
+                }
+                let ctx = ui.ctx().clone();
+                if save_favourite {
+                    let name = favourite.name.clone();
+                    match self.favourites.add(favourite) {
+                        Ok(()) => {
+                            if let Err(e) = self.favourites.save_to(&self.config_path) {
+                                eprintln!("warning: could not save favourites: {e}");
+                            }
+                            let index = self.favourites.iter().position(|f| f.name == name);
+                            if let Some(i) = index {
+                                self.selected = Some(i);
+                                self.connect(i, &ctx);
+                            }
+                        }
+                        Err(e) => eprintln!("could not save the favourite: {e}"),
+                    }
+                } else {
+                    // Not saved: target the host directly, carrying the typed fields.
+                    let mut extra = vec!["--port".to_owned(), favourite.port.to_string()];
+                    if let Some(user) = &favourite.username {
+                        extra.push("--user".to_owned());
+                        extra.push(user.clone());
+                    }
+                    if let Some(domain) = &favourite.domain {
+                        extra.push("--domain".to_owned());
+                        extra.push(domain.clone());
+                    }
+                    if let crate::favourites::WindowSize::Explicit { width, height } =
+                        favourite.window_size
+                    {
+                        extra.push("--size".to_owned());
+                        extra.push(format!("{width}x{height}"));
+                    }
+                    match spawn_connect(&favourite.host, &extra, ctx.clone()) {
+                        Ok((child, rx)) => {
+                            self.connect_flow = Some(ConnectFlow {
+                                name: favourite.host.clone(),
+                                host: favourite.host.clone(),
+                                port: favourite.port,
+                                account: favourite
+                                    .username
+                                    .clone()
+                                    .unwrap_or_else(|| "(no account)".to_owned()),
+                                child: Some(child),
+                                rx,
+                                arrived: Vec::new(),
+                                started: Instant::now(),
+                                failure: None,
+                            });
+                        }
+                        Err(e) => eprintln!("{e}"),
+                    }
+                }
+            }
+        }
     }
 
     fn modal_placeholder(&mut self, ctx: &egui::Context, title: &str) {
@@ -636,7 +714,11 @@ impl eframe::App for LauncherApp {
 }
 
 /// Run the launcher shell. Blocks until the window closes; children keep running.
-pub fn run(favourites: Favourites, config_path: PathBuf) -> Result<(), String> {
+pub fn run(
+    favourites: Favourites,
+    config_path: PathBuf,
+    default_username: Option<String>,
+) -> Result<(), String> {
     let icon = window_icon();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(WINDOW_SIZE)
@@ -657,7 +739,12 @@ pub fn run(favourites: Favourites, config_path: PathBuf) -> Result<(), String> {
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
             let menu = menus::LauncherMenu::install(cc);
-            Ok(Box::new(LauncherApp::new(favourites, config_path, menu)))
+            Ok(Box::new(LauncherApp::new(
+                favourites,
+                config_path,
+                default_username,
+                menu,
+            )))
         }),
     )
     .map_err(|e| format!("launcher window failed: {e}"))
