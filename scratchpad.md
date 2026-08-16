@@ -2,6 +2,11 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
+- [ ] 2026-08-16: `cargo check --target x86_64-pc-windows-msvc --all-targets` no longer
+  passes on this Mac: `libz-sys v1.1.29`'s build script wants a vcpkg/MSVC zlib and
+  aborts. CLAUDE.md records the check clean as of 2026-08-14, so a dependency added
+  since then (libz-sys arrives via the image stack) broke the cross-check on a machine
+  with no MSVC zlib. Until it's fixed the cfg-drift guard is dead.
 - [x] 2026-08-16: ~~video-class content is frame-starved without AVC~~ — superseded twice:
   the bandwidth-measure fix alone lifted the same YouTube run to ~25 fps on
   ClearCodec+Progressive, and the VideoToolbox AVC420 decoder is now implemented
