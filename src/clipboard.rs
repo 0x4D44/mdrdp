@@ -48,6 +48,31 @@ use tracing::{debug, trace, warn};
 /// returning to `Idle`. A stuck "pending" flag with no way back is the classic wedge.
 pub const DEFAULT_PASTE_TIMEOUT_MS: u64 = 5_000;
 
+/// Session policy for clipboard sharing, from Settings ▸ Clipboard.
+///
+/// The direction gates suppress whole flows rather than filtering content: with
+/// `to_remote` off the local clipboard is never announced, and with `from_remote`
+/// off remote announcements are never followed up. `max_image_bytes` tightens (never
+/// widens) the built-in safety ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardPolicy {
+    pub to_remote: bool,
+    pub from_remote: bool,
+    pub max_image_bytes: u64,
+    pub paste_timeout_ms: u64,
+}
+
+impl Default for ClipboardPolicy {
+    fn default() -> Self {
+        ClipboardPolicy {
+            to_remote: true,
+            from_remote: true,
+            max_image_bytes: MAX_IMAGE_BYTES as u64,
+            paste_timeout_ms: DEFAULT_PASTE_TIMEOUT_MS,
+        }
+    }
+}
+
 /// Keep malformed remote clipboard data from forcing a large allocation or expensive decode.
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
@@ -358,6 +383,10 @@ pub struct ClipboardBridge {
     /// advertised straight back — the advertise-loop hazard.
     last_seen_fingerprint: Option<[u8; 32]>,
     paste_timeout_ms: u64,
+    allow_to_remote: bool,
+    allow_from_remote: bool,
+    /// Effective image ceiling: `min(MAX_IMAGE_BYTES, policy)`.
+    max_image_bytes: usize,
 }
 
 /// Creates a matched [`ClipboardBackend`]/[`ClipboardBridge`] pair sharing one channel, using
@@ -385,11 +414,26 @@ pub fn clipboard_channel_with_clock(
         initial_format_list_requested: false,
         last_seen_fingerprint: None,
         paste_timeout_ms: DEFAULT_PASTE_TIMEOUT_MS,
+        allow_to_remote: true,
+        allow_from_remote: true,
+        max_image_bytes: MAX_IMAGE_BYTES,
     };
     (backend, bridge)
 }
 
 impl ClipboardBridge {
+    /// Apply the session's clipboard policy. The image ceiling only tightens the
+    /// built-in safety limit; the paste timeout replaces the default.
+    #[must_use]
+    pub fn with_policy(mut self, policy: ClipboardPolicy) -> Self {
+        self.allow_to_remote = policy.to_remote;
+        self.allow_from_remote = policy.from_remote;
+        self.max_image_bytes = usize::try_from(policy.max_image_bytes.min(MAX_IMAGE_BYTES as u64))
+            .unwrap_or(MAX_IMAGE_BYTES);
+        self.paste_timeout_ms = policy.paste_timeout_ms;
+        self
+    }
+
     /// Formats most recently offered by the remote's clipboard (from the last
     /// `on_remote_copy`).
     pub fn remote_formats(&self) -> &[ClipboardFormat] {
@@ -457,6 +501,9 @@ impl ClipboardBridge {
     /// `NSPasteboard.changeCount` equivalent is exposed) — but that cost no longer compounds
     /// with an O(size) hash on top of it.
     pub fn poll_local_change(&mut self) {
+        if !self.allow_to_remote {
+            return; // Policy: the local clipboard never leaves this machine.
+        }
         let content = match self.os.get_content() {
             Ok(content) => content,
             Err(error) => {
@@ -511,6 +558,11 @@ impl ClipboardBridge {
         out: &mut Vec<CliprdrSvcMessages<R>>,
     ) {
         if !self.initial_format_list_requested {
+            return;
+        }
+        if !self.allow_to_remote {
+            // Policy: never announce local content. The server simply sees a client
+            // that never copies; nothing in CLIPRDR requires a non-empty list.
             return;
         }
         if let AdvertiseState::Pending { attempt, .. } = self.advertise_state {
@@ -659,7 +711,7 @@ impl ClipboardBridge {
                 height,
                 rgba,
             }) if format == ClipboardFormatId::CF_DIB || format == ClipboardFormatId::CF_DIBV5 => {
-                match encode_dib(width, height, &rgba) {
+                match encode_dib(width, height, &rgba, self.max_image_bytes) {
                     Ok(data) => OwnedFormatDataResponse::new_data(data),
                     Err(error) => {
                         warn!(%error, "failed to encode local clipboard image; sending error response");
@@ -702,7 +754,7 @@ impl ClipboardBridge {
         } else if format == ClipboardFormatId::CF_TEXT {
             ClipboardContent::Text(decode_ansi_text(response.data()))
         } else if format == ClipboardFormatId::CF_DIB || format == ClipboardFormatId::CF_DIBV5 {
-            match decode_dib(response.data()) {
+            match decode_dib(response.data(), self.max_image_bytes) {
                 Ok((width, height, rgba)) => ClipboardContent::Image {
                     width,
                     height,
@@ -718,6 +770,9 @@ impl ClipboardBridge {
             return;
         };
 
+        if !self.allow_from_remote {
+            return; // Policy: remote clipboard content never lands locally.
+        }
         match self.os.set_content(content.clone()) {
             Ok(()) => {
                 // Remember what we just wrote so poll_local_change doesn't loop it straight
@@ -837,7 +892,12 @@ fn decode_ansi_text(bytes: &[u8]) -> String {
 
 /// Encodes a top-down RGBA image as a 32-bit `CF_DIB` (`BITMAPV5HEADER`, `BI_BITFIELDS`).
 /// Explicit channel masks make alpha semantics unambiguous to clients that preserve it.
-fn encode_dib(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+fn encode_dib(
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     validate_image_dimensions(width, height, rgba.len())?;
     let pixel_bytes = width
         .checked_mul(height)
@@ -847,8 +907,8 @@ fn encode_dib(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, Strin
     let total = DIB_HEADER_SIZE
         .checked_add(pixel_bytes)
         .ok_or_else(|| "clipboard image is too large".to_string())?;
-    if total > MAX_IMAGE_BYTES {
-        return Err("clipboard image exceeds safe size limits".to_string());
+    if total > max_bytes {
+        return Err("clipboard image exceeds the size limit".to_string());
     }
 
     let width_i32 = i32::try_from(width).map_err(|_| "clipboard image is too wide".to_string())?;
@@ -888,9 +948,9 @@ fn encode_dib(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, Strin
 
 /// Decodes the safe, uncompressed subset of `CF_DIB` used by Windows and common desktop
 /// applications. The result is RGBA, row-major, top-down.
-fn decode_dib(data: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
-    if data.len() > MAX_IMAGE_BYTES {
-        return Err("remote clipboard image exceeds safe size limits".to_string());
+fn decode_dib(data: &[u8], max_bytes: usize) -> Result<(usize, usize, Vec<u8>), String> {
+    if data.len() > max_bytes {
+        return Err("remote clipboard image exceeds the size limit".to_string());
     }
     if data.len() < 40 {
         return Err("remote clipboard image has a truncated DIB header".to_string());
@@ -1406,7 +1466,10 @@ mod tests {
             0x7352_4742,
             "BITMAPV5HEADER must declare sRGB rather than zeroed calibrated-RGB metadata"
         );
-        assert_eq!(decode_dib(&wire).expect("decode local DIB"), image);
+        assert_eq!(
+            decode_dib(&wire, MAX_IMAGE_BYTES).expect("decode local DIB"),
+            image
+        );
     }
 
     #[test]
@@ -1420,7 +1483,7 @@ mod tests {
         // B, G, R, reserved byte. BI_RGB does not declare an alpha channel.
         dib[40..44].copy_from_slice(&[3, 2, 1, 0]);
         assert_eq!(
-            decode_dib(&dib).expect("decode BI_RGB"),
+            decode_dib(&dib, MAX_IMAGE_BYTES).expect("decode BI_RGB"),
             (1, 1, vec![1, 2, 3, 255])
         );
     }
@@ -1432,7 +1495,8 @@ mod tests {
         let mut cliprdr = ready_client(backend);
         bridge.pump(&mut cliprdr);
         let image = test_image();
-        let wire = encode_dib(image.0, image.1, &image.2).expect("encode test DIB");
+        let wire =
+            encode_dib(image.0, image.1, &image.2, MAX_IMAGE_BYTES).expect("encode test DIB");
 
         backend_mut(&mut cliprdr)
             .on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIB)]);
@@ -1645,6 +1709,98 @@ mod tests {
         backend_mut(&mut cliprdr).on_format_list_response(false);
         bridge.pump(&mut cliprdr);
         assert_eq!(bridge.advertise_state, AdvertiseState::Confirmed);
+    }
+
+    #[test]
+    fn from_remote_off_never_writes_the_os_clipboard() {
+        let (state, os) = fake_clipboard();
+        let (backend, bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut bridge = bridge.with_policy(ClipboardPolicy {
+            from_remote: false,
+            ..ClipboardPolicy::default()
+        });
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+
+        backend_mut(&mut cliprdr).on_remote_copy(&[unicode_format()]);
+        bridge.pump(&mut cliprdr);
+        backend_mut(&mut cliprdr)
+            .on_format_data_response(FormatDataResponse::new_unicode_string("blocked"));
+        bridge.pump(&mut cliprdr);
+
+        assert_eq!(
+            state.lock().unwrap().text,
+            None,
+            "remote content must never land locally under from_remote=false"
+        );
+    }
+
+    #[test]
+    fn to_remote_off_never_advertises_a_local_copy() {
+        let (state, os) = fake_clipboard();
+        let (backend, bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut bridge = bridge.with_policy(ClipboardPolicy {
+            to_remote: false,
+            ..ClipboardPolicy::default()
+        });
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        backend_mut(&mut cliprdr).on_request_format_list();
+        bridge.pump(&mut cliprdr);
+
+        state.lock().unwrap().text = Some("local secret".to_owned());
+        bridge.poll_local_change();
+        let messages = bridge.pump(&mut cliprdr);
+        assert!(
+            messages.is_empty(),
+            "a local copy must produce no wire messages under to_remote=false"
+        );
+        assert!(
+            bridge.local_pending.is_empty(),
+            "the local change must not even be queued"
+        );
+    }
+
+    #[test]
+    fn the_policy_timeout_replaces_the_default() {
+        let (_state, os) = fake_clipboard();
+        let clock = FakeClock::new();
+        let (backend, bridge) = clipboard_channel_with_clock(os, clock.clone());
+        let mut bridge = bridge.with_policy(ClipboardPolicy {
+            paste_timeout_ms: 1_234,
+            ..ClipboardPolicy::default()
+        });
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        backend_mut(&mut cliprdr).on_remote_copy(&[unicode_format()]);
+        bridge.pump(&mut cliprdr);
+        assert!(matches!(bridge.paste_state, PasteState::Requested { .. }));
+        clock.advance(1_300);
+        bridge.check_timeouts();
+        assert_eq!(
+            bridge.paste_state,
+            PasteState::Idle,
+            "1.3s beats a 1.234s cap"
+        );
+    }
+
+    #[test]
+    fn the_image_ceiling_tightens_but_never_widens() {
+        // 4x4 RGBA = 64 bytes of pixels + header; a 32-byte cap must refuse it.
+        let rgba = vec![0x7Fu8; 4 * 4 * 4];
+        assert!(encode_dib(4, 4, &rgba, 32).is_err());
+        assert!(encode_dib(4, 4, &rgba, MAX_IMAGE_BYTES).is_ok());
+        let wire = encode_dib(4, 4, &rgba, MAX_IMAGE_BYTES).unwrap();
+        assert!(decode_dib(&wire, 8).is_err());
+        assert!(decode_dib(&wire, MAX_IMAGE_BYTES).is_ok());
+        // The policy cannot widen: with_policy clamps to the built-in ceiling.
+        let (_state, os) = fake_clipboard();
+        let (_backend, bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let bridge = bridge.with_policy(ClipboardPolicy {
+            max_image_bytes: u64::MAX,
+            ..ClipboardPolicy::default()
+        });
+        assert_eq!(bridge.max_image_bytes, MAX_IMAGE_BYTES);
     }
 
     #[test]

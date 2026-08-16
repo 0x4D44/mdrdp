@@ -819,6 +819,22 @@ impl AudioPlayback {
     /// this logs once, counts one `device_errors`, and returns a handle with no stream.
     /// The RDP session must continue without audio rather than fail; the caller does not
     /// need to check anything to get that behaviour.
+    /// A deliberately-silent handle: no device opened, `is_active()` false, ring
+    /// disabled. The Settings ▸ Audio "playback off" path — unlike a failed
+    /// [`start`](Self::start), this counts no device error because nothing failed.
+    pub fn disabled(ring: AudioRing) -> Self {
+        ring.disable();
+        Self {
+            _stream: None,
+            ring,
+            format: AudioFormatSummary {
+                sample_rate: 48_000,
+                channels: 2,
+                bits_per_sample: 16,
+            },
+        }
+    }
+
     pub fn start(ring: AudioRing, stats: AudioStatsHandle) -> Self {
         match try_start(&ring, &stats) {
             Ok((stream, format)) => Self {

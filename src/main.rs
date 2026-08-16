@@ -160,9 +160,15 @@ fn write_session_metrics(
 /// caller's shell must not silently turn a session into a diagnostic one. The connect
 /// sequence is unaffected either way — it runs under its own scoped subscriber, which
 /// also keeps credential-bearing connector events away from this one.
-fn install_diagnostics_subscriber() {
-    let Ok(filter) = std::env::var("MDRDP_LOG") else {
-        return;
+fn install_diagnostics_subscriber(default_filter: Option<&str>) {
+    let filter = match std::env::var("MDRDP_LOG") {
+        Ok(filter) => filter,
+        // Settings ▸ Diagnostics ▸ Stage log = Verbose supplies a default filter;
+        // an explicit MDRDP_LOG always wins over it.
+        Err(_) => match default_filter {
+            Some(f) => f.to_owned(),
+            None => return,
+        },
     };
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -177,8 +183,6 @@ fn install_diagnostics_subscriber() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    install_diagnostics_subscriber();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -306,6 +310,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             mdrdp::settings::Settings::default()
         }
     };
+    install_diagnostics_subscriber(
+        (settings.diagnostics.stage_log == mdrdp::settings::StageLogLevel::Verbose)
+            .then_some("ironrdp=debug,mdrdp=debug"),
+    );
 
     if list_only {
         if favourites.is_empty() {
@@ -346,6 +354,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .username
         .clone()
         .or_else(|| favourites.default_username().map(str::to_owned));
+    // Settings ▸ Defaults drive a bare `mdrdp <host>`: they sit between an explicit
+    // flag (which always wins) and the built-in constants, and never override a
+    // favourite's own choices.
+    let port = port.or_else(|| chosen.is_none().then_some(settings.defaults.port));
+    let size = size.or_else(|| {
+        (chosen.is_none() && settings.defaults.window == mdrdp::settings::WindowMode::Explicit)
+            .then_some((settings.defaults.width, settings.defaults.height))
+    });
+    let force_fullscreen = force_fullscreen
+        || (chosen.is_none()
+            && size.is_none()
+            && settings.defaults.window == mdrdp::settings::WindowMode::Fullscreen);
     let explicit_size = size.is_some();
     let target = reconcile(
         Some(positional),
@@ -438,8 +458,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // The backend goes into the connection (CLIPRDR is static, so it must be registered
     // before the channel join); the bridge stays here and is driven by the session loop.
+    let clipboard_enabled =
+        settings.clipboard.direction != mdrdp::settings::ClipboardDirection::Off;
     let (clipboard_backend, clipboard_bridge) =
         clipboard_channel(Box::new(ArboardClipboard::new()));
+    let clipboard_bridge = clipboard_bridge.with_policy(mdrdp::clipboard::ClipboardPolicy {
+        to_remote: matches!(
+            settings.clipboard.direction,
+            mdrdp::settings::ClipboardDirection::Both
+                | mdrdp::settings::ClipboardDirection::ToRemote
+        ),
+        from_remote: matches!(
+            settings.clipboard.direction,
+            mdrdp::settings::ClipboardDirection::Both
+                | mdrdp::settings::ClipboardDirection::FromRemote
+        ),
+        max_image_bytes: settings.clipboard.max_image_bytes,
+        paste_timeout_ms: settings.clipboard.timeout_secs.saturating_mul(1000),
+    });
 
     // Audio. The output stream is opened here and deliberately kept on the main thread for
     // the life of the window: `cpal::Stream` has thread affinity on some platforms, and
@@ -451,7 +487,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // of slack it holds; the conversion below uses the device's actual format.
     let audio_stats = AudioStatsHandle::new();
     let audio_ring = AudioRing::for_device(48_000, 2, audio_stats.clone());
-    let playback = AudioPlayback::start(audio_ring.clone(), audio_stats.clone());
+    // Settings ▸ Audio: playback off means no device is opened and no RDPSND channel
+    // is claimed — the honest form of "no sound", not a joined channel that discards.
+    let playback = if settings.audio.playback {
+        AudioPlayback::start(audio_ring.clone(), audio_stats.clone())
+    } else {
+        AudioPlayback::disabled(audio_ring.clone())
+    };
     let rdpsnd = if playback.is_active() {
         let fmt = playback.format();
         eprintln!("audio: {} Hz, {} channel(s)", fmt.sample_rate, fmt.channels);
@@ -542,7 +584,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &secret,
         Channels {
             gfx: Some(Box::new(handler)),
-            cliprdr: Some(Box::new(clipboard_backend)),
+            cliprdr: clipboard_enabled.then(|| {
+                Box::new(clipboard_backend) as Box<dyn ironrdp::cliprdr::backend::CliprdrBackend>
+            }),
             rdpsnd,
             // Lets the fullscreen toggle renegotiate the session resolution.
             display_control: true,
@@ -588,7 +632,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         desktop.width,
         desktop.height,
     )
-    .with_fullscreen(fullscreen);
+    .with_fullscreen(fullscreen)
+    .with_overlay_on_start(settings.diagnostics.overlay_on_connect)
+    .with_dynamic_resolution(settings.graphics.dynamic_resolution);
     if explicit_size {
         // Flags always win: --size names the session resolution, fullscreen or not.
         window_config = window_config.keeping_stated_resolution();
@@ -836,7 +882,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         command_rx,
         waker,
         SessionServices {
-            clipboard: Some(clipboard_bridge),
+            clipboard: clipboard_enabled.then_some(clipboard_bridge),
             stats: session_stats.clone(),
             gfx: Some(gfx_stats.clone()),
         },

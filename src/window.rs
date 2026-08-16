@@ -57,6 +57,11 @@ pub struct WindowConfig {
     /// `--size WxH --fullscreen` keeps its stated resolution. A later interactive
     /// fullscreen toggle still renegotiates — that is a fresh user action.
     pub negotiate_native_on_start: bool,
+    /// Show the stats overlay from the first frame (Settings ▸ Diagnostics).
+    pub overlay_on_start: bool,
+    /// Allow fullscreen transitions to renegotiate the session resolution
+    /// (Settings ▸ Graphics ▸ Dynamic resolution). Off = letterbox only, ever.
+    pub dynamic_resolution: bool,
 }
 
 impl WindowConfig {
@@ -67,7 +72,21 @@ impl WindowConfig {
             session_height,
             fullscreen: false,
             negotiate_native_on_start: true,
+            overlay_on_start: false,
+            dynamic_resolution: true,
         }
+    }
+
+    /// Show the stats overlay from the first frame.
+    pub fn with_overlay_on_start(mut self, on: bool) -> Self {
+        self.overlay_on_start = on;
+        self
+    }
+
+    /// Permit or forbid resolution renegotiation on fullscreen transitions.
+    pub fn with_dynamic_resolution(mut self, on: bool) -> Self {
+        self.dynamic_resolution = on;
+        self
     }
 
     /// Set whether the window should open borderless fullscreen.
@@ -818,6 +837,7 @@ impl SessionApp {
         ));
         let fullscreen = config.fullscreen;
         let windowed_session = (config.session_width, config.session_height);
+        let show_stats = config.overlay_on_start;
         SessionApp {
             present_failures: 0,
             config,
@@ -833,7 +853,7 @@ impl SessionApp {
             policy,
             started: Instant::now(),
             stats,
-            show_stats: false,
+            show_stats,
             modifiers: ModifiersState::empty(),
             on_exit: None,
             commands: None,
@@ -1037,6 +1057,9 @@ impl SessionApp {
     /// Ask the session for this monitor's native pixel resolution, advertising the
     /// monitor's scale factor so the remote can render its UI at a matching size.
     fn request_native_resolution(&mut self, window: &Window) {
+        if !self.config.dynamic_resolution {
+            return; // Settings: the session resolution never follows the display.
+        }
         let Some(monitor) = window.current_monitor() else {
             return;
         };
@@ -1054,6 +1077,9 @@ impl SessionApp {
 
     /// Ask the session to go back to the resolution the windowed session runs at.
     fn request_windowed_resolution(&mut self) {
+        if !self.config.dynamic_resolution {
+            return; // Symmetric with request_native_resolution.
+        }
         self.send_command(SessionCommand::Resize {
             width: u32::from(self.windowed_session.0),
             height: u32::from(self.windowed_session.1),
