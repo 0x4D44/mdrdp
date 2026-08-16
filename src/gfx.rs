@@ -657,6 +657,15 @@ impl GraphicsPipelineHandler for GfxHandler {
         self.with_store(|store| store.map_to_output(pdu.surface_id));
     }
 
+    /// One AVC444/AVC444v2 PDU (one logical frame).
+    ///
+    /// Counted here, not per `BitmapUpdate`: the AVC444 path emits one update per
+    /// region rect, and a per-update tally would count rects where every other
+    /// codec counts PDUs — an incomparable codec mix.
+    fn on_avc444_frame(&mut self, codec_id: Codec1Type) {
+        self.note_codec(codec_id);
+    }
+
     /// A codec payload the upstream client could not decode and skipped.
     ///
     /// The vendored client's resilience policy skips bad AVC frames rather than
@@ -674,7 +683,11 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// Bitmaps the upstream client decoded itself (uncompressed, and AVC420 if a decoder
     /// is ever configured). Already RGBA by that API's contract, so it is blitted as-is.
     fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
-        self.note_codec(update.codec_id);
+        // AVC444 frames are already counted via on_avc444_frame (one per PDU, not
+        // one per emitted rect).
+        if !matches!(update.codec_id, Codec1Type::Avc444 | Codec1Type::Avc444v2) {
+            self.note_codec(update.codec_id);
+        }
         if update.data.is_empty() {
             return;
         }

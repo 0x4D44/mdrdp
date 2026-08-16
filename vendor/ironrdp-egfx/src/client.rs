@@ -261,6 +261,13 @@ pub trait GraphicsPipelineHandler: Send {
     /// surface ID, destination rectangle, and RGBA pixel data.
     fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
 
+    /// Called once per AVC444/AVC444v2 `WireToSurface1` PDU (one logical frame)
+    ///
+    /// mdrdp patch: the AVC444 path emits one `BitmapUpdate` per region rect, so a
+    /// per-update codec tally would count rects where every other codec counts
+    /// PDUs. This hook keeps the codec mix comparable.
+    fn on_avc444_frame(&mut self, _codec_id: Codec1Type) {}
+
     /// Called when a codec payload could not be decoded and was skipped
     ///
     /// mdrdp patch: the client's resilience policy is to skip a bad frame rather
@@ -872,6 +879,10 @@ impl GraphicsPipelineClient {
         let (surf_w, surf_h) = (surface.width, surface.height);
 
         self.capture_avc_payload(codec_id, bitmap_data);
+        // One PDU = one logical AVC444 frame. The handler counts codecs here rather
+        // than per BitmapUpdate (this path emits one update per region rect, which
+        // would inflate the codec mix relative to the one-update-per-PDU codecs).
+        self.handler.on_avc444_frame(codec_id);
         let started = std::time::Instant::now();
         let mut decode_us: u128 = 0;
 
@@ -932,14 +943,33 @@ impl GraphicsPipelineClient {
             .expect("checked above that a decoder is configured");
 
         // The chroma passes index the aux frame through the geometry the encoder
-        // packed against: the 16-aligned surface. A decoded frame at any other size
-        // (an SPS-cropped unaligned frame) would shear the whole frame's chroma, so
-        // those degrade to luma-only 4:2:0 output instead (counted below).
-        let aligned_w = usize::from(surf_w).div_ceil(16) * 16;
+        // packed against, and the two axes fail differently under SPS cropping
+        // (which VideoToolbox always applies — measured):
+        //
+        // - HEIGHT: the payload lives in the display rows, so anything in
+        //   `surface ..= align16(surface)` is complete — 1920x1080 legitimately
+        //   decodes as 1080 rows (coded 1088) and must not degrade.
+        // - WIDTH: the v2 split offsets are `align32(surface)/2` and `/4` INTO the
+        //   row, so a row narrower than align32(surface) has the V half at an
+        //   unknowable offset — running the pass would shear every frame's chroma.
+        //
+        // Outside those bounds, degrade to luma-only 4:2:0 output (counted below).
+        // 32-aligned widths (1920, 2560, ...) are unaffected either way.
         let aligned_h = usize::from(surf_h).div_ceil(16) * 16;
+        let geometry_ok = |frame: &Yuv420Frame| {
+            frame.width >= ironrdp_graphics::avc444::align32(usize::from(surf_w))
+                && (usize::from(surf_h)..=aligned_h).contains(&frame.height)
+        };
 
         let mut chroma_skipped: Option<&'static str> = None;
         let mut emit_rects: Vec<ExclusiveRectangle>;
+        // The combination passes index by the frame's claimed dimensions and would
+        // panic (on the DVC thread) on a decoder that returns planes shorter than
+        // its dimensions claim. Not reachable with the in-repo decoders, but
+        // `decode_yuv420` is a public trait method.
+        fn frame_ok(frame: &Yuv420Frame) -> bool {
+            frame.is_well_formed()
+        }
 
         match passes {
             Passes::LumaAndChroma => {
@@ -955,10 +985,16 @@ impl GraphicsPipelineClient {
                     return;
                 }
                 decode_us += decode_started.elapsed().as_micros();
+                if !frame_ok(&self.yuv_scratch.0) {
+                    self.handler.on_decode_failure(codec_id, "avc444 malformed decoded frame");
+                    return;
+                }
                 let decode_started = std::time::Instant::now();
                 if let Err(e) = decoder.decode_yuv420(stream2.data, &mut self.yuv_scratch.1) {
                     warn!(error = %e, "AVC444 chroma stream decode failed; applying luma only");
                     chroma_skipped = Some("avc444 chroma decode failed");
+                } else if !frame_ok(&self.yuv_scratch.1) {
+                    chroma_skipped = Some("avc444 malformed decoded frame");
                 }
                 decode_us += decode_started.elapsed().as_micros();
 
@@ -970,11 +1006,7 @@ impl GraphicsPipelineClient {
                     .or_insert_with(|| Yuv444Buffer::new(surf_w, surf_h));
                 buffer.apply_luma(main, &stream1_rects);
                 if chroma_skipped.is_none() {
-                    if aux.width == main.width
-                        && aux.height == main.height
-                        && aux.width == aligned_w
-                        && aux.height == aligned_h
-                    {
+                    if aux.width == main.width && aux.height == main.height && geometry_ok(aux) {
                         match codec_id {
                             Codec1Type::Avc444 => buffer.apply_chroma_v1(aux, &stream2_rects),
                             _ => buffer.apply_chroma_v2(aux, &stream2_rects),
@@ -985,7 +1017,7 @@ impl GraphicsPipelineClient {
                             main_h = main.height,
                             aux_w = aux.width,
                             aux_h = aux.height,
-                            aligned_w,
+                            surf_w,
                             aligned_h,
                             "AVC444 frame geometry does not match the packing geometry; luma only"
                         );
@@ -993,9 +1025,13 @@ impl GraphicsPipelineClient {
                     }
                 }
                 emit_rects = stream1_rects;
-                for rect in stream2_rects {
-                    if !emit_rects.contains(&rect) {
-                        emit_rects.push(rect);
+                // A skipped chroma pass leaves stream2's rects unchanged in the 444
+                // buffer, so repainting them would blit stale content for nothing.
+                if chroma_skipped.is_none() {
+                    for rect in stream2_rects {
+                        if !emit_rects.contains(&rect) {
+                            emit_rects.push(rect);
+                        }
                     }
                 }
             }
@@ -1007,6 +1043,10 @@ impl GraphicsPipelineClient {
                     return;
                 }
                 decode_us += decode_started.elapsed().as_micros();
+                if !frame_ok(&self.yuv_scratch.0) {
+                    self.handler.on_decode_failure(codec_id, "avc444 malformed decoded frame");
+                    return;
+                }
                 let main = &self.yuv_scratch.0;
                 self.avc444_buffers
                     .entry(surface_id)
@@ -1023,8 +1063,12 @@ impl GraphicsPipelineClient {
                     return;
                 }
                 decode_us += decode_started.elapsed().as_micros();
+                if !frame_ok(&self.yuv_scratch.1) {
+                    self.handler.on_decode_failure(codec_id, "avc444 malformed decoded frame");
+                    return;
+                }
                 let aux = &self.yuv_scratch.1;
-                if aux.width == aligned_w && aux.height == aligned_h {
+                if geometry_ok(aux) {
                     let buffer = self
                         .avc444_buffers
                         .entry(surface_id)
@@ -1038,7 +1082,7 @@ impl GraphicsPipelineClient {
                     warn!(
                         aux_w = aux.width,
                         aux_h = aux.height,
-                        aligned_w,
+                        surf_w,
                         aligned_h,
                         "AVC444 chroma-only frame geometry mismatch; skipping this frame"
                     );
@@ -1425,7 +1469,11 @@ mod tests {
             out.width = self.width;
             out.height = self.height;
             let uv = self.width.div_ceil(2) * self.height.div_ceil(2);
-            out.y = vec![tag; self.width * self.height];
+            // Y is position-dependent so the aux plane's U half and V half are
+            // distinguishable: a constant fill cannot see a wrong split offset.
+            out.y = (0..self.width * self.height)
+                .map(|i| tag.wrapping_add(i as u8))
+                .collect();
             out.u = vec![tag.wrapping_add(1); uv];
             out.v = vec![tag.wrapping_add(2); uv];
             Ok(())
@@ -1565,11 +1613,22 @@ mod tests {
         // columns only inside ITS rect (U = aux Y tag 20 there; the luma-replicated
         // U = 11 inside the luma rect).
         let buffer = client.avc444_buffers.get(&1).expect("buffer created");
-        let (y, u, _) = buffer.planes();
+        let (y, u, v) = buffer.planes();
         assert_eq!(y[0], 10, "luma rect got Y");
         assert_eq!(y[17 * 64 + 33], 0, "chroma-only rect gets no Y");
         assert_eq!(u[1 * 64 + 1], 11, "luma rect: replicated main chroma");
-        assert_eq!(u[17 * 64 + 33], 20, "chroma rect: odd column from aux Y plane");
+        // v2 packing with W = align32(64) = 64: dst U[y][2x+1] <- aux Y[y][x], and
+        // dst V[y][2x+1] <- aux Y[y][W/2 + x]. Aux Y value = 20 + index (mod 256).
+        assert_eq!(
+            u[17 * 64 + 33],
+            20u8.wrapping_add((17 * 64 + 16) as u8),
+            "chroma rect: odd column U from the aux Y plane's first half"
+        );
+        assert_eq!(
+            v[17 * 64 + 33],
+            20u8.wrapping_add((17 * 64 + 32 + 16) as u8),
+            "chroma rect: odd column V from the aux Y plane's second half"
+        );
     }
 
     #[test]
@@ -1594,8 +1653,16 @@ mod tests {
 
         let buffer = client.avc444_buffers.get(&1).expect("buffer");
         let (y, u, _) = buffer.planes();
-        assert_eq!(y[5 * 64 + 5], 30, "luma updated inside the rect");
-        assert_eq!(y[5 * 64 + 40], 10, "luma preserved outside the rect");
+        assert_eq!(
+            y[5 * 64 + 5],
+            30u8.wrapping_add((5 * 64 + 5) as u8),
+            "luma updated inside the rect"
+        );
+        assert_eq!(
+            y[5 * 64 + 40],
+            10u8.wrapping_add((5 * 64 + 40) as u8),
+            "luma preserved outside the rect"
+        );
         assert_eq!(
             u[5 * 64 + 5],
             31,
@@ -1603,7 +1670,7 @@ mod tests {
         );
         assert_eq!(
             u[5 * 64 + 41],
-            20,
+            20u8.wrapping_add((5 * 64 + 20) as u8),
             "outside the rect the full-resolution chroma persists"
         );
         assert!(!rx.try_iter().any(|e| matches!(e, Event::Failure(_))));
@@ -1626,7 +1693,11 @@ mod tests {
         assert_eq!((buffer.width(), buffer.height()), (64, 48));
         let (y, u, _) = buffer.planes();
         assert_eq!(y[0], 0, "no luma was delivered");
-        assert_eq!(u[3 * 64 + 3], 40, "odd column chroma from the stream1 aux frame");
+        assert_eq!(
+            u[3 * 64 + 3],
+            40u8.wrapping_add((3 * 64 + 1) as u8),
+            "odd column chroma from the stream1 aux frame"
+        );
 
         let events: Vec<Event> = rx.try_iter().collect();
         assert!(
@@ -1653,6 +1724,78 @@ mod tests {
         let (y, u, _) = buffer.planes();
         assert_eq!(y[0], 10, "luma still applied");
         assert_eq!(u[1 * 64 + 1], 11, "chroma stayed at the luma-replicated value");
+        assert!(
+            rx.try_iter()
+                .any(|e| matches!(e, Event::Failure("avc444 frame geometry mismatch"))),
+            "the degradation must be counted"
+        );
+    }
+
+    #[test]
+    fn avc444_accepts_height_cropped_frames_on_an_unaligned_surface() {
+        // A 64x40 surface has coded geometry 64x48; VideoToolbox always applies SPS
+        // cropping, so the decoder legitimately delivers 40-row frames — and the
+        // cropped rows carry the whole surface's payload. 1920x1080 is exactly this
+        // shape in the wild (coded height 1088). The chroma pass must run, and the
+        // V half must come from the align32 split, not a width-derived one.
+        let (tx, rx) = channel();
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(Recorder(tx)),
+            Some(Box::new(StubYuvDecoder { width: 64, height: 40 })),
+        );
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 64,
+            height: 40,
+            pixel_format: PixelFormat::XRgb,
+        }));
+
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 40)], &[10, 0, 0]),
+            stream2: Some(avc420_sub_stream(vec![wire_rect(0, 0, 64, 40)], &[20, 0, 0])),
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
+
+        let buffer = client.avc444_buffers.get(&1).expect("buffer");
+        let (_, u, v) = buffer.planes();
+        // W = align32(64) = 64: U[3][5] <- auxY[3][2], V[3][5] <- auxY[3][32 + 2].
+        assert_eq!(u[3 * 64 + 5], 20u8.wrapping_add((3 * 64 + 2) as u8));
+        assert_eq!(v[3 * 64 + 5], 20u8.wrapping_add((3 * 64 + 34) as u8));
+        assert!(
+            !rx.try_iter().any(|e| matches!(e, Event::Failure(_))),
+            "a height-cropped frame is not a geometry mismatch"
+        );
+    }
+
+    #[test]
+    fn avc444_width_cropped_frames_degrade_to_luma_only() {
+        // A 60-wide surface has align32 packing geometry 64. A frame cropped to 60
+        // columns has its V half at an unknowable offset — running the chroma pass
+        // would shear every frame's chroma, so it must degrade to luma-only and be
+        // counted.
+        let (tx, rx) = channel();
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(Recorder(tx)),
+            Some(Box::new(StubYuvDecoder { width: 60, height: 40 })),
+        );
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 60,
+            height: 40,
+            pixel_format: PixelFormat::XRgb,
+        }));
+
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 60, 40)], &[10, 0, 0]),
+            stream2: Some(avc420_sub_stream(vec![wire_rect(0, 0, 60, 40)], &[20, 0, 0])),
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
+
+        let buffer = client.avc444_buffers.get(&1).expect("buffer");
+        let (_, u, _) = buffer.planes();
+        assert_eq!(u[3 * 60 + 5], 11, "chroma stayed at the luma-replicated value");
         assert!(
             rx.try_iter()
                 .any(|e| matches!(e, Event::Failure("avc444 frame geometry mismatch"))),

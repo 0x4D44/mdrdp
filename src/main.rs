@@ -59,7 +59,7 @@ fn usage() -> &'static str {
      --screenshot <file>    write the final frame to a BMP (session pixels on disk)\n  \
      --metrics-json <file>  write a redacted session metrics report as JSON\n  \
      --input-script <file>  inject scripted keystrokes into the session (for tests)\n  \
-     --capture-failures DIR dump undecodable tiles for offline debugging\n\n\
+     --capture-failures DIR dump undecodable tiles AND the first raw AVC444 frames\n                            (screen content!) for offline debugging\n\n\
      Flags override whatever the chosen favourite specifies. A [defaults] username in\n\
      favourites.toml is used when neither a flag nor a favourite names an account."
 }

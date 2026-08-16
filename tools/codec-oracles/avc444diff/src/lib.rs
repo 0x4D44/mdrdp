@@ -401,6 +401,13 @@ pub fn align32(width: usize) -> usize {
 
 /// The `nTotalWidth` the v2 pass must be given: the 32-aligned surface width,
 /// capped at what the decoded auxiliary plane actually holds.
+/// LIMIT OF THIS ORACLE: both sides receive this same value as `nTotalWidth`, so
+/// the campaigns prove the *primitive's* split offsets are `nTotalWidth/2` and
+/// `nTotalWidth/4` — they cannot prove the align32 derivation itself (an align16
+/// rule would pass identically). The derivation is transcribed from FreeRDP
+/// `yuv.c` (`alignedWidth`, verified in source 2026-08-16); widths where align16
+/// and align32 differ are additionally guarded at the client (degrade to
+/// luma-only), pending a real capture at such a width.
 pub fn v2_total_width(dest_width: usize, aux_width: usize) -> u32 {
     align32(dest_width).min(aux_width) as u32
 }

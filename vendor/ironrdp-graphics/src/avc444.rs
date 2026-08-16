@@ -43,14 +43,24 @@ impl Yuv420Frame {
     pub fn uv_height(&self) -> usize {
         self.height.div_ceil(2)
     }
+
+    /// Whether the plane lengths actually hold `width * height` worth of samples.
+    ///
+    /// The combination passes index by `width`/`height` and would panic on a frame
+    /// whose vectors are shorter than its claimed dimensions. The decoders in this
+    /// repo always produce consistent frames, but `decode_yuv420` is a public trait
+    /// method — callers gate on this before combining.
+    pub fn is_well_formed(&self) -> bool {
+        self.y.len() >= self.width * self.height && {
+            let uv = self.uv_row() * self.uv_height();
+            self.u.len() >= uv && self.v.len() >= uv
+        }
+    }
 }
 
-/// Round a width up to the next multiple of 32.
-///
-/// The v2 auxiliary packing splits its planes at offsets derived from the 32-aligned
-/// surface width (FreeRDP `yuv.c`: `alignedWidth`), capped by the caller at what the
-/// decoded plane actually holds.
-fn align32(width: usize) -> usize {
+/// Round a width up to the next multiple of 32 (the v2 packing geometry — see
+/// [`Yuv444Buffer::apply_chroma_v2`]).
+pub fn align32(width: usize) -> usize {
     width.div_ceil(32) * 32
 }
 
@@ -167,6 +177,11 @@ impl Yuv444Buffer {
                 if dy % 2 == 1 {
                     let k = (dy - 1) / 2;
                     let u_row = (k / 8) * 16 + k % 8;
+                    // The V rows of the last 16-row block live in the coded frame's
+                    // macroblock padding; an SPS-cropped decode does not contain
+                    // them, so the bottom few odd rows then keep their replicated
+                    // averages (bounds check below). Graceful and uncounted — the
+                    // reference client over-reads its plane in the same case.
                     let v_row = u_row + 8;
                     let src_right = right.min(aux.width);
                     for dx in left..src_right {

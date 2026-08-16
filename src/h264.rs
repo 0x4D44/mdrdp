@@ -272,6 +272,23 @@ mod videotoolbox {
             info_flags_out: *mut u32,
         ) -> OsStatus;
         fn VTDecompressionSessionInvalidate(session: VtSessionRef);
+        fn VTDecompressionSessionWaitForAsynchronousFrames(session: VtSessionRef) -> OsStatus;
+    }
+
+    /// A VideoToolbox failure with its raw `OSStatus` preserved.
+    ///
+    /// Session-death detection (`kVTInvalidSessionErr`) compares this numerically;
+    /// matching on a formatted string would silently break recovery the day the
+    /// message changes.
+    struct VtError {
+        status: OsStatus,
+        context: &'static str,
+    }
+
+    impl From<VtError> for DecoderError {
+        fn from(e: VtError) -> Self {
+            DecoderError::msg(format!("{} (status {})", e.context, e.status))
+        }
     }
 
     /// Where the synchronous decode callback deposits its result.
@@ -464,6 +481,10 @@ mod videotoolbox {
                     K_CF_NUMBER_SINT32_TYPE,
                     (&raw const pixel_format).cast(),
                 );
+                if num.is_null() {
+                    CFRelease(format);
+                    return Err(DecoderError::msg("CFNumberCreate returned null"));
+                }
                 let keys = [kCVPixelBufferPixelFormatTypeKey.cast()];
                 let values = [num.cast()];
                 let attrs = CFDictionaryCreate(
@@ -475,6 +496,10 @@ mod videotoolbox {
                     &raw const kCFTypeDictionaryValueCallBacks,
                 );
                 CFRelease(num);
+                if attrs.is_null() {
+                    CFRelease(format);
+                    return Err(DecoderError::msg("CFDictionaryCreate returned null"));
+                }
                 let record = VtDecompressionOutputCallbackRecord {
                     callback: decode_callback,
                     refcon: ptr::null_mut(),
@@ -511,7 +536,7 @@ mod videotoolbox {
             session: &Session,
             avcc: &mut [u8],
             out: &mut Yuv420Frame,
-        ) -> DecoderResult<()> {
+        ) -> Result<(), VtError> {
             let mut slot = CallbackSlot {
                 status: 0,
                 produced: false,
@@ -534,9 +559,10 @@ mod videotoolbox {
                     &mut block,
                 );
                 if status != 0 || block.is_null() {
-                    return Err(DecoderError::msg(format!(
-                        "CMBlockBuffer creation failed (status {status})"
-                    )));
+                    return Err(VtError {
+                        status,
+                        context: "CMBlockBuffer creation failed",
+                    });
                 }
                 let timing = CmSampleTimingInfo {
                     duration: CmTime::default(),
@@ -558,9 +584,10 @@ mod videotoolbox {
                 );
                 if status != 0 || sample.is_null() {
                     CFRelease(block);
-                    return Err(DecoderError::msg(format!(
-                        "CMSampleBuffer creation failed (status {status})"
-                    )));
+                    return Err(VtError {
+                        status,
+                        context: "CMSampleBuffer creation failed",
+                    });
                 }
                 let mut info_flags = 0u32;
                 let status = VTDecompressionSessionDecodeFrame(
@@ -570,30 +597,34 @@ mod videotoolbox {
                     (&raw mut slot).cast(),
                     &mut info_flags,
                 );
+                // Asynchronous decompression is never requested, but Apple's
+                // contract is "may decode asynchronously unless you wait" — and the
+                // callback writes through raw pointers into THIS stack frame, so a
+                // delayed callback would be memory corruption, not an error. The
+                // wait turns that assumption into a guarantee for one call.
+                VTDecompressionSessionWaitForAsynchronousFrames(session.session);
                 CFRelease(sample);
                 CFRelease(block);
                 if status != 0 {
-                    return Err(DecoderError::msg(format!(
-                        "VTDecompressionSessionDecodeFrame failed (status {status})"
-                    )));
+                    return Err(VtError {
+                        status,
+                        context: "VTDecompressionSessionDecodeFrame failed",
+                    });
                 }
             }
             if slot.status != 0 {
-                return Err(DecoderError::msg(format!(
-                    "VideoToolbox decode callback reported status {}",
-                    slot.status
-                )));
+                return Err(VtError {
+                    status: slot.status,
+                    context: "VideoToolbox decode callback failed",
+                });
             }
             if !slot.produced {
-                return Err(DecoderError::msg("VideoToolbox produced no picture"));
+                return Err(VtError {
+                    status: 0,
+                    context: "VideoToolbox produced no picture",
+                });
             }
             Ok(())
-        }
-
-        /// `true` when the VT status means "throw the session away and rebuild".
-        fn is_session_death(err: &DecoderError) -> bool {
-            err.to_string()
-                .contains(&K_VT_INVALID_SESSION_ERR.to_string())
         }
     }
 
@@ -624,8 +655,10 @@ mod videotoolbox {
             // That ABAB alternation is the signature of AVC444 sub-streams carrying
             // divergent parameter sets, and rebuilding on it would flush the decoder
             // twice per frame, destroying both reference chains until the next IDR
-            // (a stall, not a glitch). Refusing without a rebuild keeps the main
-            // stream alive; the caller skips and counts the frame.
+            // (a stall, not a glitch). Refusing without a rebuild keeps whichever
+            // sub-stream built the current session alive (Windows uses one SPS for
+            // both, so in practice this guard never fires); the caller skips and
+            // counts the refused frames.
             if let (Some(sps), Some(pps)) = (sps, pps) {
                 let stale = match &self.session {
                     Some(s) => s.sps != sps || s.pps != pps,
@@ -673,7 +706,7 @@ mod videotoolbox {
 
             match Self::decode_with_session(session, &mut avcc, out) {
                 Ok(()) => Ok(()),
-                Err(e) if Self::is_session_death(&e) => {
+                Err(e) if e.status == K_VT_INVALID_SESSION_ERR => {
                     // GPU reset or sleep/wake killed the session. Rebuild from the same
                     // parameter sets and retry once (recovery completes at the next IDR).
                     warn!("VideoToolbox session died; rebuilding and retrying");
@@ -684,9 +717,9 @@ mod videotoolbox {
                     let rebuilt = Self::create_session(&sps, &pps)?;
                     let result = Self::decode_with_session(&rebuilt, &mut avcc, out);
                     self.session = Some(rebuilt);
-                    result
+                    result.map_err(DecoderError::from)
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(e.into()),
             }
         }
 
