@@ -425,8 +425,11 @@ pub fn establish(
         license_cache: None,
         timezone_info: Default::default(),
         compression_type: None,
-        // P2 does not render, so a server-drawn pointer would have nowhere to go.
-        enable_server_pointer: false,
+        // The server sends pointer shapes as data and the session thread mirrors them
+        // onto the local window as native OS cursors. Software rendering stays off:
+        // burning the pointer into the frame would smear it across the scaled viewport
+        // and put it a network round-trip behind the real mouse.
+        enable_server_pointer: true,
         pointer_software_rendering: false,
         multitransport_flags: None,
     };

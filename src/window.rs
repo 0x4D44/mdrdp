@@ -32,7 +32,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
+use winit::window::{CustomCursor, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::input::{self, InputEvent, PointerMap};
 use crate::session::SessionCommand;
@@ -97,13 +97,33 @@ const MAX_CONSECUTIVE_PRESENT_FAILURES: u32 = 30;
 const TITLE_REFRESH: Duration = Duration::from_secs(1);
 
 /// Messages a producer thread can push into the event loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     /// The surface store may have changed. The loop checks the generation and only then
     /// asks for a redraw.
     Damaged,
+    /// The remote changed its pointer shape; mirror it on the local window.
+    Cursor(CursorUpdate),
     /// The session ended; close the window.
     Close,
+}
+
+/// A remote pointer change, already decoded to pixels. Session-layer types stay out of
+/// this module, so the session thread translates IronRDP's pointer outputs into this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorUpdate {
+    /// Show the platform's default arrow.
+    Default,
+    /// The remote is hiding the pointer (games, video players do this).
+    Hidden,
+    /// A concrete shape, straight-alpha RGBA in session pixels.
+    Bitmap {
+        width: u16,
+        height: u16,
+        hotspot_x: u16,
+        hotspot_y: u16,
+        rgba: Vec<u8>,
+    },
 }
 
 /// A `Send` handle onto a running window, for the thread that owns the RDP session.
@@ -119,6 +139,11 @@ impl Waker {
     /// Ask the window to close. `false` means it already has.
     pub fn close(&self) -> bool {
         self.0.send_event(SessionEvent::Close).is_ok()
+    }
+
+    /// Mirror a remote pointer change. `false` means the window is gone.
+    pub fn cursor(&self, update: CursorUpdate) -> bool {
+        self.0.send_event(SessionEvent::Cursor(update)).is_ok()
     }
 }
 
@@ -585,6 +610,12 @@ struct SessionApp {
     last_title_refresh: Instant,
     title_frames: u64,
     title_bytes: u64,
+    /// Remote cursor shapes already turned into OS cursors, keyed by content hash.
+    /// Windows re-sends the same few shapes constantly; rebuilding an `NSCursor` for
+    /// each would churn for nothing.
+    cursor_cache: std::collections::HashMap<u64, CustomCursor>,
+    /// Whether the remote asked the pointer hidden, so a shape update can restore it.
+    cursor_hidden: bool,
 }
 
 impl SessionApp {
@@ -631,6 +662,77 @@ impl SessionApp {
             last_title_refresh: Instant::now(),
             title_frames: 0,
             title_bytes: 0,
+            cursor_cache: std::collections::HashMap::new(),
+            cursor_hidden: false,
+        }
+    }
+
+    /// Mirror a remote pointer change onto the local window.
+    ///
+    /// Best-effort by design: a shape winit rejects (bad hotspot, wrong buffer length)
+    /// falls back to the default arrow rather than touching the session. The pointer is
+    /// cosmetic; the desktop is not.
+    fn apply_remote_cursor(&mut self, event_loop: &ActiveEventLoop, update: CursorUpdate) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        match update {
+            CursorUpdate::Default => {
+                window.set_cursor(winit::window::CursorIcon::Default);
+                self.set_cursor_hidden(&window, false);
+            }
+            CursorUpdate::Hidden => self.set_cursor_hidden(&window, true),
+            CursorUpdate::Bitmap {
+                width,
+                height,
+                hotspot_x,
+                hotspot_y,
+                rgba,
+            } => {
+                // A zero-sized shape is the protocol's "invisible pointer".
+                if width == 0 || height == 0 {
+                    self.set_cursor_hidden(&window, true);
+                    return;
+                }
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (width, height, hotspot_x, hotspot_y).hash(&mut h);
+                    rgba.hash(&mut h);
+                    h.finish()
+                };
+                let cursor = match self.cursor_cache.get(&key) {
+                    Some(c) => Some(c.clone()),
+                    None => {
+                        // Hotspot inside the image, or winit refuses the source.
+                        let hx = hotspot_x.min(width - 1);
+                        let hy = hotspot_y.min(height - 1);
+                        CustomCursor::from_rgba(rgba, width, height, hx, hy)
+                            .ok()
+                            .map(|source| event_loop.create_custom_cursor(source))
+                            .inspect(|c| {
+                                // Distinct shapes number in the dozens; a runaway server
+                                // gets a reset, not unbounded growth.
+                                if self.cursor_cache.len() >= 128 {
+                                    self.cursor_cache.clear();
+                                }
+                                self.cursor_cache.insert(key, c.clone());
+                            })
+                    }
+                };
+                match cursor {
+                    Some(c) => window.set_cursor(c),
+                    None => window.set_cursor(winit::window::CursorIcon::Default),
+                }
+                self.set_cursor_hidden(&window, false);
+            }
+        }
+    }
+
+    fn set_cursor_hidden(&mut self, window: &Window, hidden: bool) {
+        if self.cursor_hidden != hidden {
+            self.cursor_hidden = hidden;
+            window.set_cursor_visible(!hidden);
         }
     }
 
@@ -954,6 +1056,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 // when frames do.
                 self.maybe_refresh_title();
             }
+            SessionEvent::Cursor(update) => self.apply_remote_cursor(event_loop, update),
             SessionEvent::Close => event_loop.exit(),
         }
     }

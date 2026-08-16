@@ -15,7 +15,7 @@ use crate::connect::{ConnectError, Established, describe, send_shutdown};
 use crate::input::{InputEvent, encode_fastpath_input, to_fastpath};
 use crate::stats::StatsHandle;
 use crate::surface::SurfaceStore;
-use crate::window::Waker;
+use crate::window::{CursorUpdate, Waker};
 use ironrdp::session::{ActiveStageOutput, image::DecodedImage};
 use ironrdp_blocking::Framed;
 use ironrdp_cliprdr::CliprdrClient;
@@ -302,6 +302,27 @@ fn pump(
                     }
                 }
                 ActiveStageOutput::Terminate(_) => return SessionEnd::Graceful,
+                // The remote's pointer shape, mirrored onto the local window. A dead
+                // window is discovered by the input drain, not here.
+                ActiveStageOutput::PointerDefault => {
+                    waker.cursor(CursorUpdate::Default);
+                }
+                ActiveStageOutput::PointerHidden => {
+                    waker.cursor(CursorUpdate::Hidden);
+                }
+                ActiveStageOutput::PointerBitmap(pointer) => {
+                    waker.cursor(CursorUpdate::Bitmap {
+                        width: pointer.width,
+                        height: pointer.height,
+                        hotspot_x: pointer.hotspot_x,
+                        hotspot_y: pointer.hotspot_y,
+                        rgba: pointer.bitmap_data.clone(),
+                    });
+                }
+                // A server-side pointer warp. Moving the user's physical mouse for the
+                // server would be a fight over the one cursor the user owns — skip it,
+                // like every mainstream client does by default.
+                ActiveStageOutput::PointerPosition { .. } => {}
                 ActiveStageOutput::DeactivateAll => {
                     // The server tore the session layer down — this is how a Display
                     // Control resolution change completes. Run the
