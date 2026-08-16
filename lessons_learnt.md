@@ -9,6 +9,23 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- Windows throttles and frame-skips EGFX for a client that ignores Bandwidth Measure probes (`vendor/ironrdp-session/src/x224/mod.rs`).
+  ironrdp-session 0.11 answers RTT auto-detect requests but drops Bandwidth Measure
+  Start/Stop as "not yet implemented". Quench sent 140 unanswered pairs in a 40 s session
+  and paced graphics down to ~2 fps with 1–4 s input-to-paint latency, skipping frame ids
+  mid-repaint — which then leaves whatever was on screen stale forever. Every counter
+  reads healthy: zero decode errors, instant acks, 100% cache hits. The signature is
+  server frame ids that SKIP plus multi-second silences after bursts.
+
+- EGFX codec state dies with the SURFACE, never with ResetGraphics — resetting decoders at reset breaks live V-bar hits (`gfx::on_reset_graphics`).
+  Measured both ways on quench: resetting the ClearCodec decoder at ResetGraphics
+  produced 74 "V-bar cache miss on hit" failures on the next repaint (Windows keeps
+  referencing pre-reset V-bars), while NOT dropping a deleted surface's progressive tile
+  state lets a same-id same-dims recreate refine the old surface's pixels. So: persist
+  ClearCodec caches, surfaces, and the bitmap cache across resets; drop progressive
+  state in on_surface_deleted (FreeRDP: progressive_delete_surface_context). Do not
+  copy FreeRDP's codecs_reset-at-ResetGraphics wholesale.
+
 - Windows drops an EDISP monitor layout sent before its caps PDU; gate on `DisplayControlClient::ready` (`session::service_resize`).
   The Display Control channel being open is not the same state as capabilities having
   arrived, and `ActiveStage::encode_resize` checks only the former — it happily encodes a

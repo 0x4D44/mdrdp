@@ -2,15 +2,22 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
+- [ ] 2026-08-16: we advertise `SMALL_CACHE` in the EGFX capabilities (src/gfx.rs
+  `capabilities()`), capping the server's bitmap cache at the small profile. quench's
+  cache already serves ~43% of painted pixels; dropping the flag gives the server a
+  bigger cache and should cut wire traffic further, at the cost of client memory.
+  Measure before/after (`bytes_from_wire` in --metrics-json) before keeping it.
+- [ ] 2026-08-16: the presenter (src/window.rs `present_into`) rescales the full frame
+  on the CPU every redraw — at 5120x2880 that is a ~56 MB pass per frame even when one
+  tile changed. Damage-rect-aware presentation (the store already tracks a generation;
+  it could track dirty rects) or a GPU present path would cut the cost.
 - [ ] 2026-08-16: `SurfaceStore::surface_to_surface` (src/surface.rs:323) blits with the
   UNCLIPPED source width as stride, but `extract` clips — a source rect overhanging the
   source surface would produce rows narrower than the stride and fail as ShortSource (or
   shear). Servers do not send such rects, so this is robustness, not a live bug.
-- [ ] 2026-08-16: the session's tracing calls (e.g. clipboard warnings in
-  src/session.rs) go nowhere — main.rs installs no global tracing subscriber; only the
-  connect sequence has a scoped one. Either install a stderr subscriber behind a
-  verbosity flag or convert the load-bearing ones to eprintln (the resolution path
-  already was).
+- [x] 2026-08-16: ~~the session's tracing calls go nowhere~~ — resolved: `MDRDP_LOG=<filter>`
+  now installs a global stderr subscriber (src/main.rs `install_diagnostics_subscriber`);
+  a normal run is unchanged.
 - [ ] 2026-08-16: `SessionCommand::Resize` reactivation path (DeactivateAll) is written
   but live-unexercised — quench resizes via EGFX ResetGraphics instead. Worth exercising
   against a server that takes the DeactivateAll route before trusting it fully.
