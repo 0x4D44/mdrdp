@@ -446,18 +446,39 @@ fn service_resize(
     let (width, height) =
         ironrdp::displaycontrol::pdu::MonitorLayoutEntry::adjust_display_size(width, height);
 
+    // A monitor layout may only be sent after the server's capabilities PDU has arrived
+    // (MS-RDPEDISP 3.3.5.2) — the channel being open is NOT enough, and a layout sent
+    // early is silently ignored by Windows. `encode_resize` checks only that the channel
+    // exists, so readiness is gated here; an unready channel keeps the request pending
+    // under the same patience budget as an unopened one.
+    let ready = established
+        .stage
+        .get_dvc::<ironrdp::displaycontrol::client::DisplayControlClient>()
+        .and_then(|dvc| {
+            dvc.channel_processor_downcast_ref::<ironrdp::displaycontrol::client::DisplayControlClient>()
+        })
+        .is_some_and(|client| client.ready());
+    if !ready {
+        if asked.elapsed() > RESIZE_PATIENCE {
+            *pending = None;
+            eprintln!(
+                "resolution: the server never announced Display Control capabilities; \
+                 the resolution stays fixed"
+            );
+        }
+        return Ok(());
+    }
+
     match established
         .stage
         .encode_resize(width, height, scale_percent, None)
     {
         Some(Ok(frame)) => {
             *pending = None;
-            tracing::info!(
-                width,
-                height,
-                scale_percent,
-                "requested a session resolution change"
-            );
+            // eprintln, not tracing: the client installs no global tracing subscriber,
+            // so tracing here is invisible. These are user-facing outcome lines, like
+            // the channel report at connect.
+            eprintln!("resolution: requested {width}x{height} (scale {scale_percent:?})");
             established
                 .framed
                 .write_all(&frame)
@@ -466,7 +487,10 @@ fn service_resize(
         Some(Err(e)) => {
             // Losing one resize is not worth losing the desktop.
             *pending = None;
-            tracing::warn!(error = %describe(&e), "could not encode the resolution change; keeping the current resolution");
+            eprintln!(
+                "resolution: could not encode the change ({}); keeping the current resolution",
+                describe(&e)
+            );
             Ok(())
         }
         // The Display Control channel is not open (yet). Keep the request pending and
@@ -475,8 +499,9 @@ fn service_resize(
         None => {
             if asked.elapsed() > RESIZE_PATIENCE {
                 *pending = None;
-                tracing::info!(
-                    "the server never opened the Display Control channel; the resolution stays fixed"
+                eprintln!(
+                    "resolution: the server never opened the Display Control channel; \
+                     the resolution stays fixed"
                 );
             }
             Ok(())
@@ -551,10 +576,9 @@ fn drive_reactivation(
                 desktop_size.height,
             );
             established.desktop_size = desktop_size;
-            tracing::info!(
-                width = desktop_size.width,
-                height = desktop_size.height,
-                "session reactivated"
+            eprintln!(
+                "resolution: session reactivated at {}x{}",
+                desktop_size.width, desktop_size.height
             );
             return Ok(());
         }
