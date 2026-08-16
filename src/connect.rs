@@ -343,6 +343,18 @@ impl RdpsndHandlers {
     }
 }
 
+/// The experience settings sent in the Client Info PDU.
+///
+/// Explicit rather than `PerformanceFlags::default()` because the upstream default sets
+/// `DISABLE_FULLWINDOWDRAG`, which makes dragging a window on the remote desktop show a
+/// bare outline instead of its contents. On the LAN this client targets, full-window drag
+/// is affordable and the outline looks broken. Menu animations stay off (they are pure
+/// extra frames to decode) and font smoothing stays on.
+pub fn performance_flags() -> ironrdp::pdu::rdp::client_info::PerformanceFlags {
+    use ironrdp::pdu::rdp::client_info::PerformanceFlags;
+    PerformanceFlags::DISABLE_MENUANIMATIONS | PerformanceFlags::ENABLE_FONT_SMOOTHING
+}
+
 /// Connect and hand back the live session.
 ///
 /// The caller owns the disconnect from here on — see `send_shutdown`. Dropping the
@@ -400,7 +412,7 @@ pub fn establish(
         work_dir: String::new(),
         autologon: false,
         enable_audio_playback: wants_audio,
-        performance_flags: ironrdp::pdu::rdp::client_info::PerformanceFlags::default(),
+        performance_flags: performance_flags(),
         desktop_scale_factor: 0,
         license_cache: None,
         timezone_info: Default::default(),
@@ -633,6 +645,18 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_drag_shows_contents_not_an_outline() {
+        use ironrdp::pdu::rdp::client_info::PerformanceFlags;
+        let flags = super::performance_flags();
+        assert!(
+            !flags.contains(PerformanceFlags::DISABLE_FULLWINDOWDRAG),
+            "full-window drag must be enabled; the upstream default disables it"
+        );
+        assert!(flags.contains(PerformanceFlags::DISABLE_MENUANIMATIONS));
+        assert!(flags.contains(PerformanceFlags::ENABLE_FONT_SMOOTHING));
+    }
+
     #[test]
     fn a_known_channel_renders_as_its_name_not_its_bytes() {
         let cliprdr = ironrdp_svc::pdu::gcc::ChannelName::from_utf8("cliprdr").unwrap();
