@@ -252,6 +252,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut stage_json = false;
     let mut list_only = false;
     let mut force_fullscreen = false;
+    let mut foreground = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -285,6 +286,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 continue;
             }
+            "--foreground" => {
+                foreground = true;
+                i += 1;
+                continue;
+            }
             "--user" => user = Some(value()?.clone()),
             "--port" => port = Some(value()?.parse()?),
             "--domain" => domain = Some(value()?.clone()),
@@ -307,6 +313,48 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--ask-password needs --stage-json (a driving launcher); \
              for a scripted run use --password-stdin"
             .into());
+    }
+
+    // A GUI run started from a terminal gives the prompt back: re-spawn detached and
+    // let the lingering parent report how the startup went. Anything that talks to its
+    // invoker over stdio, or that a harness waits on, stays attached — see the module
+    // docs for the full list.
+    let launch_flags = mdrdp::detach::LaunchFlags {
+        foreground,
+        stage_json,
+        password_stdin,
+        list_only,
+        scripted: duration.is_some()
+            || screenshot.is_some()
+            || metrics_json.is_some()
+            || input_script.is_some()
+            || capture.is_some(),
+    };
+    if mdrdp::detach::should_detach(
+        &launch_flags,
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        mdrdp::detach::already_detached(),
+    ) {
+        match mdrdp::detach::respawn(positional.is_some()) {
+            Ok(mdrdp::detach::StartupOutcome::Running) => return Ok(()),
+            Ok(mdrdp::detach::StartupOutcome::Failed { code }) => {
+                // The child's log has already been replayed above this line.
+                return Err(format!(
+                    "the background {} exited during startup{}",
+                    if positional.is_some() {
+                        "session"
+                    } else {
+                        "launcher"
+                    },
+                    code.map(|c| format!(" (exit code {c})"))
+                        .unwrap_or_default()
+                )
+                .into());
+            }
+            Err(e) => {
+                eprintln!("warning: could not detach from the terminal ({e}); continuing attached");
+            }
+        }
     }
 
     let config_path = Favourites::default_path();
@@ -456,6 +504,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // The reason names the store failure kind, never a secret.
             Err(e) => ask_password_over_pipe(&target.keychain_account, &e.to_string())?,
         }
+    } else if mdrdp::detach::already_detached() {
+        // No terminal behind us: reading the tty from a background process group would
+        // stop the process on SIGTTIN, invisibly. Fail with a message in the log — the
+        // lingering parent replays it — rather than hang where nobody can answer.
+        mdrdp::creds::lookup(&target.keychain_account)?
     } else {
         mdrdp::creds::lookup_or_prompt(&target.keychain_account)?
     };
@@ -643,7 +696,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     eprintln!(
-        "connected: {}x{}, {}, {}",
+        // The prefix is the marker a detaching parent watches the log for.
+        "{} {}x{}, {}, {}",
+        mdrdp::detach::CONNECTED_MARKER,
         desktop.width,
         desktop.height,
         established.report.trust,

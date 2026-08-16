@@ -81,6 +81,10 @@ const OPTIONS: &[(&str, &str)] = &[
         "--fullscreen",
         "open fullscreen (and renegotiate to the native resolution)",
     ),
+    (
+        "--foreground",
+        "stay attached to the terminal (a GUI run normally detaches\nand logs under the config directory)",
+    ),
     ("--list", "print saved favourites and exit"),
     (
         "--duration <secs>",
@@ -223,6 +227,7 @@ mod tests {
             "--domain",
             "--size",
             "--fullscreen",
+            "--foreground",
             "--list",
             "--duration",
             "--password-stdin",
