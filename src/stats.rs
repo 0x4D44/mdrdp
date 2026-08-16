@@ -87,6 +87,14 @@ impl Latency {
         Some(percentiles(&samples))
     }
 
+    /// The rolling window itself, oldest first.
+    ///
+    /// The diagnostics chart plots the individual samples, not just their percentiles;
+    /// this is a copy so the caller never holds a lock while drawing.
+    pub fn recent_samples(&self) -> Vec<u32> {
+        self.recent.iter().copied().collect()
+    }
+
     /// The frozen opening reading. `None` until [`BASELINE_SAMPLES`] have arrived.
     pub fn baseline(&self) -> Option<Percentiles> {
         self.baseline

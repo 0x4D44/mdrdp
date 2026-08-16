@@ -8,6 +8,7 @@ pub mod autoinput;
 pub mod clipboard;
 pub mod connect;
 pub mod creds;
+pub mod diag;
 pub mod egfx;
 pub mod favourites;
 pub mod gfx;

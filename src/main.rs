@@ -552,7 +552,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_commands(command_tx)
         .with_diagnostics(mdrdp::window::DiagnosticsUis {
             cache: diagnostics_placeholder("Bitmap cache"),
-            latency: diagnostics_placeholder("Latency and drift"),
+            latency: {
+                let stats = session_stats.clone();
+                let name = display_name.clone();
+                let detail = format!(
+                    "{}@{}:{} · pid {}",
+                    target.user,
+                    target.host,
+                    target.port,
+                    std::process::id()
+                );
+                let metrics_dir = settings.diagnostics.metrics_dir.clone();
+                Box::new(move |ui: &mut egui::Ui| {
+                    let snapshot = stats.snapshot();
+                    let action = mdrdp::diag::latency::ui_with_session(
+                        ui,
+                        &snapshot,
+                        Some((name.as_str(), detail.as_str())),
+                    );
+                    if action == mdrdp::diag::latency::LatencyAction::WriteMetrics {
+                        match write_diag_metrics(&metrics_dir, &snapshot) {
+                            Ok(path) => eprintln!("metrics: written to {}", path.display()),
+                            Err(e) => eprintln!("metrics: could not write: {e}"),
+                        }
+                    }
+                })
+            },
             channels: diagnostics_placeholder("Channels and codecs"),
         });
     let fullscreen_at_exit = window.fullscreen_state();
@@ -784,6 +809,54 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     window_result?;
     Ok(())
+}
+
+/// Write a redacted stats-only report from a diagnostics window's button.
+///
+/// Mid-session, so it carries the session stats alone ("running"); the full report
+/// with gfx/audio/channel detail still lands at session end via --metrics-json.
+fn write_diag_metrics(
+    dir: &str,
+    stats: &mdrdp::stats::SessionStats,
+) -> Result<std::path::PathBuf, String> {
+    let dir = expand_home(dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("mdrdp-latency-{stamp}.json"));
+    let payload = serde_json::json!({
+        "kind": "latency_snapshot",
+        "written_unix": stamp,
+        "latency": {
+            "count": stats.latency.count(),
+            "min_us": stats.latency.min(),
+            "max_us": stats.latency.max(),
+            "recent": stats.latency.recent().map(|p| {
+                serde_json::json!({"p50": p.p50, "p95": p.p95, "p99": p.p99})
+            }),
+            "baseline": stats.latency.baseline().map(|p| {
+                serde_json::json!({"p50": p.p50, "p95": p.p95, "p99": p.p99})
+            }),
+            "drift_us": stats.latency.drift_us(),
+        },
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&payload).expect("plain json"),
+    )
+    .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn expand_home(dir: &str) -> std::path::PathBuf {
+    if let Some(rest) = dir.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::PathBuf::from(home).join(rest);
+    }
+    std::path::PathBuf::from(dir)
 }
 
 /// Placeholder body for a diagnostics window whose real screen has not landed yet.
