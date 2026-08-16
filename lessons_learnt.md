@@ -9,6 +9,21 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- Windows keys the ClearCodec glyph cache by CONTENT: equal-area hits arrive reshaped (1x6 as 2x3); strict dims checks drop tiles (`clearcodec::decode_over`).
+  Measured live during window drag/resize: 24 glyph hits in 90 s, every one an exact area
+  match at a different shape. FreeRDP only requires the cached bytes to cover the
+  destination pixel count and reinterprets at the destination stride. A strict
+  width/height equality check rejected all 24, each one leaving a stale rectangle behind —
+  the drag/resize corruption. Dimensions on a glyph entry are advisory; area is the
+  contract.
+
+- Desktop Windows strips AVC420_ENABLED from the EGFX capability confirm unless the host is configured for H.264 (`gfx::capabilities`, V8.1 offer).
+  Advertising V8.1 + AVC420 (the only version that can say "420 but not 444") negotiates
+  cleanly, but quench confirmed avc420=false and kept sending ClearCodec/Progressive —
+  same posture temper showed. The client side can be ready and provably negotiating; the
+  server will not send H.264 until "Prioritize H.264/AVC 444 graphics mode" (or hardware
+  encode) is enabled host-side. Test that policy first before debugging the client.
+
 - Windows throttles and frame-skips EGFX for a client that ignores Bandwidth Measure probes (`vendor/ironrdp-session/src/x224/mod.rs`).
   ironrdp-session 0.11 answers RTT auto-detect requests but drops Bandwidth Measure
   Start/Stop as "not yet implemented". Quench sent 140 unanswered pairs in a 40 s session

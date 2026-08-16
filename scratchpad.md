@@ -2,12 +2,23 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
-- [ ] 2026-08-16: video-class content is frame-starved without AVC: a playing YouTube
-  video reached the client at only ~2-4 fps (ClearCodec+Progressive, quench, LAN).
-  Windows will not stream video-rate motion to a client with AVC disabled. The vendored
-  ironrdp-egfx has a pluggable `H264Decoder` trait (AVC420 wired, AVC444 stubbed);
-  VideoToolbox on macOS is the natural backend. This is a feature-sized decision for
-  Arthur, not a tweak.
+- [x] 2026-08-16: ~~video-class content is frame-starved without AVC~~ — superseded twice:
+  the bandwidth-measure fix alone lifted the same YouTube run to ~25 fps on
+  ClearCodec+Progressive, and the VideoToolbox AVC420 decoder is now implemented
+  (src/h264.rs) with a V8.1+AVC420 advertisement. Remaining follow-ups below.
+- [ ] 2026-08-16: quench strips AVC420_ENABLED from the EGFX capability confirm — desktop
+  Windows will not send H.264 until the host enables "Prioritize H.264/AVC 444 graphics
+  mode" (or H.264/AVC hardware encoding) group policy. Needs Arthur on quench; after
+  flipping it, rerun the av2 script and expect `Avc420` in the codec mix.
+- [ ] 2026-08-16: AVC444 is unimplemented end-to-end: the vendored egfx client forwards
+  Avc444 PDUs to on_unhandled_pdu, and the upstream `H264Decoder` trait (RGBA out) cannot
+  express the dual-stream luma+chroma combination AVC444 needs (it must happen in YUV
+  space before RGB conversion). Real design work: extend the trait to YUV output or embed
+  the combination in the vendored client, mirroring FreeRDP's avc444 path.
+- [ ] 2026-08-16: the remote cursor bitmap is not scaled by the viewport — a heavily
+  letterboxed window shows a slightly-too-large cursor (src/window.rs
+  `apply_remote_cursor`). Scale the RGBA by the letterbox factor if it reads wrong in
+  daily use. Also worth a look on Retina: winit CustomCursor pixel dimensions vs points.
 - [ ] 2026-08-16: we advertise `SMALL_CACHE` in the EGFX capabilities (src/gfx.rs
   `capabilities()`), capping the server's bitmap cache at the small profile. quench's
   cache already serves ~43% of painted pixels; dropping the flag gives the server a
