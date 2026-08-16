@@ -14,6 +14,8 @@
 use crate::ui::theme;
 use egui::{CornerRadius, Painter, Rect, Stroke, StrokeKind};
 
+pub mod cache;
+pub mod channels;
 pub mod latency;
 
 /// Paint a diagnostics card: `bg.chrome` fill, 1px `line.hair` border, 6px radius.
