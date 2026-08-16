@@ -301,6 +301,9 @@ pub struct Established {
     pub report: ConnectReport,
     /// Kept so the caller can snapshot AFTER observing, not before.
     pub probe: Option<EgfxProbe>,
+    /// Produces a fresh Deactivation-Reactivation sequence when the server sends
+    /// Deactivate All — which is how a Display Control resolution change completes.
+    pub activation_factory: ironrdp::connector::connection_activation::ConnectionActivationFactory,
 }
 
 /// Optional channel handlers to negotiate with the server.
@@ -319,6 +322,10 @@ pub struct Channels {
     /// a client that joins either channel and discards every wave produces silence that
     /// looks exactly like working audio.
     pub rdpsnd: Option<RdpsndHandlers>,
+    /// Join the Display Control channel (MS-RDPEDISP), which lets the session ask the
+    /// server for a new resolution mid-session. Off by default so the probe paths keep
+    /// measuring the channel set they always measured.
+    pub display_control: bool,
 }
 
 /// Two handlers backed by the same playback ring, one per RDPSND transport.
@@ -368,6 +375,7 @@ pub fn establish(
         gfx: handler,
         cliprdr,
         rdpsnd,
+        display_control,
     } = channels;
     // Read before `rdpsnd` is moved into the channel set below.
     //
@@ -448,6 +456,17 @@ pub fn establish(
     if let Some(h) = gfx_handler {
         let graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(h, None);
         drdynvc.attach_dynamic_channel(graphics);
+        has_dynamic_channel = true;
+    }
+
+    // Display Control (MS-RDPEDISP): joined so the session can ask for a new resolution
+    // later — e.g. going fullscreen renegotiating to the monitor's native pixels. The
+    // capabilities callback sends nothing: a layout is only ever sent when the user
+    // actually changes something, via `ActiveStage::encode_resize`.
+    if display_control {
+        drdynvc.attach_dynamic_channel(ironrdp::displaycontrol::client::DisplayControlClient::new(
+            |_caps| Ok(Vec::new()),
+        ));
         has_dynamic_channel = true;
     }
 
@@ -584,6 +603,7 @@ pub fn establish(
         .iter()
         .map(|(_id, channel)| channel_label(&channel.channel_name()))
         .collect();
+    let activation_factory = result.activation_factory.clone();
     let stage = build_active_stage(result);
 
     let total_ms = ms(trace.started.elapsed());
@@ -610,6 +630,7 @@ pub fn establish(
         desktop_size,
         report,
         probe,
+        activation_factory,
     })
 }
 

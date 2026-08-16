@@ -18,6 +18,7 @@ pub mod process_metrics;
 pub mod screenshot;
 pub mod session;
 pub mod stagelog;
+pub mod state;
 pub mod stats;
 pub mod surface;
 pub mod trust;

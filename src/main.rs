@@ -52,6 +52,7 @@ fn usage() -> &'static str {
      --port <n>             default 3389\n  \
      --domain <d>           Windows domain\n  \
      --size WxH             session resolution, e.g. 1920x1080\n  \
+     --fullscreen           open fullscreen (and renegotiate to the native resolution)\n  \
      --list                 print saved favourites and exit\n  \
      --duration <secs>      disconnect cleanly after N seconds (for scripted runs)\n  \
      --password-stdin       read the password from stdin instead of the keychain\n  \
@@ -179,6 +180,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut metrics_json: Option<String> = None;
     let mut password_stdin = false;
     let mut list_only = false;
+    let mut force_fullscreen = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -194,6 +196,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--password-stdin" => {
                 password_stdin = true;
+                i += 1;
+                continue;
+            }
+            "--fullscreen" => {
+                force_fullscreen = true;
                 i += 1;
                 continue;
             }
@@ -269,8 +276,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let positional = positional.expect("the launcher path returned above");
     let chosen = favourites.resolve(&positional).cloned();
+    // The title names what the user asked for: the favourite if one matched, else the
+    // host they typed.
+    let display_name = chosen
+        .as_ref()
+        .map(|f| f.name.clone())
+        .unwrap_or_else(|| positional.clone());
     let default_user = favourites.default_username().map(str::to_owned);
-    let target = reconcile(Some(positional), chosen, user, default_user, port, domain, size)?;
+    let explicit_size = size.is_some();
+    let target = reconcile(
+        Some(positional),
+        chosen,
+        user,
+        default_user,
+        port,
+        domain,
+        size,
+    )?;
+
+    // Whether the last session against this target closed fullscreen. Remembered state
+    // beats the favourite's setting — "reopen how I left it" is the point — but an
+    // explicit --size flag beats both and means windowed.
+    let state_key = mdrdp::state::target_key(&target.host, target.port);
+    let state_path = mdrdp::state::SessionState::default_path();
+    let remembered = state_path
+        .as_ref()
+        .map(|p| mdrdp::state::SessionState::load_from(p))
+        .and_then(|s| s.fullscreen_for(&state_key));
+    let fullscreen =
+        force_fullscreen || (!explicit_size && remembered.unwrap_or(target.fullscreen));
 
     // Built before connecting so a headless machine fails here, with a clear message,
     // rather than after a connection has been established and a logon spent.
@@ -287,6 +321,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = Arc::new(Mutex::new(SurfaceStore::new()));
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
+    let (command_tx, command_rx) = mpsc::channel::<session::SessionCommand>();
 
     // The stats handle must be taken before the handler is boxed away.
     let handler = GfxHandler::new(Arc::clone(&store));
@@ -353,6 +388,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             gfx: Some(Box::new(handler)),
             cliprdr: Some(Box::new(clipboard_backend)),
             rdpsnd,
+            // Lets the fullscreen toggle renegotiate the session resolution.
+            display_control: true,
         },
     )?;
     let desktop = established.desktop_size;
@@ -372,16 +409,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let window = SessionWindow::new(
         event_loop,
         WindowConfig::new(
-            format!("mdrdp — {}", target.host),
+            format!("mdrdp — {display_name}"),
             desktop.width,
             desktop.height,
         )
-        .with_fullscreen(target.fullscreen),
+        .with_fullscreen(fullscreen),
         Arc::clone(&store),
         input_tx,
     )?;
     let session_stats = StatsHandle::new();
-    let window = window.with_stats(session_stats.clone());
+    let window = window
+        .with_stats(session_stats.clone())
+        .with_commands(command_tx);
+    let fullscreen_at_exit = window.fullscreen_state();
     let session_started = std::time::Instant::now();
     let resource_start = process_snapshot();
 
@@ -396,7 +436,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let gfx_for_exit = gfx_stats.clone();
     let audio_for_exit = audio_stats.clone();
     let joined_channels_for_exit = established.report.joined_static_channels.clone();
+    let state_key_for_exit = state_key.clone();
+    let state_path_for_exit = state_path.clone();
+    let fullscreen_for_exit = Arc::clone(&fullscreen_at_exit);
     let window = window.on_exit(move || {
+        // Remember how the window closed, fullscreen-wise, so the next launch of this
+        // target can open the same way. Best-effort: a failed save costs one toggle.
+        if let Some(path) = &state_path_for_exit {
+            let mut state = mdrdp::state::SessionState::load_from(path);
+            state.set_fullscreen(
+                &state_key_for_exit,
+                fullscreen_for_exit.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            if let Err(e) = state.save_to(path) {
+                eprintln!("warning: could not remember the window state: {e}");
+            }
+        }
         let handle = slot_for_exit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -447,6 +502,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         established,
         Arc::clone(&store),
         input_rx,
+        command_rx,
         waker,
         SessionServices {
             clipboard: Some(clipboard_bridge),

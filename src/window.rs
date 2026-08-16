@@ -22,19 +22,21 @@
 //! logs, or serialises pixel data, and nothing should be added that does.
 
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::input::{self, InputEvent, PointerMap};
-use crate::stats::StatsHandle;
+use crate::session::SessionCommand;
+use crate::stats::{SessionStats, StatsHandle};
 use crate::surface::SurfaceStore;
 use crate::ui::font;
 use crate::window_policy::{Geometry, WindowPolicy};
@@ -73,6 +75,13 @@ impl WindowConfig {
 /// One is a hiccup; a sustained run means the surface is genuinely unusable and holding
 /// the session open serves nobody.
 const MAX_CONSECUTIVE_PRESENT_FAILURES: u32 = 30;
+
+/// How often the title-bar diagnostics refresh.
+///
+/// Once a second reads comfortably and keeps `set_title` — a real platform call — out of
+/// the per-frame path. The refresh is driven by damage, so an idle session's title
+/// simply stops updating, which is correct: none of its numbers are moving either.
+const TITLE_REFRESH: Duration = Duration::from_secs(1);
 
 /// Messages a producer thread can push into the event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +334,49 @@ pub fn draw_overlay(dst: &mut [u32], window_width: u32, window_height: u32, line
     }
 }
 
+/// The title-bar text: the base title plus live diagnostics.
+///
+/// Pure so the wording is testable without a window. The title is the one always-visible
+/// surface the client has, so it carries the numbers someone glances at to answer "why
+/// does this feel slow?" — resolution, latency (with drift), frame rate, inbound
+/// bitrate, cache hit rate. The full breakdown stays on the Ctrl+Alt+S overlay.
+pub fn title_line(
+    base: &str,
+    session_width: u16,
+    session_height: u16,
+    stats: &SessionStats,
+    fps: f64,
+    mbps: f64,
+) -> String {
+    let mut title = format!("{base} — {session_width}x{session_height}");
+    if let Some(p) = stats.latency.recent() {
+        let p50_ms = f64::from(p.p50) / 1000.0;
+        match stats.latency.drift_us() {
+            Some(d) if d != 0 => {
+                let drift_ms = d as f64 / 1000.0;
+                title.push_str(&format!(" · {p50_ms:.1}ms ({drift_ms:+.1})"));
+            }
+            _ => title.push_str(&format!(" · {p50_ms:.1}ms")),
+        }
+    }
+    if fps > 0.0 {
+        title.push_str(&format!(" · {fps:.0} fps"));
+    }
+    if mbps > 0.0 {
+        title.push_str(&format!(" · {mbps:.1} Mb/s"));
+    }
+    if let Some(hit) = stats.cache.hit_rate() {
+        title.push_str(&format!(" · cache {:.0}%", hit * 100.0));
+    }
+    if stats.decode_errors > 0 || stats.undecoded_regions > 0 {
+        title.push_str(&format!(
+            " · STALE {}",
+            stats.decode_errors + stats.undecoded_regions
+        ));
+    }
+    title
+}
+
 /// A window bound to a surface store, not yet running.
 ///
 /// Split from `run` so the caller can take a [`Waker`] before the loop takes over the
@@ -336,6 +388,11 @@ pub struct SessionWindow {
     input: Sender<InputEvent>,
     stats: Option<StatsHandle>,
     on_exit: Option<Box<dyn FnMut()>>,
+    commands: Option<Sender<SessionCommand>>,
+    /// Mirrors the window's fullscreen state for whoever outlives the loop — the exit
+    /// path persists it so the next launch can restore it. An atomic rather than a
+    /// return value because the Cmd+Q path never returns (see [`Self::on_exit`]).
+    fullscreen_state: Arc<AtomicBool>,
 }
 
 impl SessionWindow {
@@ -367,6 +424,7 @@ impl SessionWindow {
         input: Sender<InputEvent>,
     ) -> Result<Self, WindowError> {
         event_loop.set_control_flow(ControlFlow::Wait);
+        let fullscreen_state = Arc::new(AtomicBool::new(config.fullscreen));
         Ok(SessionWindow {
             event_loop,
             config,
@@ -374,7 +432,24 @@ impl SessionWindow {
             input,
             stats: None,
             on_exit: None,
+            commands: None,
+            fullscreen_state,
         })
+    }
+
+    /// Wire up the channel for asking the session to do things — currently, to
+    /// renegotiate its resolution when the window goes fullscreen.
+    ///
+    /// Optional: without it the fullscreen toggle still works, it just letterboxes.
+    pub fn with_commands(mut self, commands: Sender<SessionCommand>) -> Self {
+        self.commands = Some(commands);
+        self
+    }
+
+    /// A handle that always holds the window's current fullscreen state, usable after
+    /// the loop has exited (including the Cmd+Q path, where `run` never returns).
+    pub fn fullscreen_state(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.fullscreen_state)
     }
 
     /// Run `f` when the event loop is tearing down, however it was told to.
@@ -420,9 +495,13 @@ impl SessionWindow {
             input,
             stats,
             on_exit,
+            commands,
+            fullscreen_state,
         } = self;
         let mut app = SessionApp::new(config, store, input, stats);
         app.on_exit = on_exit;
+        app.commands = commands;
+        app.fullscreen_state = fullscreen_state;
         event_loop
             .run_app(&mut app)
             .map_err(|e| WindowError::EventLoop(e.to_string()))?;
@@ -477,6 +556,22 @@ struct SessionApp {
     /// Monotonic origin for the policy's timestamps. Wall-clock would let a clock
     /// adjustment overnight — exactly when displays sleep — corrupt the timing.
     started: Instant,
+    /// Channel for asking the session to renegotiate its resolution. `None` in windows
+    /// with no session behind them (the probe harness).
+    commands: Option<Sender<SessionCommand>>,
+    /// Whether the window is currently fullscreen — ours to track, because winit reports
+    /// transitions only as ordinary `Resized` events.
+    fullscreen: bool,
+    /// Mirror of `fullscreen` readable after the loop dies. See
+    /// [`SessionWindow::fullscreen_state`].
+    fullscreen_state: Arc<AtomicBool>,
+    /// The session size the user ran windowed at, restored when leaving fullscreen.
+    windowed_session: (u16, u16),
+    /// Title diagnostics bookkeeping: last refresh, and the counters at that refresh so
+    /// fps and bitrate are deltas rather than lifetime averages.
+    last_title_refresh: Instant,
+    title_frames: u64,
+    title_bytes: u64,
 }
 
 impl SessionApp {
@@ -496,6 +591,8 @@ impl SessionApp {
             u32::from(config.session_width),
             u32::from(config.session_height),
         ));
+        let fullscreen = config.fullscreen;
+        let windowed_session = (config.session_width, config.session_height);
         SessionApp {
             present_failures: 0,
             config,
@@ -514,6 +611,13 @@ impl SessionApp {
             show_stats: false,
             modifiers: ModifiersState::empty(),
             on_exit: None,
+            commands: None,
+            fullscreen,
+            fullscreen_state: Arc::new(AtomicBool::new(fullscreen)),
+            windowed_session,
+            last_title_refresh: Instant::now(),
+            title_frames: 0,
+            title_bytes: 0,
         }
     }
 
@@ -527,6 +631,106 @@ impl SessionApp {
         self.modifiers.control_key()
             && self.modifiers.alt_key()
             && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("s"))
+    }
+
+    /// Ctrl+Alt+Enter toggles fullscreen.
+    ///
+    /// Echoes mstsc's Ctrl+Alt+Break — the classic RDP fullscreen toggle — with Enter
+    /// standing in for the Break key Mac keyboards do not have. Ctrl+Alt+Enter is not a
+    /// standard Windows shortcut, so claiming it locally costs the remote nothing.
+    fn is_fullscreen_hotkey(&self, event: &winit::event::KeyEvent) -> bool {
+        self.modifiers.control_key()
+            && self.modifiers.alt_key()
+            && matches!(&event.logical_key, Key::Named(NamedKey::Enter))
+    }
+
+    /// Enter or leave fullscreen, renegotiating the session resolution to match.
+    ///
+    /// This is the *only* place the session resolution follows the display, and it runs
+    /// solely on the user's say-so — the hotkey, the startup restore of a fullscreen
+    /// close, or the OS fullscreen button. A display-configuration change never lands
+    /// here; those keep going through the geometry policy, which never touches the
+    /// session (see the module note and CLAUDE.md).
+    fn set_fullscreen_mode(&mut self, on: bool) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        self.fullscreen = on;
+        self.fullscreen_state.store(on, Ordering::Relaxed);
+        if on {
+            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            window.set_decorations(false);
+            self.request_native_resolution(&window);
+        } else {
+            window.set_fullscreen(None);
+            window.set_decorations(true);
+            self.request_windowed_resolution();
+        }
+        // The transition lands as ordinary `Resized` events; tell the policy a display
+        // upheaval is in progress so it does not read them as the user dragging.
+        let now = self.now_ms();
+        self.policy.note_display_event(now);
+    }
+
+    /// Ask the session for this monitor's native pixel resolution, advertising the
+    /// monitor's scale factor so the remote can render its UI at a matching size.
+    fn request_native_resolution(&mut self, window: &Window) {
+        let Some(monitor) = window.current_monitor() else {
+            return;
+        };
+        let size = monitor.size();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let scale = (monitor.scale_factor() * 100.0).round() as u32;
+        // MS-RDPEDISP: the server ignores a scale outside 100–500.
+        let scale = (100..=500).contains(&scale).then_some(scale);
+        self.send_command(SessionCommand::Resize {
+            width: size.width,
+            height: size.height,
+            scale_percent: scale,
+        });
+    }
+
+    /// Ask the session to go back to the resolution the windowed session runs at.
+    fn request_windowed_resolution(&mut self) {
+        self.send_command(SessionCommand::Resize {
+            width: u32::from(self.windowed_session.0),
+            height: u32::from(self.windowed_session.1),
+            // Undo whatever scale fullscreen advertised, or the remote stays zoomed.
+            scale_percent: Some(100),
+        });
+    }
+
+    fn send_command(&mut self, command: SessionCommand) {
+        if let Some(commands) = &self.commands {
+            // A dead session is closing the window anyway; nothing useful to do here.
+            let _ = commands.send(command);
+        }
+    }
+
+    /// Refresh the title-bar diagnostics, at most once per [`TITLE_REFRESH`].
+    fn maybe_refresh_title(&mut self) {
+        let elapsed = self.last_title_refresh.elapsed();
+        if elapsed < TITLE_REFRESH {
+            return;
+        }
+        let (Some(window), Some(stats)) = (&self.window, &self.stats) else {
+            return;
+        };
+        let snapshot = stats.snapshot();
+        let secs = elapsed.as_secs_f64();
+        let fps = snapshot.frames.saturating_sub(self.title_frames) as f64 / secs;
+        let mbps = snapshot.bytes_in.saturating_sub(self.title_bytes) as f64 * 8.0 / secs / 1e6;
+        self.last_title_refresh = Instant::now();
+        self.title_frames = snapshot.frames;
+        self.title_bytes = snapshot.bytes_in;
+        window.set_title(&title_line(
+            &self.config.title,
+            self.viewport.session_width,
+            self.viewport.session_height,
+            &snapshot,
+            fps,
+            mbps,
+        ));
     }
 
     fn now_ms(&self) -> u64 {
@@ -711,9 +915,16 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         };
 
         window.request_redraw();
-        self.window = Some(window);
+        self.window = Some(window.clone());
         self._context = Some(context);
         self.surface = Some(surface);
+
+        // A window that *opens* fullscreen — a favourite, or a remembered fullscreen
+        // close — negotiates its monitor's native resolution the same way the hotkey
+        // does. Best-effort: on a server without Display Control it letterboxes.
+        if self.fullscreen {
+            self.request_native_resolution(&window);
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: SessionEvent) {
@@ -726,6 +937,9 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 {
                     window.request_redraw();
                 }
+                // Damage is also the clock for the title diagnostics: numbers only move
+                // when frames do.
+                self.maybe_refresh_title();
             }
             SessionEvent::Close => event_loop.exit(),
         }
@@ -738,7 +952,9 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             WindowEvent::RedrawRequested => self.redraw(event_loop),
 
             // A resize changes the viewport and nothing else. The session keeps its
-            // resolution — see the module note and CLAUDE.md.
+            // resolution — see the module note and CLAUDE.md. (A *fullscreen toggle*
+            // may renegotiate the resolution, but that happens in
+            // `set_fullscreen_mode`, on the user's say-so, never here.)
             WindowEvent::Resized(size) => {
                 self.viewport = Viewport::letterbox(
                     size.width,
@@ -746,7 +962,30 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                     self.viewport.session_width,
                     self.viewport.session_height,
                 );
-                self.hold_geometry(Geometry::new(size.width, size.height));
+                // The OS can toggle fullscreen without us — the macOS green button, a
+                // Mission Control gesture. Adopt the change as if the hotkey did it,
+                // resolution renegotiation included.
+                if let Some(window) = self.window.clone() {
+                    let os_fullscreen = window.fullscreen().is_some();
+                    if os_fullscreen != self.fullscreen {
+                        self.fullscreen = os_fullscreen;
+                        self.fullscreen_state
+                            .store(os_fullscreen, Ordering::Relaxed);
+                        if os_fullscreen {
+                            self.request_native_resolution(&window);
+                        } else {
+                            self.request_windowed_resolution();
+                        }
+                        let now = self.now_ms();
+                        self.policy.note_display_event(now);
+                    }
+                }
+                // Fullscreen geometry belongs to the OS; the policy only defends the
+                // size of a *windowed* window. Feeding it fullscreen sizes would teach
+                // it that the monitor size is what the user wants.
+                if !self.fullscreen {
+                    self.hold_geometry(Geometry::new(size.width, size.height));
+                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -762,8 +1001,10 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 // the size may have been changed while the screen was off, and no further
                 // `Resized` is guaranteed to arrive to prompt us.
                 if !occluded && let Some(window) = self.window.clone() {
-                    let size = window.inner_size();
-                    self.hold_geometry(Geometry::new(size.width, size.height));
+                    if !self.fullscreen {
+                        let size = window.inner_size();
+                        self.hold_geometry(Geometry::new(size.width, size.height));
+                    }
                     window.request_redraw();
                 }
             }
@@ -783,15 +1024,21 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 is_synthetic,
                 ..
             } => {
-                // Every other key belongs to the remote desktop, so the one local hotkey
-                // is claimed here and deliberately not forwarded — otherwise it would also
-                // type an "s" into whatever has focus on the far end.
+                // Every other key belongs to the remote desktop, so the few local
+                // hotkeys are claimed here and deliberately not forwarded — otherwise
+                // they would also type into whatever has focus on the far end.
                 if !is_synthetic && self.is_stats_hotkey(&event) {
                     if event.state == winit::event::ElementState::Pressed {
                         self.show_stats = !self.show_stats;
                         if let Some(window) = &self.window {
                             window.request_redraw();
                         }
+                    }
+                    return;
+                }
+                if !is_synthetic && self.is_fullscreen_hotkey(&event) {
+                    if event.state == winit::event::ElementState::Pressed && !event.repeat {
+                        self.set_fullscreen_mode(!self.fullscreen);
                     }
                     return;
                 }
@@ -1146,6 +1393,50 @@ mod tests {
 
     fn overlay_lines() -> Vec<String> {
         vec!["latency p50 3.5ms".to_string(), "cache 75% hit".to_string()]
+    }
+
+    // --- title diagnostics ------------------------------------------------------------
+
+    #[test]
+    fn the_title_carries_the_numbers_someone_glances_at() {
+        use crate::stats::{BASELINE_SAMPLES, CacheStats, WINDOW};
+        let mut s = SessionStats::new();
+        for _ in 0..BASELINE_SAMPLES {
+            s.latency.record(1_000);
+        }
+        for _ in 0..WINDOW {
+            s.latency.record(3_500);
+        }
+        s.cache = CacheStats {
+            hits: 3,
+            misses: 1,
+            ..Default::default()
+        };
+        let t = title_line("mdrdp — Temper", 2560, 1440, &s, 24.2, 3.12);
+        assert!(t.starts_with("mdrdp — Temper"), "got: {t}");
+        assert!(t.contains("2560x1440"), "got: {t}");
+        assert!(t.contains("3.5ms"), "got: {t}");
+        assert!(t.contains("(+2.5)"), "drift must be visible; got: {t}");
+        assert!(t.contains("24 fps"), "got: {t}");
+        assert!(t.contains("3.1 Mb/s"), "got: {t}");
+        assert!(t.contains("cache 75%"), "got: {t}");
+        assert!(!t.contains("STALE"), "nothing is stale here; got: {t}");
+    }
+
+    #[test]
+    fn a_quiet_session_title_is_just_the_name_and_resolution() {
+        let s = SessionStats::new();
+        let t = title_line("mdrdp — box", 1920, 1080, &s, 0.0, 0.0);
+        assert_eq!(t, "mdrdp — box — 1920x1080");
+    }
+
+    #[test]
+    fn staleness_reaches_the_title_because_the_title_is_always_visible() {
+        let mut s = SessionStats::new();
+        s.decode_errors = 2;
+        s.undecoded_regions = 3;
+        let t = title_line("mdrdp — box", 800, 600, &s, 0.0, 0.0);
+        assert!(t.contains("STALE 5"), "got: {t}");
     }
 
     #[test]

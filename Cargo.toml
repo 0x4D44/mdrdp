@@ -8,7 +8,7 @@ repository = "https://github.com/0x4d44/mdrdp"
 
 [dependencies]
 arboard = "3"
-ironrdp = { version = "0.17.0", features = ["connector", "session", "svc", "dvc", "graphics", "cliprdr"] }
+ironrdp = { version = "0.17.0", features = ["connector", "session", "svc", "dvc", "graphics", "cliprdr", "displaycontrol"] }
 cpal = "0.16"
 ironrdp-blocking = "0.10.0"
 ironrdp-cliprdr = "0.7.0"

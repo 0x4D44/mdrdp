@@ -56,6 +56,41 @@ pub struct SessionServices {
     pub gfx: Option<crate::gfx::GfxStatsHandle>,
 }
 
+/// A request the window can make of the running session.
+///
+/// Distinct from [`InputEvent`]: input is what the user types into the remote desktop,
+/// while a command is addressed to the session itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCommand {
+    /// Ask the server for a new session resolution over the Display Control channel.
+    ///
+    /// Best-effort by design: a server that never opened the channel simply keeps the
+    /// old resolution, and the window keeps letterboxing — that is the graceful
+    /// degradation, not an error.
+    Resize {
+        width: u32,
+        height: u32,
+        /// Desktop scale factor percent (100–500) to advertise alongside, so a HiDPI
+        /// native resolution can come with "please render the UI at 200%". `None`
+        /// advertises nothing.
+        scale_percent: Option<u32>,
+    },
+}
+
+/// How long a requested resize waits for the Display Control channel to open before the
+/// request is dropped.
+///
+/// The channel opens within the first second of a session on a server that supports it;
+/// a server that does not support it will never open it, and retrying forever would spin
+/// a lookup every pump slice for the life of the session.
+const RESIZE_PATIENCE: Duration = Duration::from_secs(10);
+
+/// Wall-clock bound on the whole Deactivation-Reactivation sequence.
+///
+/// Reactivation is a handful of small PDUs on a link measured in milliseconds; if it has
+/// not completed in this long the session is wedged and failing beats hanging.
+const REACTIVATION_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Why the session ended.
 #[derive(Debug)]
 pub enum SessionEnd {
@@ -87,6 +122,7 @@ pub fn spawn(
     established: Established,
     store: Arc<Mutex<SurfaceStore>>,
     input: Receiver<InputEvent>,
+    commands: Receiver<SessionCommand>,
     waker: Waker,
     services: SessionServices,
 ) -> SessionHandle {
@@ -95,16 +131,28 @@ pub fn spawn(
 
     let join = std::thread::Builder::new()
         .name("mdrdp-session".to_owned())
-        .spawn(move || run(established, store, input, waker, thread_stop, services))
+        .spawn(move || {
+            run(
+                established,
+                store,
+                input,
+                commands,
+                waker,
+                thread_stop,
+                services,
+            )
+        })
         .expect("spawn session thread");
 
     SessionHandle { join, stop }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     mut established: Established,
     store: Arc<Mutex<SurfaceStore>>,
     input: Receiver<InputEvent>,
+    commands: Receiver<SessionCommand>,
     waker: Waker,
     stop: Arc<AtomicBool>,
     mut services: SessionServices,
@@ -132,6 +180,7 @@ fn run(
         &mut established,
         &store,
         &input,
+        &commands,
         &waker,
         &stop,
         &mut image,
@@ -163,6 +212,7 @@ fn pump(
     established: &mut Established,
     store: &Arc<Mutex<SurfaceStore>>,
     input: &Receiver<InputEvent>,
+    commands: &Receiver<SessionCommand>,
     waker: &Waker,
     stop: &Arc<AtomicBool>,
     image: &mut DecodedImage,
@@ -170,6 +220,8 @@ fn pump(
     services: &mut SessionServices,
 ) -> SessionEnd {
     let mut last_clipboard_poll = Instant::now();
+    // A resize waiting for the Display Control channel to open, with when it was asked.
+    let mut pending_resize: Option<(SessionCommand, Instant)> = None;
     // When input went out with no resulting paint seen yet. The gap between the two is
     // the round trip the latency requirement is about.
     let mut input_sent_at: Option<Instant> = None;
@@ -194,6 +246,16 @@ fn pump(
             }
             Ok(Drained::Idle) => {}
             Err(e) => return SessionEnd::Failed(e),
+        }
+
+        // --- outbound: session commands ---------------------------------------
+        // Only the newest resize matters: a user who toggled fullscreen twice while the
+        // channel was still opening wants where they ended up, not the journey.
+        while let Ok(command) = commands.try_recv() {
+            pending_resize = Some((command, Instant::now()));
+        }
+        if let Err(e) = service_resize(established, &mut pending_resize) {
+            return SessionEnd::Failed(e);
         }
 
         // --- clipboard --------------------------------------------------------
@@ -241,8 +303,12 @@ fn pump(
                 }
                 ActiveStageOutput::Terminate(_) => return SessionEnd::Graceful,
                 ActiveStageOutput::DeactivateAll => {
-                    // A resolution change would land here. Not handled yet: the session
-                    // continues at the old size rather than dying.
+                    // The server tore the session layer down — this is how a Display
+                    // Control resolution change completes. Run the
+                    // Deactivation-Reactivation sequence and carry on at the new size.
+                    if let Err(e) = reactivate(established, image) {
+                        return SessionEnd::Failed(e);
+                    }
                 }
                 _ => {}
             }
@@ -352,6 +418,181 @@ fn notify_if_painted(
 
     *bytes_since_flush = 0;
     waker.damaged();
+}
+
+/// Try to send the pending resolution request, if the channel is ready for it.
+///
+/// Split from the pump for the same reason as the clipboard: it has its own retry state,
+/// and a failure here must be swallowed rather than ending the session — the desktop at
+/// the old resolution is strictly better than no desktop.
+fn service_resize(
+    established: &mut Established,
+    pending: &mut Option<(SessionCommand, Instant)>,
+) -> Result<(), ConnectError> {
+    let Some((
+        SessionCommand::Resize {
+            width,
+            height,
+            scale_percent,
+        },
+        asked,
+    )) = *pending
+    else {
+        return Ok(());
+    };
+
+    // MS-RDPEDISP bounds: each axis within 200..=8192 and the width even. A monitor
+    // reports whatever it likes; the wire has rules.
+    let (width, height) =
+        ironrdp::displaycontrol::pdu::MonitorLayoutEntry::adjust_display_size(width, height);
+
+    match established
+        .stage
+        .encode_resize(width, height, scale_percent, None)
+    {
+        Some(Ok(frame)) => {
+            *pending = None;
+            tracing::info!(
+                width,
+                height,
+                scale_percent,
+                "requested a session resolution change"
+            );
+            established
+                .framed
+                .write_all(&frame)
+                .map_err(ConnectError::Io)
+        }
+        Some(Err(e)) => {
+            // Losing one resize is not worth losing the desktop.
+            *pending = None;
+            tracing::warn!(error = %describe(&e), "could not encode the resolution change; keeping the current resolution");
+            Ok(())
+        }
+        // The Display Control channel is not open (yet). Keep the request pending and
+        // retry each pump slice: on a supporting server it opens within the first
+        // second; on any other, patience runs out and the resolution stays fixed.
+        None => {
+            if asked.elapsed() > RESIZE_PATIENCE {
+                *pending = None;
+                tracing::info!(
+                    "the server never opened the Display Control channel; the resolution stays fixed"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Run the [MS-RDPBCGR] Deactivation-Reactivation sequence after a Server Deactivate All.
+///
+/// This is how a Display Control resolution change completes: the server deactivates,
+/// capabilities are re-exchanged (carrying the new desktop size), and finalization runs
+/// again. The MCS channel IDs are invariant across it, so every joined channel — EGFX,
+/// clipboard, audio — survives; only the fast-path processor is rebuilt, because the
+/// share ID can change.
+fn reactivate(established: &mut Established, image: &mut DecodedImage) -> Result<(), ConnectError> {
+    // The pump's 5 ms read slice would make every quiet moment here look like a stall.
+    // Reactivation is a short sequential exchange: give reads a longer slice and bound
+    // the whole sequence with a deadline instead.
+    established
+        .socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(ConnectError::Io)?;
+
+    let outcome = drive_reactivation(established, image);
+
+    // Whatever happened, the pump depends on its short slice being back.
+    established
+        .socket
+        .set_read_timeout(Some(READ_SLICE))
+        .map_err(ConnectError::Io)?;
+
+    outcome
+}
+
+fn drive_reactivation(
+    established: &mut Established,
+    image: &mut DecodedImage,
+) -> Result<(), ConnectError> {
+    use ironrdp::connector::Sequence as _;
+    use ironrdp::connector::connection_activation::ConnectionActivationState;
+
+    let mut sequence = established.activation_factory.create();
+    let mut buf = ironrdp::core::WriteBuf::new();
+    let deadline = Instant::now() + REACTIVATION_DEADLINE;
+
+    loop {
+        if let ConnectionActivationState::Finalized {
+            desktop_size,
+            share_id,
+            enable_server_pointer,
+            pointer_software_rendering,
+        } = sequence.connection_activation_state()
+        {
+            // The share ID can change across reactivation, so the fast-path processor is
+            // rebuilt around it. The channel IDs are invariant for the connection.
+            established.stage.set_fastpath_processor(
+                ironrdp::session::fast_path::ProcessorBuilder {
+                    io_channel_id: established.activation_factory.io_channel_id(),
+                    user_channel_id: established.activation_factory.user_channel_id(),
+                    share_id,
+                    enable_server_pointer,
+                    pointer_software_rendering,
+                    // mdrdp never negotiates bulk compression (connect.rs sets
+                    // `compression_type: None`), so there is nothing to rebuild here.
+                    bulk_decompressor: None,
+                }
+                .build(),
+            );
+            *image = DecodedImage::new(
+                ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+                desktop_size.width,
+                desktop_size.height,
+            );
+            established.desktop_size = desktop_size;
+            tracing::info!(
+                width = desktop_size.width,
+                height = desktop_size.height,
+                "session reactivated"
+            );
+            return Ok(());
+        }
+
+        let Some(hint) = sequence.next_pdu_hint() else {
+            return Err(ConnectError::Protocol(
+                "reactivation stalled: the sequence wants no PDU but is not finalized".to_owned(),
+            ));
+        };
+        let pdu = loop {
+            match established.framed.read_by_hint(hint) {
+                Ok(pdu) => break pdu,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() > deadline {
+                        return Err(ConnectError::Protocol(
+                            "reactivation timed out waiting for the server".to_owned(),
+                        ));
+                    }
+                }
+                Err(e) => return Err(ConnectError::Io(e)),
+            }
+        };
+        buf.clear();
+        let written = sequence
+            .step(&pdu, &mut buf)
+            .map_err(|e| ConnectError::Protocol(describe(&e)))?;
+        if let Some(len) = written.size() {
+            established
+                .framed
+                .write_all(&buf[..len])
+                .map_err(ConnectError::Io)?;
+        }
+    }
 }
 
 /// What a drain of the input queue did.
