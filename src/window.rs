@@ -674,10 +674,16 @@ impl SessionWindow {
         Waker(self.event_loop.create_proxy())
     }
 
-    /// Run until the window closes. Consumes the loop; returns on the main thread.
-    pub fn run(self) -> Result<(), WindowError> {
+    /// Run until the window closes. Returns the still-usable event loop, so an
+    /// epilogue (the Session-ended dialog) can run another on-demand cycle on it —
+    /// winit permits exactly one loop per process, ever.
+    ///
+    /// On the macOS Cmd+Q path this never returns (AppKit exits the process); the
+    /// `on_exit` hook is what still runs.
+    pub fn run(self) -> Result<EventLoop<SessionEvent>, WindowError> {
+        use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
         let SessionWindow {
-            event_loop,
+            mut event_loop,
             config,
             store,
             input,
@@ -702,11 +708,11 @@ impl SessionWindow {
             let _ = menu_proxy.send_event(SessionEvent::Menu(event.id().0.clone()));
         }));
         event_loop
-            .run_app(&mut app)
+            .run_app_on_demand(&mut app)
             .map_err(|e| WindowError::EventLoop(e.to_string()))?;
         match app.failure.take() {
             Some(e) => Err(e),
-            None => Ok(()),
+            None => Ok(event_loop),
         }
     }
 }

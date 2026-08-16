@@ -11,6 +11,7 @@
 //! without opening a window.
 
 pub mod egui_host;
+pub mod end_dialog;
 pub mod font;
 pub mod form;
 pub mod list;

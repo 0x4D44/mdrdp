@@ -848,7 +848,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
 
-    let window_result = window.run();
+    // `run` now hands the loop back for the Session-ended/lost epilogue dialog
+    // (src/ui/end_dialog.rs). Wiring that call is the next unit; until then the
+    // returned loop is dropped and behaviour is unchanged.
+    let window_result = window.run().map(|_event_loop| ());
 
     // Stop playback before tearing the session down, so the device is released even if the
     // disconnect below takes a moment. Explicit because the drop is otherwise invisible,
