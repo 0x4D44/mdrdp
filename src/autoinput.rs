@@ -14,6 +14,7 @@
 //! type msedge https://example.com
 //! keys enter
 //! click 960 540     # left-click at a session pixel
+//! drag 500 20 900 400 800   # press at 500,20, move to 900,400 over 800 ms, release
 //! ```
 //!
 //! Key names for `keys`: letters, digits, `enter`, `esc`, `tab`, `space`, `backspace`,
@@ -39,6 +40,12 @@ enum Step {
     Click {
         x: u16,
         y: u16,
+    },
+    /// Press at `from`, move to `to` in interpolated steps, release. A window drag.
+    Drag {
+        from: (u16, u16),
+        to: (u16, u16),
+        duration: Duration,
     },
 }
 
@@ -109,6 +116,28 @@ impl Script {
                         .ok_or_else(|| format!("line {}: click wants x y", idx + 1))?;
                     Step::Click { x, y }
                 }
+                "drag" => {
+                    let mut parts = rest.split_whitespace();
+                    let mut coord = || -> Option<u16> { parts.next()?.parse().ok() };
+                    let (x1, y1, x2, y2) = (coord(), coord(), coord(), coord());
+                    let (Some(x1), Some(y1), Some(x2), Some(y2)) = (x1, y1, x2, y2) else {
+                        return Err(format!("line {}: drag wants x1 y1 x2 y2 [ms]", idx + 1));
+                    };
+                    let ms: u64 = match parts.next() {
+                        Some(v) => v.parse().map_err(|_| {
+                            format!("line {}: drag duration wants milliseconds", idx + 1)
+                        })?,
+                        None => 800,
+                    };
+                    if !(1..=60_000).contains(&ms) {
+                        return Err(format!("line {}: drag duration out of range", idx + 1));
+                    }
+                    Step::Drag {
+                        from: (x1, y1),
+                        to: (x2, y2),
+                        duration: Duration::from_millis(ms),
+                    }
+                }
                 other => return Err(format!("line {}: unknown command {other:?}", idx + 1)),
             };
             steps.push(step);
@@ -166,12 +195,74 @@ impl Script {
                         }
                     }
                 }
+                Step::Drag { from, to, duration } => send_drag(input, *from, *to, *duration),
             };
             if !ok {
                 return; // session gone; nothing left to type into
             }
         }
     }
+}
+
+/// Press at `from`, walk to `to` in ~16 ms interpolated moves, release at `to`.
+/// True while the channel lives. The pacing matters: Windows treats an instant
+/// press-jump-release as a click at the destination, not a drag.
+fn send_drag(
+    input: &Sender<InputEvent>,
+    from: (u16, u16),
+    to: (u16, u16),
+    duration: Duration,
+) -> bool {
+    const TICK: Duration = Duration::from_millis(16);
+    let steps = (duration.as_millis() / TICK.as_millis()).clamp(2, 400) as u32;
+
+    if input
+        .send(InputEvent::MouseMove {
+            x: from.0,
+            y: from.1,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    std::thread::sleep(KEY_GAP);
+    if input
+        .send(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            x: from.0,
+            y: from.1,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    // A short hold before moving, so the remote registers press-then-drag.
+    std::thread::sleep(KEY_HOLD);
+
+    let lerp = |a: u16, b: u16, i: u32| -> u16 {
+        let a = f64::from(a);
+        let b = f64::from(b);
+        let t = f64::from(i) / f64::from(steps);
+        (a + (b - a) * t).round() as u16
+    };
+    for i in 1..=steps {
+        let (x, y) = (lerp(from.0, to.0, i), lerp(from.1, to.1, i));
+        if input.send(InputEvent::MouseMove { x, y }).is_err() {
+            return false;
+        }
+        std::thread::sleep(TICK);
+    }
+
+    std::thread::sleep(KEY_HOLD);
+    input
+        .send(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            x: to.0,
+            y: to.1,
+        })
+        .is_ok()
 }
 
 /// Press every code in order, hold, release in reverse. True while the channel lives.
@@ -414,6 +505,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_drag_presses_at_the_start_and_releases_at_the_end() {
+        // 100 ms → few interpolation steps, so the test stays fast.
+        let script = Script::parse("drag 100 20 300 220 100").expect("parses");
+        let (tx, rx) = mpsc::channel();
+        script.run(&tx);
+        let events: Vec<InputEvent> = rx.try_iter().collect();
+
+        assert_eq!(events[0], InputEvent::MouseMove { x: 100, y: 20 });
+        assert_eq!(
+            events[1],
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                down: true,
+                x: 100,
+                y: 20,
+            },
+            "the press belongs at the START — pressing at the destination is a click, not a drag"
+        );
+        assert_eq!(
+            *events.last().expect("events exist"),
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                down: false,
+                x: 300,
+                y: 220,
+            }
+        );
+        // Between press and release: only moves, ending exactly at the destination.
+        let moves: Vec<(u16, u16)> = events[2..events.len() - 1]
+            .iter()
+            .map(|e| match e {
+                InputEvent::MouseMove { x, y } => (*x, *y),
+                other => panic!("unexpected event mid-drag: {other:?}"),
+            })
+            .collect();
+        assert!(
+            moves.len() >= 2,
+            "a drag interpolates, it does not teleport"
+        );
+        assert_eq!(*moves.last().expect("moves exist"), (300, 220));
+
+        let err = Script::parse("drag 1 2 3").unwrap_err();
+        assert!(err.contains("line 1"), "got: {err}");
     }
 
     #[test]
