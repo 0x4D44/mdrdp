@@ -1352,7 +1352,11 @@ mod menus {
             }
             #[cfg(target_os = "windows")]
             {
-                use eframe::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                // winit's re-export, not eframe's: eframe 0.36 does not re-export
+                // raw_window_handle, and this arm only compiles on Windows, so the
+                // cross-check is the only thing standing between this line and a
+                // broken Windows build.
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
                 if let Ok(handle) = cc.window_handle()
                     && let RawWindowHandle::Win32(h) = handle.as_raw()
                 {
