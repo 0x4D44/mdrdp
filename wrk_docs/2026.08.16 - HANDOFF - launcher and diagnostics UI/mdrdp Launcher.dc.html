@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  body { margin:0; background:#0B0C0E; font-family:'IBM Plex Sans', system-ui, sans-serif; }
+  a { color:#2BE07A; text-decoration:none; }
+  a:hover { color:#8CF0B8; }
+</style>
+</helmet>
+
+<section style="padding:64px; display:flex; flex-direction:column; gap:40px;">
+  <div style="display:flex; flex-direction:column; gap:10px; max-width:860px;">
+    <div style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.18em; color:#6F7883; text-transform:uppercase;">Turn 2 &middot; chosen direction, RGB palette</div>
+    <div style="font-size:26px; font-weight:600; color:#EAEEF3; letter-spacing:-0.01em;">A 900&times;700 launcher with a menu bar</div>
+    <div style="font-size:14px; line-height:22px; color:#A6AEB9; text-wrap:pretty;">The menu bar is drawn in the window so File / Connection / Diagnostics / Settings are identical on Windows and macOS. Each session is its own process and owns its own diagnostics windows. Every screen keeps the command line first-class: the wizard shows the equivalent <span style="font-family:'IBM Plex Mono'; color:#E0D8CB;">mdrdp &lt;host&gt;</span> invocation, and defaults set in Settings are the ones that command uses.</div>
+    <div style="font-size:13px; line-height:21px; color:#6F7883;"><a href="#1a">1a</a> connection wizard &middot; <a href="#1c">1c</a> bitmap cache &middot; <a href="#1e">1e</a> settings &middot; <a href="#1f">1f</a> favourites and menus</div>
+  </div>
+
+  <div style="display:flex; flex-wrap:wrap; gap:72px; align-items:flex-start;">
+
+    <div id="1a" style="display:flex; flex-direction:column; gap:16px;">
+      <div style="display:flex; align-items:baseline; gap:12px;">
+        <span style="font-family:'IBM Plex Mono'; font-size:12px; font-weight:600; color:#04150B; background:#2BE07A; padding:3px 7px; border-radius:3px;">1a</span>
+        <span style="font-size:17px; font-weight:600; color:#EAEEF3;">Wizard &mdash; guided, three steps</span>
+        <span style="font-size:13px; color:#6F7883;">Front page on first run. One decision per screen, connect at the end.</span>
+      </div>
+
+      <div style="width:900px; height:700px; background:#14161A; border:1px solid #2F353D; border-radius:6px; overflow:hidden; display:flex; flex-direction:column;">
+        <div style="height:30px; flex:none; background:#0E1013; border-bottom:1px solid #262B31; display:flex; align-items:center; gap:2px; padding:0 10px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; font-weight:600; letter-spacing:0.14em; color:#2BE07A; padding-right:12px;">MDRDP</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px; border-radius:3px;">File</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px; border-radius:3px;">Connection</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px; border-radius:3px;">View</span>
+          
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px; border-radius:3px;">Help</span>
+        </div>
+
+        <div style="flex:none; padding:34px 56px 0; display:flex; flex-direction:column; gap:8px;">
+          <div style="font-size:24px; font-weight:600; color:#EAEEF3; letter-spacing:-0.01em;">Set up a connection</div>
+          <div style="font-size:13px; line-height:21px; color:#6F7883;">No saved connections yet. This takes three screens &mdash; or run <span style="font-family:'IBM Plex Mono'; color:#A6AEB9;">mdrdp &lt;host&gt;</span> in a terminal and skip it entirely.</div>
+        </div>
+
+        <div style="flex:none; padding:30px 56px 0; display:flex; align-items:center; gap:14px;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:22px; height:22px; border-radius:11px; background:#2BE07A; color:#04150B; font-family:'IBM Plex Mono'; font-size:11px; font-weight:600; display:flex; align-items:center; justify-content:center;">1</span>
+            <span style="font-size:13px; font-weight:500; color:#EAEEF3;">Destination</span>
+          </div>
+          <div style="flex:1; height:1px; background:#2F353D;"></div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:22px; height:22px; border-radius:11px; border:1px solid #414A54; color:#6F7883; font-family:'IBM Plex Mono'; font-size:11px; display:flex; align-items:center; justify-content:center;">2</span>
+            <span style="font-size:13px; color:#6F7883;">Sign in</span>
+          </div>
+          <div style="flex:1; height:1px; background:#2F353D;"></div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:22px; height:22px; border-radius:11px; border:1px solid #414A54; color:#6F7883; font-family:'IBM Plex Mono'; font-size:11px; display:flex; align-items:center; justify-content:center;">3</span>
+            <span style="font-size:13px; color:#6F7883;">Display</span>
+          </div>
+        </div>
+
+        <div style="flex:1; padding:40px 56px; display:flex; flex-direction:column; gap:26px; min-height:0;">
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <div style="font-family:'IBM Plex Sans'; font-size:11px; font-weight:500; letter-spacing:0.09em; text-transform:uppercase; color:#6F7883;">Host or address</div>
+            <div style="height:44px; background:#0E1013; border:1px solid #2BE07A; border-radius:4px; padding:0 14px; display:flex; align-items:center; gap:2px;">
+              <span style="font-family:'IBM Plex Mono'; font-size:15px; color:#EAEEF3;">temper</span>
+              <span style="width:1px; height:20px; background:#2BE07A;"></span>
+            </div>
+            <div style="font-size:12px; color:#6F7883;">Resolved to 10.0.4.12 &middot; port 3389 open</div>
+          </div>
+
+          <div style="display:flex; gap:20px;">
+            <div style="flex:1; display:flex; flex-direction:column; gap:8px;">
+              <div style="font-size:11px; font-weight:500; letter-spacing:0.09em; text-transform:uppercase; color:#6F7883;">Display name</div>
+              <div style="height:38px; background:#0E1013; border:1px solid #2F353D; border-radius:4px; padding:0 12px; display:flex; align-items:center;">
+                <span style="font-family:'IBM Plex Mono'; font-size:13px; color:#545D68;">Temper</span>
+              </div>
+              <div style="font-size:12px; color:#545D68;">Defaults to the host name</div>
+            </div>
+            <div style="width:140px; display:flex; flex-direction:column; gap:8px;">
+              <div style="font-size:11px; font-weight:500; letter-spacing:0.09em; text-transform:uppercase; color:#6F7883;">Port</div>
+              <div style="height:38px; background:#0E1013; border:1px solid #2F353D; border-radius:4px; padding:0 12px; display:flex; align-items:center;">
+                <span style="font-family:'IBM Plex Mono'; font-size:13px; color:#EAEEF3;">3389</span>
+              </div>
+              <div style="font-size:12px; color:#545D68;">Default</div>
+            </div>
+          </div>
+
+          <div style="margin-top:auto; background:#0E1013; border:1px solid #262B31; border-radius:5px; padding:16px 18px; display:flex; flex-direction:column; gap:8px;">
+            <div style="font-size:11px; font-weight:500; letter-spacing:0.09em; text-transform:uppercase; color:#545D68;">Same thing from a terminal</div>
+            <div style="font-family:'IBM Plex Mono'; font-size:13px; color:#A6AEB9;"><span style="color:#2BE07A;">$</span> mdrdp temper</div>
+          </div>
+        </div>
+
+        <div style="height:72px; flex:none; border-top:1px solid #262B31; background:#0E1013; display:flex; align-items:center; justify-content:space-between; padding:0 56px;">
+          <span style="font-size:13px; color:#545D68;">Step 1 of 3</span>
+          <div style="display:flex; gap:12px;">
+            <span style="height:38px; padding:0 18px; border:1px solid #414A54; border-radius:4px; display:flex; align-items:center; font-size:13px; color:#A6AEB9;">Cancel</span>
+            <span style="height:38px; padding:0 22px; background:#2BE07A; border-radius:4px; display:flex; align-items:center; font-size:13px; font-weight:600; color:#04150B;">Continue</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="width:900px; height:700px; background:#14161A; border:1px solid #2F353D; border-radius:6px; overflow:hidden; display:flex; flex-direction:column;">
+        <div style="height:30px; flex:none; background:#0E1013; border-bottom:1px solid #262B31; display:flex; align-items:center; gap:2px; padding:0 10px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; font-weight:600; letter-spacing:0.14em; color:#2BE07A; padding-right:12px;">MDRDP</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">File</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">Connection</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">View</span>
+          
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">Help</span>
+        </div>
+
+        <div style="flex:none; padding:34px 56px 0; display:flex; flex-direction:column; gap:8px;">
+          <div style="font-size:24px; font-weight:600; color:#EAEEF3; letter-spacing:-0.01em;">Sign in to temper</div>
+          <div style="font-size:13px; line-height:21px; color:#6F7883;">The password goes straight to the Keychain (macOS) or Credential Manager (Windows). The saved connection stores only the account key <span style="font-family:'IBM Plex Mono'; color:#A6AEB9;">alice@temper:3389</span>.</div>
+        </div>
+
+        <div style="flex:none; padding:30px 56px 0; display:flex; align-items:center; gap:14px;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:22px; height:22px; border-radius:11px; border:1px solid #17603C; background:#0D2417; color:#2BE07A; font-family:'IBM Plex Mono'; font-size:12px; display:flex; align-items:center; justify-content:center;">&check;</span>
+            <span style="font-size:13px; color:#A6AEB9;">temper:3389</span>
+          </div>
+          <div style="flex:1; height:1px; background:#2F353D;"></div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:22px; height:22px; border-radius:11px; background:#2BE07A; color:#04150B; font-family:'IBM Plex Mono'; font-size:11px; font-weight:600; display:flex; align-items:center; justify-content:center;">2</span>
+            <span style="font-size:13px; font-weight:500; color:#EAEEF3;">Sign in</span>
+          </div>
+          <div style="flex:1; height:1px; background:#2F353D;"></div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:22px; height:22px; border-radius:11px; border:1px solid #414A54; color:#6F7883; font-family:'IBM Plex Mono'; font-size:11px; display:flex; align-items:center; justify-content:center;">3</span>
+            <span style="font-size:13px; color:#6F7883;">Display</span>
+          </div>
+        </div>
+
+        <div style="flex:1; padding:40px 56px; display:flex; flex-direction:column; gap:24px; min-height:0;">
+          <div style="display:flex; gap:20px;">
+            <div style="flex:1; display:flex; flex-direction:column; gap:8px;">
+              <div style="font-size:11px; font-weight:500; letter-spacing:0.09em; text-transform:uppercase; color:#6F7883;">Username</div>
+              <div style="height:44px; background:#0E1013; border:1px solid #2BE07A; border-radius:4px; padding:0 14px; display:flex; align-items:center; gap:2px;">
+                <span style="font-family:'IBM Plex Mono'; font-size:15px; color:#EAEEF3;">alice</span>
+                <span style="width:1px; height:20px; background:#2BE07A;"></span>
+              </div>
+              <div style="font-size:12px; color:#6F7883;">From Settings &rsaquo; Defaults</div>
+            </div>
+            <div style="width:220px; display:flex; flex-direction:column; gap:8px;">
+              <div style="font-size:11px; font-weight:500; letter-spacing:0.09em; text-transform:uppercase; color:#6F7883;">Domain <span style="text-transform:none; letter-spacing:0; color:#545D68;">optional</span></div>
+              <div style="height:44px; background:#0E1013; border:1px solid #2F353D; border-radius:4px; padding:0 14px; display:flex; align-items:center;">
+                <span style="font-family:'IBM Plex Mono'; font-size:14px; color:#545D68;">CORP</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <div style="font-size:11px; font-weight:500; letter-spacing:0.09em; text-transform:uppercase; color:#6F7883;">Password</div>
+            <div style="height:44px; background:#0E1013; border:1px solid #2F353D; border-radius:4px; padding:0 14px; display:flex; align-items:center; justify-content:space-between;">
+              <span style="font-family:'IBM Plex Mono'; font-size:15px; letter-spacing:0.15em; color:#EAEEF3;">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span>
+              <span style="font-size:12px; color:#6F7883;">Show</span>
+            </div>
+          </div>
+
+          <div style="display:flex; align-items:flex-start; gap:12px; padding-top:2px;">
+            <span style="width:16px; height:16px; margin-top:2px; border-radius:3px; background:#2BE07A; color:#04150B; font-size:11px; font-weight:600; display:flex; align-items:center; justify-content:center;">&check;</span>
+            <div style="display:flex; flex-direction:column; gap:4px;">
+              <span style="font-size:13px; color:#EAEEF3;">Save the password to the system credential store</span>
+              <span style="font-size:12px; line-height:19px; color:#6F7883;">Unchecked, mdrdp asks for it each time and keeps it only for that session.</span>
+            </div>
+          </div>
+
+          <div style="margin-top:auto; display:flex; gap:12px; align-items:flex-start; background:#1C1418; border:1px solid #48232B; border-radius:5px; padding:14px 16px;">
+            <span style="font-family:'IBM Plex Mono'; font-size:13px; color:#FF5D4D;">!</span>
+            <div style="font-size:12px; line-height:20px; color:#D3AAB0;">First connection to this host: mdrdp will show the server certificate fingerprint and pin it on your approval. Pinned hosts are listed under Settings &rsaquo; Certificate trust.</div>
+          </div>
+        </div>
+
+        <div style="height:72px; flex:none; border-top:1px solid #262B31; background:#0E1013; display:flex; align-items:center; justify-content:space-between; padding:0 56px;">
+          <span style="font-size:13px; color:#545D68;">Step 2 of 3</span>
+          <div style="display:flex; gap:12px;">
+            <span style="height:38px; padding:0 18px; border:1px solid #414A54; border-radius:4px; display:flex; align-items:center; font-size:13px; color:#A6AEB9;">Back</span>
+            <span style="height:38px; padding:0 22px; background:#2BE07A; border-radius:4px; display:flex; align-items:center; font-size:13px; font-weight:600; color:#04150B;">Continue</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="width:900px; height:700px; background:#14161A; border:1px solid #2F353D; border-radius:6px; overflow:hidden; display:flex; flex-direction:column;">
+        <div style="height:30px; flex:none; background:#0E1013; border-bottom:1px solid #262B31; display:flex; align-items:center; gap:2px; padding:0 10px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; font-weight:600; letter-spacing:0.14em; color:#2BE07A; padding-right:12px;">MDRDP</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">File</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">Connection</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">View</span>
+          
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">Help</span>
+        </div>
+
+        <div style="flex:none; padding:34px 56px 0; display:flex; flex-direction:column; gap:8px;">
+          <div style="font-size:24px; font-weight:600; color:#EAEEF3; letter-spacing:-0.01em;">How the desktop appears</div>
+          <div style="font-size:13px; line-height:21px; color:#6F7883;">The remote resolution stays fixed at the size chosen here for the whole session.</div>
+        </div>
+
+        <div style="flex:none; padding:30px 56px 0; display:flex; align-items:center; gap:14px;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:22px; height:22px; border-radius:11px; border:1px solid #17603C; background:#0D2417; color:#2BE07A; font-family:'IBM Plex Mono'; font-size:12px; display:flex; align-items:center; justify-content:center;">&check;</span>
+            <span style="font-size:13px; color:#A6AEB9;">temper:3389</span>
+          </div>
+          <div style="flex:1; height:1px; background:#2F353D;"></div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:22px; height:22px; border-radius:11px; border:1px solid #17603C; background:#0D2417; color:#2BE07A; font-family:'IBM Plex Mono'; font-size:12px; display:flex; align-items:center; justify-content:center;">&check;</span>
+            <span style="font-size:13px; color:#A6AEB9;">alice</span>
+          </div>
+          <div style="flex:1; height:1px; background:#2F353D;"></div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:22px; height:22px; border-radius:11px; background:#2BE07A; color:#04150B; font-family:'IBM Plex Mono'; font-size:11px; font-weight:600; display:flex; align-items:center; justify-content:center;">3</span>
+            <span style="font-size:13px; font-weight:500; color:#EAEEF3;">Display</span>
+          </div>
+        </div>
+
+        <div style="flex:1; padding:36px 56px; display:flex; flex-direction:column; gap:22px; min-height:0;">
+          <div style="display:flex; gap:16px;">
+            <div style="flex:1; background:#1E2126; border:1px solid #2BE07A; border-radius:5px; padding:18px; display:flex; flex-direction:column; gap:10px;">
+              <div style="display:flex; align-items:center; justify-content:space-between;">
+                <span style="font-size:14px; font-weight:600; color:#EAEEF3;">Fullscreen</span>
+                <span style="width:16px; height:16px; border-radius:8px; background:#2BE07A; color:#04150B; font-size:11px; font-weight:600; display:flex; align-items:center; justify-content:center;">&check;</span>
+              </div>
+              <div style="height:76px; background:#0E1013; border:1px solid #262B31; border-radius:3px; display:flex; align-items:center; justify-content:center;">
+                <div style="width:150px; height:56px; background:#17603C; opacity:0.55; border-radius:2px;"></div>
+              </div>
+              <span style="font-size:12px; line-height:19px; color:#6F7883;">Borderless, 1920&times;1080 remote. Geometry is restored if the display sleeps.</span>
+            </div>
+            <div style="flex:1; background:#1E2126; border:1px solid #2F353D; border-radius:5px; padding:18px; display:flex; flex-direction:column; gap:10px;">
+              <div style="display:flex; align-items:center; justify-content:space-between;">
+                <span style="font-size:14px; font-weight:600; color:#A6AEB9;">Explicit size</span>
+                <span style="width:16px; height:16px; border-radius:8px; border:1px solid #414A54;"></span>
+              </div>
+              <div style="height:76px; background:#0E1013; border:1px solid #262B31; border-radius:3px; display:flex; align-items:center; justify-content:center; gap:10px;">
+                <div style="height:34px; background:#0E1013; border:1px solid #2F353D; border-radius:3px; padding:0 10px; display:flex; align-items:center; font-family:'IBM Plex Mono'; font-size:13px; color:#545D68;">1920</div>
+                <span style="font-family:'IBM Plex Mono'; font-size:12px; color:#545D68;">&times;</span>
+                <div style="height:34px; background:#0E1013; border:1px solid #2F353D; border-radius:3px; padding:0 10px; display:flex; align-items:center; font-family:'IBM Plex Mono'; font-size:13px; color:#545D68;">1080</div>
+              </div>
+              <span style="font-size:12px; line-height:19px; color:#545D68;">A windowed desktop at a size you pick.</span>
+            </div>
+          </div>
+
+          <div style="background:#0E1013; border:1px solid #262B31; border-radius:5px; padding:18px 20px; display:flex; flex-direction:column; gap:14px;">
+            <div style="font-size:11px; font-weight:500; letter-spacing:0.09em; text-transform:uppercase; color:#545D68;">Ready to connect</div>
+            <div style="display:flex; gap:44px;">
+              <div style="display:flex; flex-direction:column; gap:5px;"><span style="font-size:11px; color:#545D68;">HOST</span><span style="font-family:'IBM Plex Mono'; font-size:13px; color:#EAEEF3;">temper:3389</span></div>
+              <div style="display:flex; flex-direction:column; gap:5px;"><span style="font-size:11px; color:#545D68;">ACCOUNT</span><span style="font-family:'IBM Plex Mono'; font-size:13px; color:#EAEEF3;">alice</span></div>
+              <div style="display:flex; flex-direction:column; gap:5px;"><span style="font-size:11px; color:#545D68;">DISPLAY</span><span style="font-family:'IBM Plex Mono'; font-size:13px; color:#EAEEF3;">fullscreen 1920&times;1080</span></div>
+              <div style="display:flex; flex-direction:column; gap:5px;"><span style="font-size:11px; color:#545D68;">PASSWORD</span><span style="font-family:'IBM Plex Mono'; font-size:13px; color:#2BE07A;">keychain</span></div>
+            </div>
+            <div style="height:1px; background:#262B31;"></div>
+            <div style="font-family:'IBM Plex Mono'; font-size:13px; color:#A6AEB9;"><span style="color:#2BE07A;">$</span> mdrdp temper --user alice</div>
+          </div>
+
+          <div style="margin-top:auto; display:flex; align-items:center; gap:12px;">
+            <span style="width:16px; height:16px; border-radius:3px; background:#2BE07A; color:#04150B; font-size:11px; font-weight:600; display:flex; align-items:center; justify-content:center;">&check;</span>
+            <span style="font-size:13px; color:#EAEEF3;">Save as a favourite named <span style="font-family:'IBM Plex Mono';">Temper</span></span>
+          </div>
+        </div>
+
+        <div style="height:72px; flex:none; border-top:1px solid #262B31; background:#0E1013; display:flex; align-items:center; justify-content:space-between; padding:0 56px;">
+          <span style="font-size:13px; color:#545D68;">Step 3 of 3</span>
+          <div style="display:flex; gap:12px;">
+            <span style="height:38px; padding:0 18px; border:1px solid #414A54; border-radius:4px; display:flex; align-items:center; font-size:13px; color:#A6AEB9;">Back</span>
+            <span style="height:38px; padding:0 24px; background:#2BE07A; border-radius:4px; display:flex; align-items:center; font-size:13px; font-weight:600; color:#04150B;">Save and connect</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="1c" style="display:flex; flex-direction:column; gap:16px;">
+      <div style="display:flex; align-items:baseline; gap:12px;">
+        <span style="font-family:'IBM Plex Mono'; font-size:12px; font-weight:600; color:#04150B; background:#2BE07A; padding:3px 7px; border-radius:3px;">1c</span>
+        <span style="font-size:17px; font-weight:600; color:#EAEEF3;">Bitmap cache &mdash; slot grid</span>
+        <span style="font-size:13px; color:#6F7883;">One cell per slot, uniform. A window of the session process. Switch the heat metric; click a cell to inspect.</span>
+      </div>
+
+      <div style="width:900px; height:700px; background:#14161A; border:1px solid #2F353D; border-radius:6px; overflow:hidden; display:flex; flex-direction:column;">
+        <div style="height:30px; flex:none; background:#0E1013; border-bottom:1px solid #262B31; display:flex; align-items:center; gap:2px; padding:0 10px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; font-weight:600; letter-spacing:0.14em; color:#2BE07A; padding-right:12px;">MDRDP</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">Session</span>
+          
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">View</span>
+          <span style="font-size:12px; color:#EAEEF3; background:#22262C; border-radius:3px; padding:4px 9px;">Diagnostics</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">Help</span>
+        </div>
+
+        <div style="height:54px; flex:none; border-bottom:1px solid #262B31; display:flex; align-items:center; justify-content:space-between; padding:0 24px;">
+          <div style="display:flex; align-items:center; gap:14px;">
+            <span style="font-size:15px; font-weight:600; color:#EAEEF3;">Bitmap cache</span>
+            <span style="width:1px; height:18px; background:#2F353D;"></span>
+            <div style="display:flex; align-items:center; gap:9px;">
+              <span style="width:6px; height:6px; border-radius:3px; background:#2BE07A;"></span>
+              <span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">Temper</span>
+              <span style="font-family:'IBM Plex Mono'; font-size:12px; color:#545D68;">alice@temper:3389 &middot; pid 4821</span>
+            </div>
+          </div>
+          <div style="display:flex; align-items:center; gap:16px;">
+            <span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">refresh 1s</span>
+            <span style="height:26px; padding:0 12px; border:1px solid #414A54; border-radius:4px; display:flex; align-items:center; font-size:12px; color:#A6AEB9;">Write metrics JSON</span>
+          </div>
+        </div>
+
+        <div style="height:96px; flex:none; border-bottom:1px solid #262B31; display:flex; align-items:stretch;">
+          <div style="width:210px; box-sizing:border-box; padding:18px 24px; display:flex; flex-direction:column; gap:3px; border-right:1px solid #262B31;">
+            <span style="font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:#6F7883;">Hit rate</span>
+            <span style="font-family:'IBM Plex Mono'; font-size:30px; font-weight:500; color:#EAEEF3; line-height:1.15;">{{ hitRate }}</span>
+            <span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">{{ lookupLine }}</span>
+          </div>
+          <div style="width:230px; box-sizing:border-box; padding:18px 24px; display:flex; flex-direction:column; gap:3px; border-right:1px solid #262B31;">
+            <span style="font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:#6F7883;">Pixels from cache</span>
+            <span style="font-family:'IBM Plex Mono'; font-size:30px; font-weight:500; color:#FFC93C; line-height:1.15;">{{ pixelShare }}</span>
+            <span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">{{ servedLine }}</span>
+          </div>
+          <div style="flex:1; padding:18px 24px; display:flex; align-items:center;">
+            <span style="font-size:12px; line-height:20px; color:#6F7883; text-wrap:pretty;">A hit on a 32&times;32 tile counts the same as a hit on a 448&times;448 one, so hit rate flatters the cache. The pixel share is what it actually saved. When these two disagree the cache is not earning its keep.</span>
+          </div>
+        </div>
+
+        <div style="flex:1; display:flex; min-height:0;">
+          <div style="flex:1; padding:18px 20px 20px 24px; display:flex; flex-direction:column; gap:14px; min-width:0;">
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+              <div style="display:flex; flex:none; gap:3px; background:#0E1013; border:1px solid #262B31; border-radius:4px; padding:3px;">
+                <span onClick="{{ pickServed }}" style="{{ tabServed }}">Served</span>
+                <span onClick="{{ pickHits }}" style="{{ tabHits }}">Hits</span>
+                <span onClick="{{ pickRecency }}" style="{{ tabRecency }}">Recency</span>
+                <span onClick="{{ pickReturn }}" style="{{ tabReturn }}">Return</span>
+                <span onClick="{{ pickOccupancy }}" style="{{ tabOccupancy }}">Occupancy</span>
+              </div>
+              <span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68; white-space:nowrap; margin-left:16px;">{{ gridLabel }}</span>
+            </div>
+
+            <div style="display:grid; grid-template-columns:repeat(27, 18px); gap:2px; align-content:start;">
+              <sc-for list="{{ cells }}" as="c" hint-placeholder-count="240">
+                <div onClick="{{ pickSlot }}" data-slot="{{ c.id }}" style="width:18px; height:18px; border-radius:2px; cursor:pointer; background:{{ c.bg }}; box-shadow:{{ c.ring }};" style-hover="box-shadow:0 0 0 1px #EAEEF3;"></div>
+              </sc-for>
+            </div>
+
+            <div style="margin-top:auto; display:flex; align-items:center; gap:14px;">
+              <span style="font-size:11px; color:#545D68;">{{ legendLow }}</span>
+              <div style="display:flex; align-items:center;">
+                <span style="width:210px; height:9px; border-radius:2px; background:linear-gradient(90deg,#2E3BFF 0%,#3B8CFF 16%,#24D8E0 32%,#2BE07A 48%,#B9F53C 62%,#FFE04D 76%,#FF9A2E 88%,#FF2D2D 100%);"></span>
+              </div>
+              <span style="font-size:11px; color:#545D68;">{{ legendHigh }}</span>
+              <span style="width:1px; height:14px; background:#262B31;"></span>
+              <span style="width:14px; height:9px; border-radius:2px; background:#1E2126;"></span>
+              <span style="font-size:11px; color:#545D68;">empty slot &middot; never filled</span>
+            </div>
+          </div>
+
+          <div style="width:300px; box-sizing:border-box; flex:none; border-left:1px solid #262B31; background:#171A1E; padding:16px 20px; display:flex; flex-direction:column; gap:10px; overflow:hidden;">
+            <div style="display:flex; flex-direction:column; gap:10px;">
+              <div style="display:flex; align-items:baseline; justify-content:space-between;">
+                <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#6F7883;">Slot {{ sel.id }}</span>
+                <span style="font-family:'IBM Plex Mono'; font-size:11px; color:{{ sel.stateColour }};">{{ sel.state }}</span>
+              </div>
+              <div style="display:flex; flex-direction:column; gap:8px;">
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Size</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ sel.dims }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Codec in</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ sel.codec }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Hits</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ sel.hits }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Served</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ sel.served }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Stored</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ sel.stored }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Return</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#2BE07A;">{{ sel.ret }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Last hit</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ sel.age }}</span></div>
+              </div>
+            </div>
+
+            <div style="height:1px; background:#262B31;"></div>
+
+            <div style="display:flex; flex-direction:column; gap:10px;">
+              <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#6F7883;">Totals</span>
+              <div style="display:flex; flex-direction:column; gap:8px;">
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Entries</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ totals.entries }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Evictions</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#FF5D4D;">{{ totals.evictions }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Served</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ totals.served }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">Stored</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ totals.stored }}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#6F7883;">From wire</span><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">{{ totals.wire }}</span></div>
+              </div>
+            </div>
+
+            <div style="height:1px; background:#262B31;"></div>
+
+            <div style="display:flex; flex-direction:column; gap:10px;">
+              <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#6F7883;">Codec in</span>
+              <div style="display:flex; flex-direction:column; gap:9px;">
+                <div style="display:flex; flex-direction:column; gap:4px;">
+                  <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#A6AEB9;">ClearCodec</span><span style="font-family:'IBM Plex Mono'; font-size:11px; color:#6F7883;">61%</span></div>
+                  <div style="height:5px; background:#1E2126; border-radius:3px; overflow:hidden;"><div style="width:61%; height:5px; background:#2BE07A;"></div></div>
+                </div>
+                <div style="display:flex; flex-direction:column; gap:4px;">
+                  <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#A6AEB9;">RFX Progressive</span><span style="font-family:'IBM Plex Mono'; font-size:11px; color:#6F7883;">34%</span></div>
+                  <div style="height:5px; background:#1E2126; border-radius:3px; overflow:hidden;"><div style="width:34%; height:5px; background:#FFC93C;"></div></div>
+                </div>
+                <div style="display:flex; flex-direction:column; gap:4px;">
+                  <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#A6AEB9;">Uncompressed</span><span style="font-family:'IBM Plex Mono'; font-size:11px; color:#6F7883;">5%</span></div>
+                  <div style="height:5px; background:#1E2126; border-radius:3px; overflow:hidden;"><div style="width:5%; height:5px; background:#FF5D4D;"></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="1e" style="display:flex; flex-direction:column; gap:16px;">
+      <div style="display:flex; align-items:baseline; gap:12px;">
+        <span style="font-family:'IBM Plex Mono'; font-size:12px; font-weight:600; color:#04150B; background:#2BE07A; padding:3px 7px; border-radius:3px;">1e</span>
+        <span style="font-size:17px; font-weight:600; color:#EAEEF3;">Settings</span>
+        <span style="font-size:13px; color:#6F7883;">Modal from the menu. Defaults here are the ones <span style="font-family:'IBM Plex Mono';">mdrdp &lt;host&gt;</span> uses.</span>
+      </div>
+
+      <div style="width:900px; height:700px; background:#14161A; border:1px solid #2F353D; border-radius:6px; overflow:hidden; position:relative;">
+        <div style="position:absolute; inset:0; display:flex; flex-direction:column;">
+          <div style="height:30px; flex:none; background:#0E1013; border-bottom:1px solid #262B31; display:flex; align-items:center; gap:2px; padding:0 10px;">
+            <span style="font-family:'IBM Plex Mono'; font-size:11px; font-weight:600; letter-spacing:0.14em; color:#2BE07A; padding-right:12px;">MDRDP</span>
+            <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">File</span>
+            <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">Connection</span>
+            <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">View</span>
+            
+            <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">Help</span>
+          </div>
+          <div style="flex:1; padding:26px 28px; display:flex; flex-direction:column; gap:12px; opacity:0.25;">
+            <span style="font-size:19px; font-weight:600; color:#EAEEF3;">Connections</span>
+            <div style="height:58px; background:#22262C; border-radius:5px;"></div>
+            <div style="height:58px; background:#1E2126; border-radius:5px;"></div>
+            <div style="height:58px; background:#1E2126; border-radius:5px;"></div>
+          </div>
+        </div>
+        <div style="position:absolute; inset:0; background:#05070A; opacity:0.62;"></div>
+
+        <div style="position:absolute; left:90px; top:60px; width:720px; height:580px; background:#14161A; border:1px solid #414A54; border-radius:7px; box-shadow:0 24px 60px rgba(0,0,0,0.55); display:flex; flex-direction:column; overflow:hidden;">
+          <div style="height:52px; flex:none; border-bottom:1px solid #262B31; display:flex; align-items:center; justify-content:space-between; padding:0 22px;">
+            <span style="font-size:15px; font-weight:600; color:#EAEEF3;">Settings</span>
+            <span style="font-size:14px; color:#6F7883;">&times;</span>
+          </div>
+          <div style="flex:1; display:flex; min-height:0;">
+            <div style="width:186px; flex:none; border-right:1px solid #262B31; background:#171A1E; padding:12px 10px; display:flex; flex-direction:column; gap:2px;">
+              <span style="height:32px; padding:0 12px; border-radius:4px; background:#17603C; color:#EAEEF3; font-size:13px; font-weight:500; display:flex; align-items:center;">Defaults</span>
+              <span style="height:32px; padding:0 12px; border-radius:4px; color:#A6AEB9; font-size:13px; display:flex; align-items:center;">Graphics</span>
+              <span style="height:32px; padding:0 12px; border-radius:4px; color:#A6AEB9; font-size:13px; display:flex; align-items:center;">Audio</span>
+              <span style="height:32px; padding:0 12px; border-radius:4px; color:#A6AEB9; font-size:13px; display:flex; align-items:center;">Clipboard</span>
+              <span style="height:32px; padding:0 12px; border-radius:4px; color:#A6AEB9; font-size:13px; display:flex; align-items:center;">Diagnostics</span>
+              <span style="height:32px; padding:0 12px; border-radius:4px; color:#A6AEB9; font-size:13px; display:flex; align-items:center;">Certificate trust</span>
+              <div style="margin-top:auto; padding:10px 12px; display:flex; flex-direction:column; gap:6px;">
+                <span style="font-size:11px; color:#545D68;">favourites.toml</span>
+                <span style="font-family:'IBM Plex Mono'; font-size:10px; line-height:15px; color:#545D68; word-break:break-all;">~/Library/Application Support/mdrdp/</span>
+                <span style="font-size:11px; color:#6F7883;">Reveal</span>
+              </div>
+            </div>
+
+            <div style="flex:1; padding:24px 26px; display:flex; flex-direction:column; gap:22px; overflow:hidden;">
+              <div style="display:flex; flex-direction:column; gap:6px;">
+                <span style="font-size:16px; font-weight:600; color:#EAEEF3;">Defaults</span>
+                <span style="font-size:12px; line-height:19px; color:#6F7883;">Used when a connection or command line does not say otherwise. Precedence: flag, then favourite, then these.</span>
+              </div>
+
+              <div style="display:flex; flex-direction:column; gap:16px;">
+                <div style="display:flex; align-items:center; gap:18px;">
+                  <span style="width:150px; font-size:13px; color:#A6AEB9;">Username</span>
+                  <div style="flex:1; height:34px; background:#0E1013; border:1px solid #2F353D; border-radius:4px; padding:0 11px; display:flex; align-items:center; font-family:'IBM Plex Mono'; font-size:13px; color:#EAEEF3;">alice</div>
+                </div>
+                <div style="display:flex; align-items:center; gap:18px;">
+                  <span style="width:150px; font-size:13px; color:#A6AEB9;">Port</span>
+                  <div style="width:110px; height:34px; background:#0E1013; border:1px solid #2F353D; border-radius:4px; padding:0 11px; display:flex; align-items:center; font-family:'IBM Plex Mono'; font-size:13px; color:#EAEEF3;">3389</div>
+                </div>
+                <div style="display:flex; align-items:center; gap:18px;">
+                  <span style="width:150px; font-size:13px; color:#A6AEB9;">Session window</span>
+                  <div style="display:flex; gap:6px;">
+                    <span style="height:32px; padding:0 14px; background:#17603C; border-radius:4px; display:flex; align-items:center; font-size:13px; color:#EAEEF3;">Fullscreen</span>
+                    <span style="height:32px; padding:0 14px; border:1px solid #2F353D; border-radius:4px; display:flex; align-items:center; font-size:13px; color:#6F7883;">Explicit</span>
+                  </div>
+                </div>
+                <div style="display:flex; align-items:center; gap:18px;">
+                  <span style="width:150px; font-size:13px; color:#545D68;">Explicit size</span>
+                  <div style="display:flex; align-items:center; gap:9px;">
+                    <div style="width:88px; height:34px; background:#0E1013; border:1px solid #262B31; border-radius:4px; padding:0 11px; display:flex; align-items:center; font-family:'IBM Plex Mono'; font-size:13px; color:#545D68;">1920</div>
+                    <span style="font-family:'IBM Plex Mono'; font-size:12px; color:#545D68;">&times;</span>
+                    <div style="width:88px; height:34px; background:#0E1013; border:1px solid #262B31; border-radius:4px; padding:0 11px; display:flex; align-items:center; font-family:'IBM Plex Mono'; font-size:13px; color:#545D68;">1080</div>
+                  </div>
+                </div>
+              </div>
+
+              <div style="height:1px; background:#262B31;"></div>
+
+              <div style="display:flex; flex-direction:column; gap:14px;">
+                <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#6F7883;">On connect</span>
+                <div style="display:flex; align-items:flex-start; gap:12px;">
+                  <span style="width:34px; height:19px; flex:none; border-radius:10px; background:#2BE07A; display:flex; align-items:center; justify-content:flex-end; padding:0 2px;"><span style="width:15px; height:15px; border-radius:8px; background:#04150B;"></span></span>
+                  <div style="display:flex; flex-direction:column; gap:3px;">
+                    <span style="font-size:13px; color:#EAEEF3;">Keep the launcher open</span>
+                    <span style="font-size:12px; color:#6F7883;">Each session runs in its own process, so several can run at once.</span>
+                  </div>
+                </div>
+                <div style="display:flex; align-items:flex-start; gap:12px;">
+                  <span style="width:34px; height:19px; flex:none; border-radius:10px; background:#2F353D; display:flex; align-items:center; padding:0 2px;"><span style="width:15px; height:15px; border-radius:8px; background:#6F7883;"></span></span>
+                  <div style="display:flex; flex-direction:column; gap:3px;">
+                    <span style="font-size:13px; color:#EAEEF3;">Reconnect the last session on launch</span>
+                    <span style="font-size:12px; color:#6F7883;">Opens the most recent favourite without asking.</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div style="height:64px; flex:none; border-top:1px solid #262B31; background:#0E1013; display:flex; align-items:center; justify-content:space-between; padding:0 22px;">
+            <span style="font-size:12px; color:#545D68;">Changes apply to new sessions.</span>
+            <div style="display:flex; gap:10px;">
+              <span style="height:34px; padding:0 16px; border:1px solid #414A54; border-radius:4px; display:flex; align-items:center; font-size:13px; color:#A6AEB9;">Cancel</span>
+              <span style="height:34px; padding:0 20px; background:#2BE07A; border-radius:4px; display:flex; align-items:center; font-size:13px; font-weight:600; color:#04150B;">Save</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="width:900px; display:flex; flex-wrap:wrap; gap:16px;">
+        <div style="flex:1 1 420px; background:#171A1E; border:1px solid #262B31; border-radius:6px; padding:20px 22px; display:flex; flex-direction:column; gap:14px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#2BE07A;">Graphics pane</span>
+          <div style="display:flex; flex-direction:column; gap:11px;">
+            <div style="display:flex; align-items:center; gap:11px;"><span style="width:15px; height:15px; border-radius:3px; background:#2BE07A; color:#04150B; font-size:10px; font-weight:600; display:flex; align-items:center; justify-content:center;">&check;</span><span style="font-size:13px; color:#EAEEF3;">ClearCodec</span></div>
+            <div style="display:flex; align-items:center; gap:11px;"><span style="width:15px; height:15px; border-radius:3px; background:#2BE07A; color:#04150B; font-size:10px; font-weight:600; display:flex; align-items:center; justify-content:center;">&check;</span><span style="font-size:13px; color:#EAEEF3;">RFX Progressive</span></div>
+            <div style="display:flex; align-items:center; gap:11px;"><span style="width:15px; height:15px; border-radius:3px; border:1px solid #414A54;"></span><span style="font-size:13px; color:#A6AEB9;">Allow uncompressed fallback</span></div>
+            <div style="display:flex; align-items:center; gap:11px;"><span style="width:34px; height:19px; border-radius:10px; background:#2BE07A; display:flex; align-items:center; justify-content:flex-end; padding:0 2px;"><span style="width:15px; height:15px; border-radius:8px; background:#04150B;"></span></span><span style="font-size:13px; color:#EAEEF3;">Dynamic resolution on window resize</span></div>
+          </div>
+        </div>
+        <div style="flex:1 1 420px; background:#171A1E; border:1px solid #262B31; border-radius:6px; padding:20px 22px; display:flex; flex-direction:column; gap:14px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#2BE07A;">Clipboard pane</span>
+          <div style="display:flex; flex-direction:column; gap:13px;">
+            <div style="display:flex; align-items:center; gap:14px;"><span style="width:120px; font-size:13px; color:#A6AEB9;">Direction</span><div style="display:flex; gap:6px;"><span style="height:28px; padding:0 11px; background:#17603C; border-radius:4px; display:flex; align-items:center; font-size:12px; color:#EAEEF3;">Both ways</span><span style="height:28px; padding:0 11px; border:1px solid #2F353D; border-radius:4px; display:flex; align-items:center; font-size:12px; color:#6F7883;">To remote</span><span style="height:28px; padding:0 11px; border:1px solid #2F353D; border-radius:4px; display:flex; align-items:center; font-size:12px; color:#6F7883;">Off</span></div></div>
+            <div style="display:flex; align-items:center; gap:14px;"><span style="width:120px; font-size:13px; color:#A6AEB9;">Max image</span><div style="width:96px; height:30px; background:#0E1013; border:1px solid #2F353D; border-radius:4px; padding:0 10px; display:flex; align-items:center; font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">1 MiB</div></div>
+            <div style="display:flex; align-items:center; gap:14px;"><span style="width:120px; font-size:13px; color:#A6AEB9;">Transfer timeout</span><div style="width:96px; height:30px; background:#0E1013; border:1px solid #2F353D; border-radius:4px; padding:0 10px; display:flex; align-items:center; font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">5 s</div></div>
+            <span style="font-size:12px; line-height:19px; color:#545D68;">A transfer that times out is abandoned so later transfers still work.</span>
+          </div>
+        </div>
+        <div style="flex:1 1 420px; background:#171A1E; border:1px solid #262B31; border-radius:6px; padding:20px 22px; display:flex; flex-direction:column; gap:14px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#2BE07A;">Diagnostics pane</span>
+          <div style="display:flex; flex-direction:column; gap:13px;">
+            <div style="display:flex; align-items:center; gap:11px;"><span style="width:34px; height:19px; border-radius:10px; background:#2F353D; display:flex; align-items:center; padding:0 2px;"><span style="width:15px; height:15px; border-radius:8px; background:#6F7883;"></span></span><span style="font-size:13px; color:#EAEEF3;">Show the stats overlay on connect</span></div>
+            <div style="display:flex; align-items:center; gap:14px;"><span style="width:120px; font-size:13px; color:#A6AEB9;">Metrics JSON</span><div style="flex:1; height:30px; background:#0E1013; border:1px solid #2F353D; border-radius:4px; padding:0 10px; display:flex; align-items:center; font-family:'IBM Plex Mono'; font-size:11px; color:#A6AEB9;">~/mdrdp/runs/</div></div>
+            <div style="display:flex; align-items:center; gap:14px;"><span style="width:120px; font-size:13px; color:#A6AEB9;">Stage log</span><div style="display:flex; gap:6px;"><span style="height:28px; padding:0 11px; border:1px solid #2F353D; border-radius:4px; display:flex; align-items:center; font-size:12px; color:#6F7883;">Off</span><span style="height:28px; padding:0 11px; background:#17603C; border-radius:4px; display:flex; align-items:center; font-size:12px; color:#EAEEF3;">Stages</span><span style="height:28px; padding:0 11px; border:1px solid #2F353D; border-radius:4px; display:flex; align-items:center; font-size:12px; color:#6F7883;">Verbose</span></div></div>
+            <span style="font-size:12px; line-height:19px; color:#545D68;">Reports carry no host, account, credential, path, clipboard or pixel data.</span>
+          </div>
+        </div>
+        <div style="flex:1 1 420px; background:#171A1E; border:1px solid #262B31; border-radius:6px; padding:20px 22px; display:flex; flex-direction:column; gap:14px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#2BE07A;">Certificate trust pane</span>
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding-bottom:9px; border-bottom:1px solid #262B31;">
+              <div style="display:flex; flex-direction:column; gap:3px;"><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">temper:3389</span><span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">SHA-256 9f:2c:41:0e:&hellip;:b7 &middot; pinned 14 Aug</span></div>
+              <span style="font-size:12px; color:#FF5D4D;">Forget</span>
+            </div>
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+              <div style="display:flex; flex-direction:column; gap:3px;"><span style="font-family:'IBM Plex Mono'; font-size:12px; color:#EAEEF3;">quench:3391</span><span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">SHA-256 c1:8a:77:5d:&hellip;:24 &middot; pinned 15 Aug</span></div>
+              <span style="font-size:12px; color:#FF5D4D;">Forget</span>
+            </div>
+            <span style="font-size:12px; line-height:19px; color:#545D68;">Trust on first use. A changed fingerprint stops the connection and asks.</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="1f" style="display:flex; flex-direction:column; gap:16px;">
+      <div style="display:flex; align-items:baseline; gap:12px;">
+        <span style="font-family:'IBM Plex Mono'; font-size:12px; font-weight:600; color:#04150B; background:#2BE07A; padding:3px 7px; border-radius:3px;">1f</span>
+        <span style="font-size:17px; font-weight:600; color:#EAEEF3;">Favourites, and where the menus put things</span>
+        <span style="font-size:13px; color:#6F7883;">The front page once anything is saved. Connection menu shown open.</span>
+      </div>
+
+      <div style="width:900px; height:700px; background:#14161A; border:1px solid #2F353D; border-radius:6px; overflow:hidden; position:relative; display:flex; flex-direction:column;">
+        <div style="height:30px; flex:none; background:#0E1013; border-bottom:1px solid #262B31; display:flex; align-items:center; gap:2px; padding:0 10px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; font-weight:600; letter-spacing:0.14em; color:#2BE07A; padding-right:12px;">MDRDP</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">File</span>
+          <span style="font-size:12px; color:#EAEEF3; background:#22262C; border-radius:3px; padding:4px 9px;">Connection</span>
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">View</span>
+          
+          <span style="font-size:12px; color:#A6AEB9; padding:4px 9px;">Help</span>
+        </div>
+
+        <div style="flex:none; padding:26px 28px 18px; display:flex; align-items:flex-end; justify-content:space-between;">
+          <div style="display:flex; flex-direction:column; gap:6px;">
+            <span style="font-size:20px; font-weight:600; color:#EAEEF3; letter-spacing:-0.01em;">Connections</span>
+            <span style="font-size:12px; color:#6F7883;">Double-click to connect &middot; Enter opens the selection &middot; sessions run independently</span>
+          </div>
+          <div style="display:flex; gap:10px;">
+            <span style="height:32px; padding:0 14px; border:1px solid #414A54; border-radius:4px; display:flex; align-items:center; font-size:12px; color:#A6AEB9;">Edit</span>
+            <span style="height:32px; padding:0 16px; background:#2BE07A; border-radius:4px; display:flex; align-items:center; font-size:12px; font-weight:600; color:#04150B;">New connection</span>
+          </div>
+        </div>
+
+        <div style="flex:1; padding:0 28px 20px; display:flex; flex-direction:column; gap:8px; min-height:0;">
+          <div style="height:64px; flex:none; background:#22262C; border:1px solid #2F353D; border-left:2px solid #2BE07A; border-radius:5px; padding:0 18px; display:flex; align-items:center; justify-content:space-between;">
+            <div style="display:flex; flex-direction:column; gap:4px;">
+              <span style="font-size:14px; font-weight:500; color:#EAEEF3;">Temper</span>
+              <span style="font-family:'IBM Plex Mono'; font-size:12px; color:#6F7883;">alice @ temper &middot; fullscreen 1920&times;1080</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:14px;">
+              <span style="font-family:'IBM Plex Mono'; font-size:11px; color:#2BE07A;">connected 12m</span>
+              <span style="width:6px; height:6px; border-radius:3px; background:#2BE07A;"></span>
+            </div>
+          </div>
+          <div style="height:64px; flex:none; background:#171A1E; border:1px solid #262B31; border-radius:5px; padding:0 18px; display:flex; align-items:center; justify-content:space-between;">
+            <div style="display:flex; flex-direction:column; gap:4px;">
+              <span style="font-size:14px; font-weight:500; color:#EAEEF3;">Quench</span>
+              <span style="font-family:'IBM Plex Mono'; font-size:12px; color:#6F7883;">alice @ quench:3391 &middot; 1600&times;1000</span>
+            </div>
+            <span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">last used yesterday</span>
+          </div>
+          <div style="height:64px; flex:none; background:#171A1E; border:1px solid #262B31; border-radius:5px; padding:0 18px; display:flex; align-items:center; justify-content:space-between;">
+            <div style="display:flex; flex-direction:column; gap:4px;">
+              <span style="font-size:14px; font-weight:500; color:#EAEEF3;">Build box</span>
+              <span style="font-family:'IBM Plex Mono'; font-size:12px; color:#6F7883;">CORP\alice @ 10.0.4.19 &middot; fullscreen</span>
+            </div>
+            <span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">last used 3 Aug</span>
+          </div>
+        </div>
+
+        <div style="height:38px; flex:none; border-top:1px solid #262B31; background:#0E1013; display:flex; align-items:center; justify-content:space-between; padding:0 28px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">~/Library/Application Support/mdrdp/favourites.toml</span>
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">1 session running</span>
+        </div>
+
+        <div style="position:absolute; left:113px; top:30px; width:252px; background:#1E2126; border:1px solid #414A54; border-radius:5px; box-shadow:0 16px 40px rgba(0,0,0,0.5); padding:5px; display:flex; flex-direction:column; gap:1px;">
+          <div style="height:28px; padding:0 11px; border-radius:3px; background:#17603C; display:flex; align-items:center; justify-content:space-between;"><span style="font-size:13px; color:#EAEEF3;">Connect</span><span style="font-family:'IBM Plex Mono'; font-size:11px; color:#A6AEB9;">&#8629;</span></div>
+          <div style="height:28px; padding:0 11px; display:flex; align-items:center;"><span style="font-size:13px; color:#A6AEB9;">Edit&hellip;</span></div>
+          <div style="height:28px; padding:0 11px; display:flex; align-items:center;"><span style="font-size:13px; color:#A6AEB9;">Duplicate</span></div>
+          <div style="height:28px; padding:0 11px; display:flex; align-items:center;"><span style="font-size:13px; color:#A6AEB9;">Remove&hellip;</span></div>
+          <div style="height:1px; background:#2F353D; margin:5px 0;"></div>
+          <div style="height:28px; padding:0 11px; display:flex; align-items:center;"><span style="font-size:13px; color:#A6AEB9;">Copy command line</span></div>
+          <div style="height:1px; background:#2F353D; margin:5px 0;"></div>
+          <div style="height:28px; padding:0 11px; display:flex; align-items:center; justify-content:space-between;"><span style="font-size:13px; color:#A6AEB9;">Disconnect session</span><span style="font-family:'IBM Plex Mono'; font-size:11px; color:#545D68;">Temper</span></div>
+        </div>
+
+      <div style="width:900px; display:flex; gap:16px; flex-wrap:wrap;">
+        <div style="flex:1 1 270px; background:#171A1E; border:1px solid #262B31; border-radius:6px; padding:18px 20px; display:flex; flex-direction:column; gap:10px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#2BE07A;">File</span>
+          <span style="font-size:12px; line-height:21px; color:#A6AEB9;">New connection&hellip; &#8984;N<br>Connect to host&hellip; &#8984;&#8679;N<br>Import favourites&hellip;<br>Reveal favourites.toml<br>Settings&hellip; &#8984;,<br>About mdrdp<br>Close window</span>
+        </div>
+        <div style="flex:1 1 270px; background:#171A1E; border:1px solid #262B31; border-radius:6px; padding:18px 20px; display:flex; flex-direction:column; gap:10px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#2BE07A;">Connection</span>
+          <span style="font-size:12px; line-height:21px; color:#A6AEB9;">Connect &#8629;<br>Edit&hellip;<br>Duplicate<br>Remove&hellip;<br>Copy command line<br>Disconnect session</span>
+        </div>
+        <div style="flex:1 1 270px; background:#171A1E; border:1px solid #262B31; border-radius:6px; padding:18px 20px; display:flex; flex-direction:column; gap:10px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#2BE07A;">View</span>
+          <span style="font-size:12px; line-height:21px; color:#A6AEB9;">Enter fullscreen<br>Actual size<br>Sort by name / last used<br>Show running sessions only</span>
+        </div>
+        <div style="flex:1 1 270px; background:#171A1E; border:1px solid #262B31; border-radius:6px; padding:18px 20px; display:flex; flex-direction:column; gap:10px;">
+          <span style="font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#2BE07A;">Session window &mdash; Diagnostics</span>
+          <span style="font-size:12px; line-height:21px; color:#A6AEB9;">Bitmap cache&hellip;<br>Latency and drift&hellip;<br>Channels and codecs&hellip;<br>Stats overlay &#8963;&#8997;S<br>Write metrics JSON&hellip;<br>Open stage log</span>
+        </div>
+      </div>
+      <div style="width:900px; font-size:12px; line-height:20px; color:#545D68;">Diagnostics belongs to the session process, so those windows open from the session window's menu bar &mdash; not the launcher's. On Windows this bar is the window's own menu bar; on macOS the same items appear in the system menu bar and the in-window strip is hidden.</div>
+    </div>
+
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;heatMetric&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;served&quot;,&quot;hits&quot;,&quot;recency&quot;,&quot;return&quot;,&quot;occupancy&quot;],&quot;default&quot;:&quot;served&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Bitmap cache&quot;},&quot;dimEmptySlots&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Bitmap cache&quot;}}">
+class Component extends DCLogic {
+  state = { metric: this.props.heatMetric || 'served', slot: null };
+
+  build() {
+    const n = 504;
+    let seed = 20260816;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const codecs = ['ClearCodec', 'RFX Prog.', 'ClearCodec', 'Uncompressed'];
+    const dims = [[64, 64], [128, 128], [256, 256], [448, 448], [32, 32], [512, 384], [96, 96]];
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const r = rnd();
+      const state = r < 0.30 ? 'empty' : (r < 0.40 ? 'evicted' : 'live');
+      const [w, h] = dims[Math.floor(rnd() * dims.length)];
+      const stored = w * h * 4;
+      const hits = state === 'empty' ? 0 : Math.floor(Math.pow(rnd(), 2.4) * 90) + (state === 'live' ? 1 : 0);
+      out.push({
+        id: i, state, w, h, stored,
+        hits,
+        served: hits * stored,
+        age: state === 'empty' ? null : Math.floor(Math.pow(rnd(), 1.7) * 180000),
+        codec: codecs[Math.floor(rnd() * codecs.length)]
+      });
+    }
+    return out;
+  }
+
+  slots() {
+    if (!this._slots) this._slots = this.build();
+    return this._slots;
+  }
+
+  // Continuous cold-to-hot ramp: deep blue through cyan, green and yellow to red.
+  // Interpolated rather than binned so neighbouring slots are distinguishable.
+  ramp(t) {
+    const stops = [
+      [0.00, [46, 59, 255]], [0.16, [59, 140, 255]], [0.32, [36, 216, 224]],
+      [0.48, [43, 224, 122]], [0.62, [185, 245, 60]], [0.76, [255, 224, 77]],
+      [0.88, [255, 154, 46]], [1.00, [255, 45, 45]]
+    ];
+    const u = Math.max(0, Math.min(1, t));
+    let i = 0;
+    while (i < stops.length - 2 && u > stops[i + 1][0]) i++;
+    const [t0, a] = stops[i];
+    const [t1, b] = stops[i + 1];
+    const k = t1 === t0 ? 0 : (u - t0) / (t1 - t0);
+    const c = a.map((v, j) => Math.round(v + (b[j] - v) * k));
+    return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
+  }
+
+  bytes(b) {
+    if (b == null) return '—';
+    if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GiB';
+    if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MiB';
+    if (b >= 1024) return Math.round(b / 1024) + ' KiB';
+    return b + ' B';
+  }
+
+  age(ms) {
+    if (ms == null) return 'never';
+    if (ms < 1000) return ms + 'ms ago';
+    if (ms < 60000) return (ms / 1000).toFixed(1) + 's ago';
+    return Math.round(ms / 60000) + 'm ago';
+  }
+
+  heat(s, metric, max) {
+    if (s.state === 'empty') return this.props.dimEmptySlots === false ? '#2F353D' : '#1E2126';
+    if (metric === 'occupancy') return s.state === 'live' ? '#2BE07A' : '#FF5D4D';
+    if (metric === 'recency') return this.ramp(1 - Math.min(1, (s.age || 0) / 180000));
+    if (metric === 'hits') return this.ramp(Math.log1p(s.hits) / Math.log1p(max.hits));
+    if (metric === 'return') return this.ramp(Math.min(1, Math.log1p(s.served / s.stored) / Math.log1p(20)));
+    // Rank-binned rather than absolute: a handful of huge slots would otherwise pin
+    // every other filled slot into the top two stops.
+    if (max.rank) return this.ramp(max.rank.get(s.id) || 0);
+    return this.ramp(Math.log1p(s.served) / Math.log1p(max.served));
+  }
+
+  renderVals() {
+    const slots = this.slots();
+    const metric = this.state.metric;
+    const filled = slots.filter(s => s.state !== 'empty').slice().sort((a, b) => a.served - b.served);
+    const rank = new Map();
+    filled.forEach((s, i) => rank.set(s.id, filled.length > 1 ? i / (filled.length - 1) : 1));
+    const max = {
+      hits: Math.max(...slots.map(s => s.hits)) || 1,
+      served: Math.max(...slots.map(s => s.served)) || 1,
+      rank
+    };
+    const live = slots.filter(s => s.state === 'live');
+    const evicted = slots.filter(s => s.state === 'evicted');
+    const hits = slots.reduce((a, s) => a + s.hits, 0);
+    const misses = live.length + evicted.length;
+    const served = slots.reduce((a, s) => a + s.served, 0);
+    const stored = live.reduce((a, s) => a + s.stored, 0);
+    const wire = Math.round(served * 0.63);
+    const byServed = live.slice().sort((a, b) => b.served - a.served);
+    const selId = this.state.slot == null ? (byServed[0] ? byServed[0].id : 0) : this.state.slot;
+    const sel = slots[selId] || slots[0];
+    const ring = id => id === selId ? '0 0 0 2px #EAEEF3' : 'none';
+
+    const tab = key => {
+      const on = metric === key;
+      return 'padding:5px 11px; border-radius:3px; font-size:12px; white-space:nowrap; cursor:pointer; ' +
+        (on ? 'background:#17603C; color:#EAEEF3; font-weight:500;' : 'color:#A6AEB9;');
+    };
+    const set = key => () => this.setState({ metric: key });
+
+    const labels = {
+      served: ['no bytes served', 'carrying the session'],
+      hits: ['never hit', 'hit constantly'],
+      recency: ['stale', 'hit just now'],
+      return: ['stored, barely used', 'paid back ×20'],
+      occupancy: ['evicted', 'live entry']
+    }[metric];
+
+    const idle = live.filter(s => s.hits <= 1).sort((a, b) => b.stored - a.stored).slice(0, 4);
+
+    let cseed = 771;
+    const crnd = () => { cseed = (cseed * 1103515245 + 12345) & 0x7fffffff; return cseed / 0x7fffffff; };
+    const churn = Array.from({ length: 48 }, (_, i) => ({
+      h: Math.round(4 + Math.pow(crnd(), 1.6) * 34 * (i > 30 ? 1 : 0.55)) + 'px'
+    }));
+
+    return {
+      cells: slots.map(s => ({ id: s.id, bg: this.heat(s, metric, max), ring: ring(s.id) })),
+      dots: live.map(s => {
+        const t = Math.log1p(s.served) / Math.log1p(max.served);
+        const px = Math.max(5, Math.round(4 + t * 18));
+        return {
+          id: s.id,
+          size: px + 'px',
+          bg: this.ramp(Math.min(1, Math.log1p(s.served / s.stored) / Math.log1p(20))),
+          ring: s.id === selId ? '0 0 0 2px #EAEEF3' : 'none'
+        };
+      }),
+      top: byServed.slice(0, 5).map(s => ({
+        id: '#' + s.id,
+        w: Math.round(100 * s.served / byServed[0].served) + '%',
+        served: this.bytes(s.served)
+      })),
+      dead: idle.map(s => ({ id: '#' + s.id, dims: s.w + '×' + s.h, stored: this.bytes(s.stored) })),
+      deadLine: idle.length + ' live slots have been hit once or never, holding ' + this.bytes(idle.reduce((a, s) => a + s.stored, 0)) + '.',
+      churn,
+      hitRate: (100 * hits / (hits + misses)).toFixed(1) + '%',
+      pixelShare: Math.round(100 * served / (served + wire)) + '%',
+      lookupLine: hits.toLocaleString() + ' hits / ' + misses + ' misses',
+      servedLine: this.bytes(served) + ' of ' + this.bytes(served + wire) + ' painted',
+      liveLabel: 'live · refresh 1s',
+      liveCount: live.length,
+      gridLabel: '504 slots · ' + live.length + ' live · ' + evicted.length + ' evicted',
+      legendLow: labels[0],
+      legendHigh: labels[1],
+      totals: {
+        entries: live.length + ' / 504',
+        evictions: evicted.length,
+        served: this.bytes(served),
+        stored: this.bytes(stored),
+        wire: this.bytes(wire)
+      },
+      sel: {
+        id: sel.id,
+        state: sel.state,
+        stateColour: sel.state === 'live' ? '#2BE07A' : (sel.state === 'evicted' ? '#FF5D4D' : '#545D68'),
+        dims: sel.w + '×' + sel.h,
+        codec: sel.codec,
+        hits: sel.hits,
+        served: this.bytes(sel.served),
+        stored: this.bytes(sel.stored),
+        ret: '×' + (sel.served / sel.stored).toFixed(1),
+        age: this.age(sel.age)
+      },
+      tabServed: tab('served'), tabHits: tab('hits'), tabRecency: tab('recency'),
+      tabReturn: tab('return'), tabOccupancy: tab('occupancy'),
+      pickServed: set('served'), pickHits: set('hits'), pickRecency: set('recency'),
+      pickReturn: set('return'), pickOccupancy: set('occupancy'),
+      pickSlot: e => this.setState({ slot: Number(e.currentTarget.dataset.slot) })
+    };
+  }
+}
+</script>
+</body>
+</html>
