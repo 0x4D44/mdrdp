@@ -73,6 +73,11 @@ struct ConnectFlow {
     failure: Option<dialogs::ConnectFailure>,
     cert_prompt: Option<dialogs::CertPromptInfo>,
     password_prompt: Option<dialogs::PasswordPromptState>,
+    /// The extra args this connect was spawned with, so a retry can repeat them.
+    args: Vec<String>,
+    /// Set on an Edit-password respawn: the child's password prompt then goes straight
+    /// to the input dialog instead of the "No saved password" explainer.
+    reprompt: bool,
 }
 
 /// Which modal sits over the list, if any.
@@ -293,6 +298,8 @@ impl LauncherApp {
                     failure: None,
                     cert_prompt: None,
                     password_prompt: None,
+                    args: Vec::new(),
+                    reprompt: false,
                 });
             }
             Err(e) => eprintln!("{e}"),
@@ -340,7 +347,9 @@ impl LauncherApp {
                     flow.password_prompt = Some(dialogs::PasswordPromptState {
                         account,
                         reason,
-                        entering: false,
+                        // A reprompt already knows a password is saved and wrong; the
+                        // explainer would claim none is stored. Straight to the input.
+                        entering: flow.reprompt,
                         input: zeroize::Zeroizing::new(String::new()),
                         save: false,
                     });
@@ -458,11 +467,8 @@ impl LauncherApp {
                     }
                 }
                 dialogs::ConnectDialogAction::TryDefaultPort => {
-                    if let Ok((mut child, rx)) = spawn_connect(
-                        &flow.name,
-                        &["--port".to_owned(), "3389".to_owned()],
-                        ctx.clone(),
-                    ) {
+                    let args = vec!["--port".to_owned(), "3389".to_owned()];
+                    if let Ok((mut child, rx)) = spawn_connect(&flow.name, &args, ctx.clone()) {
                         let child_stdin = child.stdin.take();
                         self.connect_flow = Some(ConnectFlow {
                             child: Some(child),
@@ -474,13 +480,32 @@ impl LauncherApp {
                             cert_prompt: None,
                             password_prompt: None,
                             port: 3389,
+                            args,
+                            reprompt: false,
                             ..flow
                         });
                     }
                 }
-                dialogs::ConnectDialogAction::ChangePassword => {
-                    // The credential dialogs land in a later unit.
-                    eprintln!("change-password flow is not built yet");
+                dialogs::ConnectDialogAction::EditPassword => {
+                    // Re-run the connect with the child forced to ask; the credential
+                    // dialog answers over the pipe and can overwrite the stored password.
+                    let mut args = flow.args.clone();
+                    args.push("--ask-password".to_owned());
+                    if let Ok((mut child, rx)) = spawn_connect(&flow.name, &args, ctx.clone()) {
+                        let child_stdin = child.stdin.take();
+                        self.connect_flow = Some(ConnectFlow {
+                            child: Some(child),
+                            child_stdin,
+                            rx,
+                            arrived: Vec::new(),
+                            started: Instant::now(),
+                            failure: None,
+                            cert_prompt: None,
+                            password_prompt: None,
+                            reprompt: true,
+                            ..flow
+                        });
+                    }
                 }
                 dialogs::ConnectDialogAction::Close | dialogs::ConnectDialogAction::Cancel => {}
                 dialogs::ConnectDialogAction::None => self.connect_flow = Some(flow),
@@ -891,6 +916,8 @@ impl LauncherApp {
                                 failure: None,
                                 cert_prompt: None,
                                 password_prompt: None,
+                                args: extra,
+                                reprompt: false,
                             });
                         }
                         Err(e) => eprintln!("{e}"),

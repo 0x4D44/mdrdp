@@ -17,7 +17,8 @@ pub enum ConnectDialogAction {
     Cancel,
     Retry,
     TryDefaultPort,
-    ChangePassword,
+    /// Re-run the connect with the child forced to ask for a fresh password.
+    EditPassword,
     Close,
 }
 
@@ -392,8 +393,8 @@ pub fn connect_failed(ctx: &egui::Context, failure: &ConnectFailure) -> ConnectD
         ),
         FailureKind::SignInRejected => (
             "Sign-in rejected",
-            "failed at Credssp · STATUS_LOGON_FAILURE".to_owned(),
-            "Change password",
+            signin_subtitle(&failure.error),
+            "Edit password",
         ),
         FailureKind::PortRefused => (
             "Port refused",
@@ -459,7 +460,7 @@ pub fn connect_failed(ctx: &egui::Context, failure: &ConnectFailure) -> ConnectD
                     ui.spacing_mut().item_spacing.x = 10.0;
                     if widgets::primary_button(ui, primary, 34.0).clicked() {
                         action = match failure.kind {
-                            FailureKind::SignInRejected => ConnectDialogAction::ChangePassword,
+                            FailureKind::SignInRejected => ConnectDialogAction::EditPassword,
                             FailureKind::PortRefused => ConnectDialogAction::TryDefaultPort,
                             _ => ConnectDialogAction::Retry,
                         };
@@ -476,6 +477,19 @@ pub fn connect_failed(ctx: &egui::Context, failure: &ConnectFailure) -> ConnectD
         return ConnectDialogAction::Close;
     }
     action
+}
+
+/// The Sign-in-rejected subtitle: the NSTATUS the server actually returned, when the
+/// error names one. Never a guessed constant — STATUS_LOGON_FAILURE (wrong credential)
+/// and STATUS_PASSWORD_EXPIRED are different problems the dialog must not conflate.
+pub fn signin_subtitle(error: &str) -> String {
+    let status = error
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .find(|t| t.starts_with("STATUS_"));
+    match status {
+        Some(s) => format!("failed at Credssp · {s}"),
+        None => "failed at Credssp".to_owned(),
+    }
 }
 
 fn host_line(failure: &ConnectFailure) -> String {
@@ -1356,6 +1370,26 @@ mod tests {
         assert_eq!(
             classify("the server closed the channel"),
             FailureKind::Other
+        );
+    }
+
+    #[test]
+    fn the_subtitle_carries_the_status_the_server_returned() {
+        assert_eq!(
+            signin_subtitle("CredSSP: STATUS_LOGON_FAILURE [0xc000006d]"),
+            "failed at Credssp · STATUS_LOGON_FAILURE"
+        );
+        assert_eq!(
+            signin_subtitle("CredSSP: STATUS_PASSWORD_EXPIRED [0xc0000071]"),
+            "failed at Credssp · STATUS_PASSWORD_EXPIRED"
+        );
+    }
+
+    #[test]
+    fn the_subtitle_claims_no_status_when_the_error_names_none() {
+        assert_eq!(
+            signin_subtitle("CredSSP: the server rejected our final token"),
+            "failed at Credssp"
         );
     }
 

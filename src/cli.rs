@@ -91,6 +91,10 @@ const OPTIONS: &[(&str, &str)] = &[
         "read the password from stdin instead of the keychain",
     ),
     (
+        "--ask-password",
+        "ask the driving launcher for a fresh password instead of\nusing the saved one (needs --stage-json)",
+    ),
+    (
         "--screenshot <file>",
         "write the final frame to a BMP (session pixels on disk)",
     ),
@@ -222,6 +226,7 @@ mod tests {
             "--list",
             "--duration",
             "--password-stdin",
+            "--ask-password",
             "--screenshot",
             "--metrics-json",
             "--input-script",

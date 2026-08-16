@@ -167,6 +167,36 @@ fn install_diagnostics_subscriber(default_filter: Option<&str>) {
         .init();
 }
 
+/// Ask the driving launcher for a password over the `--stage-json` pipe.
+///
+/// Blocks on one answer line from stdin; EOF or garbage aborts the connect. The
+/// password itself is never echoed, logged, or carried in any event this process
+/// emits, and the reason is a failure description, never a secret.
+fn ask_password_over_pipe(
+    account: &str,
+    reason: &str,
+) -> Result<mdrdp::creds::Secret, Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "password_prompt",
+            "account": account,
+            "reason": reason,
+        })
+    );
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+        .map_err(|e| format!("reading the password answer: {e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&line).map_err(|_| "the password answer was not understood")?;
+    let password = parsed["password"]
+        .as_str()
+        .ok_or("no password was provided")?
+        .to_owned();
+    zeroize::Zeroize::zeroize(&mut line);
+    Ok(mdrdp::creds::secret_from_password(password)?)
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -218,6 +248,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut metrics_json: Option<String> = None;
     let mut input_script: Option<String> = None;
     let mut password_stdin = false;
+    let mut ask_password = false;
     let mut stage_json = false;
     let mut list_only = false;
     let mut force_fullscreen = false;
@@ -236,6 +267,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--password-stdin" => {
                 password_stdin = true;
+                i += 1;
+                continue;
+            }
+            "--ask-password" => {
+                ask_password = true;
                 i += 1;
                 continue;
             }
@@ -265,6 +301,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown flag {other}\n{}", usage()).into()),
         }
         i += 2;
+    }
+
+    if ask_password && !stage_json {
+        return Err("--ask-password needs --stage-json (a driving launcher); \
+             for a scripted run use --password-stdin"
+            .into());
     }
 
     let config_path = Favourites::default_path();
@@ -400,35 +442,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // nobody is there to see.
     let secret = if password_stdin {
         mdrdp::creds::from_stdin()?
+    } else if stage_json && ask_password {
+        // The launcher saw a sign-in rejected with the stored password and wants a
+        // fresh one; the keychain is deliberately not consulted.
+        ask_password_over_pipe(
+            &target.keychain_account,
+            "the saved password was not accepted",
+        )?
     } else if stage_json {
         // A launcher is driving: a missing password is its dialog, not a tty prompt.
-        // The child asks over the pipe and blocks on one answer line from stdin;
-        // EOF or garbage aborts the connect. The password itself is never echoed,
-        // logged, or carried in any event this process emits.
         match mdrdp::creds::lookup(&target.keychain_account) {
             Ok(secret) => secret,
-            Err(e) => {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "password_prompt",
-                        "account": target.keychain_account,
-                        // The reason names the store failure kind, never a secret.
-                        "reason": e.to_string(),
-                    })
-                );
-                let mut line = String::new();
-                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
-                    .map_err(|e| format!("reading the password answer: {e}"))?;
-                let parsed: serde_json::Value = serde_json::from_str(&line)
-                    .map_err(|_| "the password answer was not understood")?;
-                let password = parsed["password"]
-                    .as_str()
-                    .ok_or("no password was provided")?
-                    .to_owned();
-                zeroize::Zeroize::zeroize(&mut line);
-                mdrdp::creds::secret_from_password(password)?
-            }
+            // The reason names the store failure kind, never a secret.
+            Err(e) => ask_password_over_pipe(&target.keychain_account, &e.to_string())?,
         }
     } else {
         mdrdp::creds::lookup_or_prompt(&target.keychain_account)?
