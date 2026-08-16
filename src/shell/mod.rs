@@ -71,8 +71,7 @@ struct ConnectFlow {
 
 /// Which modal sits over the list, if any.
 enum Modal {
-    /// Settings — pane UI arrives with its unit.
-    Settings,
+    Settings(Box<settings_ui::SettingsModal>),
     About,
     Edit(dialogs::EditState),
     Remove(dialogs::RemoveState),
@@ -94,6 +93,8 @@ pub struct LauncherApp {
     modal: Option<Modal>,
     connect_flow: Option<ConnectFlow>,
     menu: menus::LauncherMenu,
+    settings: crate::settings::Settings,
+    settings_path: Option<PathBuf>,
     /// The About dialog's icon texture, loaded on first use.
     about_icon: Option<egui::TextureHandle>,
     /// Set once the Quit dialog has approved closing over running sessions.
@@ -104,9 +105,11 @@ impl LauncherApp {
     fn new(
         favourites: Favourites,
         config_path: PathBuf,
-        default_username: Option<String>,
+        settings: crate::settings::Settings,
+        settings_path: Option<PathBuf>,
         menu: menus::LauncherMenu,
     ) -> Self {
+        let default_username = settings.defaults.username.clone();
         LauncherApp {
             selected: if favourites.is_empty() { None } else { Some(0) },
             // The front page chooses itself: no favourites means the wizard.
@@ -120,9 +123,19 @@ impl LauncherApp {
             modal: None,
             connect_flow: None,
             menu,
+            settings,
+            settings_path,
             about_icon: None,
             allow_close: false,
         }
+    }
+
+    fn open_settings(&mut self) {
+        let known_hosts = crate::trust::KnownHosts::default_path().ok();
+        self.modal = Some(Modal::Settings(Box::new(settings_ui::SettingsModal::new(
+            self.settings.clone(),
+            known_hosts,
+        ))));
     }
 
     /// Open the Edit dialog for the selected favourite.
@@ -425,7 +438,7 @@ impl LauncherApp {
         while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
             match self.menu.action_for(event.id()) {
                 Some(menus::MenuAction::NewConnection) => self.open_wizard(),
-                Some(menus::MenuAction::Settings) => self.modal = Some(Modal::Settings),
+                Some(menus::MenuAction::Settings) => self.open_settings(),
                 Some(menus::MenuAction::About) => self.modal = Some(Modal::About),
                 Some(menus::MenuAction::RevealFavourites) => reveal(&self.config_path),
                 Some(menus::MenuAction::Connect) => {
@@ -834,9 +847,22 @@ impl LauncherApp {
             return;
         };
         match &mut modal {
-            Modal::Settings => {
-                self.modal_placeholder(ctx, "Settings");
-            }
+            Modal::Settings(state) => match state.ui(ctx, &self.config_path) {
+                settings_ui::SettingsOutcome::Open => self.modal = Some(modal),
+                settings_ui::SettingsOutcome::Cancelled => {}
+                settings_ui::SettingsOutcome::Saved(settings) => {
+                    self.settings = settings;
+                    self.default_username = self.settings.defaults.username.clone();
+                    match &self.settings_path {
+                        Some(path) => {
+                            if let Err(e) = self.settings.save_to(path) {
+                                eprintln!("could not save settings: {e}");
+                            }
+                        }
+                        None => eprintln!("no settings path; changes apply this run only"),
+                    }
+                }
+            },
             Modal::About => {
                 if self.about_icon.is_none() {
                     self.about_icon = about_icon_texture(ctx);
@@ -914,37 +940,6 @@ impl LauncherApp {
             }
         }
     }
-
-    fn modal_placeholder(&mut self, ctx: &egui::Context, title: &str) {
-        let close = egui::Area::new(egui::Id::new("modal"))
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                Frame::new()
-                    .fill(theme::BG_WINDOW)
-                    .stroke(Stroke::new(1.0, theme::LINE_STRONG))
-                    .corner_radius(CornerRadius::same(theme::radius::MODAL))
-                    .inner_margin(Margin::same(24))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(title)
-                                .font(theme::sans_semibold(16.0))
-                                .color(theme::TEXT_PRIMARY),
-                        );
-                        ui.label(
-                            RichText::new("Under construction on this branch.")
-                                .font(theme::sans(13.0))
-                                .color(theme::TEXT_MUTED),
-                        );
-                        ui.add_space(10.0);
-                        widgets::secondary_button(ui, "Close", 34.0).clicked()
-                    })
-                    .inner
-            })
-            .inner;
-        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.modal = None;
-        }
-    }
 }
 
 impl eframe::App for LauncherApp {
@@ -986,7 +981,8 @@ impl eframe::App for LauncherApp {
 pub fn run(
     favourites: Favourites,
     config_path: PathBuf,
-    default_username: Option<String>,
+    settings: crate::settings::Settings,
+    settings_path: Option<PathBuf>,
 ) -> Result<(), String> {
     let icon = window_icon();
     let mut viewport = egui::ViewportBuilder::default()
@@ -1011,7 +1007,8 @@ pub fn run(
             Ok(Box::new(LauncherApp::new(
                 favourites,
                 config_path,
-                default_username,
+                settings,
+                settings_path,
                 menu,
             )))
         }),
