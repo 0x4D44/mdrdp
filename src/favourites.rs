@@ -60,6 +60,10 @@ pub struct Favourite {
     /// connect time. `None` means "prompt" — this is never a password itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keychain_account: Option<String>,
+    /// When this favourite last launched a session, as Unix seconds. Display-only —
+    /// the launcher list sorts and captions with it; nothing else reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<u64>,
 }
 
 fn default_port() -> u16 {
@@ -78,6 +82,7 @@ impl Favourite {
             domain: None,
             window_size: WindowSize::default(),
             keychain_account: None,
+            last_used: None,
         }
     }
 }
@@ -315,6 +320,20 @@ impl Favourites {
     /// Look up a favourite by exact name (case-sensitive).
     pub fn find(&self, name: &str) -> Option<&Favourite> {
         self.entries.iter().find(|f| f.name == name)
+    }
+
+    /// Record that `name` just launched a session, as Unix seconds now.
+    ///
+    /// Display-only bookkeeping for the launcher list; a missing name is a no-op
+    /// rather than an error because the launch itself already succeeded.
+    pub fn touch(&mut self, name: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(f) = self.entries.iter_mut().find(|f| f.name == name) {
+            f.last_used = Some(now);
+        }
     }
 
     fn position_ci(&self, name: &str) -> Option<usize> {
@@ -609,6 +628,7 @@ mod tests {
                 height: 1440,
             },
             keychain_account: Some("office-account".to_owned()),
+            last_used: Some(1_755_300_000),
         };
         let sparse = Favourite {
             name: "Home Lab".to_owned(),
@@ -618,6 +638,7 @@ mod tests {
             domain: None,
             window_size: WindowSize::Fullscreen,
             keychain_account: None,
+            last_used: None,
         };
 
         let mut favs = Favourites::default();

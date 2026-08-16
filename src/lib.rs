@@ -19,6 +19,7 @@ pub mod probe;
 pub mod process_metrics;
 pub mod screenshot;
 pub mod session;
+pub mod shell;
 pub mod stagelog;
 pub mod state;
 pub mod stats;

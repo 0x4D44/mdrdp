@@ -38,9 +38,9 @@ pub const INFO: Color32 = Color32::from_rgb(0x3B, 0x8C, 0xFF);
 pub const CYAN: Color32 = Color32::from_rgb(0x24, 0xD8, 0xE0);
 /// Modal backdrop: `#05070A` at 62%. Content behind additionally drops to 25% opacity.
 pub const SCRIM: Color32 = Color32::from_rgba_premultiplied(
-    (0x05 as u32 * 158 / 255) as u8,
-    (0x07 as u32 * 158 / 255) as u8,
-    (0x0A as u32 * 158 / 255) as u8,
+    (0x05_u32 * 158 / 255) as u8,
+    (0x07_u32 * 158 / 255) as u8,
+    (0x0A_u32 * 158 / 255) as u8,
     158, // 0.62 * 255
 );
 /// The warning card on wizard step 2: background and border.
@@ -265,7 +265,11 @@ mod tests {
         // Below the 0.88 anchor the red channel never dominates both others the way
         // the terminal red does; spot-check the neutral middle.
         let mid = heat(0.48);
-        assert_eq!(mid, Color32::from_rgb(43, 224, 122), "the accent green anchor");
+        assert_eq!(
+            mid,
+            Color32::from_rgb(43, 224, 122),
+            "the accent green anchor"
+        );
     }
 
     #[test]

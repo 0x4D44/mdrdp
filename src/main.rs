@@ -30,7 +30,6 @@ use mdrdp::connect::{Channels, ConnectOptions, RdpsndHandlers, establish};
 use mdrdp::favourites::{Favourite, Favourites, WindowSize};
 use mdrdp::gfx::{GfxHandler, GfxStatsHandle};
 use mdrdp::input::InputEvent;
-use mdrdp::launcher;
 use mdrdp::metrics::{ResourceMetrics, SessionMetricsReport};
 use mdrdp::process_metrics::{ProcessSnapshot, snapshot as process_snapshot};
 use mdrdp::session::{self, SessionServices};
@@ -266,7 +265,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(path) => Favourites::load_from(path),
         Err(_) => Favourites::load(),
     };
-    let mut favourites = match favourites_result {
+    let favourites = match favourites_result {
         Ok(f) => f,
         Err(e) if positional.is_some() => {
             eprintln!("warning: could not read favourites ({e}); treating the argument as a host");
@@ -296,14 +295,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // supports directly: each `pick` is an orthogonal run of the same event loop.
     if positional.is_none() {
         let config_path = config_path?;
-        let mut event_loop = SessionWindow::event_loop()?;
-        loop {
-            match launcher::pick(&mut event_loop, &mut favourites, &config_path)? {
-                Some(f) => spawn_session(&f.name)?,
-                // Closing the launcher without choosing is a normal way to quit.
-                None => return Ok(()),
-            }
-        }
+        mdrdp::shell::run(favourites, config_path)?;
+        return Ok(());
     }
 
     let positional = positional.expect("the launcher path returned above");
@@ -703,23 +696,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     window_result?;
     Ok(())
-}
-
-/// Launch a session for `name` in its own process.
-///
-/// Re-executes this binary rather than connecting in-process, so a session that wedges,
-/// panics, or is killed takes nothing else with it. The child is left running when the
-/// launcher exits: closing the picker should not tear down desktops it opened.
-fn spawn_session(name: &str) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("cannot find own path: {e}"))?;
-    std::process::Command::new(&exe)
-        // `--` first: a favourite legitimately named "--list" would otherwise be re-parsed
-        // by the child as a flag rather than as the target to connect to.
-        .arg("--")
-        .arg(name)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("could not start a session for {name:?}: {e}"))
 }
 
 /// Reconcile a favourite with command-line flags. Flags always win.

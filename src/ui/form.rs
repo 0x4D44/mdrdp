@@ -615,6 +615,7 @@ impl NewConnectionForm {
             domain: None,
             window_size,
             keychain_account: Some(keychain_account),
+            last_used: None,
         })
     }
 
