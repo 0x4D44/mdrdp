@@ -17,6 +17,8 @@
 
 use core::fmt;
 
+pub use ironrdp_graphics::avc444::Yuv420Frame;
+
 // ============================================================================
 // Decoded Frame
 // ============================================================================
@@ -166,6 +168,36 @@ pub trait H264Decoder: Send {
     /// Frame dimensions may exceed the destination rectangle due to
     /// macroblock alignment (16x16). The caller crops to fit.
     fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame>;
+
+    /// Decode one AVC-format access unit into planar 4:2:0 YUV.
+    ///
+    /// Required for AVC444/AVC444v2, whose luma+chroma combination must happen in
+    /// YUV space before any RGB conversion. `out` is caller-owned so the caller
+    /// controls buffer reuse (an LC=0 update needs two decoded frames alive at
+    /// once). Implementations must fill tight-packed planes (Y row = `width`,
+    /// U/V row = `(width + 1) / 2`).
+    ///
+    /// The default reports no support; the EGFX client then filters
+    /// AVC444-bearing capability sets out of the advertisement (see
+    /// [`Self::supports_yuv420`]), so a server never sends what this decoder
+    /// cannot decode.
+    fn decode_yuv420(
+        &mut self,
+        data: &[u8],
+        out: &mut Yuv420Frame,
+    ) -> DecoderResult<()> {
+        let _ = (data, out);
+        Err(DecoderError::msg("YUV 4:2:0 output not supported by this decoder"))
+    }
+
+    /// Whether [`Self::decode_yuv420`] is implemented.
+    ///
+    /// Gates the AVC444 capability advertisement structurally: the client drops
+    /// AVC444-bearing capability sets when this is `false`, so advertisement and
+    /// decode capability cannot drift apart.
+    fn supports_yuv420(&self) -> bool {
+        false
+    }
 
     /// Reset the decoder state
     ///

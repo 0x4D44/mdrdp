@@ -78,6 +78,10 @@ version = "0.8"
 
 [dependencies.ironrdp-graphics]
 version = "0.9"
+# mdrdp: the vendored graphics crate carries the AVC444 combination module this
+# client uses; a bare crates.io version would compile standalone (in-crate) tests
+# against upstream, which does not have it.
+path = "../ironrdp-graphics"
 
 [dependencies.ironrdp-pdu]
 version = "0.9"

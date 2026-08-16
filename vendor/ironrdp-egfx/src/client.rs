@@ -58,18 +58,20 @@ use std::collections::BTreeMap;
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
 use ironrdp_graphics::zgfx;
-use ironrdp_pdu::geometry::{ExclusiveRectangle, Rectangle as _};
+use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, trace, warn};
+
+use ironrdp_graphics::avc444::{Yuv420Frame, Yuv444Buffer};
 
 use crate::CHANNEL_NAME;
 use crate::decode::H264Decoder;
 use crate::pdu::{
-    Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
-    CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
-    EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
-    MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu,
-    SurfaceToSurfacePdu, WireToSurface2Pdu,
+    Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
+    CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type,
+    DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu,
+    MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth,
+    RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 
 /// Max capacity to keep for decompressed buffer when cleared.
@@ -259,6 +261,14 @@ pub trait GraphicsPipelineHandler: Send {
     /// surface ID, destination rectangle, and RGBA pixel data.
     fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
 
+    /// Called when a codec payload could not be decoded and was skipped
+    ///
+    /// mdrdp patch: the client's resilience policy is to skip a bad frame rather
+    /// than error the channel, but a silent skip is invisible staleness — exactly
+    /// what the visibility requirement exists to surface. `reason` is a stable,
+    /// payload-free label suitable for tallying.
+    fn on_decode_failure(&mut self, _codec_id: Codec1Type, _reason: &'static str) {}
+
     /// Called when a logical frame is complete
     ///
     /// All bitmap updates between the corresponding `StartFrame`
@@ -395,6 +405,18 @@ pub struct GraphicsPipelineClient {
     current_frame_id: Option<u32>,
     frames_queued: u32,
     total_frames_decoded: u32,
+
+    /// Per-surface persistent YUV444 state for AVC444/AVC444v2.
+    ///
+    /// LC=1 (luma-only) and LC=2 (chroma-only) updates change only part of the
+    /// frame, so the combined state must outlive individual PDUs. Keyed by surface;
+    /// dies with the surface (and on CreateSurface id reuse), survives ResetGraphics
+    /// like the surfaces themselves.
+    avc444_buffers: BTreeMap<u16, Yuv444Buffer>,
+    /// Decoded-frame scratch (main, aux) — an LC=0 update needs both alive at once.
+    yuv_scratch: (Yuv420Frame, Yuv420Frame),
+    /// RGBA conversion scratch, recycled across updates.
+    rgba_scratch: Vec<u8>,
 }
 
 impl GraphicsPipelineClient {
@@ -414,6 +436,9 @@ impl GraphicsPipelineClient {
             current_frame_id: None,
             frames_queued: 0,
             total_frames_decoded: 0,
+            avc444_buffers: BTreeMap::new(),
+            yuv_scratch: (Yuv420Frame::default(), Yuv420Frame::default()),
+            rgba_scratch: Vec::new(),
         }
     }
 
@@ -655,12 +680,18 @@ impl GraphicsPipelineClient {
             output_origin_y: 0,
         };
 
+        // A CreateSurface may reuse an id without a DeleteSurface (the ordinary
+        // resolution-change sequence). Any retained AVC444 state belongs to the old
+        // surface and its old dimensions.
+        self.avc444_buffers.remove(&surface_id);
+
         debug!(surface_id, width, height, ?pixel_format, "Surface created");
         self.handler.on_surface_created(&surface);
         self.surfaces.insert(surface_id, surface);
     }
 
     fn handle_delete_surface(&mut self, surface_id: u16) {
+        self.avc444_buffers.remove(&surface_id);
         if self.surfaces.remove(&surface_id).is_some() {
             debug!(surface_id, "Surface deleted");
             self.handler.on_surface_deleted(surface_id);
@@ -718,9 +749,8 @@ impl GraphicsPipelineClient {
             Codec1Type::Avc420 => {
                 self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
-            Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
-                debug!("AVC444 codec not yet implemented, forwarding to handler");
-                self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
+            codec @ (Codec1Type::Avc444 | Codec1Type::Avc444v2) => {
+                self.decode_avc444(pdu.surface_id, codec, &pdu.bitmap_data);
             }
             Codec1Type::Uncompressed => {
                 self.handle_uncompressed(pdu);
@@ -751,6 +781,7 @@ impl GraphicsPipelineClient {
             Ok(frame) => frame,
             Err(e) => {
                 warn!(error = %e, "H.264 decode failed; skipping this frame");
+                self.handler.on_decode_failure(Codec1Type::Avc420, "h264 decode failed");
                 return Ok(());
             }
         };
@@ -760,16 +791,20 @@ impl GraphicsPipelineClient {
 
         // Decoded frame must be at least as large as the destination rectangle.
         // Larger is expected (macroblock alignment) and handled by cropping.
-        // Smaller means the server sent mismatched dimensions.
+        // Smaller means the server sent mismatched dimensions — a skipped (and
+        // counted) frame, not a dead channel: the module doctrine is that a dropped
+        // region is a glitch the next frame repaints.
         if frame.width() < u32::from(dest_width) || frame.height() < u32::from(dest_height) {
             warn!(
                 frame_width = frame.width(),
                 frame_height = frame.height(),
                 dest_width,
                 dest_height,
-                "decoded frame smaller than destination rectangle"
+                "decoded frame smaller than destination rectangle; skipping this frame"
             );
-            return Err(pdu_other_err!("decoded frame smaller than destination rectangle"));
+            self.handler
+                .on_decode_failure(Codec1Type::Avc420, "decoded frame smaller than destination");
+            return Ok(());
         }
 
         let cropped_data = crop_decoded_frame(frame.data(), frame.width(), frame.height(), dest_width, dest_height);
@@ -785,6 +820,217 @@ impl GraphicsPipelineClient {
 
         self.handler.on_bitmap_updated(&update);
         Ok(())
+    }
+
+    /// Decode an AVC444/AVC444v2 update (MS-RDPEGFX 2.2.4.5/2.2.4.6).
+    ///
+    /// mdrdp patch. The update carries one or two H.264 4:2:0 sub-streams (LC field):
+    /// a main (luma) frame and an auxiliary chroma-packing frame, combined in YUV
+    /// space into a persistent per-surface YUV444 buffer, then converted to RGBA per
+    /// region rect. Both sub-streams go through the SAME decoder sequentially — the
+    /// Windows encoder produces a jointly-encoded, single-decoder-compatible pair
+    /// (FreeRDP decodes it the same way).
+    ///
+    /// Every failure skips the frame (logged + counted via `on_decode_failure`),
+    /// never errors the channel.
+    fn decode_avc444(&mut self, surface_id: u16, codec_id: Codec1Type, bitmap_data: &[u8]) {
+        let Some(surface) = self.surfaces.get(&surface_id) else {
+            return; // caller validated; defensive
+        };
+        let (surf_w, surf_h) = (surface.width, surface.height);
+
+        let mut cursor = ReadCursor::new(bitmap_data);
+        let stream = match Avc444BitmapStream::decode(&mut cursor) {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!(error = %e, "AVC444 bitmap stream parse failed; skipping this frame");
+                self.handler.on_decode_failure(codec_id, "avc444 stream parse failed");
+                return;
+            }
+        };
+
+        if self.h264_decoder.is_none() {
+            debug!("No H.264 decoder configured, skipping AVC444 frame");
+            return;
+        }
+
+        // Wire rects are RDPGFX_RECT16: EXCLUSIVE right/bottom despite the
+        // `InclusiveRectangle` typing (upstream artifact — the destRect handling in
+        // this file and FreeRDP both read them exclusive). Convert field-for-field
+        // and drop malformed or out-of-surface rects: a reversed rect must not
+        // underflow, and an oversized one must not index past the 444 buffer.
+        let (stream1_rects, dropped1) = valid_avc_rects(&stream.stream1.rectangles, surf_w, surf_h);
+        let (stream2_rects, dropped2) = match stream.stream2.as_ref() {
+            Some(stream2) => valid_avc_rects(&stream2.rectangles, surf_w, surf_h),
+            None => (Vec::new(), 0),
+        };
+        if dropped1 + dropped2 > 0 {
+            warn!(dropped = dropped1 + dropped2, "AVC444 update carried malformed region rects");
+            self.handler.on_decode_failure(codec_id, "avc444 malformed region rects");
+        }
+
+        // Decode the sub-streams (sequentially, one decoder). Which passes run and
+        // which rect list feeds each is the LC contract, mirrored from FreeRDP's
+        // avc444_decompress. NOTE: Encoding is a bitflags type whose
+        // LUMA_AND_CHROMA value is 0, so dispatch MUST be by equality, never
+        // `.contains()`.
+        enum Passes {
+            LumaAndChroma,
+            LumaOnly,
+            ChromaOnly,
+        }
+        let passes = match stream.encoding {
+            e if e == Encoding::LUMA_AND_CHROMA => Passes::LumaAndChroma,
+            e if e == Encoding::LUMA => Passes::LumaOnly,
+            e if e == Encoding::CHROMA => Passes::ChromaOnly,
+            _ => {
+                // The parser rejects encoding values > 2 already.
+                self.handler.on_decode_failure(codec_id, "avc444 reserved LC value");
+                return;
+            }
+        };
+
+        let decoder = self
+            .h264_decoder
+            .as_mut()
+            .expect("checked above that a decoder is configured");
+
+        // The chroma passes index the aux frame through the geometry the encoder
+        // packed against: the 16-aligned surface. A decoded frame at any other size
+        // (an SPS-cropped unaligned frame) would shear the whole frame's chroma, so
+        // those degrade to luma-only 4:2:0 output instead (counted below).
+        let aligned_w = usize::from(surf_w).div_ceil(16) * 16;
+        let aligned_h = usize::from(surf_h).div_ceil(16) * 16;
+
+        let mut chroma_skipped: Option<&'static str> = None;
+        let mut emit_rects: Vec<ExclusiveRectangle>;
+
+        match passes {
+            Passes::LumaAndChroma => {
+                let Some(stream2) = stream.stream2.as_ref() else {
+                    // Parser guarantees stream2 for LC=0; defensive.
+                    self.handler.on_decode_failure(codec_id, "avc444 missing chroma stream");
+                    return;
+                };
+                if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.0) {
+                    warn!(error = %e, "AVC444 luma stream decode failed; skipping this frame");
+                    self.handler.on_decode_failure(codec_id, "avc444 luma decode failed");
+                    return;
+                }
+                if let Err(e) = decoder.decode_yuv420(stream2.data, &mut self.yuv_scratch.1) {
+                    warn!(error = %e, "AVC444 chroma stream decode failed; applying luma only");
+                    chroma_skipped = Some("avc444 chroma decode failed");
+                }
+
+                let main = &self.yuv_scratch.0;
+                let aux = &self.yuv_scratch.1;
+                let buffer = self
+                    .avc444_buffers
+                    .entry(surface_id)
+                    .or_insert_with(|| Yuv444Buffer::new(surf_w, surf_h));
+                buffer.apply_luma(main, &stream1_rects);
+                if chroma_skipped.is_none() {
+                    if aux.width == main.width
+                        && aux.height == main.height
+                        && aux.width == aligned_w
+                        && aux.height == aligned_h
+                    {
+                        match codec_id {
+                            Codec1Type::Avc444 => buffer.apply_chroma_v1(aux, &stream2_rects),
+                            _ => buffer.apply_chroma_v2(aux, &stream2_rects),
+                        }
+                    } else {
+                        warn!(
+                            main_w = main.width,
+                            main_h = main.height,
+                            aux_w = aux.width,
+                            aux_h = aux.height,
+                            aligned_w,
+                            aligned_h,
+                            "AVC444 frame geometry does not match the packing geometry; luma only"
+                        );
+                        chroma_skipped = Some("avc444 frame geometry mismatch");
+                    }
+                }
+                emit_rects = stream1_rects;
+                for rect in stream2_rects {
+                    if !emit_rects.contains(&rect) {
+                        emit_rects.push(rect);
+                    }
+                }
+            }
+            Passes::LumaOnly => {
+                if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.0) {
+                    warn!(error = %e, "AVC444 luma stream decode failed; skipping this frame");
+                    self.handler.on_decode_failure(codec_id, "avc444 luma decode failed");
+                    return;
+                }
+                let main = &self.yuv_scratch.0;
+                self.avc444_buffers
+                    .entry(surface_id)
+                    .or_insert_with(|| Yuv444Buffer::new(surf_w, surf_h))
+                    .apply_luma(main, &stream1_rects);
+                emit_rects = stream1_rects;
+            }
+            Passes::ChromaOnly => {
+                // LC=2: the chroma frame travels in stream1, with stream1's rects.
+                if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.1) {
+                    warn!(error = %e, "AVC444 chroma stream decode failed; skipping this frame");
+                    self.handler.on_decode_failure(codec_id, "avc444 chroma decode failed");
+                    return;
+                }
+                let aux = &self.yuv_scratch.1;
+                if aux.width == aligned_w && aux.height == aligned_h {
+                    let buffer = self
+                        .avc444_buffers
+                        .entry(surface_id)
+                        .or_insert_with(|| Yuv444Buffer::new(surf_w, surf_h));
+                    match codec_id {
+                        Codec1Type::Avc444 => buffer.apply_chroma_v1(aux, &stream1_rects),
+                        _ => buffer.apply_chroma_v2(aux, &stream1_rects),
+                    }
+                    emit_rects = stream1_rects;
+                } else {
+                    warn!(
+                        aux_w = aux.width,
+                        aux_h = aux.height,
+                        aligned_w,
+                        aligned_h,
+                        "AVC444 chroma-only frame geometry mismatch; skipping this frame"
+                    );
+                    self.handler.on_decode_failure(codec_id, "avc444 frame geometry mismatch");
+                    return;
+                }
+            }
+        }
+
+        if let Some(reason) = chroma_skipped {
+            self.handler.on_decode_failure(codec_id, reason);
+        }
+
+        // Paint exactly the regions this update combined — never the PDU destRect,
+        // which may exceed them (repainting non-AVC surface content from the stale
+        // 444 buffer) or miss chroma-only rects outside it. FreeRDP paints the same
+        // region lists.
+        let Some(buffer) = self.avc444_buffers.get(&surface_id) else {
+            return;
+        };
+        for rect in emit_rects {
+            let mut data = core::mem::take(&mut self.rgba_scratch);
+            buffer.to_rgba_into(&rect, &mut data);
+            let width = rect.width();
+            let height = rect.height();
+            let update = BitmapUpdate {
+                surface_id,
+                destination_rectangle: rect,
+                codec_id,
+                data,
+                width,
+                height,
+            };
+            self.handler.on_bitmap_updated(&update);
+            self.rgba_scratch = update.data;
+        }
     }
 
     fn handle_uncompressed(&mut self, pdu: crate::pdu::WireToSurface1Pdu) {
@@ -837,28 +1083,7 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        let caps = if self.h264_decoder.is_some() {
-            self.handler.capabilities()
-        } else {
-            // No H.264 decoder: filter out capability sets that imply AVC support.
-            // Only keep sets that work without a decoder (V8 without AVC flags).
-            let filtered: Vec<CapabilitySet> = self
-                .handler
-                .capabilities()
-                .into_iter()
-                .filter(|cap| !CodecCapabilities::from_capability_set(cap).avc420)
-                .collect();
-
-            if filtered.is_empty() {
-                // All handler caps required AVC; fall back to V8-only
-                debug!("No H.264 decoder and all capabilities require AVC; falling back to V8");
-                vec![CapabilitySet::V8 {
-                    flags: CapabilitiesV8Flags::SMALL_CACHE,
-                }]
-            } else {
-                filtered
-            }
-        };
+        let caps = advertised_capabilities(self.handler.capabilities(), self.h264_decoder.as_deref());
 
         let pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&caps));
 
@@ -905,6 +1130,66 @@ impl DvcClientProcessor for GraphicsPipelineClient {}
 // ============================================================================
 // Frame Cropping
 // ============================================================================
+
+/// Filter the handler's capability sets down to what the decoder can decode.
+///
+/// The advertisement and the decode capability must not drift apart:
+/// - no decoder: drop every AVC-bearing set;
+/// - decoder without YUV 4:2:0 output: drop AVC444-bearing sets (a V10.x set
+///   without AVC_DISABLED implies AVC444) — a V8.1/AVC420 set survives;
+/// - decoder with YUV output: advertise as the handler asked.
+///
+/// If nothing survives, fall back to V8 (never AVC-bearing, always decodable).
+fn advertised_capabilities(
+    handler_caps: Vec<CapabilitySet>,
+    decoder: Option<&dyn H264Decoder>,
+) -> Vec<CapabilitySet> {
+    let filtered: Vec<CapabilitySet> = handler_caps
+        .into_iter()
+        .filter(|cap| {
+            let implied = CodecCapabilities::from_capability_set(cap);
+            match decoder {
+                Some(decoder) if decoder.supports_yuv420() => true,
+                Some(_) => !implied.avc444,
+                None => !implied.avc420,
+            }
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        debug!("All advertised capabilities require unavailable AVC decode; falling back to V8");
+        vec![CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        }]
+    } else {
+        filtered
+    }
+}
+
+/// Validate and convert AVC metablock region rects.
+///
+/// RDPGFX_RECT16 is exclusive on `right`/`bottom` despite arriving typed as
+/// [`InclusiveRectangle`] (upstream typing artifact). Wire data is untrusted:
+/// reversed rects would underflow width arithmetic and oversized ones would index
+/// past the per-surface buffers, so both are dropped. Returns the surviving rects
+/// and the number dropped.
+fn valid_avc_rects(rects: &[InclusiveRectangle], surf_w: u16, surf_h: u16) -> (Vec<ExclusiveRectangle>, usize) {
+    let mut out = Vec::with_capacity(rects.len());
+    let mut dropped = 0usize;
+    for rect in rects {
+        if rect.left < rect.right && rect.top < rect.bottom && rect.right <= surf_w && rect.bottom <= surf_h {
+            out.push(ExclusiveRectangle {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            });
+        } else {
+            dropped += 1;
+        }
+    }
+    (out, dropped)
+}
 
 /// Convert uncompressed 32bpp little-endian pixels to RGBA8888
 ///
@@ -1017,7 +1302,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_graphics_clears_surfaces_and_frame_tracking() {
+    fn reset_graphics_preserves_surfaces_and_resets_frame_tracking() {
+        // MS-RDPEGFX 3.3.5.14 resizes only the Graphics Output Buffer: surfaces have
+        // their own delete PDU and survive a reset (the mdrdp patch in
+        // handle_reset_graphics documents why). Frame tracking, in contrast, is
+        // per-stream state and must reset.
         let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
 
         let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
@@ -1047,9 +1336,384 @@ mod tests {
             monitors: vec![],
         }));
 
-        assert!(client.surfaces.is_empty(), "surfaces should be cleared");
+        assert_eq!(client.surfaces.len(), 1, "surfaces survive ResetGraphics");
         assert!(client.current_frame_id.is_none(), "frame_id should be reset");
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
+    }
+
+    // ------------------------------------------------------------------------
+    // AVC444 client-level tests: LC dispatch, rect ownership, buffer lifecycle.
+    // ------------------------------------------------------------------------
+
+    use std::sync::mpsc::{Receiver, Sender, channel};
+
+    use ironrdp_core::{Encode as _, WriteCursor};
+
+    use crate::decode::{DecodedFrame, DecoderError, DecoderResult};
+    use crate::pdu::QuantQuality;
+
+    /// A decoder whose YUV output is scripted: every plane byte is derived from the
+    /// first byte of the "H.264" payload, so tests can tell which sub-stream
+    /// produced which pixels (Y = tag, U = tag+1, V = tag+2).
+    struct StubYuvDecoder {
+        width: usize,
+        height: usize,
+    }
+
+    impl H264Decoder for StubYuvDecoder {
+        fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
+            Err(DecoderError::msg("stub is YUV-only"))
+        }
+
+        fn decode_yuv420(&mut self, data: &[u8], out: &mut Yuv420Frame) -> DecoderResult<()> {
+            let tag = *data.first().ok_or_else(|| DecoderError::msg("empty payload"))?;
+            out.width = self.width;
+            out.height = self.height;
+            let uv = self.width.div_ceil(2) * self.height.div_ceil(2);
+            out.y = vec![tag; self.width * self.height];
+            out.u = vec![tag.wrapping_add(1); uv];
+            out.v = vec![tag.wrapping_add(2); uv];
+            Ok(())
+        }
+
+        fn supports_yuv420(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    enum Event {
+        Update { rect: (u16, u16, u16, u16), data_len: usize },
+        Failure(&'static str),
+    }
+
+    struct Recorder(Sender<Event>);
+
+    impl GraphicsPipelineHandler for Recorder {
+        fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
+            let r = &update.destination_rectangle;
+            let _ = self.0.send(Event::Update {
+                rect: (r.left, r.top, r.right, r.bottom),
+                data_len: update.data.len(),
+            });
+        }
+
+        fn on_decode_failure(&mut self, _codec_id: Codec1Type, reason: &'static str) {
+            let _ = self.0.send(Event::Failure(reason));
+        }
+    }
+
+    /// A client with a 64x48 surface and a scripted YUV decoder of the given frame size.
+    fn avc444_client(frame_w: usize, frame_h: usize) -> (GraphicsPipelineClient, Receiver<Event>) {
+        let (tx, rx) = channel();
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(Recorder(tx)),
+            Some(Box::new(StubYuvDecoder {
+                width: frame_w,
+                height: frame_h,
+            })),
+        );
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 64,
+            height: 48,
+            pixel_format: PixelFormat::XRgb,
+        }));
+        (client, rx)
+    }
+
+    /// Wire rects are exclusive despite the inclusive typing; build them raw.
+    fn wire_rect(left: u16, top: u16, right: u16, bottom: u16) -> InclusiveRectangle {
+        InclusiveRectangle {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    fn avc420_sub_stream<'a>(
+        rects: Vec<InclusiveRectangle>,
+        data: &'a [u8],
+    ) -> Avc420BitmapStream<'a> {
+        let quants = rects
+            .iter()
+            .map(|_| QuantQuality {
+                quantization_parameter: 22,
+                progressive: false,
+                quality: 100,
+            })
+            .collect();
+        Avc420BitmapStream {
+            rectangles: rects,
+            quant_qual_vals: quants,
+            data,
+        }
+    }
+
+    fn deliver_avc444(
+        client: &mut GraphicsPipelineClient,
+        codec_id: Codec1Type,
+        stream: &Avc444BitmapStream<'_>,
+    ) {
+        let mut bitmap_data = vec![0u8; stream.size()];
+        stream
+            .encode(&mut WriteCursor::new(&mut bitmap_data))
+            .expect("encode avc444 stream");
+        client
+            .handle_wire_to_surface1(crate::pdu::WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id,
+                pixel_format: PixelFormat::XRgb,
+                destination_rectangle: ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 64,
+                    bottom: 48,
+                },
+                bitmap_data,
+            })
+            .expect("AVC444 must never error the channel");
+    }
+
+    #[test]
+    fn avc444_lc0_paints_each_streams_own_rects() {
+        let (mut client, rx) = avc444_client(64, 48);
+
+        // Distinct rect lists: luma updates the top-left, chroma the bottom-right.
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 32, 16)], &[10, 0, 0]),
+            stream2: Some(avc420_sub_stream(vec![wire_rect(32, 16, 64, 48)], &[20, 0, 0])),
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
+
+        let events: Vec<Event> = rx.try_iter().collect();
+        let updates: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Update { .. }))
+            .collect();
+        assert_eq!(updates.len(), 2, "one update per distinct rect: {events:?}");
+        assert!(
+            matches!(updates[0], Event::Update { rect: (0, 0, 32, 16), data_len } if *data_len == 32 * 16 * 4)
+        );
+        assert!(
+            matches!(updates[1], Event::Update { rect: (32, 16, 64, 48), data_len } if *data_len == 32 * 32 * 4)
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Failure(_))),
+            "no failures expected: {events:?}"
+        );
+
+        // The combined state proves rect ownership: the luma pass wrote only its own
+        // rect (Y = tag 10 inside, 0 outside), and the v2 chroma pass wrote odd
+        // columns only inside ITS rect (U = aux Y tag 20 there; the luma-replicated
+        // U = 11 inside the luma rect).
+        let buffer = client.avc444_buffers.get(&1).expect("buffer created");
+        let (y, u, _) = buffer.planes();
+        assert_eq!(y[0], 10, "luma rect got Y");
+        assert_eq!(y[17 * 64 + 33], 0, "chroma-only rect gets no Y");
+        assert_eq!(u[1 * 64 + 1], 11, "luma rect: replicated main chroma");
+        assert_eq!(u[17 * 64 + 33], 20, "chroma rect: odd column from aux Y plane");
+    }
+
+    #[test]
+    fn avc444_lc1_updates_luma_only_inside_its_rects() {
+        let (mut client, rx) = avc444_client(64, 48);
+
+        // Full-frame LC=0 first: odd-column chroma everywhere comes from aux (tag 20).
+        let full = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
+            stream2: Some(avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[20, 0, 0])),
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &full);
+
+        // LC=1 over the left half only.
+        let luma_only = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 32, 48)], &[30, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &luma_only);
+
+        let buffer = client.avc444_buffers.get(&1).expect("buffer");
+        let (y, u, _) = buffer.planes();
+        assert_eq!(y[5 * 64 + 5], 30, "luma updated inside the rect");
+        assert_eq!(y[5 * 64 + 40], 10, "luma preserved outside the rect");
+        assert_eq!(
+            u[5 * 64 + 5],
+            31,
+            "inside the rect chroma degrades to the replicated average"
+        );
+        assert_eq!(
+            u[5 * 64 + 41],
+            20,
+            "outside the rect the full-resolution chroma persists"
+        );
+        assert!(!rx.try_iter().any(|e| matches!(e, Event::Failure(_))));
+    }
+
+    #[test]
+    fn avc444_lc2_takes_chroma_from_stream1_and_creates_the_buffer() {
+        let (mut client, rx) = avc444_client(64, 48);
+
+        // Chroma-only as the FIRST frame: the buffer must come into being sized from
+        // the surface, with luma untouched (black).
+        let chroma_only = Avc444BitmapStream {
+            encoding: Encoding::CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[40, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &chroma_only);
+
+        let buffer = client.avc444_buffers.get(&1).expect("buffer created by LC=2");
+        assert_eq!((buffer.width(), buffer.height()), (64, 48));
+        let (y, u, _) = buffer.planes();
+        assert_eq!(y[0], 0, "no luma was delivered");
+        assert_eq!(u[3 * 64 + 3], 40, "odd column chroma from the stream1 aux frame");
+
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            matches!(events.as_slice(), [Event::Update { rect: (0, 0, 64, 48), .. }]),
+            "one update over the stream1 rects: {events:?}"
+        );
+    }
+
+    #[test]
+    fn avc444_frame_geometry_mismatch_degrades_to_luma_and_is_counted() {
+        // Decoded frames at 100x100 do not match the 64x48 surface's packing
+        // geometry: the luma pass still applies (bounds-checked), the chroma pass
+        // must not run (it would shear), and the skip must be visible.
+        let (mut client, rx) = avc444_client(100, 100);
+
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
+            stream2: Some(avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[20, 0, 0])),
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
+
+        let buffer = client.avc444_buffers.get(&1).expect("buffer");
+        let (y, u, _) = buffer.planes();
+        assert_eq!(y[0], 10, "luma still applied");
+        assert_eq!(u[1 * 64 + 1], 11, "chroma stayed at the luma-replicated value");
+        assert!(
+            rx.try_iter()
+                .any(|e| matches!(e, Event::Failure("avc444 frame geometry mismatch"))),
+            "the degradation must be counted"
+        );
+    }
+
+    #[test]
+    fn avc444_malformed_rects_are_dropped_and_counted() {
+        let (mut client, rx) = avc444_client(64, 48);
+
+        // A reversed rect and an out-of-surface rect: both dropped, nothing painted,
+        // nothing panics, and the drop is counted.
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: avc420_sub_stream(
+                vec![wire_rect(30, 10, 10, 30), wire_rect(0, 0, 65, 48)],
+                &[10, 0, 0],
+            ),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
+
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Failure("avc444 malformed region rects"))),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Update { .. })),
+            "no valid rect, so nothing painted: {events:?}"
+        );
+    }
+
+    #[test]
+    fn avc444_state_dies_with_its_surface_and_on_id_reuse() {
+        let (mut client, _rx) = avc444_client(64, 48);
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
+        assert!(client.avc444_buffers.contains_key(&1));
+
+        // CreateSurface may reuse the id without a DeleteSurface (resolution
+        // change): the old combined state belongs to the old surface.
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 32,
+            height: 32,
+            pixel_format: PixelFormat::XRgb,
+        }));
+        assert!(
+            !client.avc444_buffers.contains_key(&1),
+            "id reuse must not inherit the old surface's YUV state"
+        );
+
+        deliver_avc444(
+            &mut client,
+            Codec1Type::Avc444v2,
+            &Avc444BitmapStream {
+                encoding: Encoding::LUMA,
+                stream1: avc420_sub_stream(vec![wire_rect(0, 0, 32, 32)], &[10, 0, 0]),
+                stream2: None,
+            },
+        );
+        assert!(client.avc444_buffers.contains_key(&1));
+
+        let _ = client.handle_pdu(GfxPdu::DeleteSurface(crate::pdu::DeleteSurfacePdu { surface_id: 1 }));
+        assert!(
+            !client.avc444_buffers.contains_key(&1),
+            "the buffer dies with the surface"
+        );
+    }
+
+    #[test]
+    fn advertised_capabilities_match_the_decoder() {
+        struct RgbaOnly;
+        impl H264Decoder for RgbaOnly {
+            fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
+                Err(DecoderError::msg("unused"))
+            }
+        }
+
+        let handler_caps = || {
+            vec![
+                CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V8_1 {
+                    flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V8 {
+                    flags: CapabilitiesV8Flags::SMALL_CACHE,
+                },
+            ]
+        };
+
+        // No decoder: only the AVC-free V8 set survives.
+        let none = advertised_capabilities(handler_caps(), None);
+        assert_eq!(none.len(), 1);
+        assert!(matches!(none[0], CapabilitySet::V8 { .. }));
+
+        // RGBA-only decoder: the V10.7 set implies AVC444 and is dropped; V8.1
+        // (AVC420) survives.
+        let rgba: Box<dyn H264Decoder> = Box::new(RgbaOnly);
+        let rgba_caps = advertised_capabilities(handler_caps(), Some(rgba.as_ref()));
+        assert_eq!(rgba_caps.len(), 2);
+        assert!(matches!(rgba_caps[0], CapabilitySet::V8_1 { .. }));
+
+        // YUV-capable decoder: everything the handler asked for.
+        let yuv: Box<dyn H264Decoder> = Box::new(StubYuvDecoder { width: 4, height: 4 });
+        assert_eq!(advertised_capabilities(handler_caps(), Some(yuv.as_ref())).len(), 3);
     }
 
     #[test]
