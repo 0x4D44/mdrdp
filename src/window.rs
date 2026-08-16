@@ -106,7 +106,48 @@ pub enum SessionEvent {
     Cursor(CursorUpdate),
     /// The session ended; close the window.
     Close,
+    /// A native (muda) menu item was activated, by id.
+    Menu(String),
 }
+
+/// The session process's diagnostics windows, by purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagKind {
+    Cache,
+    Latency,
+    Channels,
+}
+
+impl DiagKind {
+    fn title(self) -> &'static str {
+        match self {
+            DiagKind::Cache => "Bitmap cache",
+            DiagKind::Latency => "Latency and drift",
+            DiagKind::Channels => "Channels and codecs",
+        }
+    }
+}
+
+/// The UI bodies for the three diagnostics windows, supplied by whoever holds the
+/// stats handles (`main.rs`). The window module stays ignorant of what they draw.
+pub struct DiagnosticsUis {
+    pub cache: Box<dyn FnMut(&mut egui::Ui)>,
+    pub latency: Box<dyn FnMut(&mut egui::Ui)>,
+    pub channels: Box<dyn FnMut(&mut egui::Ui)>,
+}
+
+impl DiagnosticsUis {
+    fn ui_for(&mut self, kind: DiagKind) -> &mut Box<dyn FnMut(&mut egui::Ui)> {
+        match kind {
+            DiagKind::Cache => &mut self.cache,
+            DiagKind::Latency => &mut self.latency,
+            DiagKind::Channels => &mut self.channels,
+        }
+    }
+}
+
+/// How often open diagnostics windows refresh (the handoff's `refresh 1s`).
+const DIAG_REFRESH: Duration = Duration::from_secs(1);
 
 /// A remote pointer change, already decoded to pixels. Session-layer types stay out of
 /// this module, so the session thread translates IronRDP's pointer outputs into this.
@@ -427,6 +468,7 @@ pub struct SessionWindow {
     stats: Option<StatsHandle>,
     on_exit: Option<Box<dyn FnMut()>>,
     commands: Option<Sender<SessionCommand>>,
+    diagnostics: Option<DiagnosticsUis>,
     /// Mirrors the window's fullscreen state for whoever outlives the loop — the exit
     /// path persists it so the next launch can restore it. An atomic rather than a
     /// return value because the Cmd+Q path never returns (see [`Self::on_exit`]).
@@ -471,6 +513,7 @@ impl SessionWindow {
             stats: None,
             on_exit: None,
             commands: None,
+            diagnostics: None,
             fullscreen_state,
         })
     }
@@ -481,6 +524,15 @@ impl SessionWindow {
     /// Optional: without it the fullscreen toggle still works, it just letterboxes.
     pub fn with_commands(mut self, commands: Sender<SessionCommand>) -> Self {
         self.commands = Some(commands);
+        self
+    }
+
+    /// Give the window the three diagnostics UI bodies its Diagnostics menu opens.
+    ///
+    /// Optional: without it the menu items open nothing and say so on stderr — a
+    /// probe-harness window has no stats to show.
+    pub fn with_diagnostics(mut self, diagnostics: DiagnosticsUis) -> Self {
+        self.diagnostics = Some(diagnostics);
         self
     }
 
@@ -534,12 +586,21 @@ impl SessionWindow {
             stats,
             on_exit,
             commands,
+            diagnostics,
             fullscreen_state,
         } = self;
         let mut app = SessionApp::new(config, store, input, stats);
         app.on_exit = on_exit;
         app.commands = commands;
+        app.diagnostics = diagnostics;
         app.fullscreen_state = fullscreen_state;
+        // Menu activations arrive on muda's own channel; forward them into the loop so
+        // they are handled on the main thread with the rest of the window state. The
+        // handler is process-global, which is fine: this process has one window.
+        let menu_proxy = event_loop.create_proxy();
+        muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
+            let _ = menu_proxy.send_event(SessionEvent::Menu(event.id().0.clone()));
+        }));
         event_loop
             .run_app(&mut app)
             .map_err(|e| WindowError::EventLoop(e.to_string()))?;
@@ -616,6 +677,14 @@ struct SessionApp {
     cursor_cache: std::collections::HashMap<u64, CustomCursor>,
     /// Whether the remote asked the pointer hidden, so a shape update can restore it.
     cursor_hidden: bool,
+    /// UI bodies for the diagnostics windows, when the caller supplied any.
+    diagnostics: Option<DiagnosticsUis>,
+    /// Open diagnostics windows. At most one per [`DiagKind`].
+    aux: Vec<(DiagKind, crate::ui::egui_host::AuxWindow)>,
+    /// The native session menu bar; dropping it removes the menu.
+    menu: Option<session_menu::SessionMenuBar>,
+    /// Last 1 Hz diagnostics refresh, used with `ControlFlow::WaitUntil`.
+    last_diag_refresh: Instant,
 }
 
 impl SessionApp {
@@ -664,6 +733,48 @@ impl SessionApp {
             title_bytes: 0,
             cursor_cache: std::collections::HashMap::new(),
             cursor_hidden: false,
+            diagnostics: None,
+            aux: Vec::new(),
+            menu: None,
+            last_diag_refresh: Instant::now(),
+        }
+    }
+
+    /// Open (or focus) the diagnostics window of `kind`.
+    fn open_diagnostics(&mut self, event_loop: &ActiveEventLoop, kind: DiagKind) {
+        if self.diagnostics.is_none() {
+            eprintln!("no diagnostics are wired into this window");
+            return;
+        }
+        if self.aux.iter().any(|(k, _)| *k == kind) {
+            return; // Already open; nothing focuses it portably, and one is enough.
+        }
+        match crate::ui::egui_host::AuxWindow::open(event_loop, kind.title(), [900.0, 700.0]) {
+            Ok(win) => {
+                self.aux.push((kind, win));
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + DIAG_REFRESH));
+            }
+            // A diagnostics window that cannot open must never take the session down.
+            Err(e) => eprintln!("could not open the {} window: {e}", kind.title()),
+        }
+    }
+
+    fn handle_menu(&mut self, event_loop: &ActiveEventLoop, id: &str) {
+        match id {
+            session_menu::DIAG_CACHE => self.open_diagnostics(event_loop, DiagKind::Cache),
+            session_menu::DIAG_LATENCY => self.open_diagnostics(event_loop, DiagKind::Latency),
+            session_menu::DIAG_CHANNELS => {
+                self.open_diagnostics(event_loop, DiagKind::Channels);
+            }
+            session_menu::STATS_OVERLAY => {
+                self.show_stats = !self.show_stats;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            session_menu::FULLSCREEN => self.set_fullscreen_mode(!self.fullscreen),
+            session_menu::DISCONNECT => event_loop.exit(),
+            _ => {}
         }
     }
 
@@ -1033,6 +1144,22 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         self.window = Some(window.clone());
         self._context = Some(context);
         self.surface = Some(surface);
+        self.menu = Some(session_menu::install(&window));
+
+        // Scripted runs cannot click a native menu, so `MDRDP_OPEN_DIAG=cache,latency,
+        // channels` opens the named diagnostics windows at startup — the automated
+        // verification path for windows that are otherwise menu-only.
+        if let Ok(names) = std::env::var("MDRDP_OPEN_DIAG") {
+            for name in names.split(',') {
+                match name.trim() {
+                    "cache" => self.open_diagnostics(event_loop, DiagKind::Cache),
+                    "latency" => self.open_diagnostics(event_loop, DiagKind::Latency),
+                    "channels" => self.open_diagnostics(event_loop, DiagKind::Channels),
+                    "" => {}
+                    other => eprintln!("MDRDP_OPEN_DIAG: unknown window {other:?}"),
+                }
+            }
+        }
 
         // A window that *opens* fullscreen — a favourite, or a remembered fullscreen
         // close — negotiates its monitor's native resolution the same way the hotkey
@@ -1058,10 +1185,53 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             }
             SessionEvent::Cursor(update) => self.apply_remote_cursor(event_loop, update),
             SessionEvent::Close => event_loop.exit(),
+            SessionEvent::Menu(id) => self.handle_menu(event_loop, &id),
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    /// Drive the 1 Hz refresh for open diagnostics windows.
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        if self.aux.is_empty() {
+            return;
+        }
+        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. })
+            || self.last_diag_refresh.elapsed() >= DIAG_REFRESH
+        {
+            self.last_diag_refresh = Instant::now();
+            for (_, win) in &self.aux {
+                win.request_redraw();
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            self.last_diag_refresh + DIAG_REFRESH,
+        ));
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Diagnostics windows first: their events must not fall through to the
+        // session handling below (a stray CloseRequested would end the session).
+        if let Some(pos) = self.aux.iter().position(|(_, w)| w.window_id() == id) {
+            match event {
+                WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+                    self.aux.remove(pos);
+                    if self.aux.is_empty() {
+                        event_loop.set_control_flow(ControlFlow::Wait);
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    let (kind, win) = &mut self.aux[pos];
+                    match self.diagnostics.as_mut() {
+                        Some(uis) => win.redraw(uis.ui_for(*kind).as_mut()),
+                        None => win.redraw(|_| {}),
+                    }
+                }
+                other => {
+                    let (_, win) = &mut self.aux[pos];
+                    win.on_window_event(&other);
+                }
+            }
+            return;
+        }
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
 
@@ -1196,6 +1366,84 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
 
             _ => {}
         }
+    }
+}
+
+mod session_menu {
+    //! The session window's native menu bar: Session · View · Diagnostics · Help.
+    //!
+    //! macOS puts these in the system menu bar; Windows in the window's own bar.
+    //! Ids are plain strings matched in `SessionApp::handle_menu`.
+
+    use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    pub const DISCONNECT: &str = "session.disconnect";
+    pub const FULLSCREEN: &str = "view.fullscreen";
+    pub const DIAG_CACHE: &str = "diag.cache";
+    pub const DIAG_LATENCY: &str = "diag.latency";
+    pub const DIAG_CHANNELS: &str = "diag.channels";
+    pub const STATS_OVERLAY: &str = "diag.overlay";
+
+    /// Holds the muda objects alive; dropping this removes the native menu.
+    pub struct SessionMenuBar {
+        _menu: Menu,
+    }
+
+    pub fn install(window: &winit::window::Window) -> SessionMenuBar {
+        let menu = Menu::new();
+
+        #[cfg(target_os = "macos")]
+        {
+            let app = Submenu::new("mdrdp", true);
+            let _ = app.append_items(&[&PredefinedMenuItem::quit(None)]);
+            let _ = menu.append(&app);
+        }
+
+        let session = Submenu::new("Session", true);
+        let _ = session.append_items(&[&MenuItem::with_id(DISCONNECT, "Disconnect", true, None)]);
+        let _ = menu.append(&session);
+
+        let view = Submenu::new("View", true);
+        let _ = view.append_items(&[&MenuItem::with_id(
+            FULLSCREEN,
+            "Toggle fullscreen",
+            true,
+            None,
+        )]);
+        let _ = menu.append(&view);
+
+        let diagnostics = Submenu::new("Diagnostics", true);
+        let _ = diagnostics.append_items(&[
+            &MenuItem::with_id(DIAG_CACHE, "Bitmap cache…", true, None),
+            &MenuItem::with_id(DIAG_LATENCY, "Latency and drift…", true, None),
+            &MenuItem::with_id(DIAG_CHANNELS, "Channels and codecs…", true, None),
+            &PredefinedMenuItem::separator(),
+            &MenuItem::with_id(STATS_OVERLAY, "Stats overlay", true, None),
+        ]);
+        let _ = menu.append(&diagnostics);
+
+        let help = Submenu::new("Help", true);
+        let _ = menu.append(&help);
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = window;
+            menu.init_for_nsapp();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+            if let Ok(handle) = window.window_handle()
+                && let RawWindowHandle::Win32(h) = handle.as_raw()
+            {
+                // SAFETY: the HWND belongs to the live window on this thread.
+                unsafe {
+                    let _ = menu.init_for_hwnd(h.hwnd.get());
+                }
+            }
+        }
+
+        SessionMenuBar { _menu: menu }
     }
 }
 

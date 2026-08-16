@@ -10,6 +10,7 @@
 //! its dimensions, and plain coordinates. That is what makes the whole thing testable
 //! without opening a window.
 
+pub mod egui_host;
 pub mod font;
 pub mod form;
 pub mod list;

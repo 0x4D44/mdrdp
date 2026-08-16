@@ -494,7 +494,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let session_stats = StatsHandle::new();
     let window = window
         .with_stats(session_stats.clone())
-        .with_commands(command_tx);
+        .with_commands(command_tx)
+        .with_diagnostics(mdrdp::window::DiagnosticsUis {
+            cache: diagnostics_placeholder("Bitmap cache"),
+            latency: diagnostics_placeholder("Latency and drift"),
+            channels: diagnostics_placeholder("Channels and codecs"),
+        });
     let fullscreen_at_exit = window.fullscreen_state();
     let session_started = std::time::Instant::now();
     let resource_start = process_snapshot();
@@ -724,6 +729,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     window_result?;
     Ok(())
+}
+
+/// Placeholder body for a diagnostics window whose real screen has not landed yet.
+fn diagnostics_placeholder(title: &'static str) -> Box<dyn FnMut(&mut egui::Ui)> {
+    Box::new(move |ui: &mut egui::Ui| {
+        use mdrdp::ui::theme;
+        ui.add_space(120.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new(title)
+                    .font(theme::sans_semibold(16.0))
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.label(
+                egui::RichText::new("Under construction on this branch.")
+                    .font(theme::sans(13.0))
+                    .color(theme::TEXT_MUTED),
+            );
+        });
+    })
 }
 
 /// Reconcile a favourite with command-line flags. Flags always win.
