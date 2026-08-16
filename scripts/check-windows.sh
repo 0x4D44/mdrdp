@@ -6,9 +6,13 @@
 #
 #   rustup target add x86_64-pc-windows-msvc
 #   brew install xwin
-#   xwin --accept-license splat --output ~/.xwin
+#   xwin --accept-license --temp splat --output ~/.xwin
 #   mkdir -p ~/.xwin/bin
 #   ln -sf "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-ar ~/.xwin/bin/llvm-lib
+#
+# --temp is not optional: xwin's --cache-dir defaults to ./.xwin-cache, so
+# provisioning from the repo root leaves a 1 GB download cache beside the
+# source. Splatting is a one-time step, so nothing wants that cache kept.
 #
 # llvm-ar ships with the rustup llvm-tools component and speaks lib.exe syntax
 # when invoked under the name llvm-lib — no Visual Studio required.

@@ -8,6 +8,9 @@ tools/**/target/
 .DS_Store
 /.vscode
 /.idea
+# xwin defaults --cache-dir to ./.xwin-cache; scripts/check-windows.sh documents
+# --temp instead. This is the backstop for a bare xwin run in the repo root.
+/.xwin-cache/
 
 # Never commit connection credentials or captured session data
 /favourites.local.toml
