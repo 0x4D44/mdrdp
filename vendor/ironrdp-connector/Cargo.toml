@@ -43,6 +43,11 @@ resolver = "2"
 default = []
 qoi = ["ironrdp-pdu/qoi"]
 qoiz = ["ironrdp-pdu/qoiz"]
+# Off by default (upstream builds it in unconditionally): smart-card logon drags in
+# winscard -> flate2/zlib -> libz-sys, whose build script needs a C zlib the
+# x86_64-pc-windows-msvc cross-check host does not have. mdrdp never does smart-card
+# logon (out of scope), so the whole subtree is dead weight.
+scard = ["sspi/scard", "dep:picky", "dep:picky-asn1-der", "dep:picky-asn1-x509"]
 
 [lib]
 name = "ironrdp_connector"
@@ -65,12 +70,15 @@ version = "0.8"
 
 [dependencies.picky]
 version = "=7.0.0-rc.25"
+optional = true
 
 [dependencies.picky-asn1-der]
 version = "0.5"
+optional = true
 
 [dependencies.picky-asn1-x509]
 version = "0.15"
+optional = true
 
 [dependencies.rand]
 version = "0.9"
@@ -78,7 +86,6 @@ features = ["std"]
 
 [dependencies.sspi]
 version = "0.21"
-features = ["scard"]
 
 [dependencies.tracing]
 version = "0.1"

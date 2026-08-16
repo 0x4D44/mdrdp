@@ -2,11 +2,13 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
-- [ ] 2026-08-16: `cargo check --target x86_64-pc-windows-msvc --all-targets` no longer
-  passes on this Mac: `libz-sys v1.1.29`'s build script wants a vcpkg/MSVC zlib and
-  aborts. CLAUDE.md records the check clean as of 2026-08-14, so a dependency added
-  since then (libz-sys arrives via the image stack) broke the cross-check on a machine
-  with no MSVC zlib. Until it's fixed the cfg-drift guard is dead.
+- [x] 2026-08-16: ~~the Windows cross-check dies in libz-sys on this Mac~~ — fixed the
+  same day, and the diagnosis was shallow: libz-sys came from sspi's smart-card feature
+  (now off by default in the vendored connector, not the image stack), and behind it
+  `ring` needed real MSVC headers — the check had in fact NEVER passed with IronRDP in
+  the tree (the 2026-08-14 "verified clean" predates commit 77e97ce). Now provisioned
+  via xwin and wrapped in `scripts/check-windows.sh`; it promptly caught a real
+  Windows-only compile error in `src/shell/mod.rs`.
 - [x] 2026-08-16: ~~video-class content is frame-starved without AVC~~ — superseded twice:
   the bandwidth-measure fix alone lifted the same YouTube run to ~25 fps on
   ClearCodec+Progressive, and the VideoToolbox AVC420 decoder is now implemented

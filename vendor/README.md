@@ -42,9 +42,9 @@ reported list and drops an out-of-range index instead of guessing.
 Remove this patch when a released `ironrdp-rdpsnd` both preserves the negotiated wire
 order and exposes that exact list to `RdpsndClientHandler`.
 
-## `ironrdp-connector` 0.10.0 — one line added
+## `ironrdp-connector` 0.10.0 — one flag added, smart-card made opt-out
 
-An unmodified copy of the published crate plus a **single flag**, in
+Two deliberate differences from the published crate. First, a **single flag** in
 `src/connection.rs` where the client's early capability flags are assembled:
 
 ```rust
@@ -81,9 +81,23 @@ It belongs upstream. Delete this directory and the `[patch.crates-io]` entry in 
 `Cargo.toml` the moment a released `ironrdp-connector` sets the flag (or exposes a knob
 for it).
 
+### Smart-card logon is behind an off-by-default `scard` feature (2026-08-16)
+
+Upstream builds `sspi` with its `scard` feature unconditionally. That drags
+`winscard → flate2/zlib → libz-sys` into every build, and `libz-sys`'s build script
+needs a C zlib the `x86_64-pc-windows-msvc` cross-check host does not have — it is what
+kept `scripts/check-windows.sh` red. mdrdp never does smart-card logon (out of scope),
+so the vendored crate makes it a real feature: `scard = ["sspi/scard", "dep:picky",
+"dep:picky-asn1-der", "dep:picky-asn1-x509"]`, default off. The
+`Credentials::SmartCard` variant stays in the public API; without the feature the
+CredSSP step answers it with an error instead of an identity (`src/credssp.rs`). Both
+feature states compile; the password path was proven live against quench the day the
+change landed (CredSSP logon, EGFX frames, graceful shutdown).
+
 ### Keeping it honest
 
-The only intended difference from the published crate is the flag above. To confirm that:
+The only intended differences from the published crate are the flag and the `scard`
+feature above. To confirm that:
 
 ```
 diff -ru ~/.cargo/registry/src/*/ironrdp-connector-0.10.0 vendor/ironrdp-connector

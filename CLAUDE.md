@@ -64,13 +64,21 @@ to build it. Run this after any change that touches platform-facing code (creden
 paths, sockets, windowing):
 
 ```
-rustup target add x86_64-pc-windows-msvc   # once
-cargo check --target x86_64-pc-windows-msvc --all-targets
+./scripts/check-windows.sh
 ```
 
-Verified clean as of 2026-08-14 with the full IronRDP + rustls + keyring stack. It is a
+Verified clean as of 2026-08-16 with the full IronRDP + rustls + keyring stack. It is a
 type-check, not a link — it will not catch a missing Windows-only runtime dependency, but
-it does catch the `cfg` drift that actually happens.
+it does catch the `cfg` drift that actually happens (it caught a Windows-only
+`eframe::raw_window_handle` import the same day it went green).
+
+The script exists because `ring` compiles C, which needs Microsoft's CRT/UCRT headers
+even for a type-check; on macOS those come from a one-time `xwin` provisioning step the
+script's header documents (`brew install xwin`, splat to `~/.xwin`, symlink rustup's
+`llvm-ar` as `llvm-lib`). Without that step the check dies in `ring`'s build script —
+that is a missing toolchain, not `cfg` drift. Never re-enable the vendored connector's
+`scard` feature to "fix" a Windows build: smart-card logon is out of scope and its
+`winscard → flate2/zlib → libz-sys` subtree is what used to break this check.
 
 ## Validation rules specific to this repo
 
