@@ -1,0 +1,10 @@
+[package]
+name = "cbtest"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.16"
+
+# Standalone: never a member of the mdrdp package above it.
+[workspace]

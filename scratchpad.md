@@ -73,6 +73,17 @@ Out-of-scope observations. A separate human-invoked review triages these.
   mis-decoded. The workflow's RLGR comparison found only an ENCODER divergence
   (UP_GR vs UQ_GR) and judged the decoder to match, so that would need re-checking
   specifically for short/exhausted streams.
-  **Blocked on a reference capture**: settling whether tile 11 is wrong or merely
-  different needs FreeRDP's output for the same frame, and screencapture returns black
-  while the Mac is locked.
+  **No longer blocked on the reference capture** (2026-08-16): two FreeRDP reference
+  captures are now in the repo at `~/language/mdrdp/baseline/freerdp-reference/`
+  (`ref2-full.png`, `ref3-full.png`, 5120x2880 Retina grabs of the FreeRDP window), and
+  `~/language/mdrdp/tools/codec-oracles/refdec.c` decodes a captured Progressive
+  payload through FreeRDP's own `progressive_decompress` and prints per-tile means. Both
+  were rescued from session scratch that was about to be deleted. What is still needed is
+  the comparison itself, not the evidence to do it with.
+  The RLGR encoder divergence above is confirmed and reproducible:
+  `cd ~/language/mdrdp/tools/codec-oracles/rlgrdiff && cargo run --release`
+  reports `ref!=orig = 2831` of 3000, and `FIX_UQ=1 cargo run --release` reports 0.
+  `~/language/mdrdp/vendor/ironrdp-graphics/src/rlgr.rs:125` uses `UP_GR` where
+  its own decoder at line 322 uses `UQ_GR`. Encode is server-side and mdrdp never runs
+  it, so this is latent, not a shipped defect — but it means the default run of that
+  oracle tests decoder agreement over malformed input, not correctness.

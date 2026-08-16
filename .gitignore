@@ -1,4 +1,6 @@
 /target
+# The rescued oracles under tools/ are standalone crates with their own build dirs.
+tools/**/target/
 **/*.rs.bk
 *.pdb
 

@@ -1,0 +1,11 @@
+[package]
+name = "s2s"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "s2s"
+path = "src/main.rs"
+
+# Standalone: never a member of the mdrdp package above it.
+[workspace]

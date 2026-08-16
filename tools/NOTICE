@@ -1,0 +1,70 @@
+NOTICE — third-party code under tools/
+
+These are differential-test oracles and probes, rescued from session scratch
+directories where they had never been under version control. They are NOT shipped
+code: nothing here is built by `cargo build` at the repository root, and no mdrdp
+binary links any of it.
+
+Several of these files contain, or are derived from, third-party source, modified
+for the experiment each one serves. Those modifications are described below.
+
+
+FreeRDP — https://github.com/FreeRDP/FreeRDP — Apache License 2.0
+Copyright the FreeRDP contributors.
+
+  codec-oracles/dwtdiff/ref.c
+  codec-oracles/dwtdiff/probe.c
+      progressive_rfx_idwt_x and progressive_rfx_idwt_y, adapted from
+      libfreerdp/codec/progressive.c. The two files carry an identical copy of
+      this body and differ only in their harness main().
+
+  codec-oracles/rlgrdiff/src/main.rs  (decode_ref, RefBs, lzcnt_s)
+      A Rust transcription of rfx_rlgr_decode, from libfreerdp/codec/rfx_rlgr.c.
+
+  codec-oracles/py/srl_diff.py  (class FreeRdpSrl)
+      A Python transcription of progressive_rfx_srl_read, from
+      libfreerdp/codec/progressive.c.
+
+  codec-oracles/py/dwt_diff.py  (c_block)
+      A Python transcription of rfx_dwt_2d_decode_block, from
+      libfreerdp/codec/rfx_dwt.c.
+
+  codec-oracles/py/cmp.py  (ref_bgrx, ref_gen)
+      The fixed-point YCbCr-to-RGB constants from
+      libfreerdp/primitives/prim_colors.c.
+
+  codec-oracles/refdec.c calls FreeRDP through its public headers and links the
+      installed library. It embeds no FreeRDP source.
+
+  UNVERIFIED, and it matters: no FreeRDP source tree exists on the machine these
+  were rescued on, so ref.c and probe.c could not be diffed against upstream
+  progressive.c. They retain FreeRDP's own spellings (WINPR_RESTRICT, INT16, its
+  full parameter lists), so they may be closer to verbatim than "adapted"
+  suggests. Anyone extending them should do that diff and, if they are verbatim,
+  give them FreeRDP's own file header in place of this summary.
+
+
+IronRDP — https://github.com/Devolutions/IronRDP — MIT OR Apache-2.0
+Copyright Devolutions Inc. and contributors.
+
+  codec-oracles/rlgrdiff/src/main.rs  (Bits, encode, decode and their helpers)
+      Copied from ironrdp-graphics 0.9.0, src/utils.rs and src/rlgr.rs. One
+      change: the Golomb-Rice update in encode() selects UQ_GR or UP_GR from the
+      FIX_UQ environment variable, to test which upstream intended.
+
+  codec-oracles/dwtdiff/ours.rs
+  codec-oracles/dwtdiff/ours_clamped.rs
+  codec-oracles/dwtdiff/probe.rs
+      Copied from ironrdp-graphics 0.9.0, src/dwt_extrapolate.rs, with the test
+      module removed and a harness main() added. ours_clamped.rs saturates in
+      t() where ours.rs truncates. Verified near-verbatim by normalised diff
+      against the published crate.
+
+  codec-oracles/dwtcmp/main.rs  (idwt_row, idwt_col, decode_block, decode)
+      Adapted from the same file, with the narrowing function t lifted to a
+      parameter so both behaviours can be driven from one binary.
+
+  surface-repro/s2s/src/surface.rs is a stale snapshot of mdrdp's own
+      src/surface.rs, not third-party.
+
+Full licence texts: LICENSE-APACHE and LICENSE-MIT at the repository root.
