@@ -274,6 +274,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => return Err(e.into()),
     };
 
+    // Settings live beside the favourites; the legacy [defaults] username in
+    // favourites.toml migrates into settings.toml on first sight and is only read
+    // as a fallback after that.
+    let settings = match mdrdp::settings::Settings::default_path()
+        .map_err(|e| e.to_string())
+        .and_then(|p| {
+            mdrdp::settings::Settings::load_from(&p)
+                .map(|s| (p, s))
+                .map_err(|e| e.to_string())
+        }) {
+        Ok((path, mut s)) => {
+            if s.adopt_username(favourites.default_username())
+                && let Err(e) = s.save_to(&path)
+            {
+                eprintln!("warning: could not write settings.toml: {e}");
+            }
+            s
+        }
+        Err(e) => {
+            eprintln!("warning: {e}; using default settings");
+            mdrdp::settings::Settings::default()
+        }
+    };
+
     if list_only {
         if favourites.is_empty() {
             println!("no favourites yet — open mdrdp to add one ({config_path_display})");
@@ -307,7 +331,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map(|f| f.name.clone())
         .unwrap_or_else(|| positional.clone());
-    let default_user = favourites.default_username().map(str::to_owned);
+    let default_user = settings
+        .defaults
+        .username
+        .clone()
+        .or_else(|| favourites.default_username().map(str::to_owned));
     let explicit_size = size.is_some();
     let target = reconcile(
         Some(positional),
