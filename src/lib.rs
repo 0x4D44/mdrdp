@@ -5,6 +5,7 @@
 
 pub mod audio;
 pub mod autoinput;
+pub mod cli;
 pub mod clipboard;
 pub mod connect;
 pub mod creds;

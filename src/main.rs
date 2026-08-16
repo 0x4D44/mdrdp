@@ -41,27 +41,12 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-fn usage() -> &'static str {
-    "usage:\n  \
-     mdrdp                            pick from the favourites launcher\n  \
-     mdrdp <favourite>                connect to a saved favourite by name\n  \
-     mdrdp <host> --user <account>    connect to a host directly\n\n\
-     options:\n  \
-     --user <account>       keychain account holding the password\n  \
-     --port <n>             default 3389\n  \
-     --domain <d>           Windows domain\n  \
-     --size WxH             session resolution, e.g. 1920x1080\n  \
-     --fullscreen           open fullscreen (and renegotiate to the native resolution)\n  \
-     --list                 print saved favourites and exit\n  \
-     --duration <secs>      disconnect cleanly after N seconds (for scripted runs)\n  \
-     --password-stdin       read the password from stdin instead of the keychain\n  \
-     --screenshot <file>    write the final frame to a BMP (session pixels on disk)\n  \
-     --metrics-json <file>  write a redacted session metrics report as JSON\n  \
-     --input-script <file>  inject scripted keystrokes into the session (for tests)\n  \
-     --stage-json           print machine-readable connect progress on stdout\n  \
-     --capture-failures DIR dump undecodable tiles AND the first raw AVC444 frames\n                            (screen content!) for offline debugging\n\n\
-     Flags override whatever the chosen favourite specifies. A [defaults] username in\n\
-     favourites.toml is used when neither a flag nor a favourite names an account."
+/// The help screen as it goes into error messages: always plain, never coloured —
+/// an error string ends up in pipes and logs, where ANSI codes are noise. The
+/// interactive `--help` path colours it separately. The text itself lives in
+/// `mdrdp::cli` so the plain and coloured forms cannot drift apart.
+fn usage() -> String {
+    mdrdp::cli::help_text(false)
 }
 
 /// The size a session gets when nothing asks for a specific one.
@@ -186,9 +171,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{}", usage());
+        println!(
+            "{}",
+            mdrdp::cli::help_text(mdrdp::cli::stdout_wants_color())
+        );
         return Ok(());
     }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "{}",
+            mdrdp::cli::version_banner(mdrdp::cli::stdout_wants_color())
+        );
+        return Ok(());
+    }
+
+    // The banner leads every run, on stderr with the rest of the status stream, so
+    // stdout consumers (--list, --stage-json) never see it.
+    eprintln!(
+        "{}",
+        mdrdp::cli::version_banner(mdrdp::cli::stderr_wants_color())
+    );
 
     // `--` ends the options, so a favourite whose name looks like a flag is still usable
     // as a target. `spawn_session` always passes it, because a name is user data and may
@@ -1297,7 +1299,7 @@ fn reconcile(
         // A resolved favourite names its own host; the argument was its *name*.
         (Some(f), _) => f.host.clone(),
         (None, Some(p)) => p.clone(),
-        (None, None) => return Err(usage().to_owned()),
+        (None, None) => return Err(usage()),
     };
 
     let user = user
@@ -1342,13 +1344,6 @@ fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn usage_documents_the_redacted_metrics_export() {
-        let text = usage();
-        assert!(text.contains("--metrics-json <file>"));
-        assert!(text.contains("redacted"));
-    }
 
     #[test]
     fn resource_report_uses_session_cpu_delta_and_process_peak_memory() {
