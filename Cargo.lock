@@ -3121,7 +3121,7 @@ dependencies = [
 
 [[package]]
 name = "mdrdp"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "arboard",
  "cpal",
