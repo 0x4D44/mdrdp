@@ -39,7 +39,8 @@ use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use serde::Serialize;
 
-use crate::surface::{Rect, SurfaceError, SurfaceStore};
+use crate::stats::{SlotStatsHandle, UNKNOWN_CODEC};
+use crate::surface::{BPP, Rect, SurfaceError, SurfaceStore};
 
 /// Convert an EGFX rectangle to a surface rectangle.
 ///
@@ -201,6 +202,16 @@ pub struct GfxHandler {
     /// destination point that would overflow a `u16` coordinate before the store does
     /// the arithmetic.
     cache_dims: HashMap<u16, (u16, u16)>,
+    /// Per-slot cache accounting, for the diagnostics grid. Written here because this is
+    /// where a slot's size and the codec that produced its pixels are both known; the
+    /// store below sees the bytes but not the codec.
+    slots: SlotStatsHandle,
+    /// The codec that most recently painted each surface.
+    ///
+    /// `SurfaceToCache` copies pixels out of a surface and names no codec of its own, so
+    /// the codec a slot is attributed to is the one that last wrote the surface it came
+    /// from. Protocol constants only — never payload.
+    surface_codec: HashMap<u16, &'static str>,
     /// Opt-in dump of tiles the decoder rejected. Default: off.
     capture: FailureCapture,
     /// Advertise the AVC capability ladder (V10.7 with AVC444 implied, V8.1 with
@@ -232,6 +243,8 @@ impl GfxHandler {
             stats: GfxStatsHandle::new(),
             live_surfaces: HashSet::new(),
             cache_dims: HashMap::new(),
+            slots: SlotStatsHandle::new(),
+            surface_codec: HashMap::new(),
             capture: FailureCapture::default(),
             avc: false,
         }
@@ -258,6 +271,17 @@ impl GfxHandler {
     /// A handle the caller keeps after the handler is boxed into the graphics client.
     pub fn stats(&self) -> GfxStatsHandle {
         self.stats.clone()
+    }
+
+    /// Per-cache-slot counters, for the diagnostics grid. Poll
+    /// [`snapshot`](SlotStatsHandle::snapshot) from any thread.
+    pub fn slot_stats(&self) -> SlotStatsHandle {
+        self.slots.clone()
+    }
+
+    /// Remember which codec last painted a surface — see [`Self::surface_codec`].
+    fn note_surface_codec(&mut self, surface_id: u16, codec: &'static str) {
+        self.surface_codec.insert(surface_id, codec);
     }
 
     fn with_store<R>(&self, f: impl FnOnce(&mut SurfaceStore) -> R) -> R {
@@ -313,6 +337,7 @@ impl GfxHandler {
     /// so a surface we do not know about cannot be decoded into.
     fn apply_wire_to_surface2(&mut self, pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
         let surface_id = pdu.surface_id;
+        self.note_surface_codec(surface_id, codec2_name(pdu.codec_id));
         let Some((width, height)) =
             self.with_store(|store| store.get(surface_id).map(|s| (s.width, s.height)))
         else {
@@ -371,6 +396,7 @@ impl GfxHandler {
     /// holding the lock across it would stall the presenter for no reason.
     fn apply_wire_to_surface1(&mut self, pdu: &WireToSurface1Pdu) {
         self.note_codec(pdu.codec_id);
+        self.note_surface_codec(pdu.surface_id, codec_name(pdu.codec_id));
 
         if pdu.codec_id != Codec1Type::ClearCodec {
             // Some other codec we do not decode. Counted above; nothing to paint.
@@ -470,6 +496,16 @@ impl GfxHandler {
         if result.is_ok() {
             self.cache_dims
                 .insert(pdu.cache_slot, (src.width(), src.height()));
+            let codec = self
+                .surface_codec
+                .get(&pdu.surface_id)
+                .copied()
+                .unwrap_or(UNKNOWN_CODEC);
+            // The same dimensions `cache_dims` records, so the grid's size and its byte
+            // figure can never disagree with each other.
+            let bytes = u64::from(src.width()) * u64::from(src.height()) * BPP as u64;
+            let (w, h, slot) = (src.width(), src.height(), pdu.cache_slot);
+            self.slots.update(|s| s.fill(slot, w, h, codec, bytes));
         }
         self.absorb(result);
     }
@@ -488,6 +524,12 @@ impl GfxHandler {
         }
         let result = self
             .with_store(|store| store.cache_to_surface(pdu.cache_slot, pdu.surface_id, &points));
+        if result.is_ok() {
+            // One hit per destination painted, matching the aggregate CacheStats. A
+            // refused copy painted nothing, so it is not a hit.
+            let (slot, times) = (pdu.cache_slot, points.len() as u32);
+            self.slots.update(|s| s.hit(slot, times));
+        }
         self.absorb(result);
     }
 
@@ -515,6 +557,13 @@ fn placeable_points(points: &[Point], width: u16, height: u16) -> (Vec<(u16, u16
         }
     }
     (kept, skipped)
+}
+
+/// A stable name per `WireToSurface2` codec id. Protocol constants, never payload.
+fn codec2_name(codec: ironrdp_egfx::pdu::Codec2Type) -> &'static str {
+    match codec {
+        ironrdp_egfx::pdu::Codec2Type::RemoteFxProgressive => "RemoteFxProgressive",
+    }
 }
 
 /// A stable name per codec id. Protocol constants, never payload.
@@ -605,6 +654,7 @@ impl GraphicsPipelineHandler for GfxHandler {
 
     fn on_surface_deleted(&mut self, surface_id: u16) {
         self.live_surfaces.remove(&surface_id);
+        self.surface_codec.remove(&surface_id);
         self.with_store(|store| store.delete(surface_id));
         // Progressive tile state is keyed by surface id (see apply_wire_to_surface2), so
         // it dies with the surface — FreeRDP's gdi_DeleteSurface calls
@@ -688,6 +738,8 @@ impl GraphicsPipelineHandler for GfxHandler {
         if !matches!(update.codec_id, Codec1Type::Avc444 | Codec1Type::Avc444v2) {
             self.note_codec(update.codec_id);
         }
+        // Cache attribution wants the painter's codec either way.
+        self.note_surface_codec(update.surface_id, codec_name(update.codec_id));
         if update.data.is_empty() {
             return;
         }
@@ -724,6 +776,10 @@ impl GraphicsPipelineHandler for GfxHandler {
 
     fn on_evict_cache_entry(&mut self, pdu: &EvictCacheEntryPdu) {
         self.cache_dims.remove(&pdu.cache_slot);
+        // The slot record survives the eviction on purpose: what it served while live is
+        // what says whether dropping it cost anything.
+        let slot = pdu.cache_slot;
+        self.slots.update(|s| s.evict(slot));
         self.with_store(|store| store.evict_cache(pdu.cache_slot));
     }
 
@@ -1092,6 +1148,104 @@ mod tests {
         assert_eq!(store.lock().unwrap().cache_stats().entries, 0);
         assert!(!handler.cache_dims.contains_key(&7));
         assert_eq!(store.lock().unwrap().cache_stats().evictions, 1);
+    }
+
+    #[test]
+    fn cache_slot_records_track_the_fill_every_hit_and_the_eviction() {
+        // The per-slot grid's whole claim, end to end through the PDUs. Distinct numbers
+        // throughout — a 10x4 tile, slot 7, three destinations — so a swapped width and
+        // height, or hits counted per PDU instead of per destination, cannot pass.
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 32, 16));
+
+        // Paint the region with ClearCodec, so the slot has a codec to be attributed to.
+        let region_bgra: Vec<u8> = [0x10u8, 0x20, 0x30, 0xFF]
+            .iter()
+            .copied()
+            .cycle()
+            .take(10 * 4 * BPP)
+            .collect();
+        handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id: 1,
+            codec_id: Codec1Type::ClearCodec,
+            pixel_format: PixelFormat::XRgb,
+            destination_rectangle: rect(0, 0, 10, 4),
+            bitmap_data: ClearCodecEncoder::new().encode(&region_bgra, 10, 4),
+        }));
+
+        handler.on_surface_to_cache(&SurfaceToCachePdu {
+            surface_id: 1,
+            cache_key: 0,
+            cache_slot: 7,
+            source_rectangle: rect(0, 0, 10, 4),
+        });
+
+        let filled = handler.slot_stats().snapshot();
+        let slot = *filled.get(7).expect("the fill must create a slot record");
+        assert_eq!(slot.slot, 7);
+        assert_eq!(slot.width, 10);
+        assert_eq!(slot.height, 4);
+        assert_eq!(slot.codec, "ClearCodec");
+        assert_eq!(slot.state, crate::stats::SlotState::Live);
+        assert_eq!(slot.bytes_stored, 10 * 4 * BPP as u64);
+        assert_eq!(slot.hits, 0);
+        assert_eq!(slot.bytes_served, 0);
+
+        // One PDU, three destinations: three hits, three tiles' worth of bytes served.
+        handler.on_cache_to_surface(&CacheToSurfacePdu {
+            cache_slot: 7,
+            surface_id: 1,
+            destination_points: vec![
+                Point { x: 0, y: 4 },
+                Point { x: 10, y: 4 },
+                Point { x: 20, y: 4 },
+            ],
+        });
+
+        let hit = *handler.slot_stats().snapshot().get(7).expect("slot 7");
+        assert_eq!(hit.hits, 3, "one hit per destination painted");
+        assert_eq!(hit.bytes_served, 3 * 10 * 4 * BPP as u64);
+        assert_eq!(hit.bytes_stored, 10 * 4 * BPP as u64);
+        assert!(hit.last_hit.is_some());
+        assert_eq!(handler.stats().snapshot().surface_errors, 0);
+
+        handler.on_evict_cache_entry(&EvictCacheEntryPdu { cache_slot: 7 });
+
+        let evicted = *handler
+            .slot_stats()
+            .snapshot()
+            .get(7)
+            .expect("an evicted slot is still reported");
+        assert_eq!(evicted.state, crate::stats::SlotState::Evicted);
+        assert_eq!(evicted.hits, 3, "eviction must not zero what it served");
+        assert_eq!(evicted.bytes_served, 3 * 10 * 4 * BPP as u64);
+        assert_eq!(evicted.width, 10);
+        assert_eq!(evicted.height, 4);
+    }
+
+    #[test]
+    fn a_cache_hit_on_a_slot_we_never_saw_filled_records_no_slot() {
+        // Without a fill there is no stored size, so a record for it would report zero
+        // bytes served for a hit that really did paint something — worse than absent.
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 8, 8));
+        handler.on_cache_to_surface(&CacheToSurfacePdu {
+            cache_slot: 7,
+            surface_id: 1,
+            destination_points: vec![Point { x: 0, y: 0 }],
+        });
+        assert!(handler.slot_stats().snapshot().is_empty());
+        assert_eq!(
+            handler
+                .stats()
+                .snapshot()
+                .surface_error_reasons
+                .get("unknown_cache_dimensions"),
+            Some(&1),
+            "and the miss is still counted where it always was"
+        );
     }
 
     #[test]

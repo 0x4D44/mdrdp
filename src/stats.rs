@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// How many recent samples the rolling window holds.
 ///
@@ -172,6 +173,194 @@ impl CacheStats {
             return None;
         }
         Some(self.bytes_served as f64 / painted as f64)
+    }
+}
+
+/// What one bitmap-cache slot is currently holding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SlotState {
+    /// Never filled, or filled with nothing.
+    #[default]
+    Empty,
+    /// Holds a bitmap the server can still reference.
+    Live,
+    /// The server dropped it. The counters it earned while live are kept.
+    Evicted,
+}
+
+impl SlotState {
+    /// A stable, payload-free name, for a report or a legend.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotState::Empty => "empty",
+            SlotState::Live => "live",
+            SlotState::Evicted => "evicted",
+        }
+    }
+}
+
+/// The codec attributed to a slot nothing identifiable has filled yet.
+pub const UNKNOWN_CODEC: &str = "unknown";
+
+/// One bitmap-cache slot, as the diagnostics grid needs to draw it.
+///
+/// The aggregate [`CacheStats`] answers "is the cache working"; this answers "which slots
+/// are earning their keep", which is the question a thrashing cache is diagnosed by.
+///
+/// `bytes_served` is accumulated per hit rather than derived as `hits * bytes_stored`: a
+/// slot refilled at a different size would otherwise have its whole history restated at
+/// the newest size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotStat {
+    pub slot: u16,
+    pub width: u16,
+    pub height: u16,
+    /// The codec reported for the update that filled this slot.
+    pub codec: &'static str,
+    pub state: SlotState,
+    pub hits: u32,
+    /// Bytes painted out of this slot, accumulated one stored-size per hit.
+    pub bytes_served: u64,
+    /// Bytes the current occupant of the slot takes.
+    pub bytes_stored: u64,
+    pub last_hit: Option<Instant>,
+}
+
+impl SlotStat {
+    /// A slot that exists but holds nothing.
+    pub fn empty(slot: u16) -> Self {
+        Self {
+            slot,
+            width: 0,
+            height: 0,
+            codec: UNKNOWN_CODEC,
+            state: SlotState::Empty,
+            hits: 0,
+            bytes_served: 0,
+            bytes_stored: 0,
+            last_hit: None,
+        }
+    }
+}
+
+/// Every cache slot this session has touched, keyed by slot id.
+///
+/// Ordered, so the grid draws in slot order without the caller sorting, and so two
+/// snapshots taken a second apart put the same slot in the same place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlotStats {
+    slots: BTreeMap<u16, SlotStat>,
+}
+
+impl SlotStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A `SurfaceToCache` filled (or refilled) the slot.
+    ///
+    /// Size, codec and stored bytes describe the new occupant; the hit history the slot
+    /// already earned is deliberately kept, because the interesting question about a
+    /// repeatedly refilled slot is how much it has served over the session.
+    pub fn fill(
+        &mut self,
+        slot: u16,
+        width: u16,
+        height: u16,
+        codec: &'static str,
+        bytes_stored: u64,
+    ) {
+        let entry = self
+            .slots
+            .entry(slot)
+            .or_insert_with(|| SlotStat::empty(slot));
+        entry.width = width;
+        entry.height = height;
+        entry.codec = codec;
+        entry.state = SlotState::Live;
+        entry.bytes_stored = bytes_stored;
+    }
+
+    /// A `CacheToSurface` painted this slot into `times` destinations.
+    ///
+    /// One hit per destination, matching [`CacheStats`]: a single PDU that stamps a cached
+    /// tile in twelve places saved twelve regions' worth of wire traffic.
+    ///
+    /// A slot we never saw filled is ignored rather than invented: without a fill there is
+    /// no size to serve, so a record for it would carry zero bytes and misreport the grid.
+    pub fn hit(&mut self, slot: u16, times: u32) {
+        self.hit_at(slot, times, Instant::now());
+    }
+
+    /// [`hit`](Self::hit) with the clock supplied, so age-based behaviour is testable.
+    pub fn hit_at(&mut self, slot: u16, times: u32, at: Instant) {
+        if times == 0 {
+            return;
+        }
+        let Some(entry) = self.slots.get_mut(&slot) else {
+            return;
+        };
+        entry.hits = entry.hits.saturating_add(times);
+        entry.bytes_served = entry
+            .bytes_served
+            .saturating_add(entry.bytes_stored.saturating_mul(u64::from(times)));
+        entry.last_hit = Some(at);
+    }
+
+    /// An `EvictCacheEntry` dropped the slot.
+    ///
+    /// The counters stay: what a slot served before it was evicted is exactly the evidence
+    /// that says whether the eviction cost anything.
+    pub fn evict(&mut self, slot: u16) {
+        if let Some(entry) = self.slots.get_mut(&slot) {
+            entry.state = SlotState::Evicted;
+        }
+    }
+
+    pub fn get(&self, slot: u16) -> Option<&SlotStat> {
+        self.slots.get(&slot)
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Every touched slot, in slot order.
+    pub fn iter(&self) -> impl Iterator<Item = &SlotStat> {
+        self.slots.values()
+    }
+}
+
+/// A cloneable handle on the live [`SlotStats`].
+///
+/// The graphics thread writes on every cache PDU; the diagnostics UI polls
+/// [`snapshot`](Self::snapshot) at 1 Hz from another thread. Same idiom, and same
+/// poisoned-lock recovery, as [`StatsHandle`] and [`crate::gfx::GfxStatsHandle`].
+#[derive(Debug, Clone, Default)]
+pub struct SlotStatsHandle(Arc<Mutex<SlotStats>>);
+
+impl SlotStatsHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A point-in-time copy. Never aliases later mutation.
+    pub fn snapshot(&self) -> SlotStats {
+        self.lock().clone()
+    }
+
+    pub fn update<F: FnOnce(&mut SlotStats)>(&self, f: F) {
+        f(&mut self.lock());
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SlotStats> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -520,6 +709,107 @@ mod tests {
         let text = lines.join("\n");
         assert!(!text.contains("NaN"), "got:\n{text}");
         assert!(text.contains("codec    no surface updates yet"));
+    }
+
+    #[test]
+    fn filling_then_hitting_a_slot_accumulates_stored_bytes_per_hit() {
+        // Every field a different value, so a swapped width/height or a hits/bytes mix-up
+        // cannot pass.
+        let mut slots = SlotStats::new();
+        slots.fill(9, 448, 256, "ClearCodec", 1234);
+
+        let filled = *slots.get(9).expect("the slot was just filled");
+        assert_eq!(filled.slot, 9);
+        assert_eq!(filled.width, 448);
+        assert_eq!(filled.height, 256);
+        assert_eq!(filled.codec, "ClearCodec");
+        assert_eq!(filled.state, SlotState::Live);
+        assert_eq!(filled.hits, 0);
+        assert_eq!(filled.bytes_served, 0, "a fill serves nothing by itself");
+        assert_eq!(filled.bytes_stored, 1234);
+        assert_eq!(filled.last_hit, None);
+
+        // One PDU stamping the tile in three places, then another stamping it once.
+        slots.hit(9, 3);
+        slots.hit(9, 1);
+
+        let hit = *slots.get(9).expect("slot 9");
+        assert_eq!(hit.hits, 4, "one hit per destination painted");
+        assert_eq!(
+            hit.bytes_served,
+            1234 * 4,
+            "each hit serves the stored size again"
+        );
+        assert_eq!(hit.bytes_stored, 1234, "the occupant did not change size");
+        assert!(hit.last_hit.is_some());
+    }
+
+    #[test]
+    fn an_evicted_slot_keeps_the_counters_it_earned() {
+        // What a slot served before the server dropped it is the evidence that says
+        // whether the eviction cost anything, so eviction must not zero it.
+        let mut slots = SlotStats::new();
+        slots.fill(9, 448, 256, "RemoteFxProgressive", 1234);
+        slots.hit(9, 2);
+        slots.evict(9);
+
+        let evicted = *slots.get(9).expect("an evicted slot is still reported");
+        assert_eq!(evicted.state, SlotState::Evicted);
+        assert_eq!(evicted.hits, 2);
+        assert_eq!(evicted.bytes_served, 2468);
+        assert_eq!(evicted.bytes_stored, 1234);
+        assert_eq!(evicted.width, 448);
+        assert_eq!(evicted.height, 256);
+        assert_eq!(evicted.codec, "RemoteFxProgressive");
+    }
+
+    #[test]
+    fn a_refilled_slot_serves_at_its_new_size_without_restating_its_history() {
+        // bytes_served is accumulated, not `hits * bytes_stored`. Deriving it would
+        // restate the two 1234-byte hits at the new 40-byte size and report 160.
+        let mut slots = SlotStats::new();
+        slots.fill(9, 448, 256, "ClearCodec", 1234);
+        slots.hit(9, 2);
+        slots.fill(9, 10, 4, "Uncompressed", 40);
+        slots.hit(9, 2);
+
+        let s = *slots.get(9).expect("slot 9");
+        assert_eq!(s.hits, 4);
+        assert_eq!(s.bytes_served, 1234 * 2 + 40 * 2);
+        assert_eq!(s.bytes_stored, 40, "only the current occupant's size");
+        assert_eq!(s.width, 10);
+        assert_eq!(s.height, 4);
+        assert_eq!(s.codec, "Uncompressed");
+        assert_eq!(s.state, SlotState::Live, "a refill makes a slot live again");
+    }
+
+    #[test]
+    fn a_slot_that_was_never_filled_is_not_invented_by_a_hit_or_an_evict() {
+        let mut slots = SlotStats::new();
+        slots.hit(9, 5);
+        slots.evict(11);
+        assert!(slots.is_empty(), "no size to serve means no record to keep");
+        assert_eq!(slots.get(9), None);
+    }
+
+    #[test]
+    fn slots_are_reported_in_slot_order() {
+        let mut slots = SlotStats::new();
+        slots.fill(11, 448, 256, "ClearCodec", 1234);
+        slots.fill(2, 64, 32, "Uncompressed", 40);
+        let order: Vec<u16> = slots.iter().map(|s| s.slot).collect();
+        assert_eq!(order, vec![2, 11]);
+        assert_eq!(slots.len(), 2);
+    }
+
+    #[test]
+    fn a_snapshot_does_not_alias_later_mutation() {
+        let handle = SlotStatsHandle::new();
+        handle.update(|s| s.fill(9, 448, 256, "ClearCodec", 1234));
+        let before = handle.snapshot();
+        handle.update(|s| s.hit(9, 7));
+        assert_eq!(before.get(9).unwrap().hits, 0, "the copy must be frozen");
+        assert_eq!(handle.snapshot().get(9).unwrap().hits, 7);
     }
 
     #[test]

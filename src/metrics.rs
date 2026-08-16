@@ -6,12 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Instant;
 
 use serde::Serialize;
 
 use crate::audio::AudioStats;
 use crate::gfx::GfxStats;
-use crate::stats::{CacheStats, Latency, SessionStats};
+use crate::stats::{CacheStats, Latency, SessionStats, SlotStat, SlotStats};
 
 /// Stable schema identifier for [`SessionMetricsReport`].
 pub const SCHEMA_VERSION: u32 = 1;
@@ -129,6 +130,47 @@ impl From<&CacheStats> for CacheStatsMetrics {
     }
 }
 
+/// One bitmap-cache slot, copied from [`SlotStat`].
+///
+/// A slot index, a bitmap size and a codec name are protocol metadata, not content — none
+/// of them can identify a host, an account or a pixel, so they are safe in the report.
+///
+/// `last_hit` is an [`Instant`], which is process-local and does not serialise; it is
+/// carried as an age instead, which is what a reader actually wants ("cold for 40 s").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SlotMetrics {
+    pub slot: u16,
+    pub width: u16,
+    pub height: u16,
+    pub codec: &'static str,
+    pub state: &'static str,
+    pub hits: u32,
+    pub bytes_served: u64,
+    pub bytes_stored: u64,
+    /// Milliseconds since this slot was last painted from. `None` if it never was.
+    pub last_hit_age_ms: Option<u64>,
+}
+
+impl SlotMetrics {
+    /// Snapshot one slot, with `now` supplied so the age is taken from a single clock
+    /// reading for the whole report rather than drifting across it.
+    pub fn from_slot(stat: &SlotStat, now: Instant) -> Self {
+        Self {
+            slot: stat.slot,
+            width: stat.width,
+            height: stat.height,
+            codec: stat.codec,
+            state: stat.state.as_str(),
+            hits: stat.hits,
+            bytes_served: stat.bytes_served,
+            bytes_stored: stat.bytes_stored,
+            last_hit_age_ms: stat
+                .last_hit
+                .map(|at| now.saturating_duration_since(at).as_millis() as u64),
+        }
+    }
+}
+
 /// Redacted JSON-ready evidence for one client session.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMetricsReport {
@@ -139,6 +181,9 @@ pub struct SessionMetricsReport {
     pub session: SessionMetrics,
     pub gfx: GfxStats,
     pub audio: AudioStats,
+    /// Per-bitmap-cache-slot detail, in slot order. Empty unless
+    /// [`with_slots`](SessionMetricsReport::with_slots) was called.
+    pub slots: Vec<SlotMetrics>,
     pub joined_channels: Vec<String>,
     pub resources: Option<ResourceMetrics>,
 }
@@ -169,9 +214,30 @@ impl SessionMetricsReport {
             session: SessionMetrics::from(session),
             gfx: gfx.clone(),
             audio: audio.clone(),
+            slots: Vec::new(),
             joined_channels: joined_channels.into_iter().map(Into::into).collect(),
             resources,
         }
+    }
+
+    /// Attach per-cache-slot detail.
+    ///
+    /// Separate from [`new`](Self::new) because the slot counters live on their own
+    /// handle, written by the graphics thread — a caller that has no graphics handler
+    /// simply does not call this.
+    #[must_use]
+    pub fn with_slots(self, slots: &SlotStats) -> Self {
+        self.with_slots_at(slots, Instant::now())
+    }
+
+    /// [`with_slots`](Self::with_slots) with the clock supplied, so slot ages are testable.
+    #[must_use]
+    pub fn with_slots_at(mut self, slots: &SlotStats, now: Instant) -> Self {
+        self.slots = slots
+            .iter()
+            .map(|slot| SlotMetrics::from_slot(slot, now))
+            .collect();
+        self
     }
 }
 
@@ -281,6 +347,69 @@ mod tests {
             json["joined_channels"],
             serde_json::json!(["cliprdr", "rdpsnd"])
         );
+    }
+
+    #[test]
+    fn report_carries_per_slot_detail_and_still_carries_nothing_sensitive() {
+        // Every field a different value, so a swapped width/height or a
+        // bytes_served/bytes_stored mix-up cannot pass.
+        let mut slots = SlotStats::new();
+        slots.fill(9, 448, 256, "ClearCodec", 1234);
+        let hit_at = Instant::now();
+        slots.hit_at(9, 3, hit_at);
+        slots.fill(11, 64, 32, "RemoteFxProgressive", 40);
+        slots.evict(11);
+
+        let report = SessionMetricsReport::new(
+            1,
+            "graceful_shutdown",
+            &SessionStats::new(),
+            &GfxStats::default(),
+            &AudioStats::default(),
+            ["cliprdr"],
+            None,
+        )
+        .with_slots_at(&slots, hit_at + std::time::Duration::from_millis(2_500));
+
+        assert_eq!(report.slots.len(), 2);
+        let hot = report.slots[0];
+        assert_eq!(hot.slot, 9);
+        assert_eq!(hot.width, 448);
+        assert_eq!(hot.height, 256);
+        assert_eq!(hot.codec, "ClearCodec");
+        assert_eq!(hot.state, "live");
+        assert_eq!(hot.hits, 3);
+        assert_eq!(hot.bytes_served, 3_702);
+        assert_eq!(hot.bytes_stored, 1_234);
+        assert_eq!(hot.last_hit_age_ms, Some(2_500));
+
+        let cold = report.slots[1];
+        assert_eq!(cold.slot, 11);
+        assert_eq!(cold.state, "evicted");
+        assert_eq!(cold.last_hit_age_ms, None, "it was never painted from");
+
+        let json = serde_json::to_string(&report).expect("report serialises");
+        let parsed: Value = serde_json::from_str(&json).expect("report is JSON");
+        assert_eq!(parsed["slots"][0]["slot"], 9);
+        assert_eq!(parsed["slots"][0]["bytes_served"], 3_702);
+        assert_eq!(parsed["slots"][1]["state"], "evicted");
+        // The redaction rule, restated over the new field: slot detail must not have
+        // smuggled in a host, an account, a path or a payload.
+        for forbidden in [
+            "host",
+            "user",
+            "username",
+            "account",
+            "password",
+            "path",
+            "clipboard",
+            "pixels",
+        ] {
+            assert!(
+                parsed["slots"][0].get(forbidden).is_none(),
+                "slot detail must not carry {forbidden}"
+            );
+        }
     }
 
     #[test]
