@@ -30,5 +30,6 @@ pub mod stats;
 pub mod surface;
 pub mod trust;
 pub mod ui;
+pub mod wake;
 pub mod window;
 pub mod window_policy;

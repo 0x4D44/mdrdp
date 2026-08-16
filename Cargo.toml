@@ -46,6 +46,14 @@ winit = "0.30.13"
 x509-cert = "0.2.5"
 zeroize = "1.9.0"
 
+# Readiness polling for the session pump's wake-able wait (src/wake.rs): poll(2) on
+# Unix, WSAPoll on Windows. Both crates were already in the dependency tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 [build-dependencies]
 # Embeds assets/icon/windows/mdrdp.ico into the Windows executable; a no-op elsewhere.
 winresource = "0.1"

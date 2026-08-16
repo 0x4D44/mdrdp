@@ -1,36 +1,47 @@
 //! The RDP session thread: read PDUs, paint, send input, disconnect cleanly.
 //!
 //! Threading is deliberately simple. winit must own the main thread, so the session runs
-//! on one worker thread that owns the socket. It alternates between a short blocking read
-//! and draining the input queue, rather than splitting the socket across two threads —
+//! on one worker thread that owns the socket. It alternates between reading PDUs and
+//! draining the input queue, rather than splitting the socket across two threads —
 //! the TLS stream is not usefully splittable and an RDP session is a single connection,
 //! so the extra machinery would buy nothing but complexity.
 //!
-//! The cost is input latency bounded by the read timeout, which is why that timeout is
-//! small. If input latency ever measures badly, that constant is the first thing to look
-//! at, not the threading model.
+//! Input latency does NOT pay for that simplicity: when nothing is decodable the loop
+//! sleeps in [`wake::wait_readable`] on the socket *and* a doorbell every input sender
+//! rings, so a keystroke wakes it immediately instead of waiting out a read timeout.
+//! [`READ_SLICE`] only bounds the rare wait for the rest of an already-started PDU.
 
 use crate::clipboard::ClipboardBridge;
 use crate::connect::{ConnectError, Established, describe, send_shutdown};
 use crate::input::{InputEvent, encode_fastpath_input, to_fastpath};
 use crate::stats::StatsHandle;
 use crate::surface::SurfaceStore;
+use crate::wake::{self, Doorbell, DoorbellReceiver};
 use crate::window::{CursorUpdate, Waker};
 use ironrdp::session::{ActiveStageOutput, image::DecodedImage};
 use ironrdp_blocking::Framed;
 use ironrdp_cliprdr::CliprdrClient;
+use rustls::{ClientConnection, StreamOwned};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How long a read blocks before the loop checks the input queue.
+/// How long a read blocks when a PDU has started arriving but is not complete yet.
 ///
-/// This is the worst-case added latency between a keystroke and it reaching the wire, so
-/// it is small. Too small and the loop spins; 5 ms is well under the ~3.3 ms network
-/// floor plus server processing, so it is not the bottleneck.
+/// This is NOT the input-latency bound — input wakes the loop through the doorbell
+/// while the socket is quiet. It only caps the wait for the tail of a PDU whose head
+/// is already buffered, where more socket data is the only thing that can help.
 const READ_SLICE: Duration = Duration::from_millis(5);
+
+/// How long the idle sleep lasts when neither the socket nor the doorbell fires.
+///
+/// This is a cadence, not a latency bound: it is what keeps the clipboard poll and
+/// paste timers serviced on a completely quiet link. Matched to [`CLIPBOARD_POLL`]
+/// so the poll runs at most one period late.
+const IDLE_WAIT: Duration = Duration::from_millis(250);
 
 /// How often the local clipboard is checked for a change the user made.
 ///
@@ -104,12 +115,16 @@ pub enum SessionEnd {
 pub struct SessionHandle {
     join: JoinHandle<SessionEnd>,
     stop: Arc<AtomicBool>,
+    /// Rung after `stop` is set so a pump asleep in `wait_readable` exits now,
+    /// not at the end of its idle sleep.
+    bell: Doorbell,
 }
 
 impl SessionHandle {
     /// Ask the session to disconnect and wait for it.
     pub fn shutdown(self) -> SessionEnd {
         self.stop.store(true, Ordering::Relaxed);
+        self.bell.ring();
         self.join.join().unwrap_or(SessionEnd::Graceful)
     }
 }
@@ -118,6 +133,7 @@ impl SessionHandle {
 ///
 /// Takes ownership of the established connection. The caller keeps the store (to paint
 /// from) and the input sender (to feed it).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     established: Established,
     store: Arc<Mutex<SurfaceStore>>,
@@ -125,6 +141,8 @@ pub fn spawn(
     commands: Receiver<SessionCommand>,
     waker: Waker,
     services: SessionServices,
+    bell: Doorbell,
+    wake_rx: DoorbellReceiver,
 ) -> SessionHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
@@ -140,11 +158,12 @@ pub fn spawn(
                 waker,
                 thread_stop,
                 services,
+                wake_rx,
             )
         })
         .expect("spawn session thread");
 
-    SessionHandle { join, stop }
+    SessionHandle { join, stop, bell }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -156,6 +175,7 @@ fn run(
     waker: Waker,
     stop: Arc<AtomicBool>,
     mut services: SessionServices,
+    wake_rx: DoorbellReceiver,
 ) -> SessionEnd {
     // A short read timeout is what lets one thread serve both directions.
     if let Err(e) = established
@@ -186,6 +206,7 @@ fn run(
         &mut image,
         &mut last_generation,
         &mut services,
+        &wake_rx,
     );
 
     // Always disconnect properly. Abandoning the socket leaves a session alive on the
@@ -218,6 +239,7 @@ fn pump(
     image: &mut DecodedImage,
     last_generation: &mut u64,
     services: &mut SessionServices,
+    wake_rx: &DoorbellReceiver,
 ) -> SessionEnd {
     let mut last_clipboard_poll = Instant::now();
     // A resize waiting for the Display Control channel to open, with when it was asked.
@@ -234,6 +256,11 @@ fn pump(
         if stop.load(Ordering::Relaxed) {
             return SessionEnd::Graceful;
         }
+
+        // Swallow pending doorbell rings first: anything rung after this point
+        // stays queued and cuts the coming `wait_readable` short, so a send can
+        // never slip between the channel drains below and the sleep.
+        wake_rx.drain();
 
         // --- outbound: input --------------------------------------------------
         match drain_input(input, &mut established.framed) {
@@ -265,6 +292,29 @@ fn pump(
         }
 
         // --- inbound: server PDUs ---------------------------------------------
+        // Only read when something is already decodable client-side or the socket
+        // has bytes. Otherwise flush any pending paint and sleep until the socket
+        // or the doorbell wakes the loop — this is what keeps a keystroke's path
+        // to the wire free of read-timeout waits.
+        if !decodable_waiting(&mut established.framed) {
+            notify_if_painted(
+                store,
+                waker,
+                last_generation,
+                services,
+                &mut input_sent_at,
+                &mut bytes_since_flush,
+            );
+            let ready = match wake::wait_readable(&established.socket, wake_rx, IDLE_WAIT) {
+                Ok(ready) => ready,
+                Err(e) => return SessionEnd::Failed(ConnectError::Io(e)),
+            };
+            if !ready.socket {
+                // Doorbell ring or cadence tick: service the queues at the loop top.
+                continue;
+            }
+        }
+
         let (action, payload) = match established.framed.read_pdu() {
             Ok(pdu) => pdu,
             Err(e)
@@ -694,6 +744,30 @@ fn drive_reactivation(
                 .write_all(&buf[..len])
                 .map_err(ConnectError::Io)?;
         }
+    }
+}
+
+/// True when `read_pdu` can make progress without new socket bytes.
+///
+/// Two stashes can hold a frame the socket will never signal for: the framer's own
+/// buffer (a second PDU read alongside the first) and rustls's plaintext buffer (a
+/// decrypted record the framer has not pulled yet). Sleeping in `poll` while either
+/// holds data would stall a frame for the whole idle wait, so the pump asks first.
+///
+/// A partial PDU — head buffered, tail still in flight — reports `false`: only more
+/// socket data can finish it, so the socket poll is exactly the right wait.
+fn decodable_waiting(framed: &mut Framed<StreamOwned<ClientConnection, TcpStream>>) -> bool {
+    match ironrdp::pdu::find_size(framed.peek()) {
+        Ok(Some(info)) if framed.peek().len() >= info.length => return true,
+        // Malformed framing: let read_pdu hit it and report the error properly.
+        Err(_) => return true,
+        _ => {}
+    }
+    let (stream, _) = framed.get_inner_mut();
+    match stream.conn.process_new_packets() {
+        Ok(state) => state.plaintext_bytes_to_read() > 0,
+        // A TLS-level fault: let read_pdu surface it rather than swallowing it here.
+        Err(_) => true,
     }
 }
 

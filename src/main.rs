@@ -36,6 +36,7 @@ use mdrdp::session::{self, SessionServices};
 use mdrdp::stats::StatsHandle;
 use mdrdp::surface::SurfaceStore;
 use mdrdp::trust::KnownHosts;
+use mdrdp::wake::{WakingSender, doorbell};
 use mdrdp::window::{SessionWindow, WindowConfig};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -514,8 +515,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let store = Arc::new(Mutex::new(SurfaceStore::new()));
-    let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
-    let (command_tx, command_rx) = mpsc::channel::<session::SessionCommand>();
+    // Every sender of input or commands rings this doorbell, so the session pump
+    // acts immediately instead of on its next read timeout.
+    let (session_bell, session_wake_rx) =
+        doorbell().map_err(|e| format!("session doorbell: {e}"))?;
+    let (raw_input_tx, input_rx) = mpsc::channel::<InputEvent>();
+    let (raw_command_tx, command_rx) = mpsc::channel::<session::SessionCommand>();
+    let input_tx = WakingSender::new(raw_input_tx, session_bell.clone());
+    let command_tx = WakingSender::new(raw_command_tx, session_bell.clone());
 
     // The stats handle must be taken before the handler is boxed away.
     let handler = GfxHandler::new(Arc::clone(&store));
@@ -972,6 +979,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             stats: session_stats.clone(),
             gfx: Some(gfx_stats.clone()),
         },
+        session_bell,
+        session_wake_rx,
     );
 
     // A scripted run must end the way a user closing the window does — through the

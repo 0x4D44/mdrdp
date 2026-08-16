@@ -21,9 +21,9 @@
 //! **Security:** the buffer this module touches is session pixels. Nothing here formats,
 //! logs, or serialises pixel data, and nothing should be added that does.
 
+use crate::wake::WakingSender;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -622,10 +622,10 @@ pub struct SessionWindow {
     event_loop: EventLoop<SessionEvent>,
     config: WindowConfig,
     store: Arc<Mutex<SurfaceStore>>,
-    input: Sender<InputEvent>,
+    input: WakingSender<InputEvent>,
     stats: Option<StatsHandle>,
     on_exit: Option<Box<dyn FnMut()>>,
-    commands: Option<Sender<SessionCommand>>,
+    commands: Option<WakingSender<SessionCommand>>,
     diagnostics: Option<DiagnosticsUis>,
     transients: Option<Box<dyn FnMut() -> TransientReport>>,
     /// Mirrors the window's fullscreen state for whoever outlives the loop — the exit
@@ -660,7 +660,7 @@ impl SessionWindow {
         event_loop: EventLoop<SessionEvent>,
         config: WindowConfig,
         store: Arc<Mutex<SurfaceStore>>,
-        input: Sender<InputEvent>,
+        input: WakingSender<InputEvent>,
     ) -> Result<Self, WindowError> {
         event_loop.set_control_flow(ControlFlow::Wait);
         let fullscreen_state = Arc::new(AtomicBool::new(config.fullscreen));
@@ -682,7 +682,7 @@ impl SessionWindow {
     /// renegotiate its resolution when the window goes fullscreen.
     ///
     /// Optional: without it the fullscreen toggle still works, it just letterboxes.
-    pub fn with_commands(mut self, commands: Sender<SessionCommand>) -> Self {
+    pub fn with_commands(mut self, commands: WakingSender<SessionCommand>) -> Self {
         self.commands = Some(commands);
         self
     }
@@ -804,7 +804,7 @@ fn window_attributes(config: &WindowConfig) -> WindowAttributes {
 struct SessionApp {
     config: WindowConfig,
     store: Arc<Mutex<SurfaceStore>>,
-    input: Sender<InputEvent>,
+    input: WakingSender<InputEvent>,
     window: Option<Arc<Window>>,
     // Held for as long as the surface: dropping the context invalidates it.
     _context: Option<SbContext>,
@@ -833,7 +833,7 @@ struct SessionApp {
     started: Instant,
     /// Channel for asking the session to renegotiate its resolution. `None` in windows
     /// with no session behind them (the probe harness).
-    commands: Option<Sender<SessionCommand>>,
+    commands: Option<WakingSender<SessionCommand>>,
     /// Whether the window is currently fullscreen — ours to track, because winit reports
     /// transitions only as ordinary `Resized` events.
     fullscreen: bool,
@@ -877,7 +877,7 @@ impl SessionApp {
     fn new(
         config: WindowConfig,
         store: Arc<Mutex<SurfaceStore>>,
-        input: Sender<InputEvent>,
+        input: WakingSender<InputEvent>,
         stats: Option<StatsHandle>,
     ) -> Self {
         let viewport = Viewport::letterbox(

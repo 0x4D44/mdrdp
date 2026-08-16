@@ -24,7 +24,7 @@
 //! **This is an input source, not input logging.** Script contents are the operator's
 //! own commands; nothing here reads or records what the session sends otherwise.
 
-use std::sync::mpsc::Sender;
+use crate::wake::WakingSender;
 use std::time::Duration;
 
 use crate::input::{InputEvent, MouseButton, Scancode};
@@ -149,7 +149,7 @@ impl Script {
     ///
     /// A closed channel (the session ended) just stops the script — an unattended run
     /// that outlives its session is normal, not an error worth surfacing.
-    pub fn spawn(self, input: Sender<InputEvent>) {
+    pub fn spawn(self, input: WakingSender<InputEvent>) {
         std::thread::Builder::new()
             .name("mdrdp-input-script".to_owned())
             .spawn(move || self.run(&input))
@@ -157,7 +157,7 @@ impl Script {
             .unwrap_or_else(|e| eprintln!("input script: could not start: {e}"));
     }
 
-    fn run(&self, input: &Sender<InputEvent>) {
+    fn run(&self, input: &WakingSender<InputEvent>) {
         for step in &self.steps {
             let ok = match step {
                 Step::Sleep(d) => {
@@ -208,7 +208,7 @@ impl Script {
 /// True while the channel lives. The pacing matters: Windows treats an instant
 /// press-jump-release as a click at the destination, not a drag.
 fn send_drag(
-    input: &Sender<InputEvent>,
+    input: &WakingSender<InputEvent>,
     from: (u16, u16),
     to: (u16, u16),
     duration: Duration,
@@ -266,7 +266,7 @@ fn send_drag(
 }
 
 /// Press every code in order, hold, release in reverse. True while the channel lives.
-fn send_chord(input: &Sender<InputEvent>, codes: &[Scancode]) -> bool {
+fn send_chord(input: &WakingSender<InputEvent>, codes: &[Scancode]) -> bool {
     for code in codes {
         if input
             .send(InputEvent::Key {
@@ -427,7 +427,7 @@ mod tests {
     fn a_chord_presses_in_order_and_releases_in_reverse() {
         let script = Script::parse("keys win+r").expect("parses");
         let (tx, rx) = mpsc::channel();
-        script.run(&tx);
+        script.run(&WakingSender::silent(tx));
         let events: Vec<InputEvent> = rx.try_iter().collect();
         assert_eq!(
             events,
@@ -457,7 +457,7 @@ mod tests {
     fn typing_a_url_produces_shift_only_where_needed() {
         let script = Script::parse("type a:/B").expect("parses");
         let (tx, rx) = mpsc::channel();
-        script.run(&tx);
+        script.run(&WakingSender::silent(tx));
         let events: Vec<InputEvent> = rx.try_iter().collect();
         // a (2 events), shift+: (4), / (2), shift+B (4)
         assert_eq!(events.len(), 12);
@@ -486,7 +486,7 @@ mod tests {
     fn a_click_moves_then_presses_then_releases() {
         let script = Script::parse("click 100 200").expect("parses");
         let (tx, rx) = mpsc::channel();
-        script.run(&tx);
+        script.run(&WakingSender::silent(tx));
         let events: Vec<InputEvent> = rx.try_iter().collect();
         assert_eq!(events[0], InputEvent::MouseMove { x: 100, y: 200 });
         assert!(matches!(
@@ -512,7 +512,7 @@ mod tests {
         // 100 ms → few interpolation steps, so the test stays fast.
         let script = Script::parse("drag 100 20 300 220 100").expect("parses");
         let (tx, rx) = mpsc::channel();
-        script.run(&tx);
+        script.run(&WakingSender::silent(tx));
         let events: Vec<InputEvent> = rx.try_iter().collect();
 
         assert_eq!(events[0], InputEvent::MouseMove { x: 100, y: 20 });
