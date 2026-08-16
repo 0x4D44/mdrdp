@@ -411,3 +411,32 @@ cc -O2 -o refdec refdec.c $(pkg-config --cflags --libs freerdp3)
 With this fix, all 30 row-0 tiles match FreeRDP's output exactly. That comparison is what
 found this bug, after four other hypotheses (upgrade passes, the bitmap cache, tile-state
 contamination, and content dependence) had each been tested and eliminated.
+
+## ironrdp-graphics: AVC444 combination module (new, 2026-08-16)
+
+`src/avc444.rs` is mdrdp-authored (no upstream equivalent): the MS-RDPEGFX 3.3.8.3
+luma/chroma combination for AVC444 and AVC444v2, plus the full-range BT.709 YUV444 to
+RGBA conversion with the 2x2 chroma reconstruction (`4*avg - p01 - p10 - p11`,
+conditional on a >= 30 delta). Layouts and coefficients transcribed from FreeRDP's
+`prim_YUV.c` / `prim_internal.h` and verified byte-exact against the installed
+FreeRDP 3.27.1 primitives by `tools/codec-oracles/avc444diff` (720 differential runs,
+plus negative controls). One deliberate divergence: rects are combined via absolute
+frame coordinates rather than FreeRDP's ROI-relative pointer walks, which are only
+phase-correct for aligned rect origins.
+
+## ironrdp-egfx: AVC444/AVC444v2 decode path (new, 2026-08-16)
+
+Upstream forwards `Codec1Type::Avc444`/`Avc444v2` to `on_unhandled_pdu`. The vendored
+client decodes them: both sub-streams through the ONE configured `H264Decoder`
+sequentially (the Windows encoder produces a jointly-encoded, single-decoder-compatible
+pair; FreeRDP decodes it the same way), per-surface persistent `Yuv444Buffer`s, LC
+dispatch by equality (the bitflags `LUMA_AND_CHROMA` value is 0 — `.contains()` is
+always true), wire rects treated as exclusive despite the `InclusiveRectangle` typing,
+and painting exactly the combined region rects (never the PDU destRect). The
+`H264Decoder` trait gains `decode_yuv420` (out-param) and `supports_yuv420`; the
+capability advertisement is filtered against both, so AVC444 is never advertised
+without a YUV-capable decoder. All AVC failures (444 and the 420 arm's
+frame-smaller-than-rect case, which upstream escalated into a channel error) now skip
+the frame and report through the new `on_decode_failure(codec, reason)` handler seam.
+`ironrdp-graphics` became a path dependency so standalone (in-crate) tests compile
+against the vendored module rather than crates.io.

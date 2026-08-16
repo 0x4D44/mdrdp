@@ -1,0 +1,25 @@
+[package]
+name = "avc444diff"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ironrdp-graphics = "0.9.0"
+ironrdp-pdu = { version = "0.9.0", features = ["std"] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.dev]
+opt-level = 2
+
+# The same pins as the repository root Cargo.toml. The crate under test is the
+# *vendored* ironrdp-graphics, and it must see the same ironrdp-pdu we do — two
+# instances would give two incompatible `ExclusiveRectangle` types.
+[patch.crates-io]
+ironrdp-graphics = { path = "../../../vendor/ironrdp-graphics" }
+ironrdp-pdu = { path = "../../../vendor/ironrdp-pdu" }
+
+# Standalone: never a member of the mdrdp package above it.
+[workspace]

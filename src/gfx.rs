@@ -203,10 +203,13 @@ pub struct GfxHandler {
     cache_dims: HashMap<u16, (u16, u16)>,
     /// Opt-in dump of tiles the decoder rejected. Default: off.
     capture: FailureCapture,
-    /// Advertise AVC420 (the V8.1 capability set) instead of the AVC-free V10.7 set.
-    /// Only set when the build carries an H.264 decoder — see
-    /// [`crate::h264::hardware_decoder`].
-    avc420: bool,
+    /// Advertise the AVC capability ladder (V10.7 with AVC444 implied, V8.1 with
+    /// AVC420, V8 fallback) instead of the AVC-free V10.7 set. Only set when the
+    /// build carries an H.264 decoder — see [`crate::h264::hardware_decoder`]. The
+    /// vendored client additionally filters the ladder against what the configured
+    /// decoder actually supports (`H264Decoder::supports_yuv420`), so the two gates
+    /// cannot drift into advertising something undecodable.
+    avc: bool,
 }
 
 impl std::fmt::Debug for GfxHandler {
@@ -230,7 +233,7 @@ impl GfxHandler {
             live_surfaces: HashSet::new(),
             cache_dims: HashMap::new(),
             capture: FailureCapture::default(),
-            avc420: false,
+            avc: false,
         }
     }
 
@@ -243,11 +246,12 @@ impl GfxHandler {
         self
     }
 
-    /// Advertise AVC420 support. Call only when a decoder is actually configured on the
-    /// graphics client — advertising a codec nothing decodes blanks every video region.
+    /// Advertise AVC support (AVC444 via V10.7, AVC420 via V8.1). Call only when a
+    /// decoder is actually configured on the graphics client — advertising a codec
+    /// nothing decodes blanks every video region.
     #[must_use]
-    pub fn advertising_avc420(mut self) -> Self {
-        self.avc420 = true;
+    pub fn advertising_avc(mut self) -> Self {
+        self.avc = true;
         self
     }
 
@@ -537,15 +541,18 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// pipeline than the server would otherwise use. Saying "V10.7, and no AVC please"
     /// survives that filter and keeps the modern pipeline.
     ///
-    /// **With an H.264 decoder ([`advertising_avc420`](GfxHandler::advertising_avc420)):**
-    /// V8.1 with AVC420 enabled. This is deliberately *lower*-versioned: V10+ has no
-    /// "AVC420 but not AVC444" flag — a V10.7 set without AVC_DISABLED invites AVC444,
-    /// which neither the vendored client nor the decoder handles — while V8.1 still
-    /// carries ClearCodec and RFX Progressive alongside AVC420, so the server keeps
-    /// using those for ordinary desktop content and switches to H.264 for video regions.
+    /// **With an H.264 decoder ([`advertising_avc`](GfxHandler::advertising_avc)):**
+    /// the AVC ladder. V10.7 without AVC_DISABLED implies AVC444 — the codec modern
+    /// Windows actually sends when AVC is on (measured on quench: Avc444v2 for the
+    /// whole desktop) — then V8.1 with AVC420 for a downlevel server, then V8. The
+    /// vendored client filters this ladder against `H264Decoder::supports_yuv420`,
+    /// so a decoder without YUV output structurally falls back to the V8.1 rung.
     fn capabilities(&self) -> Vec<CapabilitySet> {
-        if self.avc420 {
+        if self.avc {
             return vec![
+                CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::SMALL_CACHE,
+                },
                 CapabilitySet::V8_1 {
                     flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED
                         | ironrdp_egfx::pdu::CapabilitiesV81Flags::SMALL_CACHE,
@@ -648,6 +655,20 @@ impl GraphicsPipelineHandler for GfxHandler {
         pdu: &ironrdp_egfx::pdu::MapSurfaceToScaledWindowPdu,
     ) {
         self.with_store(|store| store.map_to_output(pdu.surface_id));
+    }
+
+    /// A codec payload the upstream client could not decode and skipped.
+    ///
+    /// The vendored client's resilience policy skips bad AVC frames rather than
+    /// erroring the channel; without this seam those skips are invisible staleness —
+    /// requirement 4 (visibility) reproduced inside the new codec. Counted with the
+    /// same reason-tally shape the ClearCodec path uses.
+    fn on_decode_failure(&mut self, codec_id: Codec1Type, reason: &'static str) {
+        let reason = format!("{}: {reason}", codec_name(codec_id));
+        self.stats.note(|s| {
+            s.decode_errors = s.decode_errors.saturating_add(1);
+            *s.decode_error_reasons.entry(reason).or_insert(0) += 1;
+        });
     }
 
     /// Bitmaps the upstream client decoded itself (uncompressed, and AVC420 if a decoder
@@ -851,28 +872,56 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_with_a_decoder_prefer_v8_1_with_avc420() {
-        // V8.1 rather than V10.7-with-AVC, deliberately: V10+ has no "AVC420 but not
-        // AVC444" flag, and a V10.7 set without AVC_DISABLED invites AVC444, which
-        // nothing in this build decodes. V8.1 still carries ClearCodec and Progressive.
-        let handler = GfxHandler::new(store()).advertising_avc420();
+    fn capabilities_with_a_decoder_offer_the_avc_ladder() {
+        // V10.7 WITHOUT AVC_DISABLED first: that is what invites the AVC444v2 the
+        // build now decodes (and what modern Windows sends — measured on quench).
+        // V8.1/AVC420 next for downlevel servers, V8 last. The vendored client
+        // filters this ladder against the decoder's actual abilities, so a build
+        // whose decoder cannot produce YUV structurally falls back to V8.1.
+        let handler = GfxHandler::new(store()).advertising_avc();
         let caps = handler.capabilities();
-        assert_eq!(caps.len(), 2, "V8.1 preferred, V8 fallback");
+        assert_eq!(caps.len(), 3, "V10.7, V8.1, V8");
 
         match &caps[0] {
+            CapabilitySet::V10_7 { flags } => {
+                assert!(
+                    !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+                    "AVC444 is the point of this advertisement"
+                );
+                assert!(flags.contains(CapabilitiesV107Flags::SMALL_CACHE));
+            }
+            other => panic!("expected V10_7 first, got {other:?}"),
+        }
+        match &caps[1] {
             CapabilitySet::V8_1 { flags } => {
                 assert!(
                     flags.contains(ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED),
-                    "the whole point of this advertisement is AVC420"
+                    "the downlevel rung still carries AVC420"
                 );
-                assert!(flags.contains(ironrdp_egfx::pdu::CapabilitiesV81Flags::SMALL_CACHE));
             }
-            other => panic!("expected V8_1 first, got {other:?}"),
+            other => panic!("expected V8_1 second, got {other:?}"),
         }
         assert!(
-            matches!(&caps[1], CapabilitySet::V8 { .. }),
+            matches!(&caps[2], CapabilitySet::V8 { .. }),
             "expected a V8 fallback, got {:?}",
-            caps[1]
+            caps[2]
+        );
+    }
+
+    #[test]
+    fn a_decode_failure_reported_by_the_client_is_counted_with_its_reason() {
+        let mut handler = GfxHandler::new(store());
+        handler.on_decode_failure(Codec1Type::Avc444v2, "avc444 luma decode failed");
+        handler.on_decode_failure(Codec1Type::Avc444v2, "avc444 luma decode failed");
+
+        let s = handler.stats().snapshot();
+        assert_eq!(s.decode_errors, 2);
+        assert_eq!(
+            s.decode_error_reasons
+                .get("Avc444v2: avc444 luma decode failed"),
+            Some(&2),
+            "{:?}",
+            s.decode_error_reasons
         );
     }
 

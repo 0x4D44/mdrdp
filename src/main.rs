@@ -357,10 +357,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // The stats handle must be taken before the handler is boxed away.
     let handler = GfxHandler::new(Arc::clone(&store));
-    // Advertise AVC420 only where connect() will actually configure a decoder, or the
-    // server sends H.264 into a void and every video region goes black.
+    // Advertise AVC (AVC444 via V10.7, AVC420 via V8.1) only where connect() will
+    // actually configure a decoder, or the server sends H.264 into a void and every
+    // video region goes black.
     let handler = if mdrdp::h264::hardware_decode_available() {
-        handler.advertising_avc420()
+        handler.advertising_avc()
     } else {
         handler
     };
@@ -417,6 +418,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         known_hosts: KnownHosts::default_path()?,
         observe_egfx: None,
+        // The same --capture opt-in that dumps undecodable ClearCodec tiles also
+        // dumps the first few AVC444 payloads for offline replay.
+        avc_capture: capture.as_ref().map(std::path::PathBuf::from),
     };
 
     eprintln!("connecting to {}:{} …", target.host, target.port);

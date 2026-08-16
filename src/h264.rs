@@ -3,9 +3,11 @@
 //! The EGFX pipeline hands [`ironrdp_egfx::decode::H264Decoder`] AVC-format access
 //! units: NAL units with 4-byte big-endian length prefixes (AVCC), exactly the framing
 //! Apple's VideoToolbox consumes natively — no Annex-B conversion, no transcode. The
-//! macOS implementation drives a `VTDecompressionSession` with BGRA output, so the
-//! GPU/media engine does both the H.264 decode and the YUV→RGB conversion that dominate
-//! the software path's cost.
+//! macOS implementation drives a `VTDecompressionSession` with full-range planar
+//! 4:2:0 output ('f420') for every decode: AVC444's luma+chroma combination must
+//! happen in YUV space, the RGBA path converts the same planes in software, and a
+//! single output format means a codec switch never rebuilds the session (a mid-GOP
+//! rebuild kills decode until the next IDR — measured).
 //!
 //! Platform split per the architecture rule (portable by default, platform-specific at
 //! the edges): the pure AVCC parsing helpers are portable and unit-tested; everything
@@ -18,7 +20,7 @@ use ironrdp_egfx::decode::H264Decoder;
 
 /// Whether this build carries a hardware H.264 decoder.
 ///
-/// The capability advertisement (see `GfxHandler::advertising_avc420`) and the decoder
+/// The capability advertisement (see `GfxHandler::advertising_avc`) and the decoder
 /// wiring in `connect::establish` must agree, and both key off this one answer.
 pub fn hardware_decode_available() -> bool {
     cfg!(target_os = "macos")
@@ -111,7 +113,9 @@ mod videotoolbox {
     use std::ffi::c_void;
     use std::ptr;
 
-    use ironrdp_egfx::decode::{DecodedFrame, DecoderError, DecoderResult, H264Decoder};
+    use ironrdp_egfx::decode::{
+        DecodedFrame, DecoderError, DecoderResult, H264Decoder, Yuv420Frame,
+    };
     use tracing::{debug, warn};
 
     use super::{NAL_PPS, NAL_SPS, nal_type, nal_units, parameter_sets};
@@ -166,7 +170,17 @@ mod videotoolbox {
         refcon: *mut c_void,
     }
 
-    const K_CV_PIXEL_FORMAT_TYPE_32BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+    /// `kCVPixelFormatType_420YpCbCr8PlanarFullRange` ('f420').
+    ///
+    /// Full-range three-plane 4:2:0 — the one output format for every decode here.
+    /// Measured (2026-08-16 probes): VideoToolbox normalises samples to the
+    /// REQUESTED format's range regardless of the stream's VUI, so 'f420' hands over
+    /// values matching the full-range BT.709 coefficients the RGB conversion uses,
+    /// while 'y420' (video range) irreversibly squeezes them into 16-235. One format
+    /// for both the RGBA and YUV paths also means a codec switch never rebuilds the
+    /// session — a rebuild mid-GOP fails every P-frame until the next IDR (measured
+    /// -12909), so rebuilds must never be routine.
+    const K_CV_PIXEL_FORMAT_TYPE_420_PLANAR_FULL: u32 = u32::from_be_bytes(*b"f420");
     const K_CF_NUMBER_SINT32_TYPE: CfIndex = 3;
     const K_CV_PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 1;
     /// `kVTInvalidSessionErr`: the session died (GPU reset, sleep); recreate and retry.
@@ -232,10 +246,12 @@ mod videotoolbox {
         static kCVPixelBufferPixelFormatTypeKey: CfTypeRef;
         fn CVPixelBufferLockBaseAddress(buffer: CvImageBufferRef, flags: u64) -> CvReturn;
         fn CVPixelBufferUnlockBaseAddress(buffer: CvImageBufferRef, flags: u64) -> CvReturn;
-        fn CVPixelBufferGetBaseAddress(buffer: CvImageBufferRef) -> *const u8;
-        fn CVPixelBufferGetBytesPerRow(buffer: CvImageBufferRef) -> usize;
-        fn CVPixelBufferGetWidth(buffer: CvImageBufferRef) -> usize;
-        fn CVPixelBufferGetHeight(buffer: CvImageBufferRef) -> usize;
+        fn CVPixelBufferGetPixelFormatType(buffer: CvImageBufferRef) -> u32;
+        fn CVPixelBufferGetPlaneCount(buffer: CvImageBufferRef) -> usize;
+        fn CVPixelBufferGetBaseAddressOfPlane(buffer: CvImageBufferRef, plane: usize) -> *const u8;
+        fn CVPixelBufferGetBytesPerRowOfPlane(buffer: CvImageBufferRef, plane: usize) -> usize;
+        fn CVPixelBufferGetWidthOfPlane(buffer: CvImageBufferRef, plane: usize) -> usize;
+        fn CVPixelBufferGetHeightOfPlane(buffer: CvImageBufferRef, plane: usize) -> usize;
     }
 
     #[link(name = "VideoToolbox", kind = "framework")]
@@ -259,15 +275,64 @@ mod videotoolbox {
     }
 
     /// Where the synchronous decode callback deposits its result.
-    #[derive(Default)]
+    ///
+    /// `out` points at the caller's live [`Yuv420Frame`] for the duration of the
+    /// synchronous decode call; `produced` records that the callback actually
+    /// filled it (a decode can "succeed" with no picture).
     struct CallbackSlot {
         status: OsStatus,
-        frame: Option<DecodedFrame>,
+        produced: bool,
+        out: *mut Yuv420Frame,
+    }
+
+    /// Copy one plane out of a locked pixel buffer into a tight-packed vec.
+    ///
+    /// Returns false (leaving the vec untouched beyond a resize) when the plane is
+    /// missing or its stride is shorter than its width — wire-driven output is
+    /// untrusted, and this runs inside an `extern "C"` callback where a panic would
+    /// abort the process, so every access is guarded.
+    ///
+    /// # Safety
+    /// `buffer` must be a locked, planar pixel buffer.
+    unsafe fn copy_plane(
+        buffer: CvImageBufferRef,
+        plane: usize,
+        expect_w: usize,
+        expect_h: usize,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        // SAFETY: per contract, the buffer is locked and planar; plane accessors on
+        // an out-of-range index return null/0, which the guards below reject.
+        unsafe {
+            let base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane);
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane);
+            let width = CVPixelBufferGetWidthOfPlane(buffer, plane);
+            let height = CVPixelBufferGetHeightOfPlane(buffer, plane);
+            if base.is_null()
+                || width != expect_w
+                || height != expect_h
+                || stride < width
+                || width == 0
+            {
+                return false;
+            }
+            out.clear();
+            out.reserve(width * height);
+            for row in 0..height {
+                out.extend_from_slice(std::slice::from_raw_parts(base.add(row * stride), width));
+            }
+            true
+        }
     }
 
     /// The output callback. Runs on the decoding thread before `DecodeFrame` returns
     /// (asynchronous decompression is never requested), so the raw pointer in
     /// `source_frame_refcon` is the caller's live stack slot.
+    ///
+    /// The delivered buffer is gated on its ACTUAL pixel format, not on what was
+    /// requested: measured probes showed `CVPixelBufferGetBaseAddress` returns a
+    /// non-null (but wrong) pointer on planar buffers and plane accessors "work" on
+    /// packed ones, so only the format type itself is trustworthy.
     extern "C" fn decode_callback(
         _refcon: *mut c_void,
         source_frame_refcon: *mut c_void,
@@ -285,31 +350,36 @@ mod videotoolbox {
         if status != 0 || image_buffer.is_null() {
             return;
         }
-        // SAFETY: VideoToolbox hands a valid, locked-lockable pixel buffer for the
-        // duration of the callback.
+        // SAFETY: VideoToolbox hands a valid, lockable pixel buffer for the duration
+        // of the callback; `slot.out` is the caller's live frame per the slot contract.
         unsafe {
+            if CVPixelBufferGetPixelFormatType(image_buffer)
+                != K_CV_PIXEL_FORMAT_TYPE_420_PLANAR_FULL
+                || CVPixelBufferGetPlaneCount(image_buffer) != 3
+            {
+                slot.status = -2;
+                return;
+            }
             if CVPixelBufferLockBaseAddress(image_buffer, K_CV_PIXEL_BUFFER_LOCK_READ_ONLY) != 0 {
                 slot.status = -1;
                 return;
             }
-            let width = CVPixelBufferGetWidth(image_buffer);
-            let height = CVPixelBufferGetHeight(image_buffer);
-            let stride = CVPixelBufferGetBytesPerRow(image_buffer);
-            let base = CVPixelBufferGetBaseAddress(image_buffer);
-            if !base.is_null() && width > 0 && height > 0 && stride >= width * 4 {
-                let mut rgba = vec![0u8; width * height * 4];
-                for row in 0..height {
-                    let src = std::slice::from_raw_parts(base.add(row * stride), width * 4);
-                    let dst = &mut rgba[row * width * 4..(row + 1) * width * 4];
-                    // BGRA -> RGBA
-                    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                        d[0] = s[2];
-                        d[1] = s[1];
-                        d[2] = s[0];
-                        d[3] = s[3];
-                    }
-                }
-                slot.frame = Some(DecodedFrame::new(rgba, width as u32, height as u32));
+            let width = CVPixelBufferGetWidthOfPlane(image_buffer, 0);
+            let height = CVPixelBufferGetHeightOfPlane(image_buffer, 0);
+            let uv_w = width.div_ceil(2);
+            let uv_h = height.div_ceil(2);
+            let out = &mut *slot.out;
+            if width > 0
+                && height > 0
+                && copy_plane(image_buffer, 0, width, height, &mut out.y)
+                && copy_plane(image_buffer, 1, uv_w, uv_h, &mut out.u)
+                && copy_plane(image_buffer, 2, uv_w, uv_h, &mut out.v)
+            {
+                out.width = width;
+                out.height = height;
+                slot.produced = true;
+            } else {
+                slot.status = -3;
             }
             CVPixelBufferUnlockBaseAddress(image_buffer, K_CV_PIXEL_BUFFER_LOCK_READ_ONLY);
         }
@@ -341,6 +411,11 @@ mod videotoolbox {
     /// session invalid (GPU reset, sleep/wake).
     pub struct VideoToolboxDecoder {
         session: Option<Session>,
+        /// Parameter sets of the session BEFORE the current one — the ABAB
+        /// oscillation guard (see `decode_yuv420`).
+        previous_params: Option<(Vec<u8>, Vec<u8>)>,
+        /// Reusable frame for the RGBA path (`decode` = YUV decode + conversion).
+        scratch: Yuv420Frame,
     }
 
     // SAFETY: the raw VideoToolbox/CoreMedia references are used from one thread at a
@@ -350,7 +425,11 @@ mod videotoolbox {
 
     impl VideoToolboxDecoder {
         pub fn new() -> Self {
-            Self { session: None }
+            Self {
+                session: None,
+                previous_params: None,
+                scratch: Yuv420Frame::default(),
+            }
         }
 
         /// Build a decompression session for the given parameter sets.
@@ -375,9 +454,10 @@ mod videotoolbox {
                 )));
             }
 
-            // Ask for BGRA output so the media engine does the YUV->RGB conversion.
+            // Ask for full-range planar 4:2:0 output — see the constant's docs for
+            // why this is the one correct format (and the only one ever requested).
             // SAFETY: CF creation calls with valid arguments; ownership released below.
-            let pixel_format = K_CV_PIXEL_FORMAT_TYPE_32BGRA;
+            let pixel_format = K_CV_PIXEL_FORMAT_TYPE_420_PLANAR_FULL;
             let session = unsafe {
                 let num = CFNumberCreate(
                     ptr::null(),
@@ -426,9 +506,17 @@ mod videotoolbox {
             })
         }
 
-        /// Feed one AVCC access unit through the session, synchronously.
-        fn decode_with_session(session: &Session, avcc: &mut [u8]) -> DecoderResult<DecodedFrame> {
-            let mut slot = CallbackSlot::default();
+        /// Feed one AVCC access unit through the session, synchronously, filling `out`.
+        fn decode_with_session(
+            session: &Session,
+            avcc: &mut [u8],
+            out: &mut Yuv420Frame,
+        ) -> DecoderResult<()> {
+            let mut slot = CallbackSlot {
+                status: 0,
+                produced: false,
+                out: core::ptr::from_mut(out),
+            };
             // SAFETY: the block buffer borrows `avcc` (kCFAllocatorNull = no copy, no
             // free); the sample and block buffers are released before this function
             // returns, and the decode is synchronous, so the borrow outlives all use.
@@ -496,8 +584,10 @@ mod videotoolbox {
                     slot.status
                 )));
             }
-            slot.frame
-                .ok_or_else(|| DecoderError::msg("VideoToolbox produced no picture"))
+            if !slot.produced {
+                return Err(DecoderError::msg("VideoToolbox produced no picture"));
+            }
+            Ok(())
         }
 
         /// `true` when the VT status means "throw the session away and rebuild".
@@ -508,22 +598,55 @@ mod videotoolbox {
     }
 
     impl H264Decoder for VideoToolboxDecoder {
+        /// RGBA output, implemented on top of the planar path.
+        ///
+        /// One session, one output format: converting in software here (a few ms at
+        /// desktop sizes, measured cheaper than a second BGRA-configured session)
+        /// means an AVC420 frame arriving on a 444-negotiated connection can never
+        /// force a session rebuild — which would kill decode until the next IDR.
         fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
+            let mut out = core::mem::take(&mut self.scratch);
+            let result = self.decode_yuv420(data, &mut out);
+            let frame = result.map(|()| {
+                let rgba = ironrdp_graphics::avc444::yuv420_to_rgba(&out);
+                DecodedFrame::new(rgba, out.width as u32, out.height as u32)
+            });
+            self.scratch = out;
+            frame
+        }
+
+        fn decode_yuv420(&mut self, data: &[u8], out: &mut Yuv420Frame) -> DecoderResult<()> {
             let units = nal_units(data);
             let (sps, pps) = parameter_sets(&units);
 
-            // (Re)build the session when parameter sets first arrive or change.
+            // (Re)build the session when parameter sets first arrive or change —
+            // EXCEPT when the "new" pair equals the pair before the current one.
+            // That ABAB alternation is the signature of AVC444 sub-streams carrying
+            // divergent parameter sets, and rebuilding on it would flush the decoder
+            // twice per frame, destroying both reference chains until the next IDR
+            // (a stall, not a glitch). Refusing without a rebuild keeps the main
+            // stream alive; the caller skips and counts the frame.
             if let (Some(sps), Some(pps)) = (sps, pps) {
                 let stale = match &self.session {
                     Some(s) => s.sps != sps || s.pps != pps,
                     None => true,
                 };
                 if stale {
+                    if let Some((prev_sps, prev_pps)) = &self.previous_params
+                        && prev_sps == sps
+                        && prev_pps == pps
+                    {
+                        return Err(DecoderError::msg(
+                            "oscillating SPS/PPS (divergent AVC444 sub-streams); refusing to rebuild",
+                        ));
+                    }
                     debug!(
                         sps_len = sps.len(),
                         pps_len = pps.len(),
                         "creating VideoToolbox session from new parameter sets"
                     );
+                    self.previous_params =
+                        self.session.take().map(|s| (s.sps.clone(), s.pps.clone()));
                     self.session = Some(Self::create_session(sps, pps)?);
                 }
             }
@@ -548,18 +671,18 @@ mod videotoolbox {
                 return Err(DecoderError::msg("access unit carried no slice NALs"));
             }
 
-            match Self::decode_with_session(session, &mut avcc) {
-                Ok(frame) => Ok(frame),
+            match Self::decode_with_session(session, &mut avcc, out) {
+                Ok(()) => Ok(()),
                 Err(e) if Self::is_session_death(&e) => {
                     // GPU reset or sleep/wake killed the session. Rebuild from the same
-                    // parameter sets and retry once.
+                    // parameter sets and retry once (recovery completes at the next IDR).
                     warn!("VideoToolbox session died; rebuilding and retrying");
                     let (sps, pps) = {
                         let s = self.session.take().expect("session existed above");
                         (s.sps.clone(), s.pps.clone())
                     };
                     let rebuilt = Self::create_session(&sps, &pps)?;
-                    let result = Self::decode_with_session(&rebuilt, &mut avcc);
+                    let result = Self::decode_with_session(&rebuilt, &mut avcc, out);
                     self.session = Some(rebuilt);
                     result
                 }
@@ -567,9 +690,14 @@ mod videotoolbox {
             }
         }
 
+        fn supports_yuv420(&self) -> bool {
+            true
+        }
+
         fn reset(&mut self) {
             // New stream: the next access unit brings fresh SPS/PPS.
             self.session = None;
+            self.previous_params = None;
         }
     }
 }

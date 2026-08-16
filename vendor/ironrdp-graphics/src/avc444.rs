@@ -102,7 +102,13 @@ impl Yuv444Buffer {
         assert_eq!(y.len(), width * height);
         assert_eq!(u.len(), width * height);
         assert_eq!(v.len(), width * height);
-        Self { y, u, v, width, height }
+        Self {
+            y,
+            u,
+            v,
+            width,
+            height,
+        }
     }
 
     /// Clip a rect to this buffer, returning half-open pixel ranges.
@@ -130,7 +136,9 @@ impl Yuv444Buffer {
                 let src_right = right.min(main.width);
                 if left < src_right {
                     let dst = &mut self.y[dy * self.width + left..dy * self.width + src_right];
-                    dst.copy_from_slice(&main.y[dy * main.width + left..dy * main.width + src_right]);
+                    dst.copy_from_slice(
+                        &main.y[dy * main.width + left..dy * main.width + src_right],
+                    );
                 }
                 let sy = dy / 2;
                 for dx in left..src_right {
@@ -266,8 +274,18 @@ impl Yuv444Buffer {
                 let i = y * self.width + x;
                 let (mut u, mut v) = (self.u[i], self.v[i]);
                 if x % 2 == 0 && y % 2 == 0 && x + 1 < self.width && y + 1 < self.height {
-                    u = reconstruct_chroma(u, self.u[i + 1], self.u[i + self.width], self.u[i + self.width + 1]);
-                    v = reconstruct_chroma(v, self.v[i + 1], self.v[i + self.width], self.v[i + self.width + 1]);
+                    u = reconstruct_chroma(
+                        u,
+                        self.u[i + 1],
+                        self.u[i + self.width],
+                        self.u[i + self.width + 1],
+                    );
+                    v = reconstruct_chroma(
+                        v,
+                        self.v[i + 1],
+                        self.v[i + self.width],
+                        self.v[i + self.width + 1],
+                    );
                 }
                 out.extend_from_slice(&yuv_to_rgba(self.y[i], u, v));
             }
@@ -279,7 +297,11 @@ impl Yuv444Buffer {
 fn reconstruct_chroma(avg: u8, p01: u8, p10: u8, p11: u8) -> u8 {
     let recon = 4 * i32::from(avg) - i32::from(p01) - i32::from(p10) - i32::from(p11);
     let clipped = recon.clamp(0, 255) as u8;
-    if clipped.abs_diff(avg) < 30 { avg } else { clipped }
+    if clipped.abs_diff(avg) < 30 {
+        avg
+    } else {
+        clipped
+    }
 }
 
 /// Full-range BT.709 fixed-point YUV -> RGBA (FreeRDP `prim_internal.h`, verbatim
@@ -310,7 +332,11 @@ pub fn yuv420_to_rgba(frame: &Yuv420Frame) -> Vec<u8> {
     for y in 0..frame.height {
         for x in 0..frame.width {
             let s = (y / 2) * uv_row + x / 2;
-            out.extend_from_slice(&yuv_to_rgba(frame.y[y * frame.width + x], frame.u[s], frame.v[s]));
+            out.extend_from_slice(&yuv_to_rgba(
+                frame.y[y * frame.width + x],
+                frame.u[s],
+                frame.v[s],
+            ));
         }
     }
     out
@@ -335,9 +361,15 @@ mod tests {
         let uv_row = width.div_ceil(2);
         let uv_h = height.div_ceil(2);
         Yuv420Frame {
-            y: (0..width * height).map(|i| (i as u8).wrapping_add(tag)) .collect(),
-            u: (0..uv_row * uv_h).map(|i| (i as u8).wrapping_mul(3).wrapping_add(tag)).collect(),
-            v: (0..uv_row * uv_h).map(|i| (i as u8).wrapping_mul(7).wrapping_add(tag)).collect(),
+            y: (0..width * height)
+                .map(|i| (i as u8).wrapping_add(tag))
+                .collect(),
+            u: (0..uv_row * uv_h)
+                .map(|i| (i as u8).wrapping_mul(3).wrapping_add(tag))
+                .collect(),
+            v: (0..uv_row * uv_h)
+                .map(|i| (i as u8).wrapping_mul(7).wrapping_add(tag))
+                .collect(),
             width,
             height,
         }
@@ -386,7 +418,8 @@ mod tests {
         let mut buf = Yuv444Buffer::new(8, 32);
         buf.apply_chroma_v1(&aux, &[rect(0, 0, 8, 32)]);
 
-        for (dst_row, aux_u_row, aux_v_row) in [(1, 0, 8), (15, 7, 15), (17, 16, 24), (31, 23, 31)] {
+        for (dst_row, aux_u_row, aux_v_row) in [(1, 0, 8), (15, 7, 15), (17, 16, 24), (31, 23, 31)]
+        {
             for x in 0..8 {
                 assert_eq!(
                     buf.u[dst_row * 8 + x],

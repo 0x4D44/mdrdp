@@ -417,9 +417,16 @@ pub struct GraphicsPipelineClient {
     yuv_scratch: (Yuv420Frame, Yuv420Frame),
     /// RGBA conversion scratch, recycled across updates.
     rgba_scratch: Vec<u8>,
+    /// Opt-in dump of raw AVC444 container payloads (dir, files written so far).
+    /// **Session content** — only ever set by an operator who asked for it, and
+    /// capped at [`Self::AVC_CAPTURE_MAX`] files.
+    avc_capture: Option<(std::path::PathBuf, u32)>,
 }
 
 impl GraphicsPipelineClient {
+    /// Cap on captured AVC payload files, so a long session cannot fill a disk.
+    const AVC_CAPTURE_MAX: u32 = 32;
+
     /// Create a new `GraphicsPipelineClient`
     ///
     /// If `h264_decoder` is `None`, AVC420 frames are logged and skipped.
@@ -439,6 +446,31 @@ impl GraphicsPipelineClient {
             avc444_buffers: BTreeMap::new(),
             yuv_scratch: (Yuv420Frame::default(), Yuv420Frame::default()),
             rgba_scratch: Vec::new(),
+            avc_capture: None,
+        }
+    }
+
+    /// Dump the first [`Self::AVC_CAPTURE_MAX`] raw AVC444 container payloads into
+    /// `dir`, for offline replay of a decode anomaly. mdrdp patch. Writes **session
+    /// content**; opt-in by construction.
+    #[must_use]
+    pub fn capturing_avc_payloads_to(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.avc_capture = Some((dir.into(), 0));
+        self
+    }
+
+    /// Write one captured payload, silently stopping at the cap or on I/O trouble
+    /// (capture must never affect the session).
+    fn capture_avc_payload(&mut self, codec_id: Codec1Type, payload: &[u8]) {
+        let Some((dir, written)) = &mut self.avc_capture else {
+            return;
+        };
+        if *written >= Self::AVC_CAPTURE_MAX || std::fs::create_dir_all(&*dir).is_err() {
+            return;
+        }
+        let path = dir.join(format!("avc444-{written:03}-{codec_id:?}.bin"));
+        if std::fs::write(path, payload).is_ok() {
+            *written += 1;
         }
     }
 
@@ -839,6 +871,10 @@ impl GraphicsPipelineClient {
         };
         let (surf_w, surf_h) = (surface.width, surface.height);
 
+        self.capture_avc_payload(codec_id, bitmap_data);
+        let started = std::time::Instant::now();
+        let mut decode_us: u128 = 0;
+
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = match Avc444BitmapStream::decode(&mut cursor) {
             Ok(stream) => stream,
@@ -912,15 +948,19 @@ impl GraphicsPipelineClient {
                     self.handler.on_decode_failure(codec_id, "avc444 missing chroma stream");
                     return;
                 };
+                let decode_started = std::time::Instant::now();
                 if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.0) {
                     warn!(error = %e, "AVC444 luma stream decode failed; skipping this frame");
                     self.handler.on_decode_failure(codec_id, "avc444 luma decode failed");
                     return;
                 }
+                decode_us += decode_started.elapsed().as_micros();
+                let decode_started = std::time::Instant::now();
                 if let Err(e) = decoder.decode_yuv420(stream2.data, &mut self.yuv_scratch.1) {
                     warn!(error = %e, "AVC444 chroma stream decode failed; applying luma only");
                     chroma_skipped = Some("avc444 chroma decode failed");
                 }
+                decode_us += decode_started.elapsed().as_micros();
 
                 let main = &self.yuv_scratch.0;
                 let aux = &self.yuv_scratch.1;
@@ -960,11 +1000,13 @@ impl GraphicsPipelineClient {
                 }
             }
             Passes::LumaOnly => {
+                let decode_started = std::time::Instant::now();
                 if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.0) {
                     warn!(error = %e, "AVC444 luma stream decode failed; skipping this frame");
                     self.handler.on_decode_failure(codec_id, "avc444 luma decode failed");
                     return;
                 }
+                decode_us += decode_started.elapsed().as_micros();
                 let main = &self.yuv_scratch.0;
                 self.avc444_buffers
                     .entry(surface_id)
@@ -974,11 +1016,13 @@ impl GraphicsPipelineClient {
             }
             Passes::ChromaOnly => {
                 // LC=2: the chroma frame travels in stream1, with stream1's rects.
+                let decode_started = std::time::Instant::now();
                 if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.1) {
                     warn!(error = %e, "AVC444 chroma stream decode failed; skipping this frame");
                     self.handler.on_decode_failure(codec_id, "avc444 chroma decode failed");
                     return;
                 }
+                decode_us += decode_started.elapsed().as_micros();
                 let aux = &self.yuv_scratch.1;
                 if aux.width == aligned_w && aux.height == aligned_h {
                     let buffer = self
@@ -1031,6 +1075,17 @@ impl GraphicsPipelineClient {
             self.handler.on_bitmap_updated(&update);
             self.rgba_scratch = update.data;
         }
+
+        // Per-frame cost split, for the "why does it feel slow" question. Protocol
+        // metadata only, debug level (a per-frame line is too hot for info).
+        let total_us = started.elapsed().as_micros();
+        debug!(
+            codec = ?codec_id,
+            total_us,
+            decode_us,
+            combine_convert_us = total_us.saturating_sub(decode_us),
+            "AVC444 frame processed"
+        );
     }
 
     fn handle_uncompressed(&mut self, pdu: crate::pdu::WireToSurface1Pdu) {

@@ -36,6 +36,13 @@ Copyright the FreeRDP contributors.
   codec-oracles/refdec.c calls FreeRDP through its public headers and links the
       installed library. It embeds no FreeRDP source.
 
+  codec-oracles/avc444diff/shim.c likewise calls FreeRDP through its public
+      headers (freerdp/primitives.h, freerdp/codec/color.h) and links the
+      installed libfreerdp3 and libwinpr3. It embeds no FreeRDP source.
+      codec-oracles/avc444diff/tests/differential.rs contains one four-line
+      transcription of the fixed-point YUV-to-RGB matrix from
+      libfreerdp/primitives/prim_internal.h, used as a negative control.
+
   UNVERIFIED, and it matters: no FreeRDP source tree exists on the machine these
   were rescued on, so ref.c and probe.c could not be diffed against upstream
   progressive.c. They retain FreeRDP's own spellings (WINPR_RESTRICT, INT16, its

@@ -94,6 +94,54 @@ On this Mac `pkg-config` resolves to Homebrew's FreeRDP 3.27.1. Without those he
 build fails with `freerdp/codec/progressive.h: file not found` — that is a missing
 dependency, not a broken tool.
 
+### `avc444diff/` — AVC444 combination and RGB conversion, ours vs FreeRDP
+**Live.** The oracle for `vendor/ironrdp-graphics/src/avc444.rs`.
+
+Links the installed FreeRDP 3 through a small C shim (`shim.c`, compiled by
+`build.rs`) and drives its `YUV420CombineToYUV444` and `YUV444ToRGB_8u_P3AC4R`
+primitives on the same inputs as our `Yuv444Buffer`, then byte-compares all three
+444 planes — or the RGBA image — and reports the first differing position.
+
+```
+cd tools/codec-oracles/avc444diff && cargo test -- --nocapture
+```
+
+`--nocapture` is what prints the per-campaign case counts; without it you get only
+pass/fail. Verified 2026-08-16 against FreeRDP 3.27.1 (Homebrew, Apple Silicon):
+all six campaigns green, 120 case-runs each.
+
+Every case runs twice — against `primitives_get()` (the optimized table; on this
+Mac it reports `PRIM_FLAGS_HAVE_EXTCPU` and its two function pointers differ from
+the generic ones, so the SIMD code really is under test) and against
+`primitives_get_generic()`. A failure message names which table disagreed, so a
+FreeRDP SIMD bug is distinguishable from an algorithm difference.
+
+**The comparison is deliberately constrained, and that is the interesting part.**
+FreeRDP walks each region ROI-*relative* — `roi->left / 2` for luma chroma,
+`roi->left / 4` and `roi->top / 2` for v2, and a 16-row block counter that
+restarts at the ROI top edge for v1 — so it is only phase-correct on aligned
+rects, and its `halfWidth`/`halfHeight` round up past unaligned edges. Our
+implementation uses absolute frame coordinates and is a deliberate superset. The
+oracle therefore tests the overlap only: even rects for luma, full-frame for v1,
+4-aligned rects for v2, and full-frame even-sized images for RGB. Behaviour
+outside the overlap is pinned by `avc444.rs`'s own unit tests.
+
+Two further limits worth knowing. v1 geometries must have a height that is a
+multiple of 16: FreeRDP's `padHeigth = nHeight + 16 - nHeight % 16` walk reads
+auxiliary Y rows past the end of the plane otherwise (height 40 reads row 43 of a
+40-row plane), which we will not feed it. And `PIXEL_FORMAT_RGBA32` gets
+FreeRDP's `writePixelRGBX`, which never touches the alpha byte — the harness
+pre-fills the destination with 0xFF so the comparison against our constant-0xFF
+alpha means something.
+
+Four of the ten tests are negative controls: they plant a wrong auxiliary byte, a
+wrong v2 `nTotalWidth`, and a missing reconstruction filter, and require the
+comparison to *fail*. Without them a green run would prove only that the harness
+runs.
+
+Needs the FreeRDP 3 development headers, like `refdec.c`. `build.rs` asks
+`pkg-config` first and falls back to the Homebrew paths.
+
 ### `py/` — throwaway modelling scripts
 Python 3 standard library only. Four model decode maths, four score screenshots.
 

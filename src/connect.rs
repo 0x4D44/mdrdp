@@ -36,6 +36,9 @@ pub struct ConnectOptions {
     /// Open the graphics channel and observe what the server negotiates, for how long.
     /// `None` connects and disconnects without touching EGFX (P2 behaviour).
     pub observe_egfx: Option<Duration>,
+    /// Dump the first few raw AVC444 payloads here, for offline replay of a decode
+    /// anomaly. **Session content** — carried by the operator's `--capture` opt-in.
+    pub avc_capture: Option<PathBuf>,
 }
 
 /// One step of the connection sequence.
@@ -463,7 +466,10 @@ pub fn establish(
         // decode them — the vendored client drops AVC capability sets itself when the
         // decoder is absent, so the failure mode is a silent downgrade, not a crash.
         let decoder = crate::h264::hardware_decoder();
-        let graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(h, decoder);
+        let mut graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(h, decoder);
+        if let Some(dir) = &opts.avc_capture {
+            graphics = graphics.capturing_avc_payloads_to(dir);
+        }
         drdynvc.attach_dynamic_channel(graphics);
         has_dynamic_channel = true;
     }
