@@ -2,6 +2,12 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
+- [ ] 2026-08-16: video-class content is frame-starved without AVC: a playing YouTube
+  video reached the client at only ~2-4 fps (ClearCodec+Progressive, quench, LAN).
+  Windows will not stream video-rate motion to a client with AVC disabled. The vendored
+  ironrdp-egfx has a pluggable `H264Decoder` trait (AVC420 wired, AVC444 stubbed);
+  VideoToolbox on macOS is the natural backend. This is a feature-sized decision for
+  Arthur, not a tweak.
 - [ ] 2026-08-16: we advertise `SMALL_CACHE` in the EGFX capabilities (src/gfx.rs
   `capabilities()`), capping the server's bitmap cache at the small profile. quench's
   cache already serves ~43% of painted pixels; dropping the flag gives the server a
