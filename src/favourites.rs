@@ -253,7 +253,9 @@ impl Favourites {
     fn first_duplicate_name(&self) -> Option<String> {
         let mut seen: Vec<String> = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
-            let key = entry.name.to_lowercase();
+            // ASCII lowering, to match the uniqueness rule `add` enforces — Unicode
+            // lowering here would refuse to reload a file `add` legitimately created.
+            let key = entry.name.to_ascii_lowercase();
             if seen.contains(&key) {
                 return Some(entry.name.clone());
             }
@@ -317,9 +319,10 @@ impl Favourites {
         self.entries.iter()
     }
 
-    /// Look up a favourite by exact name (case-sensitive).
+    /// Look up a favourite by name, case-insensitively — names are unique
+    /// case-insensitively (see `add`), so this is never ambiguous.
     pub fn find(&self, name: &str) -> Option<&Favourite> {
-        self.entries.iter().find(|f| f.name == name)
+        self.position_ci(name).map(|i| &self.entries[i])
     }
 
     /// Record that `name` just launched a session, as Unix seconds now.
@@ -331,8 +334,8 @@ impl Favourites {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if let Some(f) = self.entries.iter_mut().find(|f| f.name == name) {
-            f.last_used = Some(now);
+        if let Some(idx) = self.position_ci(name) {
+            self.entries[idx].last_used = Some(now);
         }
     }
 
@@ -367,13 +370,11 @@ impl Favourites {
         Ok(())
     }
 
-    /// Remove the favourite named `name` (case-sensitive). Returns it, or an error if
+    /// Remove the favourite named `name` (case-insensitive). Returns it, or an error if
     /// no such favourite exists.
     pub fn remove(&mut self, name: &str) -> Result<Favourite, FavouritesError> {
         let idx = self
-            .entries
-            .iter()
-            .position(|f| f.name == name)
+            .position_ci(name)
             .ok_or_else(|| FavouritesError::NotFound(name.to_owned()))?;
         Ok(self.entries.remove(idx))
     }
@@ -404,9 +405,7 @@ impl Favourites {
 
     pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), FavouritesError> {
         let idx = self
-            .entries
-            .iter()
-            .position(|f| f.name == old_name)
+            .position_ci(old_name)
             .ok_or_else(|| FavouritesError::NotFound(old_name.to_owned()))?;
 
         if new_name.trim().is_empty() {
@@ -426,9 +425,7 @@ impl Favourites {
     /// if it is already first.
     pub fn move_up(&mut self, name: &str) -> Result<(), FavouritesError> {
         let idx = self
-            .entries
-            .iter()
-            .position(|f| f.name == name)
+            .position_ci(name)
             .ok_or_else(|| FavouritesError::NotFound(name.to_owned()))?;
         if idx > 0 {
             self.entries.swap(idx, idx - 1);
@@ -440,9 +437,7 @@ impl Favourites {
     /// it is already last.
     pub fn move_down(&mut self, name: &str) -> Result<(), FavouritesError> {
         let idx = self
-            .entries
-            .iter()
-            .position(|f| f.name == name)
+            .position_ci(name)
             .ok_or_else(|| FavouritesError::NotFound(name.to_owned()))?;
         if idx + 1 < self.entries.len() {
             self.entries.swap(idx, idx + 1);
@@ -450,12 +445,13 @@ impl Favourites {
         Ok(())
     }
 
-    /// Resolve a CLI argument to a favourite: an exact name match first, falling back to
+    /// Resolve a CLI argument to a favourite: a name match first, falling back to
     /// treating `s` as a bare hostname so `mdrdp <host>` keeps working for a host that
-    /// was never saved.
+    /// was never saved. Both comparisons are case-insensitive — names are unique that
+    /// way already, and DNS hostnames are case-insensitive by definition.
     pub fn resolve(&self, s: &str) -> Option<&Favourite> {
         self.find(s)
-            .or_else(|| self.entries.iter().find(|f| f.host == s))
+            .or_else(|| self.entries.iter().find(|f| f.host.eq_ignore_ascii_case(s)))
     }
 
     /// The `[defaults]` username, used when neither a flag nor a favourite names one.
@@ -781,6 +777,48 @@ mod tests {
             .expect("should resolve by exact name first");
         assert_eq!(resolved.name, "192.0.2.171");
         assert_eq!(resolved.host, "decoy-host");
+    }
+
+    /// Names are hostnames in practice, and hostnames are case-insensitive — so every
+    /// name-keyed operation must match regardless of case. Each favourite's fields are
+    /// distinct so a wrong match is detectable.
+    #[test]
+    fn name_lookups_are_case_insensitive() {
+        let mut favs = Favourites::default();
+        favs.add(Favourite::new("Temper", "temper.lan.example"))
+            .unwrap();
+        favs.add(Favourite::new("Quench", "quench.lan.example"))
+            .unwrap();
+
+        assert_eq!(favs.find("temper").unwrap().host, "temper.lan.example");
+        assert_eq!(favs.find("TEMPER").unwrap().host, "temper.lan.example");
+        assert_eq!(favs.resolve("tEmPeR").unwrap().host, "temper.lan.example");
+
+        favs.touch("temper");
+        assert!(favs.find("Temper").unwrap().last_used.is_some());
+
+        favs.move_down("TEMPER").expect("move_down by case variant");
+        let names: Vec<&str> = favs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["Quench", "Temper"]);
+        favs.move_up("temper").expect("move_up by case variant");
+
+        favs.rename("QUENCH", "Quench Lab")
+            .expect("rename by case variant");
+        assert_eq!(favs.find("quench lab").unwrap().host, "quench.lan.example");
+
+        let removed = favs.remove("temper").expect("remove by case variant");
+        assert_eq!(removed.host, "temper.lan.example");
+        assert_eq!(favs.len(), 1);
+    }
+
+    /// DNS hostnames are case-insensitive by definition, so the bare-hostname fallback
+    /// in `resolve` must match them that way too.
+    #[test]
+    fn resolve_matches_hostname_case_insensitively() {
+        let mut favs = Favourites::default();
+        favs.add(Favourite::new("Home Lab", "temper.lan.example"))
+            .unwrap();
+        assert_eq!(favs.resolve("TEMPER.lan.example").unwrap().name, "Home Lab");
     }
 
     #[test]
