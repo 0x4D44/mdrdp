@@ -326,12 +326,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // supports directly: each `pick` is an orthogonal run of the same event loop.
     if positional.is_none() {
         let config_path = config_path?;
-        let default_username = settings
-            .defaults
-            .username
-            .clone()
-            .or_else(|| favourites.default_username().map(str::to_owned));
-        mdrdp::shell::run(favourites, config_path, default_username)?;
+        let settings_path = mdrdp::settings::Settings::default_path().ok();
+        mdrdp::shell::run(favourites, config_path, settings, settings_path)?;
         return Ok(());
     }
 
@@ -406,6 +402,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => handler,
     };
     let gfx_stats = handler.stats();
+    let slot_stats = handler.slot_stats();
 
     // The backend goes into the connection (CLIPRDR is static, so it must be registered
     // before the channel join); the bridge stays here and is driven by the session loop.
@@ -576,11 +573,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let window = SessionWindow::new(event_loop, window_config, Arc::clone(&store), input_tx)?;
     let session_stats = StatsHandle::new();
+    let session_started = std::time::Instant::now();
+    let resource_start = process_snapshot();
     let window = window
         .with_stats(session_stats.clone())
         .with_commands(command_tx)
         .with_diagnostics(mdrdp::window::DiagnosticsUis {
-            cache: diagnostics_placeholder("Bitmap cache"),
+            cache: {
+                let stats = session_stats.clone();
+                let slots = slot_stats.clone();
+                let name = display_name.clone();
+                let detail = format!(
+                    "{}@{}:{} · pid {}",
+                    target.user,
+                    target.host,
+                    target.port,
+                    std::process::id()
+                );
+                let metrics_dir = settings.diagnostics.metrics_dir.clone();
+                let mut window_state = mdrdp::diag::cache::CacheWindow::new();
+                Box::new(move |ui: &mut egui::Ui| {
+                    let slots_snapshot = slots.snapshot();
+                    let cache = stats.snapshot().cache;
+                    let action = window_state.ui(
+                        ui,
+                        &slots_snapshot,
+                        &cache,
+                        Some((name.as_str(), detail.as_str())),
+                        std::time::Instant::now(),
+                    );
+                    if action == mdrdp::diag::cache::CacheAction::WriteMetrics {
+                        match write_cache_metrics(&metrics_dir, &slots_snapshot, &cache) {
+                            Ok(path) => eprintln!("metrics: written to {}", path.display()),
+                            Err(e) => eprintln!("metrics: could not write: {e}"),
+                        }
+                    }
+                })
+            },
             latency: {
                 let stats = session_stats.clone();
                 let name = display_name.clone();
@@ -607,11 +636,59 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 })
             },
-            channels: diagnostics_placeholder("Channels and codecs"),
+            channels: {
+                let stats = session_stats.clone();
+                let gfx = gfx_stats.clone();
+                let audio = audio_stats.clone();
+                let name = display_name.clone();
+                let detail = format!(
+                    "{}@{}:{} · pid {}",
+                    target.user,
+                    target.host,
+                    target.port,
+                    std::process::id()
+                );
+                let joined = established.report.joined_static_channels.clone();
+                let timeline: Vec<mdrdp::diag::channels::TimelineEntry> = {
+                    let mut entries = Vec::new();
+                    for stage in &established.report.stages {
+                        if stage.name == "post_tls_sequence" {
+                            // The connector's own legs break this blob down; insert
+                            // them first, then the blob total, mirroring the mock.
+                            for leg in &established.report.connector_stages {
+                                entries.push(mdrdp::diag::channels::TimelineEntry {
+                                    stage: leg.state.clone(),
+                                    elapsed_ms: leg.elapsed_ms,
+                                });
+                            }
+                        }
+                        entries.push(mdrdp::diag::channels::TimelineEntry {
+                            stage: stage.name.to_owned(),
+                            elapsed_ms: stage.elapsed_ms,
+                        });
+                    }
+                    entries
+                };
+                let total_ms = established.report.total_ms;
+                Box::new(move |ui: &mut egui::Ui| {
+                    let elapsed_ms =
+                        u64::try_from(session_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let snapshot = build_channels_snapshot(
+                        &stats.snapshot(),
+                        &gfx.snapshot(),
+                        &audio.snapshot(),
+                        &joined,
+                        timeline.clone(),
+                        total_ms,
+                        resource_start,
+                        elapsed_ms,
+                        (name.clone(), detail.clone()),
+                    );
+                    let _ = mdrdp::diag::channels::ui(ui, &snapshot);
+                })
+            },
         });
     let fullscreen_at_exit = window.fullscreen_state();
-    let session_started = std::time::Instant::now();
-    let resource_start = process_snapshot();
 
     // The session handle is shared with the window's exit hook so the disconnect happens
     // exactly once, whichever way the loop ends. On macOS a Cmd+Q makes AppKit call
@@ -888,24 +965,130 @@ fn expand_home(dir: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(dir)
 }
 
-/// Placeholder body for a diagnostics window whose real screen has not landed yet.
-fn diagnostics_placeholder(title: &'static str) -> Box<dyn FnMut(&mut egui::Ui)> {
-    Box::new(move |ui: &mut egui::Ui| {
-        use mdrdp::ui::theme;
-        ui.add_space(120.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .font(theme::sans_semibold(16.0))
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.label(
-                egui::RichText::new("Under construction on this branch.")
-                    .font(theme::sans(13.0))
-                    .color(theme::TEXT_MUTED),
-            );
-        });
-    })
+/// Assemble the channels-window snapshot from the live handles.
+#[allow(clippy::too_many_arguments)]
+fn build_channels_snapshot(
+    stats: &mdrdp::stats::SessionStats,
+    gfx: &mdrdp::gfx::GfxStats,
+    audio: &mdrdp::audio::AudioStats,
+    joined: &[String],
+    timeline: Vec<mdrdp::diag::channels::TimelineEntry>,
+    total_ms: f64,
+    resource_start: ProcessSnapshot,
+    elapsed_ms: u64,
+    session: (String, String),
+) -> mdrdp::diag::channels::ChannelsSnapshot {
+    use mdrdp::diag::channels::{
+        ChannelRow, ChannelState, ChannelsSnapshot, CodecBar, ProcessRows,
+    };
+    let is_joined = |name: &str| joined.iter().any(|c| c.eq_ignore_ascii_case(name));
+    let state_for = |name: &str, idle: bool| {
+        if !is_joined(name) {
+            ChannelState::NotRequested
+        } else if idle {
+            ChannelState::JoinedIdle
+        } else {
+            ChannelState::Joined
+        }
+    };
+    let audio_idle = audio.packets_received == 0;
+    let channels = vec![
+        ChannelRow {
+            name: "DRDYNVC",
+            description: "dynamic channel transport · carries EGFX and audio".to_owned(),
+            state: state_for("drdynvc", false),
+            counter: None,
+        },
+        ChannelRow {
+            name: "CLIPRDR",
+            description: "clipboard sharing".to_owned(),
+            state: state_for("cliprdr", false),
+            counter: None,
+        },
+        ChannelRow {
+            name: "RDPSND",
+            description: "audio output".to_owned(),
+            state: state_for("rdpsnd", audio_idle),
+            counter: is_joined("rdpsnd").then(|| format!("{} packets", audio.packets_received)),
+        },
+        ChannelRow {
+            name: "RDPDR",
+            description: "device redirection · attached so audio can open".to_owned(),
+            state: state_for("rdpdr", true),
+            counter: is_joined("rdpdr").then(|| "idle".to_owned()),
+        },
+        ChannelRow {
+            name: "AINPUT",
+            description: "not requested · also ECHO, RAIL".to_owned(),
+            state: ChannelState::NotRequested,
+            counter: None,
+        },
+    ];
+    let codecs: Vec<CodecBar> = gfx
+        .codec_ids_seen
+        .iter()
+        .map(|(name, updates)| CodecBar {
+            label: name.clone(),
+            updates: *updates,
+            painted_bytes: gfx.codec_bytes_painted.get(name).copied().unwrap_or(0),
+        })
+        .collect();
+    let resources = resource_metrics(resource_start, process_snapshot(), elapsed_ms);
+    let process = ProcessRows {
+        cpu_average_percent: resources.as_ref().and_then(|r| r.average_cpu_percent),
+        peak_resident_bytes: resources.as_ref().map(|r| r.peak_resident_bytes),
+        frames: stats.frames,
+        bytes_in: stats.bytes_in,
+    };
+    ChannelsSnapshot {
+        decode_errors: gfx.decode_errors,
+        undecoded_regions: gfx.undecoded_regions,
+        unhandled_pdus: gfx.unhandled_pdus,
+        channels,
+        codecs,
+        timeline,
+        total_to_first_frame_ms: Some(total_ms),
+        process,
+        session: Some(session),
+    }
+}
+
+/// Write a redacted per-slot cache report from the cache window's button.
+fn write_cache_metrics(
+    dir: &str,
+    slots: &mdrdp::stats::SlotStats,
+    cache: &mdrdp::stats::CacheStats,
+) -> Result<std::path::PathBuf, String> {
+    let dir = expand_home(dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("mdrdp-cache-{stamp}.json"));
+    let now = std::time::Instant::now();
+    let slot_rows: Vec<mdrdp::metrics::SlotMetrics> = slots
+        .iter()
+        .map(|s| mdrdp::metrics::SlotMetrics::from_slot(s, now))
+        .collect();
+    let payload = serde_json::json!({
+        "kind": "cache_snapshot",
+        "written_unix": stamp,
+        "aggregate": {
+            "hits": cache.hits,
+            "misses": cache.misses,
+            "evictions": cache.evictions,
+            "bytes_served": cache.bytes_served,
+            "bytes_from_wire": cache.bytes_from_wire,
+        },
+        "slots": slot_rows,
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&payload).expect("plain json"),
+    )
+    .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Reconcile a favourite with command-line flags. Flags always win.
