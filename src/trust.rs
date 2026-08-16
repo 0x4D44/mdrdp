@@ -104,7 +104,36 @@ pub enum TrustOutcome {
     Pinned,
     /// Not seen before; recorded now.
     PinnedOnFirstSight,
+    /// Not seen before; the user accepted this session only — nothing was stored,
+    /// so the next connection is a first sight again.
+    AcceptedOnce,
 }
+
+/// A first-sight certificate, presented for a decision.
+#[derive(Debug, Clone)]
+pub struct FirstSight {
+    /// `host:port`, as keyed in the store.
+    pub host: String,
+    pub fingerprint: Fingerprint,
+    /// Where a pin would be recorded — the dialog names the durable file it touches.
+    pub store_path: PathBuf,
+}
+
+/// What the user decided about a first-sight certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustDecision {
+    PinAndConnect,
+    ConnectOnce,
+    Reject,
+}
+
+/// Blocks the connecting thread until someone decides about a first sight.
+///
+/// The handoff's decision 6: the GUI fronts this with the TOFU dialog. With no prompt
+/// installed the verifier keeps the original CLI behaviour — pin on first sight —
+/// because a scripted `mdrdp <host>` has nobody to ask. A CHANGED certificate is
+/// refused outright either way; there is deliberately no prompt for that case.
+pub type TrustPrompt = Arc<dyn Fn(&FirstSight) -> TrustDecision + Send + Sync>;
 
 /// The `host:port → fingerprint` store, in ssh's format because it is well understood
 /// and readable in a text editor.
@@ -178,6 +207,17 @@ impl KnownHosts {
         self.entries.insert(host.to_owned(), fp);
     }
 
+    /// Every pin, in host order — what Settings ▸ Certificate trust lists.
+    pub fn pins(&self) -> impl Iterator<Item = (&str, Fingerprint)> {
+        self.entries.iter().map(|(host, fp)| (host.as_str(), *fp))
+    }
+
+    /// Drop a pin, returning whether one was there. The caller still has to
+    /// [`save`](Self::save) for the file itself to change.
+    pub fn forget(&mut self, host: &str) -> bool {
+        self.entries.remove(host).is_some()
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), TrustError> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
@@ -193,13 +233,22 @@ impl KnownHosts {
 }
 
 /// A rustls verifier that pins instead of chaining.
-#[derive(Debug)]
 pub struct TofuVerifier {
     host: String,
     store_path: PathBuf,
     store: Mutex<KnownHosts>,
     outcome: Mutex<Option<TrustOutcome>>,
     provider: Arc<CryptoProvider>,
+    prompt: Option<TrustPrompt>,
+}
+
+impl std::fmt::Debug for TofuVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TofuVerifier")
+            .field("host", &self.host)
+            .field("store_path", &self.store_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TofuVerifier {
@@ -215,7 +264,14 @@ impl TofuVerifier {
             store: Mutex::new(store),
             outcome: Mutex::new(None),
             provider,
+            prompt: None,
         }
+    }
+
+    /// Consult `prompt` on first sight instead of auto-pinning.
+    pub fn with_prompt(mut self, prompt: TrustPrompt) -> Self {
+        self.prompt = Some(prompt);
+        self
     }
 
     /// What the handshake decided, once it has run.
@@ -251,17 +307,39 @@ impl ServerCertVerifier for TofuVerifier {
                 self.store_path.display()
             ))),
             None => {
-                store.insert(&self.host, presented);
-                store.save(&self.store_path).map_err(|e| {
-                    // A pin we cannot persist would silently re-trust on every run.
-                    TlsError::General(format!(
-                        "could not record certificate pin for {}: {e}",
+                let decision = match &self.prompt {
+                    Some(prompt) => prompt(&FirstSight {
+                        host: self.host.clone(),
+                        fingerprint: presented,
+                        store_path: self.store_path.clone(),
+                    }),
+                    // No prompt installed: the original CLI behaviour, pin on sight.
+                    None => TrustDecision::PinAndConnect,
+                };
+                match decision {
+                    TrustDecision::PinAndConnect => {
+                        store.insert(&self.host, presented);
+                        store.save(&self.store_path).map_err(|e| {
+                            // A pin we cannot persist would silently re-trust every run.
+                            TlsError::General(format!(
+                                "could not record certificate pin for {}: {e}",
+                                self.host
+                            ))
+                        })?;
+                        *self.outcome.lock().expect("trust outcome mutex") =
+                            Some(TrustOutcome::PinnedOnFirstSight);
+                        Ok(ServerCertVerified::assertion())
+                    }
+                    TrustDecision::ConnectOnce => {
+                        *self.outcome.lock().expect("trust outcome mutex") =
+                            Some(TrustOutcome::AcceptedOnce);
+                        Ok(ServerCertVerified::assertion())
+                    }
+                    TrustDecision::Reject => Err(TlsError::General(format!(
+                        "first connection to {} rejected by the user",
                         self.host
-                    ))
-                })?;
-                *self.outcome.lock().expect("trust outcome mutex") =
-                    Some(TrustOutcome::PinnedOnFirstSight);
-                Ok(ServerCertVerified::assertion())
+                    ))),
+                }
             }
         }
     }
@@ -512,6 +590,73 @@ mod tests {
             reloaded.get("other:3389"),
             Some(Fingerprint::of_der(b"other-cert"))
         );
+    }
+
+    fn verifier_with_prompt(path: &Path, decision: TrustDecision) -> TofuVerifier {
+        verifier_at(path).with_prompt(Arc::new(move |_sight: &FirstSight| decision))
+    }
+
+    #[test]
+    fn connect_once_accepts_without_writing_a_pin() {
+        let path = tmpdir().join("known_hosts_once");
+        let _ = fs::remove_file(&path);
+        let verifier = verifier_with_prompt(&path, TrustDecision::ConnectOnce);
+        verify(&verifier, b"once-cert").expect("accepted for this session");
+        assert_eq!(verifier.outcome(), Some(TrustOutcome::AcceptedOnce));
+        let reloaded = KnownHosts::load(&path).expect("reload");
+        assert_eq!(reloaded.get("temper:3389"), None, "nothing may be stored");
+    }
+
+    #[test]
+    fn a_rejected_first_sight_fails_and_stores_nothing() {
+        let path = tmpdir().join("known_hosts_reject");
+        let _ = fs::remove_file(&path);
+        let verifier = verifier_with_prompt(&path, TrustDecision::Reject);
+        let err = verify(&verifier, b"reject-cert").expect_err("rejected");
+        assert!(err.to_string().contains("rejected by the user"), "{err}");
+        assert_eq!(verifier.outcome(), None);
+        assert_eq!(
+            KnownHosts::load(&path).expect("reload").get("temper:3389"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_prompted_pin_persists_and_reports_the_sight() {
+        let path = tmpdir().join("known_hosts_prompted_pin");
+        let _ = fs::remove_file(&path);
+        let seen: Arc<Mutex<Option<FirstSight>>> = Arc::new(Mutex::new(None));
+        let seen_in = Arc::clone(&seen);
+        let verifier = verifier_at(&path).with_prompt(Arc::new(move |sight: &FirstSight| {
+            *seen_in.lock().unwrap() = Some(sight.clone());
+            TrustDecision::PinAndConnect
+        }));
+        verify(&verifier, b"prompted-cert").expect("pinned");
+        assert_eq!(verifier.outcome(), Some(TrustOutcome::PinnedOnFirstSight));
+        let sight = seen.lock().unwrap().clone().expect("prompt was consulted");
+        assert_eq!(sight.host, "temper:3389");
+        assert_eq!(sight.fingerprint, Fingerprint::of_der(b"prompted-cert"));
+        assert_eq!(sight.store_path, path);
+        assert_eq!(
+            KnownHosts::load(&path).expect("reload").get("temper:3389"),
+            Some(Fingerprint::of_der(b"prompted-cert"))
+        );
+    }
+
+    #[test]
+    fn a_changed_certificate_never_consults_the_prompt() {
+        // No accept path for CHANGED, with or without a prompt installed.
+        let path = tmpdir().join("known_hosts_changed_prompt");
+        let _ = fs::remove_file(&path);
+        verify(&verifier_at(&path), b"original-cert").expect("first sight");
+        let called = Arc::new(Mutex::new(false));
+        let called_in = Arc::clone(&called);
+        let verifier = verifier_at(&path).with_prompt(Arc::new(move |_s: &FirstSight| {
+            *called_in.lock().unwrap() = true;
+            TrustDecision::PinAndConnect
+        }));
+        verify(&verifier, b"changed-cert").expect_err("CHANGED is refused");
+        assert!(!*called.lock().unwrap(), "the prompt must not be consulted");
     }
 
     #[test]

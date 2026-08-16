@@ -12,6 +12,7 @@
 //! dialog must name them.
 
 pub mod dialogs;
+pub mod settings_ui;
 pub mod widgets;
 pub mod wizard;
 
@@ -46,6 +47,8 @@ enum ChildEvent {
     },
     Connected,
     Failed(String),
+    /// The child hit a first-sight certificate and waits on our decision.
+    CertPrompt(dialogs::CertPromptInfo),
     /// The pipe closed without a terminal event: the child died mid-connect.
     Eof,
 }
@@ -57,10 +60,13 @@ struct ConnectFlow {
     port: u16,
     account: String,
     child: Option<Child>,
+    /// The child's stdin — the return path for a certificate decision.
+    child_stdin: Option<std::process::ChildStdin>,
     rx: std::sync::mpsc::Receiver<ChildEvent>,
     arrived: Vec<(String, u64, Option<String>)>,
     started: Instant,
     failure: Option<dialogs::ConnectFailure>,
+    cert_prompt: Option<dialogs::CertPromptInfo>,
 }
 
 /// Which modal sits over the list, if any. Placeholder variants fill in as their
@@ -147,17 +153,20 @@ impl LauncherApp {
             .clone()
             .unwrap_or_else(|| "(no account)".to_owned());
         match spawn_connect(&name, &[], ctx.clone()) {
-            Ok((child, rx)) => {
+            Ok((mut child, rx)) => {
+                let child_stdin = child.stdin.take();
                 self.connect_flow = Some(ConnectFlow {
                     name,
                     host,
                     port,
                     account,
+                    child_stdin,
                     child: Some(child),
                     rx,
                     arrived: Vec::new(),
                     started: Instant::now(),
                     failure: None,
+                    cert_prompt: None,
                 });
             }
             Err(e) => eprintln!("{e}"),
@@ -200,6 +209,7 @@ impl LauncherApp {
                         error,
                     });
                 }
+                ChildEvent::CertPrompt(info) => flow.cert_prompt = Some(info),
                 ChildEvent::Eof => {
                     if flow.failure.is_none() {
                         reap(flow.child.take());
@@ -213,6 +223,38 @@ impl LauncherApp {
                     }
                 }
             }
+        }
+
+        if flow.failure.is_none()
+            && let Some(info) = flow.cert_prompt.clone()
+        {
+            match dialogs::first_connection(ctx, &info) {
+                dialogs::CertPromptAction::None => {}
+                decision => {
+                    let word = match decision {
+                        dialogs::CertPromptAction::PinAndConnect => "pin",
+                        dialogs::CertPromptAction::ConnectOnce => "once",
+                        _ => "reject",
+                    };
+                    if let Some(stdin) = flow.child_stdin.as_mut() {
+                        use std::io::Write as _;
+                        let line = format!("{}\n", serde_json::json!({ "decision": word }));
+                        if stdin.write_all(line.as_bytes()).is_err() {
+                            eprintln!("could not answer the certificate prompt");
+                        }
+                        let _ = stdin.flush();
+                    }
+                    flow.cert_prompt = None;
+                    if decision == dialogs::CertPromptAction::Reject {
+                        // The child fails its connect and reports; the failure
+                        // dialog (or plain closure) follows from its own event.
+                        reap(flow.child.take());
+                        return;
+                    }
+                }
+            }
+            self.connect_flow = Some(flow);
+            return;
         }
 
         match &flow.failure {
@@ -231,6 +273,11 @@ impl LauncherApp {
                 }
                 self.connect_flow = Some(flow);
             }
+            Some(failure) if failure.kind == dialogs::FailureKind::CertificateChanged => {
+                if !dialogs::certificate_changed(ctx, failure) {
+                    self.connect_flow = Some(flow);
+                }
+            }
             Some(failure) => match dialogs::connect_failed(ctx, failure) {
                 dialogs::ConnectDialogAction::Retry => {
                     let index = self.favourites.iter().position(|f| f.name == flow.name);
@@ -239,17 +286,20 @@ impl LauncherApp {
                     }
                 }
                 dialogs::ConnectDialogAction::TryDefaultPort => {
-                    if let Ok((child, rx)) = spawn_connect(
+                    if let Ok((mut child, rx)) = spawn_connect(
                         &flow.name,
                         &["--port".to_owned(), "3389".to_owned()],
                         ctx.clone(),
                     ) {
+                        let child_stdin = child.stdin.take();
                         self.connect_flow = Some(ConnectFlow {
                             child: Some(child),
+                            child_stdin,
                             rx,
                             arrived: Vec::new(),
                             started: Instant::now(),
                             failure: None,
+                            cert_prompt: None,
                             port: 3389,
                             ..flow
                         });
@@ -629,7 +679,8 @@ impl LauncherApp {
                         extra.push(format!("{width}x{height}"));
                     }
                     match spawn_connect(&favourite.host, &extra, ctx.clone()) {
-                        Ok((child, rx)) => {
+                        Ok((mut child, rx)) => {
+                            let child_stdin = child.stdin.take();
                             self.connect_flow = Some(ConnectFlow {
                                 name: favourite.host.clone(),
                                 host: favourite.host.clone(),
@@ -638,11 +689,13 @@ impl LauncherApp {
                                     .username
                                     .clone()
                                     .unwrap_or_else(|| "(no account)".to_owned()),
+                                child_stdin,
                                 child: Some(child),
                                 rx,
                                 arrived: Vec::new(),
                                 started: Instant::now(),
                                 failure: None,
+                                cert_prompt: None,
                             });
                         }
                         Err(e) => eprintln!("{e}"),
@@ -787,6 +840,8 @@ fn spawn_connect(
         .arg("--stage-json")
         .args(extra_args)
         .stdout(std::process::Stdio::piped())
+        // Stdin is the certificate-decision return path; unused otherwise.
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not start a session for {name:?}: {e}"))?;
     let stdout = child.stdout.take().expect("stdout was requested piped");
@@ -809,6 +864,11 @@ fn spawn_connect(
                 Some("failed") => {
                     ChildEvent::Failed(v["error"].as_str().unwrap_or("unknown error").to_owned())
                 }
+                Some("cert_prompt") => ChildEvent::CertPrompt(dialogs::CertPromptInfo {
+                    host: v["host"].as_str().unwrap_or("?").to_owned(),
+                    fingerprint: v["fingerprint"].as_str().unwrap_or("").to_owned(),
+                    store_path: v["store_path"].as_str().unwrap_or("").to_owned(),
+                }),
                 _ => continue,
             };
             if tx.send(event).is_err() {

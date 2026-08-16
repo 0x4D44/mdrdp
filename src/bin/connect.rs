@@ -81,6 +81,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         observe_egfx: egfx,
         avc_capture: None,
         live_stages: None,
+        trust_prompt: None,
     };
 
     let report = connect(&opts, &secret)?;

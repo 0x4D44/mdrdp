@@ -30,6 +30,8 @@ pub enum FailureKind {
     SignInRejected,
     /// "Port refused" — ECONNREFUSED.
     PortRefused,
+    /// "Certificate CHANGED" — danger variant, deliberately without an accept path.
+    CertificateChanged,
     /// Anything else: generic failure dialog with the error verbatim.
     Other,
 }
@@ -49,6 +51,9 @@ pub struct ConnectFailure {
 /// substrings are the stable parts of our own `ConnectError` display forms.
 pub fn classify(error: &str) -> FailureKind {
     let lowered = error.to_lowercase();
+    if lowered.contains("has changed") {
+        return FailureKind::CertificateChanged;
+    }
     if lowered.contains("status_logon_failure")
         || lowered.contains("logon")
         || lowered.contains("credssp")
@@ -395,7 +400,12 @@ pub fn connect_failed(ctx: &egui::Context, failure: &ConnectFailure) -> ConnectD
             "failed at tcp_connect · ECONNREFUSED".to_owned(),
             "Try port 3389",
         ),
-        FailureKind::Other => ("Could not connect", String::new(), "Retry"),
+        // CHANGED gets its own danger dialog (certificate_changed); routing it here
+        // would invent an accept path the spec forbids. Render it as generic if it
+        // ever lands here by mistake.
+        FailureKind::CertificateChanged | FailureKind::Other => {
+            ("Could not connect", String::new(), "Retry")
+        }
     };
     let (_, action) = dialog(
         ctx,
@@ -480,6 +490,196 @@ fn host_line(failure: &ConnectFailure) -> String {
 #[allow(dead_code)]
 const _: Color32 = theme::SCRIM;
 
+/// A first-sight certificate, as the child reports it over the pipe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertPromptInfo {
+    /// `host:port`, as keyed in known_hosts.
+    pub host: String,
+    /// Bare hex SHA-256.
+    pub fingerprint: String,
+    /// The durable file a pin would touch — the footnote names it.
+    pub store_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertPromptAction {
+    None,
+    PinAndConnect,
+    ConnectOnce,
+    Reject,
+}
+
+/// `9f2c…b7` → `9f:2c:…:b7` display form, uppercase-free like ssh's.
+pub fn colon_fingerprint(hex: &str) -> String {
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| std::str::from_utf8(pair).unwrap_or("?"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// The First-connection (TOFU) dialog: fingerprint card, Pin and connect / Connect
+/// once, and the footnote naming the known_hosts file.
+pub fn first_connection(ctx: &egui::Context, info: &CertPromptInfo) -> CertPromptAction {
+    let (_, action) = dialog(
+        ctx,
+        "first-connection",
+        560.0,
+        false,
+        |ui| {
+            ui.label(
+                RichText::new(format!("First connection to {}", info.host))
+                    .font(theme::sans_semibold(16.0))
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new(
+                    "Nothing vouches for this certificate yet. Pinning it means a later                      change — a reinstalled host, or someone in the middle — stops the                      connection and asks.",
+                )
+                .font(theme::sans(13.0))
+                .color(theme::TEXT_SECONDARY),
+            );
+            Frame::new()
+                .fill(theme::BG_CHROME)
+                .stroke(Stroke::new(1.0, theme::LINE_HAIR))
+                .corner_radius(CornerRadius::same(theme::radius::CARD))
+                .inner_margin(Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.label(
+                        RichText::new("SHA-256 FINGERPRINT")
+                            .font(theme::mono(11.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                    ui.label(
+                        RichText::new(colon_fingerprint(&info.fingerprint))
+                            .font(theme::mono(12.0))
+                            .color(theme::TEXT_PRIMARY),
+                    );
+                });
+            ui.label(
+                RichText::new(format!("A pin is recorded in {}", info.store_path))
+                    .font(theme::mono(11.0))
+                    .color(theme::TEXT_DIM),
+            );
+            CertPromptAction::None
+        },
+        |ui| {
+            let mut action = CertPromptAction::None;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if widgets::primary_button(ui, "Pin and connect", 34.0).clicked() {
+                    action = CertPromptAction::PinAndConnect;
+                }
+                if widgets::secondary_button(ui, "Connect once", 34.0).clicked() {
+                    action = CertPromptAction::ConnectOnce;
+                }
+                if widgets::secondary_button(ui, "Cancel", 34.0).clicked() {
+                    action = CertPromptAction::Reject;
+                }
+            });
+            action
+        },
+    );
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return CertPromptAction::Reject;
+    }
+    action
+}
+
+/// Pull the pinned and presented fingerprints out of the CHANGED refusal text.
+///
+/// The message is ours (`trust.rs`), so the format is stable; parsing failure just
+/// means the dialog shows the raw error instead of the two-fingerprint card.
+pub fn changed_fingerprints(error: &str) -> Option<(String, String)> {
+    let pinned = error.split("pinned:").nth(1)?.split_whitespace().next()?;
+    let presented = error
+        .split("presented:")
+        .nth(1)?
+        .split_whitespace()
+        .next()?;
+    Some((pinned.to_owned(), presented.to_owned()))
+}
+
+/// The Certificate CHANGED dialog: danger variant, Close only — deliberately no
+/// accept path. The pin is forgotten in Settings ▸ Certificate trust, nowhere else.
+pub fn certificate_changed(ctx: &egui::Context, failure: &ConnectFailure) -> bool {
+    let fingerprints = changed_fingerprints(&failure.error);
+    let (_, close) = dialog(
+        ctx,
+        "certificate-changed",
+        560.0,
+        true,
+        |ui| {
+            ui.horizontal(|ui| {
+                danger_chip(ui);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("Certificate for {} has CHANGED", failure.host))
+                        .font(theme::sans_semibold(16.0))
+                        .color(theme::DANGER_TEXT),
+                );
+            });
+            ui.label(
+                RichText::new(
+                    "The host is presenting a different certificate from the one pinned.                      That is what a reinstalled host looks like — and also what an                      interception looks like. This connection will not proceed.",
+                )
+                .font(theme::sans(12.0))
+                .color(theme::DANGER_BODY),
+            );
+            match &fingerprints {
+                Some((pinned, presented)) => {
+                    Frame::new()
+                        .fill(theme::BG_CHROME)
+                        .stroke(Stroke::new(1.0, theme::LINE_HAIR))
+                        .corner_radius(CornerRadius::same(theme::radius::CARD))
+                        .inner_margin(Margin::symmetric(16, 12))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            for (label, value) in [("PINNED", pinned), ("PRESENTED", presented)] {
+                                ui.label(
+                                    RichText::new(label)
+                                        .font(theme::mono(11.0))
+                                        .color(theme::TEXT_DIM),
+                                );
+                                ui.label(
+                                    RichText::new(value.as_str())
+                                        .font(theme::mono(12.0))
+                                        .color(theme::TEXT_PRIMARY),
+                                );
+                            }
+                        });
+                }
+                None => {
+                    ui.label(
+                        RichText::new(&failure.error)
+                            .font(theme::mono(11.0))
+                            .color(theme::TEXT_MUTED),
+                    );
+                }
+            }
+            ui.label(
+                RichText::new(
+                    "If the change is legitimate, forget the pin in Settings ▸                      Certificate trust and connect again.",
+                )
+                .font(theme::sans(12.0))
+                .color(theme::TEXT_MUTED),
+            );
+            false
+        },
+        |ui| {
+            let mut close = false;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::primary_button(ui, "Close", 34.0).clicked() {
+                    close = true;
+                }
+            });
+            close
+        },
+    );
+    close || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +706,23 @@ mod tests {
             classify("the server closed the channel"),
             FailureKind::Other
         );
+    }
+
+    #[test]
+    fn a_changed_certificate_classifies_to_its_own_dialog() {
+        let error = "certificate for temper:3389 has CHANGED.\n  pinned:    sha256:aaaa\n  presented: sha256:bbbb\nRefusing to connect.";
+        assert_eq!(classify(error), FailureKind::CertificateChanged);
+        assert_eq!(
+            changed_fingerprints(error),
+            Some(("sha256:aaaa".to_owned(), "sha256:bbbb".to_owned()))
+        );
+        assert_eq!(changed_fingerprints("no fingerprints here"), None);
+    }
+
+    #[test]
+    fn fingerprints_display_in_colon_pairs() {
+        assert_eq!(colon_fingerprint("9f2cb7"), "9f:2c:b7");
+        assert_eq!(colon_fingerprint(""), "");
     }
 
     #[test]

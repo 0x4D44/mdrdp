@@ -43,6 +43,9 @@ pub struct ConnectOptions {
     /// `None` costs nothing. The receiver disappearing is not an error — progress
     /// display must never be able to fail a connect.
     pub live_stages: Option<std::sync::mpsc::Sender<LiveStage>>,
+    /// Consulted on a first-sight certificate, blocking the connect until a decision
+    /// arrives. `None` keeps the CLI's pin-on-first-sight behaviour.
+    pub trust_prompt: Option<crate::trust::TrustPrompt>,
 }
 
 /// One live progress event, streamed while connecting.
@@ -552,12 +555,16 @@ pub fn establish(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let store =
         KnownHosts::load(&opts.known_hosts).map_err(|e| ConnectError::Trust(e.to_string()))?;
-    let verifier = Arc::new(TofuVerifier::new(
+    let verifier = TofuVerifier::new(
         &target,
         opts.known_hosts.clone(),
         store,
         Arc::clone(&provider),
-    ));
+    );
+    let verifier = Arc::new(match &opts.trust_prompt {
+        Some(prompt) => verifier.with_prompt(prompt.clone()),
+        None => verifier,
+    });
 
     let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
@@ -603,6 +610,7 @@ pub fn establish(
     let trust = match verifier.outcome() {
         Some(TrustOutcome::Pinned) => "pinned (matched stored fingerprint)",
         Some(TrustOutcome::PinnedOnFirstSight) => "pinned on first sight (newly recorded)",
+        Some(TrustOutcome::AcceptedOnce) => "accepted once (not stored)",
         None => "unknown",
     };
     let tls_version = tls.conn.protocol_version().map(|v| format!("{v:?}"));

@@ -476,6 +476,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // dumps the first few AVC444 payloads for offline replay.
         avc_capture: capture.as_ref().map(std::path::PathBuf::from),
         live_stages,
+        // With --stage-json, a first-sight certificate is the launcher's question:
+        // emit a cert_prompt event and block on one decision line from stdin. EOF or
+        // garbage is a rejection — trust fails closed, never open.
+        trust_prompt: stage_json.then(|| {
+            std::sync::Arc::new(|sight: &mdrdp::trust::FirstSight| {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "cert_prompt",
+                        "host": sight.host,
+                        "fingerprint": sight.fingerprint.to_hex(),
+                        "store_path": sight.store_path.display().to_string(),
+                    })
+                );
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).is_err() {
+                    return mdrdp::trust::TrustDecision::Reject;
+                }
+                match serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v["decision"].as_str().map(str::to_owned))
+                    .as_deref()
+                {
+                    Some("pin") => mdrdp::trust::TrustDecision::PinAndConnect,
+                    Some("once") => mdrdp::trust::TrustDecision::ConnectOnce,
+                    _ => mdrdp::trust::TrustDecision::Reject,
+                }
+            }) as mdrdp::trust::TrustPrompt
+        }),
     };
 
     eprintln!("connecting to {}:{} …", target.host, target.port);
