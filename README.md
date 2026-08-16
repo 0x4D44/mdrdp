@@ -41,6 +41,9 @@ users can inspect or edit it at:
 - Windows: `%APPDATA%\mdrdp\favourites.toml`
 
 ```toml
+[defaults]
+username = "YOUR-ACCOUNT"
+
 [[favourite]]
 name = "Temper"
 host = "temper"
@@ -55,6 +58,11 @@ height = 1080
 
 `mode = "fullscreen"` opens a real borderless fullscreen window. The remote resolution
 remains fixed at 1920x1080 unless an explicit size is chosen.
+
+The `[defaults]` username is used by `mdrdp <host>` when the host has no saved favourite
+and no `--user` flag was given — so a one-off connection to a new machine needs nothing
+but the hostname. Precedence: `--user` flag, then the favourite's `username`, then the
+default.
 
 **3. Command-line alternatives.**
 

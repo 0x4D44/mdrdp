@@ -58,7 +58,8 @@ fn usage() -> &'static str {
      --screenshot <file>    write the final frame to a BMP (session pixels on disk)\n  \
      --metrics-json <file>  write a redacted session metrics report as JSON\n  \
      --capture-failures DIR dump undecodable tiles for offline debugging\n\n\
-     Flags override whatever the chosen favourite specifies."
+     Flags override whatever the chosen favourite specifies. A [defaults] username in\n\
+     favourites.toml is used when neither a flag nor a favourite names an account."
 }
 
 /// The size a session gets when nothing asks for a specific one.
@@ -268,7 +269,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let positional = positional.expect("the launcher path returned above");
     let chosen = favourites.resolve(&positional).cloned();
-    let target = reconcile(Some(positional), chosen, user, port, domain, size)?;
+    let default_user = favourites.default_username().map(str::to_owned);
+    let target = reconcile(Some(positional), chosen, user, default_user, port, domain, size)?;
 
     // Built before connecting so a headless machine fails here, with a clear message,
     // rather than after a connection has been established and a logon spent.
@@ -616,10 +618,15 @@ fn spawn_session(name: &str) -> Result<(), String> {
 /// Pulled out of `run` because this precedence is the one piece of the argument handling
 /// that can be silently wrong — connecting as the wrong account, or to the favourite's
 /// host when one was typed explicitly — and it is worth a test.
+///
+/// The account precedence is flag > favourite > `[defaults]` username: an explicit flag
+/// is the user speaking now, a favourite is what they saved for this host, and the
+/// default is what they use everywhere else.
 fn reconcile(
     positional: Option<String>,
     chosen: Option<Favourite>,
     user: Option<String>,
+    default_user: Option<String>,
     port: Option<u16>,
     domain: Option<String>,
     size: Option<(u16, u16)>,
@@ -633,9 +640,11 @@ fn reconcile(
 
     let user = user
         .or_else(|| chosen.as_ref().and_then(|f| f.username.clone()))
+        .or(default_user)
         .ok_or_else(|| {
             format!(
-                "no account for {host}: pass --user <account>, or set one on the favourite\n{}",
+                "no account for {host}: pass --user <account>, set one on the favourite, \
+                 or add a [defaults] username to favourites.toml\n{}",
                 usage()
             )
         })?;
@@ -732,6 +741,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -751,6 +761,7 @@ mod tests {
             Some("Temper".into()),
             Some(temper()),
             Some("flag-user".into()),
+            None,
             Some(3389),
             Some("FLAG".into()),
             Some((800, 600)),
@@ -776,6 +787,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(t.host, "192.0.2.50");
@@ -787,8 +799,54 @@ mod tests {
 
     #[test]
     fn a_host_with_no_account_anywhere_is_an_error_not_a_guess() {
-        let err = reconcile(Some("box".into()), None, None, None, None, None).unwrap_err();
+        let err = reconcile(Some("box".into()), None, None, None, None, None, None).unwrap_err();
         assert!(err.contains("no account for box"), "got: {err}");
+    }
+
+    #[test]
+    fn the_default_username_covers_a_bare_host() {
+        let t = reconcile(
+            Some("box".into()),
+            None,
+            None,
+            Some("default-user".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.user, "default-user");
+        assert_eq!(
+            t.keychain_account, "default-user",
+            "the default account also names the keychain entry"
+        );
+    }
+
+    #[test]
+    fn a_favourite_account_beats_the_default_and_a_flag_beats_both() {
+        let with_favourite = reconcile(
+            Some("Temper".into()),
+            Some(temper()),
+            None,
+            Some("default-user".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(with_favourite.user, "saved-user");
+
+        let with_flag = reconcile(
+            Some("Temper".into()),
+            Some(temper()),
+            Some("flag-user".into()),
+            Some("default-user".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(with_flag.user, "flag-user");
     }
 
     #[test]
@@ -802,7 +860,7 @@ mod tests {
             keychain_account: Some("MicrosoftAccount\\user@example.com".into()),
             ..Favourite::new("Temper", "temper")
         };
-        let t = reconcile(Some("Temper".into()), Some(f), None, None, None, None).unwrap();
+        let t = reconcile(Some("Temper".into()), Some(f), None, None, None, None, None).unwrap();
         assert_eq!(t.user, "user@example.com", "what we log on as");
         assert_eq!(
             t.keychain_account, "MicrosoftAccount\\user@example.com",
@@ -817,13 +875,13 @@ mod tests {
             keychain_account: None,
             ..Favourite::new("Plain", "host")
         };
-        let t = reconcile(Some("Plain".into()), Some(f), None, None, None, None).unwrap();
+        let t = reconcile(Some("Plain".into()), Some(f), None, None, None, None, None).unwrap();
         assert_eq!(t.keychain_account, t.user, "one name unless told otherwise");
     }
 
     #[test]
     fn nothing_at_all_is_a_usage_error() {
-        assert!(reconcile(None, None, None, None, None, None).is_err());
+        assert!(reconcile(None, None, None, None, None, None, None).is_err());
     }
 
     #[test]
@@ -833,7 +891,7 @@ mod tests {
             window_size: WindowSize::Fullscreen,
             ..Favourite::new("FS", "fs.local")
         };
-        let t = reconcile(Some("FS".into()), Some(f), None, None, None, None).unwrap();
+        let t = reconcile(Some("FS".into()), Some(f), None, None, None, None, None).unwrap();
         assert_eq!(
             t.size, DEFAULT_SIZE,
             "fullscreen cannot be resolved to pixels before a window exists"
@@ -854,6 +912,7 @@ mod tests {
         let t = reconcile(
             Some("Fullscreen".into()),
             Some(f),
+            None,
             None,
             None,
             None,

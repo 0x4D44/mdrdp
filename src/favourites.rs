@@ -146,10 +146,29 @@ impl From<io::Error> for FavouritesError {
     }
 }
 
+/// Settings that apply when neither a flag nor a favourite supplies a value.
+///
+/// Lives in `favourites.toml` as a `[defaults]` table so there is exactly one
+/// configuration file to know about:
+///
+/// ```toml
+/// [defaults]
+/// username = "someone@example.com"
+/// ```
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Defaults {
+    /// Account to log on with when `mdrdp <host>` names a host that has no saved
+    /// favourite and no `--user` flag was given. Never a password — see the module note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+}
+
 /// On-disk shape. A bare `Vec<Favourite>` at the TOML top level does not round-trip
 /// through the `toml` crate the way a named array-of-tables does, so this wraps it.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FavouritesFile {
+    #[serde(default)]
+    defaults: Defaults,
     #[serde(default)]
     favourite: Vec<Favourite>,
 }
@@ -158,6 +177,7 @@ struct FavouritesFile {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Favourites {
     entries: Vec<Favourite>,
+    defaults: Defaults,
 }
 
 impl Favourites {
@@ -210,6 +230,7 @@ impl Favourites {
             })?;
         let loaded = Favourites {
             entries: file.favourite,
+            defaults: file.defaults,
         };
         // `add`/`rename` enforce unique names, but a hand-edited file bypasses both, and
         // everything downstream identifies a favourite BY NAME — the launcher returns a
@@ -247,6 +268,7 @@ impl Favourites {
         fs::create_dir_all(dir)?;
 
         let file = FavouritesFile {
+            defaults: self.defaults.clone(),
             favourite: self.entries.clone(),
         };
         let text = toml::to_string_pretty(&file)
@@ -395,6 +417,11 @@ impl Favourites {
         self.find(s)
             .or_else(|| self.entries.iter().find(|f| f.host == s))
     }
+
+    /// The `[defaults]` username, used when neither a flag nor a favourite names one.
+    pub fn default_username(&self) -> Option<&str> {
+        self.defaults.username.as_deref()
+    }
 }
 
 /// A small per-call nonce so two saves racing in the same millisecond (unlikely, but
@@ -483,6 +510,38 @@ mod tests {
                 height: 1080
             }
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_defaults_username_parses_and_survives_a_round_trip() {
+        let dir = tmpdir();
+        let path = dir.join("favourites.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nusername = \"everywhere@example.com\"\n\n\
+             [[favourite]]\nname = \"Temper\"\nhost = \"temper\"\n",
+        )
+        .unwrap();
+
+        let loaded = Favourites::load_from(&path).expect("defaults table must parse");
+        assert_eq!(loaded.default_username(), Some("everywhere@example.com"));
+
+        // A save driven by a favourites edit must not drop the defaults table.
+        loaded.save_to(&path).expect("save");
+        let reloaded = Favourites::load_from(&path).expect("reload");
+        assert_eq!(reloaded.default_username(), Some("everywhere@example.com"));
+        assert_eq!(reloaded.len(), 1);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_file_without_a_defaults_table_still_loads_with_no_default() {
+        let dir = tmpdir();
+        let path = dir.join("favourites.toml");
+        std::fs::write(&path, "[[favourite]]\nname = \"A\"\nhost = \"a\"\n").unwrap();
+        let loaded = Favourites::load_from(&path).expect("load");
+        assert_eq!(loaded.default_username(), None);
         cleanup(&dir);
     }
 
