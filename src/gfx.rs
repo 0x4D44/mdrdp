@@ -544,6 +544,15 @@ impl GraphicsPipelineHandler for GfxHandler {
         //
         // ironrdp-egfx 0.3 clears its private surface metadata, but this handler's store is
         // the authoritative pixel state for mdrdp and must follow the wire specification.
+        //
+        // CODEC state is the opposite case: the server resets its encoders at this
+        // boundary, so the decoders must restart with it — FreeRDP's gdi_ResetGraphics
+        // calls freerdp_client_codecs_reset at exactly this point. Carrying the
+        // ClearCodec V-bar/glyph caches across a reset replays strips of the OLD
+        // resolution's pixels wherever the restarted encoder signals a cache hit, which
+        // is how a fullscreen resolution change left mis-scaled window fragments behind.
+        self.decoder = ClearCodecDecoder::new();
+        self.progressive.reset();
         self.stats
             .note(|s| s.reset_graphics = Some((width, height)));
     }
@@ -559,6 +568,11 @@ impl GraphicsPipelineHandler for GfxHandler {
     fn on_surface_deleted(&mut self, surface_id: u16) {
         self.live_surfaces.remove(&surface_id);
         self.with_store(|store| store.delete(surface_id));
+        // Progressive tile state is keyed by surface id (see apply_wire_to_surface2), so
+        // it dies with the surface — FreeRDP's gdi_DeleteSurface calls
+        // progressive_delete_surface_context the same way. A recreated surface with the
+        // same id must start from empty tile state, not refine the old surface's pixels.
+        self.progressive.delete_context(u32::from(surface_id));
         self.stats
             .note(|s| s.surfaces_deleted = s.surfaces_deleted.saturating_add(1));
     }
@@ -1740,5 +1754,98 @@ mod tests {
         handler.stats.note(|s| s.frames_completed += 1);
         assert_eq!(before.frames_completed, 0, "snapshot must not alias");
         assert_eq!(handle.snapshot().frames_completed, 1);
+    }
+
+    /// A minimal valid RFX Progressive stream (SYNC + CONTEXT + empty frame) that
+    /// establishes one codec context in the decoder without painting anything.
+    fn minimal_progressive_stream() -> Vec<u8> {
+        use ironrdp::pdu::codecs::rfx::RfxRectangle;
+        use ironrdp::pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu,
+            ProgressiveFrameEndPdu, ProgressiveRegion, ProgressiveSyncPdu,
+            encode_progressive_stream,
+        };
+        let region = ProgressiveRegion {
+            tile_size: 0x40,
+            rects: vec![RfxRectangle {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            }],
+            quant_vals: vec![],
+            quant_prog_vals: vec![],
+            flags: 0,
+            tiles: vec![],
+        };
+        encode_progressive_stream(&[
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 0x0040,
+                flags: 0,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(region),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ])
+        .expect("encode progressive stream")
+    }
+
+    fn decode_progressive_into(handler: &mut GfxHandler, surface_id: u16) {
+        let pdu = ironrdp_egfx::pdu::WireToSurface2Pdu {
+            surface_id,
+            codec_context_id: 0,
+            codec_id: ironrdp_egfx::pdu::Codec2Type::RemoteFxProgressive,
+            pixel_format: ironrdp_egfx::pdu::PixelFormat::XRgb,
+            bitmap_data: minimal_progressive_stream(),
+        };
+        handler.on_wire_to_surface2(&pdu);
+        assert_eq!(
+            handler.stats().snapshot().undecoded_regions,
+            0,
+            "the fixture stream must decode, or the test observes nothing"
+        );
+    }
+
+    /// Progressive tile state is keyed by surface id, so a deleted surface must take its
+    /// state with it — a recreated surface with the same id would otherwise refine the
+    /// OLD surface's pixels into the new one. FreeRDP's gdi_DeleteSurface does the same
+    /// via progressive_delete_surface_context.
+    #[test]
+    fn deleting_a_surface_drops_its_progressive_tile_state() {
+        let mut handler = GfxHandler::new(store());
+        handler.on_surface_created(&egfx_surface(3, 64, 64));
+        decode_progressive_into(&mut handler, 3);
+        assert_eq!(handler.progressive.context_count(), 1);
+
+        handler.on_surface_deleted(3);
+        assert_eq!(
+            handler.progressive.context_count(),
+            0,
+            "the surface's tile state must die with the surface"
+        );
+    }
+
+    /// ResetGraphics is where the server resets its encoders (FreeRDP resets its codec
+    /// contexts there too), so decoder state must restart — while surfaces and the
+    /// bitmap cache persist, which `reset_graphics_preserves_surfaces_and_cache_entries`
+    /// pins separately.
+    #[test]
+    fn reset_graphics_discards_progressive_codec_state() {
+        let mut handler = GfxHandler::new(store());
+        handler.on_surface_created(&egfx_surface(4, 64, 64));
+        decode_progressive_into(&mut handler, 4);
+        assert_eq!(handler.progressive.context_count(), 1);
+
+        handler.on_reset_graphics(1920, 1080);
+        assert_eq!(
+            handler.progressive.context_count(),
+            0,
+            "a reset must not carry codec state into the new resolution"
+        );
     }
 }

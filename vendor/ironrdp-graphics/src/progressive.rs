@@ -1358,6 +1358,14 @@ impl ProgressiveDecoder {
     pub fn reset(&mut self) {
         self.contexts.clear();
     }
+
+    /// How many codec contexts currently hold tile state.
+    ///
+    /// mdrdp patch: exposed so the client's tests can prove that a surface delete or a
+    /// graphics reset actually discards the state — the contexts themselves are private.
+    pub fn context_count(&self) -> usize {
+        self.contexts.len()
+    }
 }
 
 #[expect(
