@@ -928,6 +928,15 @@ impl SessionApp {
                     window.request_redraw();
                 }
             }
+            session_menu::COPY_AVC444 => {
+                // Local copy only — the clipboard channel then carries it into the
+                // session for pasting into a PowerShell window on the host.
+                let copied = arboard::Clipboard::new()
+                    .and_then(|mut c| c.set_text(crate::hostscripts::ENABLE_AVC444));
+                if let Err(e) = copied {
+                    eprintln!("could not copy the AVC444 script: {e}");
+                }
+            }
             session_menu::FULLSCREEN => self.set_fullscreen_mode(!self.fullscreen),
             session_menu::DISCONNECT => event_loop.exit(),
             _ => {}
@@ -1554,6 +1563,7 @@ mod session_menu {
     use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 
     pub const DISCONNECT: &str = "session.disconnect";
+    pub const COPY_AVC444: &str = "session.copy_avc444_script";
     pub const FULLSCREEN: &str = "view.fullscreen";
     pub const DIAG_CACHE: &str = "diag.cache";
     pub const DIAG_LATENCY: &str = "diag.latency";
@@ -1576,7 +1586,11 @@ mod session_menu {
         }
 
         let session = Submenu::new("Session", true);
-        let _ = session.append_items(&[&MenuItem::with_id(DISCONNECT, "Disconnect", true, None)]);
+        let _ = session.append_items(&[
+            &MenuItem::with_id(COPY_AVC444, "Copy AVC444 enable script", true, None),
+            &PredefinedMenuItem::separator(),
+            &MenuItem::with_id(DISCONNECT, "Disconnect", true, None),
+        ]);
         let _ = menu.append(&session);
 
         let view = Submenu::new("View", true);

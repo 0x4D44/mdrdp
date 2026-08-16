@@ -516,6 +516,9 @@ impl LauncherApp {
                         ctx.copy_text(format!("mdrdp {quoted}"));
                     }
                 }
+                Some(menus::MenuAction::CopyAvc444Script) => {
+                    ctx.copy_text(crate::hostscripts::ENABLE_AVC444.to_owned());
+                }
                 Some(menus::MenuAction::CloseWindow) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1258,6 +1261,7 @@ mod menus {
         Duplicate,
         Remove,
         CopyCommandLine,
+        CopyAvc444Script,
         CloseWindow,
     }
 
@@ -1324,6 +1328,7 @@ mod menus {
             let duplicate = item("Duplicate", MenuAction::Duplicate);
             let remove = item("Remove…", MenuAction::Remove);
             let copy_cli = item("Copy command line", MenuAction::CopyCommandLine);
+            let copy_avc444 = item("Copy AVC444 enable script", MenuAction::CopyAvc444Script);
             let _ = connection.append_items(&[
                 &connect,
                 &edit,
@@ -1331,6 +1336,7 @@ mod menus {
                 &remove,
                 &PredefinedMenuItem::separator(),
                 &copy_cli,
+                &copy_avc444,
             ]);
             let _ = menu.append(&connection);
 
