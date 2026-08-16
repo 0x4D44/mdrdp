@@ -1,3 +1,4 @@
+- An AVC server DIES rather than falls back when asked for a resolution past H.264's 4096x2304 ceiling; clamp requests (`session::clamp_to_encodable`).
 - A re-entered run_app_on_demand loop parks until an event arrives; prime it with one proxy user event (`ui::end_dialog::show`).
 - winit fires Resumed once per process, not per on-demand cycle; late windows go in new_events/about_to_wait (`ui::end_dialog`).
 - A closed window's queued Destroyed can land in the NEXT on-demand cycle; match window ids before acting (`ui::end_dialog`).
