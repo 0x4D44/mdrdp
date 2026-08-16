@@ -277,11 +277,12 @@ pub struct AudioStats {
     /// Samples dropped because the ring buffer was full when new audio arrived. Each drop
     /// removed the OLDEST sample, never the newest — see [`AudioRing`].
     pub overruns: u64,
-    /// Device-callback invocations that needed at least one sample the ring buffer did
-    /// not have, and were filled with silence instead — counted only from the moment real
-    /// audio has flowed at least once. Silence before the first sample ever arrives (the
-    /// device opens and starts pulling before the RDP session even exists) is expected,
-    /// not a glitch, and is not counted.
+    /// Dry-spell *episodes*: times the ring ran out of samples mid-stream and playback
+    /// fell to silence, counted once per episode however many device pulls the silence
+    /// spans. Counted only from the moment real audio has flowed at least once — silence
+    /// before the first sample ever arrives (the device opens and starts pulling before
+    /// the RDP session even exists) is expected, not a glitch. One episode is one
+    /// audible gap, so this number is directly comparable to what the user heard.
     pub underruns: u64,
     /// Audio-device failures observed (open failure, runtime device error). The session
     /// keeps running without audio when this is non-zero; see [`AudioPlayback`].
@@ -335,14 +336,16 @@ impl AudioStatsHandle {
 
 /// How long the playback ring buffer is allowed to hold, in wall-clock time.
 ///
-/// 200ms. Long enough to absorb scheduling jitter on the channel-processing thread (a
-/// decode stall elsewhere in the session, a scheduler hiccup) without every such hiccup
-/// becoming an audible gap; short enough that it does not become a perceptible extra
-/// round-trip on top of the network latency this client already has. This is a queueing
-/// buffer for smoothing delivery, not a jitter-buffer trying to reconstruct timing — RDPSND
-/// carries no per-sample timestamp finer than the block, so there is nothing more precise
-/// to target.
-pub const RING_BUFFER_MS: u64 = 200;
+/// 400ms of *capacity*, not of latency: the ring only ever holds what the server has sent
+/// ahead of playback, so steady-state depth — and therefore latency — is the server's
+/// actual lead (Windows targets roughly 150-250ms), whatever the capacity. Capacity only
+/// matters when a burst lands, and there the measurement decides: a 120s YouTube session
+/// through a 200ms ring dropped ~20ms of audio across the bursts (MDR-BUG-FLUX-00001),
+/// meaning the bursts marginally exceed 200ms. Doubling the headroom absorbs them without
+/// adding a millisecond to the quiet-path latency. This is a queueing buffer for smoothing
+/// delivery, not a jitter-buffer trying to reconstruct timing — RDPSND carries no
+/// per-sample timestamp finer than the block, so there is nothing more precise to target.
+pub const RING_BUFFER_MS: u64 = 400;
 
 struct RingBuf {
     samples: VecDeque<f32>,
@@ -351,6 +354,12 @@ struct RingBuf {
     /// Distinguishes "audio has never arrived yet" from "audio arrived and then the ring
     /// ran dry" — only the latter is a real underrun. See [`pop_into`](Self::pop_into).
     has_flowed: bool,
+    /// Whether the consumer is currently inside a dry spell. An underrun is counted once
+    /// per *episode* — the transition into silence — not once per callback pull: the
+    /// device pulls ~100 times a second, so per-pull counting turned every quiet stretch
+    /// (a paused video, the stream simply ending) into thousands of "underruns" and made
+    /// the counter useless for telling an audible mid-stream gap from ordinary silence.
+    in_gap: bool,
 }
 
 impl RingBuf {
@@ -362,6 +371,7 @@ impl RingBuf {
             samples: VecDeque::with_capacity(capacity),
             capacity,
             has_flowed: false,
+            in_gap: false,
         }
     }
 
@@ -374,6 +384,8 @@ impl RingBuf {
     fn push(&mut self, incoming: &[f32]) -> u64 {
         if !incoming.is_empty() {
             self.has_flowed = true;
+            // Fresh audio ends any dry spell; the next one is a new episode.
+            self.in_gap = false;
         }
         let mut dropped = 0u64;
         for &s in incoming {
@@ -388,12 +400,14 @@ impl RingBuf {
 
     /// Fill `out` from the buffer. Any samples the buffer cannot supply are left at
     /// silence (`0.0`) — repeating the last buffer instead would produce an audible buzz,
-    /// which is the one thing worse than a gap. Returns whether this pull is a genuine
-    /// underrun: silence was needed **and** real audio has flowed at least once before.
-    /// Silence pulled before the first sample ever arrives is not an underrun — nothing was
-    /// expected yet (the cpal callback starts pulling the instant the device opens, which
-    /// is before the RDP session even exists — see `AudioPlayback::start`); once audio has
-    /// flowed, every later empty pull is a real gap the user would hear.
+    /// which is the one thing worse than a gap. Returns whether this pull *starts* an
+    /// underrun episode: silence was needed, real audio has flowed at least once before,
+    /// and the previous pull was not already dry. Silence pulled before the first sample
+    /// ever arrives is not an underrun — nothing was expected yet (the cpal callback
+    /// starts pulling the instant the device opens, which is before the RDP session even
+    /// exists — see `AudioPlayback::start`). Continuation pulls of an ongoing dry spell
+    /// do not count either: one episode is one audible gap, however long the device keeps
+    /// pulling silence through it.
     fn pop_into(&mut self, out: &mut [f32]) -> bool {
         let mut had_gap = false;
         for slot in out.iter_mut() {
@@ -405,7 +419,11 @@ impl RingBuf {
                 }
             };
         }
-        had_gap && self.has_flowed
+        let starts_episode = had_gap && self.has_flowed && !self.in_gap;
+        if had_gap {
+            self.in_gap = true;
+        }
+        starts_episode
     }
 }
 
@@ -1421,13 +1439,21 @@ mod tests {
     }
 
     #[test]
-    fn repeated_underruns_each_count_once_per_callback_not_per_missing_sample() {
+    fn an_underrun_episode_counts_once_however_long_the_dry_spell_lasts() {
         let (ring, stats) = ring(8);
         ring.push(&[1.0]); // audio must have flowed at least once for underruns to count
         let mut out = [1.0f32; 4];
-        ring.pop_into(&mut out); // 1 real sample + 3 gap slots: one underrun event
-        ring.pop_into(&mut out); // fully empty: a second underrun event
+        ring.pop_into(&mut out); // 1 real sample + 3 gap slots: the episode starts
+        ring.pop_into(&mut out); // still dry: same episode, not a second underrun
         assert_eq!(out, [0.0; 4]);
+        assert_eq!(
+            stats.snapshot().underruns,
+            1,
+            "one dry spell is one audible gap, not one count per device pull"
+        );
+
+        ring.push(&[2.0]); // audio resumes …
+        ring.pop_into(&mut out); // … and runs dry again: a NEW episode
         assert_eq!(stats.snapshot().underruns, 2);
     }
 
