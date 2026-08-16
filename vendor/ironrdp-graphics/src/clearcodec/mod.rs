@@ -98,10 +98,20 @@ impl ClearCodecDecoder {
                 .glyph_cache
                 .get(glyph_index)
                 .ok_or_else(|| invalid_field_err!("glyphIndex", "glyph cache miss on hit"))?;
-            if entry.width != width || entry.height != height {
-                return Err(invalid_field_err!("glyphIndex", "cached glyph dimensions mismatch"));
+            // Windows keys this cache by pixel CONTENT, so a hit legitimately arrives
+            // with a different shape of the same area (measured live: 1x6 hit as 2x3,
+            // 12x12 as 24x6). Like FreeRDP, require only that the cached bytes cover the
+            // destination and reinterpret them at the destination's shape.
+            let needed = pixel_count
+                .checked_mul(4)
+                .ok_or_else(|| invalid_field_err!("dimensions", "pixel byte count overflow"))?;
+            if entry.pixels.len() < needed {
+                return Err(invalid_field_err!(
+                    "glyphIndex",
+                    "cached glyph smaller than destination"
+                ));
             }
-            return Ok(entry.pixels.clone());
+            return Ok(entry.pixels[..needed].to_vec());
         }
 
         // Cap allocation to prevent OOM from adversarial dimensions.
@@ -639,6 +649,44 @@ mod tests {
 
         let pixels2 = decoder.decode(&hit_stream, 1, 1).unwrap();
         assert_eq!(pixels1, pixels2);
+    }
+
+    #[test]
+    fn a_glyph_hit_with_a_different_shape_but_equal_area_succeeds() {
+        // Windows keys the glyph cache by pixel CONTENT, not shape: measured live against
+        // a Windows 11 host, every mismatched hit was an equal-area reshape (1x6 hit as
+        // 2x3, 12x12 as 24x6, 7x5 as 5x7 …). FreeRDP tolerates any hit whose destination
+        // area fits the cached entry; rejecting them leaves stale rectangles on screen.
+        let mut decoder = ClearCodecDecoder::new();
+
+        // Store a 2x3 glyph (6 white pixels) at index 7.
+        let mut stream = Vec::new();
+        stream.push(FLAG_GLYPH_INDEX);
+        stream.push(0x00); // seq
+        stream.extend_from_slice(&7u16.to_le_bytes());
+        let residual = [0xFF, 0xFF, 0xFF, 0x06]; // BGR white, run=6
+        stream.extend_from_slice(&4u32.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&residual);
+        let stored = decoder.decode(&stream, 2, 3).unwrap();
+
+        // Hit it back as 3x2: same 6 pixels, different shape.
+        let mut hit = Vec::new();
+        hit.push(FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT);
+        hit.push(0x01); // seq
+        hit.extend_from_slice(&7u16.to_le_bytes());
+        let reshaped = decoder.decode(&hit, 3, 2).expect("equal-area reshape must hit");
+        assert_eq!(stored, reshaped, "the bytes are the same, only the shape differs");
+
+        // A destination LARGER than the cached entry is still an error.
+        let mut big = Vec::new();
+        big.push(FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT);
+        big.push(0x02); // seq
+        big.extend_from_slice(&7u16.to_le_bytes());
+        decoder
+            .decode(&big, 4, 4)
+            .expect_err("a hit needing more pixels than cached must fail");
     }
 
     #[test]
