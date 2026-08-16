@@ -1335,6 +1335,10 @@ impl SessionApp {
         // across a long session would close a perfectly healthy window.
         self.present_failures = 0;
         self.presented = Some(generation);
+        // Close the paint→present handoff measurement for this generation.
+        if let Some(stats) = &self.stats {
+            stats.update(|s| s.mark_presented(generation));
+        }
     }
 }
 

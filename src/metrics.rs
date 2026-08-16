@@ -178,6 +178,10 @@ pub struct SessionMetricsReport {
     pub elapsed_ms: u64,
     pub end_state: String,
     pub latency: LatencySnapshot,
+    /// Client decode-and-paint work per painted frame (summed PDU process time).
+    pub decode: LatencySnapshot,
+    /// Painted-in-store → presented-by-the-window handoff, per frame.
+    pub present: LatencySnapshot,
     pub session: SessionMetrics,
     pub gfx: GfxStats,
     pub audio: AudioStats,
@@ -211,6 +215,8 @@ impl SessionMetricsReport {
             elapsed_ms,
             end_state: end_state.into(),
             latency: LatencySnapshot::from(&session.latency),
+            decode: LatencySnapshot::from(&session.decode),
+            present: LatencySnapshot::from(&session.present),
             session: SessionMetrics::from(session),
             gfx: gfx.clone(),
             audio: audio.clone(),

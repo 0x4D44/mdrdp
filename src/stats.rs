@@ -376,6 +376,19 @@ impl SlotStatsHandle {
 #[derive(Debug, Clone, Default)]
 pub struct SessionStats {
     pub latency: Latency,
+    /// Client decode-and-paint work per painted frame: the summed PDU `process`
+    /// time between one generation bump and the next. CPU cost, not wall time —
+    /// gaps waiting for the network are deliberately excluded.
+    pub decode: Latency,
+    /// Painted-into-the-store → presented-by-the-window, per frame. This is the
+    /// cross-thread handoff: the wake, the redraw, the scale/convert pass and the
+    /// present call. The input round trip in `latency` stops at the paint, so
+    /// this segment is exactly what that number hides.
+    pub present: Latency,
+    /// The generation whose paint is still waiting for its present, and when it
+    /// painted. One slot: a newer paint overwrites an unpresented older one, so
+    /// the measurement always tracks the freshest content.
+    pending_present: Option<(u64, Instant)>,
     pub cache: CacheStats,
     pub frames: u64,
     pub bytes_in: u64,
@@ -391,6 +404,24 @@ pub struct SessionStats {
 impl SessionStats {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The session thread painted `generation` into the store just now.
+    pub fn mark_painted(&mut self, generation: u64) {
+        self.pending_present = Some((generation, Instant::now()));
+    }
+
+    /// The window put `generation` on screen; close the pending handoff if this
+    /// present covers it. A newer generation covers an older pending one — the
+    /// screen now shows content at least that new.
+    pub fn mark_presented(&mut self, generation: u64) {
+        if let Some((painted, at)) = self.pending_present
+            && generation >= painted
+        {
+            let micros = u32::try_from(at.elapsed().as_micros()).unwrap_or(u32::MAX);
+            self.present.record(micros);
+            self.pending_present = None;
+        }
     }
 
     /// The overlay text, one line per row.
@@ -427,6 +458,18 @@ impl SessionStats {
                 }
             }
             None => lines.push("latency  no samples yet".to_string()),
+        }
+
+        // The client-side split of that round trip: decode work and the
+        // paint→present handoff. What is left over lives on the server and the wire.
+        if let (Some(d), Some(p)) = (self.decode.recent(), self.present.recent()) {
+            lines.push(format!(
+                "pipeline decode p50 {:.1}ms p95 {:.1}ms  present p50 {:.1}ms p95 {:.1}ms",
+                ms(d.p50),
+                ms(d.p95),
+                ms(p.p50),
+                ms(p.p95)
+            ));
         }
 
         let hit = match self.cache.hit_rate() {
@@ -653,6 +696,65 @@ mod tests {
         let c = CacheStats::default();
         assert_eq!(c.hit_rate(), None, "0/0 is unknown, not 0%");
         assert_eq!(c.byte_savings(), None);
+    }
+
+    #[test]
+    fn a_present_closes_the_matching_paint_handoff() {
+        let mut s = SessionStats::new();
+        s.mark_painted(7);
+        s.mark_presented(7);
+        assert_eq!(s.present.count(), 1);
+        // The slot is consumed: re-presenting the same content (overlay redraws,
+        // resizes) must not mint extra samples.
+        s.mark_presented(7);
+        assert_eq!(s.present.count(), 1);
+    }
+
+    #[test]
+    fn a_present_of_newer_content_covers_an_older_pending_paint() {
+        let mut s = SessionStats::new();
+        s.mark_painted(3);
+        s.mark_presented(9);
+        assert_eq!(s.present.count(), 1, "the screen shows gen 9 ≥ pending 3");
+    }
+
+    #[test]
+    fn a_present_of_older_content_leaves_the_pending_paint_open() {
+        let mut s = SessionStats::new();
+        s.mark_painted(5);
+        s.mark_presented(4);
+        assert_eq!(
+            s.present.count(),
+            0,
+            "gen 4 on screen does not show paint 5"
+        );
+        s.mark_presented(5);
+        assert_eq!(s.present.count(), 1);
+    }
+
+    #[test]
+    fn a_present_with_no_pending_paint_records_nothing() {
+        let mut s = SessionStats::new();
+        s.mark_presented(1);
+        assert_eq!(s.present.count(), 0);
+    }
+
+    #[test]
+    fn the_overlay_names_the_pipeline_split_once_both_segments_have_samples() {
+        let mut s = SessionStats::new();
+        assert!(
+            !s.overlay_lines().iter().any(|l| l.contains("pipeline")),
+            "no pipeline line before any samples"
+        );
+        s.decode.record(2_000);
+        s.present.record(8_000);
+        let lines = s.overlay_lines();
+        let pipeline = lines
+            .iter()
+            .find(|l| l.contains("pipeline"))
+            .expect("pipeline line appears");
+        assert!(pipeline.contains("decode p50 2.0ms"), "{pipeline}");
+        assert!(pipeline.contains("present p50 8.0ms"), "{pipeline}");
     }
 
     #[test]

@@ -251,6 +251,9 @@ fn pump(
     // every PDU would put a mutex in the hottest path in the client for a counter nobody
     // reads more than a few times a second.
     let mut bytes_since_flush: u64 = 0;
+    // Summed `process` time since the last paint — the client's decode cost for the
+    // frame it is building. Flushed alongside the paint notification.
+    let mut decode_spent = Duration::ZERO;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -304,6 +307,7 @@ fn pump(
                 services,
                 &mut input_sent_at,
                 &mut bytes_since_flush,
+                &mut decode_spent,
             );
             let ready = match wake::wait_readable(&established.socket, wake_rx, IDLE_WAIT) {
                 Ok(ready) => ready,
@@ -331,6 +335,7 @@ fn pump(
                     services,
                     &mut input_sent_at,
                     &mut bytes_since_flush,
+                    &mut decode_spent,
                 );
                 continue;
             }
@@ -339,10 +344,12 @@ fn pump(
 
         bytes_since_flush = bytes_since_flush.saturating_add(payload.len() as u64);
 
+        let process_started = Instant::now();
         let outputs = match established.stage.process(image, action, &payload) {
             Ok(outputs) => outputs,
             Err(e) => return SessionEnd::Failed(ConnectError::Protocol(describe(&e))),
         };
+        decode_spent += process_started.elapsed();
 
         for output in outputs {
             match output {
@@ -403,6 +410,7 @@ fn pump(
             services,
             &mut input_sent_at,
             &mut bytes_since_flush,
+            &mut decode_spent,
         );
     }
 }
@@ -461,6 +469,7 @@ fn notify_if_painted(
     services: &SessionServices,
     input_sent_at: &mut Option<Instant>,
     bytes_since_flush: &mut u64,
+    decode_spent: &mut Duration,
 ) {
     let Ok(guard) = store.lock() else {
         return;
@@ -487,10 +496,16 @@ fn notify_if_painted(
     // ones the overlay reports so its STALE line reflects reality rather than a constant
     // zero. A snapshot is cheap and this runs only when the picture actually changed.
     let gfx = services.gfx.as_ref().map(|g| g.snapshot());
+    let decode_micros = u32::try_from(decode_spent.as_micros()).unwrap_or(u32::MAX);
     services.stats.update(|s| {
         s.frames = s.frames.saturating_add(1);
         s.cache = cache;
         s.bytes_in = s.bytes_in.saturating_add(*bytes_since_flush);
+        // This frame's client-side split: the decode work it took to build, and
+        // the paint→present handoff the window will close when it puts
+        // `generation` (or newer) on screen.
+        s.decode.record(decode_micros);
+        s.mark_painted(now);
         if let Some(gfx) = gfx {
             s.decode_errors = gfx.decode_errors;
             s.undecoded_regions = gfx.undecoded_regions;
@@ -500,6 +515,7 @@ fn notify_if_painted(
     });
 
     *bytes_since_flush = 0;
+    *decode_spent = Duration::ZERO;
     waker.damaged();
 }
 
