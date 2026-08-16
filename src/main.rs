@@ -357,6 +357,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // The stats handle must be taken before the handler is boxed away.
     let handler = GfxHandler::new(Arc::clone(&store));
+    // Advertise AVC420 only where connect() will actually configure a decoder, or the
+    // server sends H.264 into a void and every video region goes black.
+    let handler = if mdrdp::h264::hardware_decode_available() {
+        handler.advertising_avc420()
+    } else {
+        handler
+    };
     let handler = match &capture {
         Some(dir) => {
             eprintln!("capturing undecodable tiles to {dir} (session content — your call)");

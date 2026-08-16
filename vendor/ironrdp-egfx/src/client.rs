@@ -742,9 +742,17 @@ impl GraphicsPipelineClient {
             return Ok(());
         };
 
-        let frame = decoder
-            .decode(stream.data)
-            .map_err(|e| pdu_other_err!("H.264 decode", source: e))?;
+        // mdrdp patch: a failed decode of one access unit skips that frame instead of
+        // erroring the whole channel — the region stays stale until the next IDR heals
+        // it, which beats tearing the session down over a single bad frame. (A hostile
+        // or buggy server gets a dropped frame and a warning, never a stall.)
+        let frame = match decoder.decode(stream.data) {
+            Ok(frame) => frame,
+            Err(e) => {
+                warn!(error = %e, "H.264 decode failed; skipping this frame");
+                return Ok(());
+            }
+        };
 
         let dest_width = dest_rect.width();
         let dest_height = dest_rect.height();

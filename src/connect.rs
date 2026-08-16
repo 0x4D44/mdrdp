@@ -457,7 +457,13 @@ pub fn establish(
     let mut drdynvc = ironrdp_dvc::DrdynvcClient::new();
     let mut has_dynamic_channel = false;
     if let Some(h) = gfx_handler {
-        let graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(h, None);
+        // The hardware H.264 decoder, where this platform has one. Its presence must
+        // match the handler's capability advertisement (main.rs keys both off
+        // `h264::hardware_decode_available`), or AVC frames arrive with nothing to
+        // decode them — the vendored client drops AVC capability sets itself when the
+        // decoder is absent, so the failure mode is a silent downgrade, not a crash.
+        let decoder = crate::h264::hardware_decoder();
+        let graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(h, decoder);
         drdynvc.attach_dynamic_channel(graphics);
         has_dynamic_channel = true;
     }

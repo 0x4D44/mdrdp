@@ -110,6 +110,13 @@ The intended difference from the published crate is the removal of `self.surface
 in `src/client.rs::handle_reset_graphics`. Remove this patch once a released IronRDP version
 preserves surfaces across `ResetGraphics`.
 
+### Additional patch: a failed H.264 decode skips the frame, not the session
+
+`decode_avc420` in `src/client.rs` propagated a decoder error as a PDU-processing error,
+which tears down the whole channel over one bad access unit. The vendored copy logs a
+warning and skips the frame instead; the stale region heals at the next IDR. Remove when
+upstream adopts equivalent per-frame resilience.
+
 ## `ironrdp-graphics` 0.9.0 — RFX Progressive `quality` is a level, not an index
 
 An unmodified copy of the published crate plus one change, applied identically to the
@@ -253,6 +260,17 @@ the RFX_PROGRESSIVE_REGION flags as well as in CONTEXT, and FreeRDP reads the re
 the context's value to every region, so a dissenting region would decode with both the
 wrong band layout and the wrong inverse transform. Latent on this server — every region
 here agrees with the context — but wrong by construction.
+
+## `ironrdp-graphics` 0.9.0 — glyph hits accept equal-area reshapes
+
+Windows keys the ClearCodec glyph cache by pixel *content*, so a `GLYPH_HIT` legitimately
+arrives with a different shape of the same area — measured live against a Windows 11 host
+during window drag/resize: 24 hits in 90 s, every one an exact area match (1x6 hit as 2x3,
+12x12 as 24x6, 7x5 as 5x7). The strict width/height equality check in
+`ClearCodecDecoder::decode_over` rejected them all, leaving stale rectangles on screen.
+The vendored copy mirrors FreeRDP's `clear_decompress_glyph_data`: a hit succeeds when the
+cached bytes cover the destination pixel count, reinterpreted at the destination shape.
+Pinned by `a_glyph_hit_with_a_different_shape_but_equal_area_succeeds`.
 
 ## `ironrdp-graphics` 0.9.0 — `ProgressiveDecoder::context_count` test accessor
 
