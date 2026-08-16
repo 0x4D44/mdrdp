@@ -749,6 +749,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `exit(0)` from inside `run()`, so a disconnect written after `run()` returns would
     // simply never happen and the session would be abandoned on the host.
     let session_slot: Arc<Mutex<Option<session::SessionHandle>>> = Arc::new(Mutex::new(None));
+    // How the session ended, written by whichever path performed the shutdown. The
+    // exit hook runs at LoopExiting on EVERY close (not only Cmd+Q), so by the time
+    // the epilogue runs the handle is long gone — this slot is what survives.
+    let session_end: Arc<Mutex<Option<session::SessionEnd>>> = Arc::new(Mutex::new(None));
+    let end_for_exit = Arc::clone(&session_end);
     let slot_for_exit = Arc::clone(&session_slot);
     let metrics_path_for_exit = metrics_json.clone();
     let stats_for_exit = session_stats.clone();
@@ -756,6 +761,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let audio_for_exit = audio_stats.clone();
     let slots_for_exit = slot_stats.clone();
     let joined_channels_for_exit = established.report.joined_static_channels.clone();
+    let established_channels = established.report.joined_static_channels.clone();
     let state_key_for_exit = state_key.clone();
     let state_path_for_exit = state_path.clone();
     let fullscreen_for_exit = Arc::clone(&fullscreen_at_exit);
@@ -795,6 +801,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Err(error) => eprintln!("  metrics: could not write {path}: {error}"),
                 }
             }
+            // Moved in whole (SessionEnd is not Clone); the epilogue takes it back out.
+            *end_for_exit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(end);
         }
     });
     let waker = window.waker();
@@ -848,10 +858,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
 
-    // `run` now hands the loop back for the Session-ended/lost epilogue dialog
-    // (src/ui/end_dialog.rs). Wiring that call is the next unit; until then the
-    // returned loop is dropped and behaviour is unchanged.
-    let window_result = window.run().map(|_event_loop| ());
+    // `run` hands the loop back so the Session-ended/lost epilogue dialog can run
+    // one more on-demand cycle on it. On the Cmd+Q path it never returns at all.
+    let window_result = window.run();
 
     // Stop playback before tearing the session down, so the device is released even if the
     // disconnect below takes a moment. Explicit because the drop is otherwise invisible,
@@ -881,18 +890,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // `None` here means the exit hook already disconnected — the Cmd+Q path.
+    // Usually the exit hook has already disconnected (it runs at LoopExiting for
+    // every close); this direct take only matters if the hook somehow did not run.
     let end = session_slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
-        .map(|h| h.shutdown());
+        .map(|h| h.shutdown())
+        .or_else(|| {
+            session_end
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        });
     let s = gfx_stats.snapshot();
     let cache = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .cache_stats();
-    if let Some(end) = end {
+    if let Some(end) = &end {
         eprintln!("session ended: {end:?}");
     }
     eprintln!(
@@ -972,8 +988,69 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    window_result?;
-    Ok(())
+    // The §7 epilogue dialogs, for interactive sessions only: a scripted run has
+    // nobody to click Done, and its exit code already says what happened.
+    let scripted = duration.is_some() || screenshot.is_some() || input_script.is_some();
+    match window_result {
+        Ok(mut event_loop) => {
+            if !scripted && let Some(end) = &end {
+                let lost = match end {
+                    session::SessionEnd::Failed(reason) => Some(reason.to_string()),
+                    session::SessionEnd::Graceful | session::SessionEnd::WindowClosed => None,
+                };
+                let stats_snapshot = session_stats.snapshot();
+                let info = mdrdp::ui::end_dialog::EndInfo {
+                    lost,
+                    session_name: display_name.clone(),
+                    duration_secs: session_started.elapsed().as_secs(),
+                    drift_ms: stats_snapshot.latency.drift_us().map(|d| d as f64 / 1000.0),
+                    cache_share: cache.byte_savings(),
+                };
+                match mdrdp::ui::end_dialog::show(&mut event_loop, info) {
+                    Some(mdrdp::ui::end_dialog::EndChoice::SaveMetricsAndClose) => {
+                        let dir = expand_home(&settings.diagnostics.metrics_dir);
+                        if let Err(e) = std::fs::create_dir_all(&dir) {
+                            eprintln!("metrics: could not create {}: {e}", dir.display());
+                        } else {
+                            let stamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let path = dir.join(format!("mdrdp-session-{stamp}.json"));
+                            let path_text = path.display().to_string();
+                            match write_session_metrics(
+                                &path_text,
+                                session_started,
+                                resource_start,
+                                end,
+                                &session_stats,
+                                &gfx_stats,
+                                &audio_stats,
+                                &slot_stats,
+                                &established_channels,
+                            ) {
+                                Ok(()) => eprintln!("metrics: written to {path_text}"),
+                                Err(e) => eprintln!("metrics: could not write {path_text}: {e}"),
+                            }
+                        }
+                    }
+                    Some(mdrdp::ui::end_dialog::EndChoice::Reconnect) => {
+                        // A fresh process, same target: re-exec ourselves with the
+                        // original arguments. The new session does its own logon.
+                        if let Ok(exe) = std::env::current_exe() {
+                            let args: Vec<String> = std::env::args().skip(1).collect();
+                            if let Err(e) = std::process::Command::new(exe).args(args).spawn() {
+                                eprintln!("could not reconnect: {e}");
+                            }
+                        }
+                    }
+                    Some(mdrdp::ui::end_dialog::EndChoice::Done) | None => {}
+                }
+            }
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Write a redacted stats-only report from a diagnostics window's button.

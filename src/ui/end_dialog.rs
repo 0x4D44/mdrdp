@@ -38,10 +38,20 @@ struct EndApp {
     info: EndInfo,
     window: Option<AuxWindow>,
     choice: Option<EndChoice>,
+    /// Scripted-verification affordance: `MDRDP_END_DIALOG_AUTOCLOSE_MS` closes the
+    /// dialog as Done after this deadline, because nothing can click a button in an
+    /// automated run. Absent in normal use.
+    autoclose_at: Option<std::time::Instant>,
 }
 
-impl ApplicationHandler<SessionEvent> for EndApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+impl EndApp {
+    /// Open the dialog window if it does not exist yet.
+    ///
+    /// Called from `new_events` and `about_to_wait`, NOT `resumed`: winit emits
+    /// `Resumed` only on the loop's first-ever activation, and this app runs on the
+    /// loop's *second* `run_app_on_demand` cycle — a `resumed`-only creation path
+    /// waits forever on a window that never comes (observed live, 2026-08-16).
+    fn ensure_window(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
@@ -59,17 +69,51 @@ impl ApplicationHandler<SessionEvent> for EndApp {
         }
     }
 
+    fn poll_autoclose(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(deadline) = self.autoclose_at else {
+            return;
+        };
+        if std::time::Instant::now() >= deadline {
+            self.choice = Some(EndChoice::Done);
+            event_loop.exit();
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+        }
+    }
+}
+
+impl ApplicationHandler<SessionEvent> for EndApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.ensure_window(event_loop);
+    }
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        self.ensure_window(event_loop);
+        self.poll_autoclose(event_loop);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.ensure_window(event_loop);
+        self.poll_autoclose(event_loop);
+    }
+
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: SessionEvent) {}
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _id: winit::window::WindowId,
+        id: winit::window::WindowId,
         event: WindowEvent,
     ) {
         let Some(window) = self.window.as_mut() else {
             return;
         };
+        // The just-closed session window's tail events (Destroyed, focus churn) can
+        // still be queued when this cycle starts; treating its Destroyed as ours
+        // closed the dialog before it ever painted (observed live, 2026-08-16).
+        if window.window_id() != id {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
             WindowEvent::RedrawRequested => {
@@ -93,11 +137,21 @@ impl ApplicationHandler<SessionEvent> for EndApp {
 /// Show the dialog; blocks until a choice or close. `None` means plain close.
 pub fn show(event_loop: &mut EventLoop<SessionEvent>, info: EndInfo) -> Option<EndChoice> {
     use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
+    let autoclose_at = std::env::var("MDRDP_END_DIALOG_AUTOCLOSE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     let mut app = EndApp {
         info,
         window: None,
         choice: None,
+        autoclose_at,
     };
+    // Prime the pump: a freshly re-entered on-demand loop on macOS parks until an
+    // external event arrives, so with nothing queued the dialog window is never even
+    // created (observed live, 2026-08-16 — the loop woke only when a debugger
+    // attached). One queued user event forces the first callback batch.
+    let _ = event_loop.create_proxy().send_event(SessionEvent::Damaged);
     if let Err(e) = event_loop.run_app_on_demand(&mut app) {
         eprintln!("end dialog loop failed: {e}");
     }
