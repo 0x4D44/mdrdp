@@ -938,25 +938,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Usually the exit hook has already disconnected (it runs at LoopExiting for
     // every close); this direct take only matters if the hook somehow did not run.
-    let end = session_slot
+    let direct_end = session_slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
-        .map(|h| h.shutdown())
-        .or_else(|| {
-            session_end
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-        });
+        .map(|h| h.shutdown());
+    if let Some(end) = &direct_end {
+        // The hook prints its own line; this branch only runs when it did not.
+        eprintln!("session ended: {end:?}");
+    }
+    let end = direct_end.or_else(|| {
+        session_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    });
     let s = gfx_stats.snapshot();
     let cache = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .cache_stats();
-    if let Some(end) = &end {
-        eprintln!("session ended: {end:?}");
-    }
+
     eprintln!(
         "  frames {}  decode errors {}  undecoded regions {}  surface errors {}\n  \
          surfaces +{} -{}  reset {:?}  unhandled pdus {}\n  codecs {:?}",

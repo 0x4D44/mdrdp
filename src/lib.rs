@@ -14,7 +14,6 @@ pub mod favourites;
 pub mod gfx;
 pub mod h264;
 pub mod input;
-pub mod launcher;
 pub mod metrics;
 pub mod probe;
 pub mod process_metrics;

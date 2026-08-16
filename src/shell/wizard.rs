@@ -23,7 +23,76 @@ use std::fmt;
 
 use crate::favourites::{DEFAULT_PORT, Favourite, WindowSize};
 use crate::shell::widgets;
-use crate::ui::form::{FormError, FormField};
+// FormError/FormField moved here verbatim when the software-rendered form was
+// deleted (handoff decision 1): the wizard is the wording's home now.
+
+/// The field a validation error points at. Survives from the deleted
+/// software-rendered form; the wizard highlights and focuses by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormField {
+    DisplayName,
+    Host,
+    Port,
+    Username,
+    Password,
+    SessionMode,
+    Width,
+    Height,
+    Save,
+    Cancel,
+}
+
+/// Why validation failed, with the exact wording the original form shipped —
+/// the handoff mandates reusing these strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormError {
+    BlankDisplayName,
+    BlankHost,
+    BlankUsername,
+    BlankPassword,
+    InvalidPort,
+    PortOutOfRange,
+    InvalidWidth,
+    WidthOutOfRange,
+    InvalidHeight,
+    HeightOutOfRange,
+}
+
+impl FormError {
+    /// The field that needs attention for this error.
+    pub const fn field(self) -> FormField {
+        match self {
+            Self::BlankDisplayName => FormField::DisplayName,
+            Self::BlankHost => FormField::Host,
+            Self::BlankUsername => FormField::Username,
+            Self::BlankPassword => FormField::Password,
+            Self::InvalidPort | Self::PortOutOfRange => FormField::Port,
+            Self::InvalidWidth | Self::WidthOutOfRange => FormField::Width,
+            Self::InvalidHeight | Self::HeightOutOfRange => FormField::Height,
+        }
+    }
+}
+
+impl std::fmt::Display for FormError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::BlankDisplayName => "display name must not be blank",
+            Self::BlankHost => "host must not be blank",
+            Self::BlankUsername => "username must not be blank",
+            Self::BlankPassword => "password must not be blank",
+            Self::InvalidPort => "port must be a whole number from 1 to 65535",
+            Self::PortOutOfRange => "port must be between 1 and 65535",
+            Self::InvalidWidth => "width must be a whole number from 1 to 65535",
+            Self::WidthOutOfRange => "width must be between 1 and 65535",
+            Self::InvalidHeight => "height must be a whole number from 1 to 65535",
+            Self::HeightOutOfRange => "height must be between 1 and 65535",
+        };
+        f.write_str(text)
+    }
+}
+
+impl std::error::Error for FormError {}
+
 use crate::ui::theme;
 use egui::{
     Align2, Color32, CornerRadius, Frame, Id, Margin, Rect, Response, RichText, Sense, Stroke,

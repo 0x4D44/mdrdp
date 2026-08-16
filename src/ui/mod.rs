@@ -1,18 +1,17 @@
-//! A tiny software-rendered UI toolkit for the favourites launcher.
+//! UI building blocks shared by the launcher shell and the session process.
 //!
-//! `mdrdp` deliberately does not pull in egui or any UI framework for what is, in the
-//! end, a list of rows the user double-clicks — the dependency and binary-size cost
-//! buys nothing a hand-rolled font + list widget doesn't already cover. This module is
-//! that hand-rolled minimum: [`font`] renders text into a plain `&mut [u32]` pixel
-//! buffer, and [`list`] builds a scrollable, selectable row list on top of it.
+//! The original hand-rolled toolkit ("no egui or any UI framework") is gone — the
+//! 2026-08-16 design handoff superseded that position, and the launcher/dialog
+//! surfaces are egui now (see `crate::shell` and the HLD in `wrk_docs/`). What
+//! remains here is:
 //!
-//! Neither submodule depends on `winit` or `softbuffer` — callers pass the framebuffer,
-//! its dimensions, and plain coordinates. That is what makes the whole thing testable
-//! without opening a window.
+//! - [`font`] — the 8×16 bitmap font, still rendering the Ctrl+Alt+S overlay and
+//!   the transient toasts straight into the softbuffer frame;
+//! - [`theme`] — the handoff's design tokens, egui fonts and visuals;
+//! - [`egui_host`] — auxiliary egui windows on an existing winit loop;
+//! - [`end_dialog`] — the Session-ended/lost epilogue dialogs.
 
 pub mod egui_host;
 pub mod end_dialog;
 pub mod font;
-pub mod form;
-pub mod list;
 pub mod theme;
