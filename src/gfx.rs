@@ -82,6 +82,10 @@ pub struct GfxStats {
     pub frames_completed: u64,
     /// Every codec id seen on a surface command, counted by name.
     pub codec_ids_seen: BTreeMap<String, u64>,
+    /// Bytes actually painted per codec (4 bytes per pixel of blitted region), keyed
+    /// by the same names as `codec_ids_seen`. Only successful paints count — a failed
+    /// decode painted nothing, and the diagnostics window must not pretend it did.
+    pub codec_bytes_painted: BTreeMap<String, u64>,
     /// ClearCodec decodes that failed. Each one is a region that was not painted.
     pub decode_errors: u64,
     /// Why they failed, tallied by reason.
@@ -325,6 +329,15 @@ impl GfxHandler {
         });
     }
 
+    /// Record `area_px` pixels painted by `name` (4 bytes each).
+    fn note_painted(&self, name: &str, area_px: u64) {
+        let bytes = area_px.saturating_mul(4);
+        self.stats.note(|s| {
+            let total = s.codec_bytes_painted.entry(name.to_owned()).or_insert(0);
+            *total = total.saturating_add(bytes);
+        });
+    }
+
     /// Decode an RFX Progressive frame and blit every tile it updated.
     ///
     /// `ironrdp-graphics` carries a complete progressive decoder; like ClearCodec it is
@@ -378,8 +391,11 @@ impl GfxHandler {
             }
         };
 
+        let mut painted_px: u64 = 0;
         for tile in tiles {
             let rect = progressive_tile_rect(tile.x_idx, tile.y_idx);
+            painted_px =
+                painted_px.saturating_add(u64::from(rect.width()) * u64::from(rect.height()));
             // `pixels` is a full 64x64 RGBA tile, so the source stride is the tile side
             // even when the destination is clipped at the surface edge. Passing the
             // clipped width instead shears the tile — the same trap `blit_rgba` documents.
@@ -388,6 +404,7 @@ impl GfxHandler {
             });
             self.absorb(result);
         }
+        self.note_painted(&format!("WireToSurface2/{:?}", pdu.codec_id), painted_px);
     }
 
     /// Decode a ClearCodec tile and blit it into its surface.
@@ -458,6 +475,10 @@ impl GfxHandler {
         let stride = dest.width();
         let result =
             self.with_store(|store| store.blit_rgba(pdu.surface_id, dest, &pixels, stride));
+        self.note_painted(
+            codec_name(pdu.codec_id),
+            u64::from(dest.width()) * u64::from(dest.height()),
+        );
         self.absorb(result);
     }
 
@@ -1278,6 +1299,11 @@ mod tests {
         assert_eq!(stats.decode_errors, 0, "the round trip must decode");
         assert_eq!(stats.surface_errors, 0);
         assert_eq!(stats.codec_ids_seen.get("ClearCodec"), Some(&1));
+        assert_eq!(
+            stats.codec_bytes_painted.get("ClearCodec"),
+            Some(&(2 * 2 * 4)),
+            "a 2x2 blit paints 16 bytes under its codec"
+        );
 
         // Stored as RGBA: R=0x30, G=0x20, B=0x10, opaque.
         for (x, y) in [(3, 5), (4, 5), (3, 6), (4, 6)] {
@@ -1312,6 +1338,11 @@ mod tests {
         let stats = handler.stats().snapshot();
         assert_eq!(stats.decode_errors, 1, "the failure must be counted");
         assert_eq!(stats.codec_ids_seen.get("ClearCodec"), Some(&1));
+        assert_eq!(
+            stats.codec_bytes_painted.get("ClearCodec"),
+            None,
+            "a failed decode painted nothing and must not claim bytes"
+        );
         assert_eq!(pixel_at(&store, 1, 0, 0), [0, 0, 0, 0], "nothing painted");
 
         // ...and the handler still works afterwards.
