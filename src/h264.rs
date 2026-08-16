@@ -1,8 +1,10 @@
 //! Hardware H.264 decode for EGFX AVC streams.
 //!
-//! The EGFX pipeline hands [`ironrdp_egfx::decode::H264Decoder`] AVC-format access
-//! units: NAL units with 4-byte big-endian length prefixes (AVCC), exactly the framing
-//! Apple's VideoToolbox consumes natively — no Annex-B conversion, no transcode. The
+//! The EGFX pipeline hands [`ironrdp_egfx::decode::H264Decoder`] H.264 access units.
+//! Windows delivers them in **Annex B** framing (start codes, AUD + SPS + PPS +
+//! slices — measured from captured quench payloads; the upstream ironrdp docs claim
+//! AVCC and are wrong), so the units are split on start codes and re-packed with the
+//! 4-byte length prefixes VideoToolbox consumes. The
 //! macOS implementation drives a `VTDecompressionSession` with full-range planar
 //! 4:2:0 output ('f420') for every decode: AVC444's luma+chroma combination must
 //! happen in YUV space, the RGBA path converts the same planes in software, and a
@@ -42,7 +44,7 @@ pub fn hardware_decoder() -> Option<Box<dyn H264Decoder>> {
 }
 
 // ---------------------------------------------------------------------------------------
-// AVCC parsing — portable, pure, tested
+// NAL parsing — portable, pure, tested
 // ---------------------------------------------------------------------------------------
 //
 // Only the macOS backend consumes these today, so they are compiled for macOS and for
@@ -54,13 +56,65 @@ const NAL_SPS: u8 = 7;
 #[cfg(any(target_os = "macos", test))]
 const NAL_PPS: u8 = 8;
 
-/// Split an AVCC stream (4-byte big-endian length prefix per NAL) into NAL units.
+/// Split an H.264 elementary stream into NAL units, whatever its framing.
 ///
-/// A truncated tail — a length prefix promising more bytes than remain — ends the walk;
-/// everything before it is still returned. Wire data is untrusted, so this must never
-/// panic or over-read.
+/// **Windows sends Annex B** (start-code-delimited: `00 00 01` / `00 00 00 01`,
+/// AUD + SPS + PPS + slices) in RFX_AVC420/AVC444 bitmap streams — measured from
+/// captured quench payloads 2026-08-16. The upstream ironrdp-egfx docs claim
+/// AVC/AVCC framing (4-byte big-endian length prefixes); that is wrong for real
+/// Windows, and it went unnoticed elsewhere because ffmpeg/openh264 consume Annex B
+/// natively. VideoToolbox does not, so the caller re-packs these units as AVCC.
+///
+/// A stream that does not begin with a start code is walked as AVCC (the framing
+/// the upstream docs promise), so a spec-faithful server still decodes. Wire data
+/// is untrusted either way: truncation ends the walk, nothing panics or over-reads.
 #[cfg(any(target_os = "macos", test))]
 fn nal_units(data: &[u8]) -> Vec<&[u8]> {
+    if data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1]) {
+        annex_b_units(data)
+    } else {
+        avcc_units(data)
+    }
+}
+
+/// Split an Annex B byte stream on its start codes.
+///
+/// Emulation prevention guarantees `00 00 01` never occurs inside a NAL, so start
+/// codes are unambiguous split points. Trailing zero bytes of each unit are
+/// trimmed: they are either the leading `00` of a following 4-byte start code or
+/// `cabac_zero_words` padding, and decoders accept their removal (ffmpeg's
+/// splitter does the same).
+#[cfg(any(target_os = "macos", test))]
+fn annex_b_units(data: &[u8]) -> Vec<&[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= data.len() {
+        if data[i..i + 3] == [0, 0, 1] {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut units = Vec::with_capacity(starts.len());
+    for (k, &start) in starts.iter().enumerate() {
+        let mut end = match starts.get(k + 1) {
+            Some(&next) => next - 3,
+            None => data.len(),
+        };
+        while end > start && data[end - 1] == 0 {
+            end -= 1;
+        }
+        if end > start {
+            units.push(&data[start..end]);
+        }
+    }
+    units
+}
+
+/// Walk an AVCC stream (4-byte big-endian length prefix per NAL).
+#[cfg(any(target_os = "macos", test))]
+fn avcc_units(data: &[u8]) -> Vec<&[u8]> {
     let mut units = Vec::new();
     let mut offset = 0usize;
     while offset + 4 <= data.len() {
@@ -746,6 +800,59 @@ mod tests {
             out.extend_from_slice(nal);
         }
         out
+    }
+
+    #[test]
+    fn nal_units_split_annex_b_start_codes() {
+        // The shape Windows actually sends (captured from quench 2026-08-16):
+        // 4-byte start codes, AUD + SPS + PPS + slice.
+        let mut stream = Vec::new();
+        for nal in [
+            &[0x09u8, 0x10][..],
+            &[0x67, 0x4d, 0x00, 0x28],
+            &[0x68, 0xee],
+            &[0x65, 0x88, 0x84],
+        ] {
+            stream.extend_from_slice(&[0, 0, 0, 1]);
+            stream.extend_from_slice(nal);
+        }
+        let units = nal_units(&stream);
+        assert_eq!(units.len(), 4);
+        assert_eq!(nal_type(units[0]), 9, "AUD");
+        assert_eq!(nal_type(units[1]), NAL_SPS);
+        assert_eq!(nal_type(units[2]), NAL_PPS);
+        assert_eq!(units[3], &[0x65, 0x88, 0x84]);
+
+        // 3-byte start codes split identically.
+        let mut short = Vec::new();
+        for nal in [&[0x67u8, 0x4d][..], &[0x65, 0x88]] {
+            short.extend_from_slice(&[0, 0, 1]);
+            short.extend_from_slice(nal);
+        }
+        assert_eq!(nal_units(&short), vec![&[0x67u8, 0x4d][..], &[0x65, 0x88]]);
+    }
+
+    #[test]
+    fn annex_b_units_trim_trailing_zeros_but_keep_interior_ones() {
+        // Trailing zeros are either the leading 00 of a 4-byte start code or
+        // cabac_zero_words padding; interior zeros are payload.
+        let stream = [
+            0, 0, 0, 1, 0x65, 0x01, 0x00, 0x02, // slice with an interior zero
+            0, 0, 0, 1, 0x41, 0x03, 0x00, 0x00, // final unit with zero padding
+        ];
+        let units = nal_units(&stream);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0], &[0x65, 0x01, 0x00, 0x02]);
+        assert_eq!(units[1], &[0x41, 0x03], "trailing zero padding trimmed");
+    }
+
+    #[test]
+    fn a_stream_without_start_codes_is_walked_as_avcc() {
+        // The framing the upstream docs promise; kept for spec-faithful servers.
+        let stream = avcc(&[&[0x67, 1, 2], &[0x65, 3]]);
+        let units = nal_units(&stream);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0], &[0x67, 1, 2]);
     }
 
     #[test]

@@ -301,7 +301,12 @@ fn pump(
                         return SessionEnd::Failed(ConnectError::Io(e));
                     }
                 }
-                ActiveStageOutput::Terminate(_) => return SessionEnd::Graceful,
+                ActiveStageOutput::Terminate(reason) => {
+                    // The server chose to end the session; the reason is the only
+                    // clue to why (idle policy, another logon, server-side error).
+                    eprintln!("server ended the session: {reason:?}");
+                    return SessionEnd::Graceful;
+                }
                 // The remote's pointer shape, mirrored onto the local window. A dead
                 // window is discovered by the input drain, not here.
                 ActiveStageOutput::PointerDefault => {
