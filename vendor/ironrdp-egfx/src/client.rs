@@ -608,6 +608,7 @@ impl GraphicsPipelineClient {
         let cap = self.negotiated_caps.insert(cap);
 
         debug!(
+            version = ?cap.version(),
             avc420 = self.codec_caps.avc420,
             avc444 = self.codec_caps.avc444,
             "EGFX capabilities confirmed"

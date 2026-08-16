@@ -6,10 +6,15 @@ Out-of-scope observations. A separate human-invoked review triages these.
   the bandwidth-measure fix alone lifted the same YouTube run to ~25 fps on
   ClearCodec+Progressive, and the VideoToolbox AVC420 decoder is now implemented
   (src/h264.rs) with a V8.1+AVC420 advertisement. Remaining follow-ups below.
-- [ ] 2026-08-16: quench strips AVC420_ENABLED from the EGFX capability confirm — desktop
-  Windows will not send H.264 until the host enables "Prioritize H.264/AVC 444 graphics
-  mode" (or H.264/AVC hardware encoding) group policy. Needs Arthur on quench; after
-  flipping it, rerun the av2 script and expect `Avc420` in the codec mix.
+- [ ] 2026-08-16: AVC negotiation on quench, measured with the H.264 policy LIVE
+  (AVC444ModePreferred=1 + AVCHardwareEncodePreferred=1; gpupdate sufficed, no reboot):
+  the server confirms our V8.1 offer at V8.1 but STRIPS AVC420_ENABLED — modern Windows
+  has abandoned the legacy 8.1 AVC path. Advertising V10.7 without AVC_DISABLED confirms
+  avc420=true avc444=true and the server immediately sends **Avc444v2 for the whole
+  desktop**; adding AVC_THIN_CLIENT changes nothing. So hardware H.264 on a
+  policy-enabled host requires AVC444v2 support (next entry). Cheap counter-test worth
+  one try: delete AVC444ModePreferred (keep AVCHardwareEncodePreferred) and rerun the
+  V10.7 probe — Windows may then choose AVC420, which src/h264.rs already decodes.
 - [ ] 2026-08-16: AVC444 is unimplemented end-to-end: the vendored egfx client forwards
   Avc444 PDUs to on_unhandled_pdu, and the upstream `H264Decoder` trait (RGBA out) cannot
   express the dual-stream luma+chroma combination AVC444 needs (it must happen in YUV
