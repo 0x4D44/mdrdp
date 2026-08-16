@@ -146,7 +146,36 @@ fn write_session_metrics(
     mdrdp::metrics::write_report(std::path::Path::new(path), &report)
 }
 
+/// Install a global stderr tracing subscriber when `MDRDP_LOG` names a filter.
+///
+/// Session-thread instrumentation (EGFX frame/ack traffic, DVC dispatch, clipboard
+/// warnings) is written against `tracing`, but a normal run installs no global
+/// subscriber, so all of it is invisible. Setting e.g. `MDRDP_LOG=ironrdp_egfx=trace`
+/// makes that stream observable without touching a default run.
+///
+/// `MDRDP_LOG` rather than `RUST_LOG` on purpose: an ambient `RUST_LOG` from the
+/// caller's shell must not silently turn a session into a diagnostic one. The connect
+/// sequence is unaffected either way — it runs under its own scoped subscriber, which
+/// also keeps credential-bearing connector events away from this one.
+fn install_diagnostics_subscriber() {
+    let Ok(filter) = std::env::var("MDRDP_LOG") else {
+        return;
+    };
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(filter))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
+        )
+        .init();
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    install_diagnostics_subscriber();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
