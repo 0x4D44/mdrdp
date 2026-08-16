@@ -668,9 +668,7 @@ impl Wizard {
         });
 
         let preview = self.draft.command_preview(false);
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            terminal_card(ui, &preview);
-        });
+        pin_bottom(ui, TERMINAL_CARD_H, |ui| terminal_card(ui, &preview));
     }
 
     /// Step 2 — username, domain, password, the save checkbox and the TOFU notice.
@@ -761,7 +759,7 @@ impl Wizard {
             Some("Unchecked, mdrdp asks for it each time and keeps it only for that session."),
         );
 
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        pin_bottom(ui, WARNING_CARD_H, |ui| {
             warning_card(
                 ui,
                 "First connection to this host: mdrdp will show the server certificate \
@@ -812,7 +810,7 @@ impl Wizard {
         self.summary_card(ui, monitor);
 
         let name = self.draft.name();
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        pin_bottom(ui, CHECKBOX_ROW_H, |ui| {
             checkbox_row(
                 ui,
                 &mut self.save_favourite,
@@ -1513,8 +1511,8 @@ fn card_sub(ui: &mut Ui, card: Rect, strip: Rect, text: &str, selected: bool) {
 
 /// The step-1 card: "SAME THING FROM A TERMINAL" over the equivalent invocation.
 fn terminal_card(ui: &mut Ui, command: &str) {
-    let height = 16.0 + 14.0 + 8.0 + 17.0 + 16.0;
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), TERMINAL_CARD_H), Sense::hover());
     ui.painter().rect(
         rect,
         CornerRadius::same(theme::radius::CARD),
@@ -1556,11 +1554,22 @@ fn command_line(ui: &mut Ui, at: egui::Pos2, command: &str) {
     );
 }
 
+/// Push `add` to the bottom of the remaining space when there is room; flow on from the
+/// cursor when there is not. A `bottom_up` layout pins unconditionally, so a short window
+/// draws the pinned widget over the content above it — this degrades instead.
+fn pin_bottom(ui: &mut Ui, height: f32, add: impl FnOnce(&mut Ui)) {
+    ui.add_space((ui.available_height() - height).max(0.0));
+    add(ui);
+}
+
+const TERMINAL_CARD_H: f32 = 16.0 + 14.0 + 8.0 + 17.0 + 16.0;
+const WARNING_CARD_H: f32 = 14.0 + 60.0 + 14.0;
+const CHECKBOX_ROW_H: f32 = 20.0;
+
 /// The step-2 first-connection notice.
 fn warning_card(ui: &mut Ui, body: &str) {
     let width = ui.available_width();
-    let height = 14.0 + 60.0 + 14.0;
-    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(width, WARNING_CARD_H), Sense::hover());
     ui.painter().rect(
         rect,
         CornerRadius::same(theme::radius::CARD),
