@@ -1165,6 +1165,172 @@ pub fn about(ctx: &egui::Context, icon: Option<&egui::TextureHandle>) -> bool {
     close || ctx.input(|i| i.key_pressed(egui::Key::Escape))
 }
 
+/// State of the credential dialogs: "No saved password" first, then the prompt.
+pub struct PasswordPromptState {
+    pub account: String,
+    /// The store failure, named in warn mono per the mock. Never a secret.
+    pub reason: String,
+    /// Flipped by "Enter password": switches from the explainer to the input dialog.
+    pub entering: bool,
+    pub input: zeroize::Zeroizing<String>,
+    pub save: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordAction {
+    None,
+    /// Send the typed password to the child (and optionally store it).
+    Connect,
+    Cancel,
+}
+
+/// The `security add-generic-password` command the mock shows, for the account.
+pub fn keychain_command(account: &str) -> String {
+    format!("security add-generic-password -s mdrdp -a '{account}' -w")
+}
+
+/// The No-saved-password explainer (560) or the Password prompt (480), by state.
+pub fn credential_dialog(ctx: &egui::Context, state: &mut PasswordPromptState) -> PasswordAction {
+    if !state.entering {
+        let command = keychain_command(&state.account);
+        let (_, action) = dialog(
+            ctx,
+            "no-saved-password",
+            560.0,
+            false,
+            |ui| {
+                ui.label(
+                    RichText::new("No saved password")
+                        .font(theme::sans_semibold(16.0))
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Nothing is stored for {} in the system credential store.",
+                        state.account
+                    ))
+                    .font(theme::sans(13.0))
+                    .color(theme::TEXT_SECONDARY),
+                );
+                Frame::new()
+                    .fill(theme::BG_CHROME)
+                    .stroke(Stroke::new(1.0, theme::LINE_HAIR))
+                    .corner_radius(CornerRadius::same(theme::radius::CARD))
+                    .inner_margin(Margin::symmetric(16, 12))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&command)
+                                    .font(theme::mono(12.0))
+                                    .color(theme::TEXT_SECONDARY),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if widgets::secondary_button(ui, "Copy", 24.0).clicked() {
+                                        ui.ctx().copy_text(command.clone());
+                                    }
+                                },
+                            );
+                        });
+                    });
+                PasswordAction::None
+            },
+            |ui| {
+                let mut action = PasswordAction::None;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if widgets::primary_button(ui, "Enter password", 34.0).clicked() {
+                        action = PasswordAction::Connect; // repurposed: advance to input
+                    }
+                    if widgets::secondary_button(ui, "Cancel", 34.0).clicked() {
+                        action = PasswordAction::Cancel;
+                    }
+                });
+                action
+            },
+        );
+        return match action {
+            PasswordAction::Connect => {
+                state.entering = true;
+                PasswordAction::None
+            }
+            other if ctx.input(|i| i.key_pressed(egui::Key::Escape)) => {
+                let _ = other;
+                PasswordAction::Cancel
+            }
+            other => other,
+        };
+    }
+
+    let reason = state.reason.clone();
+    let mut typed = std::mem::take(&mut *state.input);
+    let mut save = state.save;
+    let (_, action) = dialog(
+        ctx,
+        "password-prompt",
+        480.0,
+        false,
+        |ui| {
+            ui.label(
+                RichText::new(format!("Password for {}", state.account))
+                    .font(theme::sans_semibold(16.0))
+                    .color(theme::TEXT_PRIMARY),
+            );
+            let edit = egui::TextEdit::singleline(&mut typed)
+                .password(true)
+                .font(theme::mono(15.0))
+                .desired_width(f32::INFINITY);
+            let response = ui.add_sized([ui.available_width(), 38.0], edit);
+            response.request_focus();
+            ui.checkbox(
+                &mut save,
+                RichText::new("Save to the system credential store")
+                    .font(theme::sans(12.0))
+                    .color(theme::TEXT_SECONDARY),
+            );
+            ui.label(
+                RichText::new(&reason)
+                    .font(theme::mono(11.0))
+                    .color(theme::WARN),
+            );
+            PasswordAction::None
+        },
+        |ui| {
+            let mut action = PasswordAction::None;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if widgets::primary_button(ui, "Connect", 34.0).clicked() {
+                    action = PasswordAction::Connect;
+                }
+                if widgets::secondary_button(ui, "Cancel", 34.0).clicked() {
+                    action = PasswordAction::Cancel;
+                }
+            });
+            action
+        },
+    );
+    *state.input = typed;
+    state.save = save;
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return PasswordAction::Cancel;
+    }
+    if action == PasswordAction::Connect && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        return PasswordAction::Connect;
+    }
+    if action == PasswordAction::Connect && state.input.is_empty() {
+        return PasswordAction::None; // An empty password is a non-answer.
+    }
+    // Enter in the field also connects.
+    if action == PasswordAction::None
+        && !state.input.is_empty()
+        && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+    {
+        return PasswordAction::Connect;
+    }
+    action
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1190,6 +1356,14 @@ mod tests {
         assert_eq!(
             classify("the server closed the channel"),
             FailureKind::Other
+        );
+    }
+
+    #[test]
+    fn the_keychain_command_names_the_exact_account() {
+        assert_eq!(
+            keychain_command("alice@temper:3389"),
+            "security add-generic-password -s mdrdp -a 'alice@temper:3389' -w"
         );
     }
 

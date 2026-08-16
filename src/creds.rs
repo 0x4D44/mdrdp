@@ -180,6 +180,12 @@ fn prompt_for_password(account: &str) -> Result<Secret, CredsError> {
 /// unit test, but "someone pressed Enter on an empty prompt" is exactly the case worth
 /// pinning — sending an empty password to a Windows host is a failed logon that looks
 /// like a rejected credential.
+/// Wrap a password that arrived over the launcher pipe. Same emptiness rule as a
+/// typed one; the caller owns zeroizing its transport buffer.
+pub fn secret_from_password(password: String) -> Result<Secret, CredsError> {
+    secret_from_typed(password)
+}
+
 fn secret_from_typed(password: String) -> Result<Secret, CredsError> {
     if password.is_empty() {
         return Err(CredsError::NoPassword(

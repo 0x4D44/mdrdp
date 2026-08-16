@@ -49,6 +49,11 @@ enum ChildEvent {
     Failed(String),
     /// The child hit a first-sight certificate and waits on our decision.
     CertPrompt(dialogs::CertPromptInfo),
+    /// The child has no stored password and waits on one.
+    PasswordPrompt {
+        account: String,
+        reason: String,
+    },
     /// The pipe closed without a terminal event: the child died mid-connect.
     Eof,
 }
@@ -67,6 +72,7 @@ struct ConnectFlow {
     started: Instant,
     failure: Option<dialogs::ConnectFailure>,
     cert_prompt: Option<dialogs::CertPromptInfo>,
+    password_prompt: Option<dialogs::PasswordPromptState>,
 }
 
 /// Which modal sits over the list, if any.
@@ -286,6 +292,7 @@ impl LauncherApp {
                     started: Instant::now(),
                     failure: None,
                     cert_prompt: None,
+                    password_prompt: None,
                 });
             }
             Err(e) => eprintln!("{e}"),
@@ -329,6 +336,15 @@ impl LauncherApp {
                     });
                 }
                 ChildEvent::CertPrompt(info) => flow.cert_prompt = Some(info),
+                ChildEvent::PasswordPrompt { account, reason } => {
+                    flow.password_prompt = Some(dialogs::PasswordPromptState {
+                        account,
+                        reason,
+                        entering: false,
+                        input: zeroize::Zeroizing::new(String::new()),
+                        save: false,
+                    });
+                }
                 ChildEvent::Eof => {
                     if flow.failure.is_none() {
                         reap(flow.child.take());
@@ -342,6 +358,43 @@ impl LauncherApp {
                     }
                 }
             }
+        }
+
+        if flow.failure.is_none() && flow.password_prompt.is_some() {
+            let mut state = flow.password_prompt.take().expect("checked above");
+            match dialogs::credential_dialog(ctx, &mut state) {
+                dialogs::PasswordAction::None => {
+                    flow.password_prompt = Some(state);
+                }
+                dialogs::PasswordAction::Connect => {
+                    if state.save
+                        && let Err(e) = crate::creds::store(&state.account, &state.input)
+                    {
+                        eprintln!("could not store the password: {e}");
+                    }
+                    if let Some(stdin) = flow.child_stdin.as_mut() {
+                        use std::io::Write as _;
+                        let mut line =
+                            format!("{}\n", serde_json::json!({ "password": &*state.input }));
+                        if stdin.write_all(line.as_bytes()).is_err() {
+                            eprintln!("could not send the password to the session");
+                        }
+                        let _ = stdin.flush();
+                        zeroize::Zeroize::zeroize(&mut line);
+                    }
+                    // state drops here; its Zeroizing buffer wipes the typed copy.
+                }
+                dialogs::PasswordAction::Cancel => {
+                    if let Some(mut child) = flow.child.take() {
+                        // Pre-logon: nothing exists on the host yet to abandon.
+                        let _ = child.kill();
+                        reap(Some(child));
+                    }
+                    return;
+                }
+            }
+            self.connect_flow = Some(flow);
+            return;
         }
 
         if flow.failure.is_none()
@@ -419,6 +472,7 @@ impl LauncherApp {
                             started: Instant::now(),
                             failure: None,
                             cert_prompt: None,
+                            password_prompt: None,
                             port: 3389,
                             ..flow
                         });
@@ -833,6 +887,7 @@ impl LauncherApp {
                                 started: Instant::now(),
                                 failure: None,
                                 cert_prompt: None,
+                                password_prompt: None,
                             });
                         }
                         Err(e) => eprintln!("{e}"),
@@ -1087,6 +1142,10 @@ fn spawn_connect(
                 Some("failed") => {
                     ChildEvent::Failed(v["error"].as_str().unwrap_or("unknown error").to_owned())
                 }
+                Some("password_prompt") => ChildEvent::PasswordPrompt {
+                    account: v["account"].as_str().unwrap_or("?").to_owned(),
+                    reason: v["reason"].as_str().unwrap_or("").to_owned(),
+                },
                 Some("cert_prompt") => ChildEvent::CertPrompt(dialogs::CertPromptInfo {
                     host: v["host"].as_str().unwrap_or("?").to_owned(),
                     fingerprint: v["fingerprint"].as_str().unwrap_or("").to_owned(),

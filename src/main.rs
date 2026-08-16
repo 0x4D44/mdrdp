@@ -131,6 +131,7 @@ fn write_session_metrics(
     stats: &StatsHandle,
     gfx: &GfxStatsHandle,
     audio: &AudioStatsHandle,
+    slots: &mdrdp::stats::SlotStatsHandle,
     joined_channels: &[String],
 ) -> std::io::Result<()> {
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -143,7 +144,8 @@ fn write_session_metrics(
         &audio.snapshot(),
         joined_channels.iter().cloned(),
         resources,
-    );
+    )
+    .with_slots(&slots.snapshot());
     mdrdp::metrics::write_report(std::path::Path::new(path), &report)
 }
 
@@ -376,6 +378,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // nobody is there to see.
     let secret = if password_stdin {
         mdrdp::creds::from_stdin()?
+    } else if stage_json {
+        // A launcher is driving: a missing password is its dialog, not a tty prompt.
+        // The child asks over the pipe and blocks on one answer line from stdin;
+        // EOF or garbage aborts the connect. The password itself is never echoed,
+        // logged, or carried in any event this process emits.
+        match mdrdp::creds::lookup(&target.keychain_account) {
+            Ok(secret) => secret,
+            Err(e) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "password_prompt",
+                        "account": target.keychain_account,
+                        // The reason names the store failure kind, never a secret.
+                        "reason": e.to_string(),
+                    })
+                );
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+                    .map_err(|e| format!("reading the password answer: {e}"))?;
+                let parsed: serde_json::Value = serde_json::from_str(&line)
+                    .map_err(|_| "the password answer was not understood")?;
+                let password = parsed["password"]
+                    .as_str()
+                    .ok_or("no password was provided")?
+                    .to_owned();
+                zeroize::Zeroize::zeroize(&mut line);
+                mdrdp::creds::secret_from_password(password)?
+            }
+        }
     } else {
         mdrdp::creds::lookup_or_prompt(&target.keychain_account)?
     };
@@ -700,6 +732,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let stats_for_exit = session_stats.clone();
     let gfx_for_exit = gfx_stats.clone();
     let audio_for_exit = audio_stats.clone();
+    let slots_for_exit = slot_stats.clone();
     let joined_channels_for_exit = established.report.joined_static_channels.clone();
     let state_key_for_exit = state_key.clone();
     let state_path_for_exit = state_path.clone();
@@ -733,6 +766,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &stats_for_exit,
                     &gfx_for_exit,
                     &audio_for_exit,
+                    &slots_for_exit,
                     &joined_channels_for_exit,
                 ) {
                     Ok(()) => eprintln!("  metrics: redacted report written to {path}"),
