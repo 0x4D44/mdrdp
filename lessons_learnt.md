@@ -1,3 +1,8 @@
+- A re-entered run_app_on_demand loop parks until an event arrives; prime it with one proxy user event (`ui::end_dialog::show`).
+- winit fires Resumed once per process, not per on-demand cycle; late windows go in new_events/about_to_wait (`ui::end_dialog`).
+- A closed window's queued Destroyed can land in the NEXT on-demand cycle; match window ids before acting (`ui::end_dialog`).
+- The window exit hook runs at LoopExiting on EVERY close, not just Cmd+Q; epilogue state rides a shared slot (`main`).
+- EGFX advertises codecs by capability VERSION, so per-codec settings toggles have nothing honest to bind to (`gfx::capabilities`).
 <!-- lessons-format: index-v1 -->
 # Lessons learnt
 
