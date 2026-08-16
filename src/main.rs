@@ -710,6 +710,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             Err(e) => eprintln!("metrics: could not write: {e}"),
                         }
                     }
+                    action == mdrdp::diag::cache::CacheAction::Close
                 })
             },
             latency: {
@@ -736,6 +737,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             Err(e) => eprintln!("metrics: could not write: {e}"),
                         }
                     }
+                    action == mdrdp::diag::latency::LatencyAction::Close
                 })
             },
             channels: {
@@ -786,7 +788,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         elapsed_ms,
                         (name.clone(), detail.clone()),
                     );
-                    let _ = mdrdp::diag::channels::ui(ui, &snapshot);
+                    mdrdp::diag::channels::ui(ui, &snapshot)
+                        == mdrdp::diag::channels::ChannelsAction::Close
                 })
             },
         });

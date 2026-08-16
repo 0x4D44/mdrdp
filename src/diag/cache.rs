@@ -38,6 +38,10 @@ pub enum CacheAction {
     #[default]
     None,
     WriteMetrics,
+    /// The header's Close button: the host should close this window. Drawn in the
+    /// window itself because a diagnostics window over a fullscreen session has no
+    /// OS titlebar to close it with.
+    Close,
 }
 
 // --- geometry (handoff values) --------------------------------------------------------
@@ -884,33 +888,10 @@ fn header(ui: &mut Ui, session: Option<(&str, &str)>) -> CacheAction {
         theme::sans_semibold(15.0),
         theme::TEXT_PRIMARY,
     );
-    if let Some((name, detail)) = session {
-        let divider_x = title.max.x + 14.0;
-        painter.vline(
-            divider_x,
-            egui::Rangef::new(cy - 9.0, cy + 9.0),
-            Stroke::new(1.0, theme::LINE_SUBTLE),
-        );
-        let dot_x = divider_x + 14.0;
-        painter.circle_filled(pos2(dot_x + 3.0, cy), 3.0, theme::ACCENT);
-        let name_rect = painter.text(
-            pos2(dot_x + 6.0 + 9.0, cy),
-            Align2::LEFT_CENTER,
-            name,
-            theme::mono(12.0),
-            theme::TEXT_PRIMARY,
-        );
-        painter.text(
-            pos2(name_rect.max.x + 9.0, cy),
-            Align2::LEFT_CENTER,
-            detail,
-            theme::mono(12.0),
-            theme::TEXT_DIM,
-        );
-    }
 
-    // The refresh note and the metrics button live in a right-aligned child, so their
-    // widths do not have to be guessed.
+    // The buttons and the refresh note live in a right-aligned child, so their widths
+    // do not have to be guessed — and it goes down first, so the session line knows
+    // where it must stop instead of painting straight through it.
     let mut action = CacheAction::None;
     let area = Rect::from_min_max(
         pos2(rect.min.x + PAD_X, rect.min.y),
@@ -921,6 +902,9 @@ fn header(ui: &mut Ui, session: Option<(&str, &str)>) -> CacheAction {
             .max_rect(area)
             .layout(Layout::right_to_left(Align::Center)),
     );
+    if widgets::secondary_button(&mut child, "Close", 26.0).clicked() {
+        action = CacheAction::Close;
+    }
     if widgets::secondary_button(&mut child, "Write metrics JSON", 26.0).clicked() {
         action = CacheAction::WriteMetrics;
     }
@@ -930,6 +914,11 @@ fn header(ui: &mut Ui, session: Option<(&str, &str)>) -> CacheAction {
             .font(theme::mono(11.0))
             .color(theme::TEXT_DIM),
     );
+    let right_edge = child.min_rect().min.x - 14.0;
+
+    if let Some((name, detail)) = session {
+        crate::diag::session_line(ui.painter(), cy, title.max.x, right_edge, name, detail);
+    }
     action
 }
 

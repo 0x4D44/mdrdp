@@ -11,8 +11,8 @@
 //! above and the 900×700 window around it belong to the host.
 
 use egui::{
-    Align2, Color32, CornerRadius, FontId, Frame, Margin, Painter, Rect, RichText, Sense, Stroke,
-    Ui, pos2, vec2,
+    Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Painter, Rect, RichText,
+    Sense, Stroke, Ui, UiBuilder, pos2, vec2,
 };
 
 use crate::diag::{ms1, paint_card, signed_ms1, thousands};
@@ -30,6 +30,10 @@ pub enum LatencyAction {
     #[default]
     None,
     WriteMetrics,
+    /// The header's Close button: the host should close this window. Drawn in the
+    /// window itself because a diagnostics window over a fullscreen session has no
+    /// OS titlebar to close it with.
+    Close,
 }
 
 // --- geometry (handoff values) --------------------------------------------------------
@@ -247,59 +251,60 @@ pub fn ui_with_session(
     stats: &SessionStats,
     session: Option<(&str, &str)>,
 ) -> LatencyAction {
-    header(ui, stats, session);
+    let header_action = header(ui, stats, session);
     metric_row(ui, stats);
-    chart(ui, stats)
+    let chart_action = chart(ui, stats);
+    if header_action == LatencyAction::None {
+        chart_action
+    } else {
+        header_action
+    }
 }
 
-fn header(ui: &mut Ui, stats: &SessionStats, session: Option<(&str, &str)>) {
+fn header(ui: &mut Ui, stats: &SessionStats, session: Option<(&str, &str)>) -> LatencyAction {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEADER_H), Sense::hover());
-    let painter = ui.painter();
-    painter.hline(
+    ui.painter().hline(
         rect.x_range(),
         rect.max.y - 0.5,
         Stroke::new(1.0, theme::LINE_HAIR),
     );
 
     let cy = rect.center().y;
-    let title = painter.text(
+    let title = ui.painter().text(
         pos2(rect.min.x + PAD_X, cy),
         Align2::LEFT_CENTER,
         "Latency and drift",
         theme::sans_semibold(15.0),
         theme::TEXT_PRIMARY,
     );
-    if let Some((name, detail)) = session {
-        let divider_x = title.max.x + 14.0;
-        painter.vline(
-            divider_x,
-            egui::Rangef::new(cy - 9.0, cy + 9.0),
-            Stroke::new(1.0, theme::LINE_SUBTLE),
-        );
-        let dot_x = divider_x + 14.0;
-        painter.circle_filled(pos2(dot_x + 3.0, cy), 3.0, theme::ACCENT);
-        let name_rect = painter.text(
-            pos2(dot_x + 6.0 + 9.0, cy),
-            Align2::LEFT_CENTER,
-            name,
-            theme::mono(12.0),
-            theme::TEXT_PRIMARY,
-        );
-        painter.text(
-            pos2(name_rect.max.x + 9.0, cy),
-            Align2::LEFT_CENTER,
-            detail,
-            theme::mono(12.0),
-            theme::TEXT_DIM,
-        );
-    }
-    painter.text(
-        pos2(rect.max.x - PAD_X, cy),
-        Align2::RIGHT_CENTER,
-        header_right(stats),
-        theme::mono(11.0),
-        theme::TEXT_DIM,
+
+    // The right-aligned content goes down first, so the session line knows exactly
+    // where it must stop instead of painting straight through it.
+    let mut action = LatencyAction::None;
+    let area = Rect::from_min_max(
+        pos2(rect.min.x + PAD_X, rect.min.y),
+        pos2(rect.max.x - PAD_X, rect.max.y),
     );
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .max_rect(area)
+            .layout(Layout::right_to_left(Align::Center)),
+    );
+    if widgets::secondary_button(&mut child, "Close", 26.0).clicked() {
+        action = LatencyAction::Close;
+    }
+    child.add_space(16.0 - child.spacing().item_spacing.x);
+    child.label(
+        RichText::new(header_right(stats))
+            .font(theme::mono(11.0))
+            .color(theme::TEXT_DIM),
+    );
+    let right_edge = child.min_rect().min.x - 14.0;
+
+    if let Some((name, detail)) = session {
+        crate::diag::session_line(ui.painter(), cy, title.max.x, right_edge, name, detail);
+    }
+    action
 }
 
 fn metric_row(ui: &mut Ui, stats: &SessionStats) {

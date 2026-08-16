@@ -148,15 +148,16 @@ impl DiagKind {
 }
 
 /// The UI bodies for the three diagnostics windows, supplied by whoever holds the
-/// stats handles (`main.rs`). The window module stays ignorant of what they draw.
+/// stats handles (`main.rs`). The window module stays ignorant of what they draw;
+/// each returns `true` when its Close control was used and the window should go.
 pub struct DiagnosticsUis {
-    pub cache: Box<dyn FnMut(&mut egui::Ui)>,
-    pub latency: Box<dyn FnMut(&mut egui::Ui)>,
-    pub channels: Box<dyn FnMut(&mut egui::Ui)>,
+    pub cache: Box<dyn FnMut(&mut egui::Ui) -> bool>,
+    pub latency: Box<dyn FnMut(&mut egui::Ui) -> bool>,
+    pub channels: Box<dyn FnMut(&mut egui::Ui) -> bool>,
 }
 
 impl DiagnosticsUis {
-    fn ui_for(&mut self, kind: DiagKind) -> &mut Box<dyn FnMut(&mut egui::Ui)> {
+    fn ui_for(&mut self, kind: DiagKind) -> &mut Box<dyn FnMut(&mut egui::Ui) -> bool> {
         match kind {
             DiagKind::Cache => &mut self.cache,
             DiagKind::Latency => &mut self.latency,
@@ -1466,9 +1467,28 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 }
                 WindowEvent::RedrawRequested => {
                     let (kind, win) = &mut self.aux[pos];
+                    let mut close = false;
                     match self.diagnostics.as_mut() {
-                        Some(uis) => win.redraw(uis.ui_for(*kind).as_mut()),
+                        Some(uis) => {
+                            let body = uis.ui_for(*kind);
+                            win.redraw(|ui| {
+                                close |= body(ui);
+                                // Cmd+W (Ctrl+W elsewhere) and Escape close too: over
+                                // a fullscreen session the window may have no OS
+                                // titlebar, so the button must not be the only way.
+                                close |= ui.input(|i| {
+                                    i.key_pressed(egui::Key::Escape)
+                                        || (i.modifiers.command && i.key_pressed(egui::Key::W))
+                                });
+                            });
+                        }
                         None => win.redraw(|_| {}),
+                    }
+                    if close {
+                        self.aux.remove(pos);
+                        if self.aux.is_empty() && self.toasts.is_empty() {
+                            event_loop.set_control_flow(ControlFlow::Wait);
+                        }
                     }
                 }
                 other => {

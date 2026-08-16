@@ -12,11 +12,78 @@
 //! as literals.
 
 use crate::ui::theme;
-use egui::{CornerRadius, Painter, Rect, Stroke, StrokeKind};
+use egui::text::{LayoutJob, TextWrapping};
+use egui::{Color32, CornerRadius, FontId, Painter, Pos2, Rangef, Rect, Stroke, StrokeKind, pos2};
 
 pub mod cache;
 pub mod channels;
 pub mod latency;
+
+/// Paint one line at `at` (left edge, vertically centred), elided with `…` so it never
+/// paints past `max_x`. Returns the x where the text ended.
+///
+/// Every left-flowing string that shares a band with right-aligned content goes through
+/// this: a plain `painter.text` has no width and runs straight under its neighbour.
+pub fn elided_text(
+    painter: &Painter,
+    at: Pos2,
+    max_x: f32,
+    text: &str,
+    font: FontId,
+    colour: Color32,
+) -> f32 {
+    let width = max_x - at.x;
+    if width <= 0.0 {
+        return at.x;
+    }
+    let mut job = LayoutJob::simple_singleline(text.to_owned(), font, colour);
+    job.wrap = TextWrapping::truncate_at_width(width);
+    let galley = painter.layout_job(job);
+    let size = galley.size();
+    painter.galley(pos2(at.x, at.y - size.y / 2.0), galley, colour);
+    at.x + size.x
+}
+
+/// The header's session line — hairline divider, live dot, name, detail — painted after
+/// the title and elided so it can never run under the header's right-aligned content at
+/// `max_x`. All three diagnostics windows draw exactly this line.
+pub fn session_line(
+    painter: &Painter,
+    cy: f32,
+    after_x: f32,
+    max_x: f32,
+    name: &str,
+    detail: &str,
+) {
+    let divider_x = after_x + 14.0;
+    let dot_x = divider_x + 14.0;
+    let name_x = dot_x + 6.0 + 9.0;
+    if name_x >= max_x {
+        return; // No room: a divider and dot with no text reads as a glitch.
+    }
+    painter.vline(
+        divider_x,
+        Rangef::new(cy - 9.0, cy + 9.0),
+        Stroke::new(1.0, theme::LINE_SUBTLE),
+    );
+    painter.circle_filled(pos2(dot_x + 3.0, cy), 3.0, theme::ACCENT);
+    let name_end = elided_text(
+        painter,
+        pos2(name_x, cy),
+        max_x,
+        name,
+        theme::mono(12.0),
+        theme::TEXT_PRIMARY,
+    );
+    elided_text(
+        painter,
+        pos2(name_end + 9.0, cy),
+        max_x,
+        detail,
+        theme::mono(12.0),
+        theme::TEXT_DIM,
+    );
+}
 
 /// Paint a diagnostics card: `bg.chrome` fill, 1px `line.hair` border, 6px radius.
 ///

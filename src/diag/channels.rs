@@ -18,9 +18,13 @@
 //! (`padding:20px`, gap 14). The 30px menu strip above and the 900×700 window around it
 //! belong to the host.
 
-use egui::{Align2, Color32, CornerRadius, FontId, Painter, Rect, Sense, Stroke, Ui, pos2, vec2};
+use egui::{
+    Align, Align2, Color32, CornerRadius, FontId, Layout, Painter, Rect, RichText, Sense, Stroke,
+    Ui, UiBuilder, pos2, vec2,
+};
 
 use crate::diag::thousands;
+use crate::shell::widgets;
 use crate::ui::theme;
 
 // --- the snapshot ---------------------------------------------------------------------
@@ -96,15 +100,18 @@ pub struct ChannelsSnapshot {
 
 /// What the window wants its host to do after the frame is drawn.
 ///
-/// Screen 6 carries no control of its own — the handoff pins a note where the latency
-/// window puts its button — so `ui` returns [`ChannelsAction::None`] today. The enum
-/// exists because the host drives all three diagnostics windows through one shape, and
-/// a metrics-write from the menu bar lands here without changing the signature.
+/// The enum exists because the host drives all three diagnostics windows through one
+/// shape, and a metrics-write from the menu bar lands here without changing the
+/// signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelsAction {
     #[default]
     None,
     WriteMetrics,
+    /// The header's Close button: the host should close this window. Drawn in the
+    /// window itself because a diagnostics window over a fullscreen session has no
+    /// OS titlebar to close it with.
+    Close,
 }
 
 // --- geometry (handoff values) --------------------------------------------------------
@@ -277,7 +284,7 @@ pub fn codec_caption(bar: &CodecBar) -> String {
 
 /// Draw the whole window body from one snapshot.
 pub fn ui(ui: &mut Ui, snapshot: &ChannelsSnapshot) -> ChannelsAction {
-    header(ui, snapshot);
+    let action = header(ui, snapshot);
 
     let (body, _) = ui.allocate_exact_size(
         vec2(ui.available_width(), ui.available_height()),
@@ -291,65 +298,61 @@ pub fn ui(ui: &mut Ui, snapshot: &ChannelsSnapshot) -> ChannelsAction {
     left_pane(painter, left, snapshot);
     right_sidebar(painter, sidebar, snapshot);
 
-    ChannelsAction::None
+    action
 }
 
-fn header(ui: &mut Ui, snapshot: &ChannelsSnapshot) {
+fn header(ui: &mut Ui, snapshot: &ChannelsSnapshot) -> ChannelsAction {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEADER_H), Sense::hover());
-    let painter = ui.painter();
-    painter.hline(
+    ui.painter().hline(
         rect.x_range(),
         rect.max.y - 0.5,
         Stroke::new(1.0, theme::LINE_HAIR),
     );
 
     let cy = rect.center().y;
-    let title = painter.text(
+    let title = ui.painter().text(
         pos2(rect.min.x + PAD_X, cy),
         Align2::LEFT_CENTER,
         "Channels and codecs",
         theme::sans_semibold(15.0),
         theme::TEXT_PRIMARY,
     );
-    if let Some((name, detail)) = &snapshot.session {
-        let divider_x = title.max.x + 14.0;
-        painter.vline(
-            divider_x,
-            egui::Rangef::new(cy - 9.0, cy + 9.0),
-            Stroke::new(1.0, theme::LINE_SUBTLE),
-        );
-        let dot_x = divider_x + 14.0;
-        painter.circle_filled(pos2(dot_x + 3.0, cy), 3.0, theme::ACCENT);
-        let name_rect = painter.text(
-            pos2(dot_x + 6.0 + 9.0, cy),
-            Align2::LEFT_CENTER,
-            name,
-            theme::mono(12.0),
-            theme::TEXT_PRIMARY,
-        );
-        painter.text(
-            pos2(name_rect.max.x + 9.0, cy),
-            Align2::LEFT_CENTER,
-            detail,
-            theme::mono(12.0),
-            theme::TEXT_DIM,
-        );
-    }
-    painter.text(
-        pos2(rect.max.x - PAD_X, cy),
-        Align2::RIGHT_CENTER,
-        error_summary(
-            snapshot.decode_errors,
-            snapshot.undecoded_regions,
-            snapshot.unhandled_pdus,
-        ),
-        theme::mono(11.0),
-        error_summary_colour(
-            snapshot.decode_errors,
-            snapshot.undecoded_regions,
-            snapshot.unhandled_pdus,
-        ),
+
+    // The right-aligned content goes down first, so the session line knows exactly
+    // where it must stop instead of painting straight through it.
+    let mut action = ChannelsAction::None;
+    let area = Rect::from_min_max(
+        pos2(rect.min.x + PAD_X, rect.min.y),
+        pos2(rect.max.x - PAD_X, rect.max.y),
     );
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .max_rect(area)
+            .layout(Layout::right_to_left(Align::Center)),
+    );
+    if widgets::secondary_button(&mut child, "Close", 26.0).clicked() {
+        action = ChannelsAction::Close;
+    }
+    child.add_space(16.0 - child.spacing().item_spacing.x);
+    child.label(
+        RichText::new(error_summary(
+            snapshot.decode_errors,
+            snapshot.undecoded_regions,
+            snapshot.unhandled_pdus,
+        ))
+        .font(theme::mono(11.0))
+        .color(error_summary_colour(
+            snapshot.decode_errors,
+            snapshot.undecoded_regions,
+            snapshot.unhandled_pdus,
+        )),
+    );
+    let right_edge = child.min_rect().min.x - 14.0;
+
+    if let Some((name, detail)) = &snapshot.session {
+        crate::diag::session_line(ui.painter(), cy, title.max.x, right_edge, name, detail);
+    }
+    action
 }
 
 fn left_pane(painter: &Painter, pane: Rect, snapshot: &ChannelsSnapshot) {
@@ -492,19 +495,22 @@ fn right_sidebar(painter: &Painter, pane: Rect, snapshot: &ChannelsSnapshot) {
             (theme::TEXT_SECONDARY, theme::TEXT_DIM)
         };
         let cy = y + SIDE_ROW_H / 2.0;
-        painter.text(
-            pos2(content.min.x, cy),
-            Align2::LEFT_CENTER,
-            &entry.stage,
-            theme::mono(12.0),
-            stage_colour,
-        );
-        painter.text(
+        let ms = painter.text(
             pos2(content.max.x, cy),
             Align2::RIGHT_CENTER,
             stage_ms(entry.elapsed_ms),
             theme::mono(11.0),
             ms_colour,
+        );
+        // Elided against the milliseconds column: connector stage names arrive
+        // verbatim and some are longer than the sidebar.
+        crate::diag::elided_text(
+            painter,
+            pos2(content.min.x, cy),
+            ms.min.x - 8.0,
+            &entry.stage,
+            theme::mono(12.0),
+            stage_colour,
         );
         y += SIDE_ROW_H + SIDE_ROW_GAP;
     }
@@ -921,5 +927,57 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(frame(&partial), ChannelsAction::None);
+    }
+
+    /// The regression seen live: a long session detail painted straight through the
+    /// header's right-aligned error summary, and a long stage name through its
+    /// milliseconds column. Lay out a real frame and assert no two texts intersect.
+    #[test]
+    fn no_two_texts_overlap_however_long_the_left_hand_strings_run() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 670.0))),
+            ..Default::default()
+        };
+        let mut snapshot = mock_snapshot();
+        snapshot.session = Some((
+            "Kiln".to_owned(),
+            "user@example.com@Kiln:3389 · pid 44422".to_owned(),
+        ));
+        snapshot.timeline.push(TimelineEntry {
+            stage: "BasicSettingsExchangeWaitResponse".to_owned(),
+            elapsed_ms: 3.0,
+        });
+        let output = ctx.run_ui(input, |u| {
+            super::ui(u, &snapshot);
+        });
+        let mut texts: Vec<Rect> = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                // `pos` is the halign anchor, not the top-left: a right-aligned
+                // galley's glyphs run leftward from it.
+                let size = t.galley.size();
+                let min_x = match t.galley.job.halign {
+                    egui::Align::LEFT => t.pos.x,
+                    egui::Align::Center => t.pos.x - size.x / 2.0,
+                    egui::Align::RIGHT => t.pos.x - size.x,
+                };
+                texts.push(Rect::from_min_size(pos2(min_x, t.pos.y), size));
+            }
+        }
+        // Consumed before the asserts: FullOutput's destructor panics on unapplied
+        // deltas, which would turn a plain assert failure into a SIGABRT.
+        output.drop_without_applying_deltas();
+        assert!(
+            texts.len() >= 10,
+            "a populated frame draws many texts; got {}",
+            texts.len()
+        );
+        for (i, a) in texts.iter().enumerate() {
+            for b in &texts[i + 1..] {
+                assert!(!a.intersects(*b), "texts overlap: {a:?} and {b:?}");
+            }
+        }
     }
 }
