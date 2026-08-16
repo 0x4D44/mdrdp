@@ -59,6 +59,9 @@ pub struct StageEvent {
 struct Inner {
     events: Vec<StageEvent>,
     last: Option<Instant>,
+    /// Mirrors each *transition* to a live listener (a connect progress UI). Send
+    /// failures are ignored; display must never fail the connect being displayed.
+    live: Option<std::sync::mpsc::Sender<crate::connect::LiveStage>>,
 }
 
 /// Shared handle to the collected stages.
@@ -68,6 +71,13 @@ pub struct StageLog(Arc<Mutex<Inner>>);
 impl StageLog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A stage log that also streams each transition to `live`.
+    pub fn with_sender(live: std::sync::mpsc::Sender<crate::connect::LiveStage>) -> Self {
+        let log = Self::default();
+        log.0.lock().expect("stage log mutex").live = Some(live);
+        log
     }
 
     fn record(&self, state: &str) {
@@ -88,6 +98,13 @@ impl StageLog {
             return;
         }
 
+        if let Some(live) = &inner.live {
+            let _ = live.send(crate::connect::LiveStage {
+                name: state.to_owned(),
+                elapsed_ms,
+                qualifier: None,
+            });
+        }
         inner.events.push(StageEvent {
             state: state.to_owned(),
             elapsed_ms,

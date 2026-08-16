@@ -39,6 +39,22 @@ pub struct ConnectOptions {
     /// Dump the first few raw AVC444 payloads here, for offline replay of a decode
     /// anomaly. **Session content** — carried by the operator's `--capture` opt-in.
     pub avc_capture: Option<PathBuf>,
+    /// Stream each connect stage as it happens, for a UI that shows live progress.
+    /// `None` costs nothing. The receiver disappearing is not an error — progress
+    /// display must never be able to fail a connect.
+    pub live_stages: Option<std::sync::mpsc::Sender<LiveStage>>,
+}
+
+/// One live progress event, streamed while connecting.
+///
+/// Deliberately its own type rather than [`StageEvent`]: the qualifier may carry a
+/// peer address, which belongs in an interactive progress row but must never enter
+/// the redacted metrics report that `StageEvent` feeds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveStage {
+    pub name: String,
+    pub elapsed_ms: f64,
+    pub qualifier: Option<String>,
 }
 
 /// One step of the connection sequence.
@@ -147,23 +163,35 @@ struct Trace {
     started: Instant,
     last: Instant,
     stages: Vec<Stage>,
+    /// Mirror of each mark, streamed to a listening UI. Send failures are ignored:
+    /// a closed progress display must never fail a connect.
+    live: Option<std::sync::mpsc::Sender<LiveStage>>,
 }
 
 impl Trace {
-    fn new() -> Self {
+    fn new(live: Option<std::sync::mpsc::Sender<LiveStage>>) -> Self {
         let now = Instant::now();
         Trace {
             started: now,
             last: now,
             stages: Vec::new(),
+            live,
         }
     }
 
     fn mark(&mut self, name: &'static str, detail: Option<String>) {
         let now = Instant::now();
+        let elapsed_ms = ms(now - self.last);
+        if let Some(live) = &self.live {
+            let _ = live.send(LiveStage {
+                name: name.to_owned(),
+                elapsed_ms,
+                qualifier: detail.clone(),
+            });
+        }
         self.stages.push(Stage {
             name,
-            elapsed_ms: ms(now - self.last),
+            elapsed_ms,
             detail,
         });
         self.last = now;
@@ -389,7 +417,7 @@ pub fn establish(
     // the server never to use it — the server obliges, no Wave PDU ever arrives, and the
     // feature looks present while producing permanent silence.
     let wants_audio = rdpsnd.is_some();
-    let mut trace = Trace::new();
+    let mut trace = Trace::new(opts.live_stages.clone());
     let target = format!("{}:{}", opts.host, opts.port);
 
     // --- TCP -------------------------------------------------------------------
@@ -591,7 +619,10 @@ pub fn establish(
 
     // IronRDP reports each connector state as it steps; capture that rather than
     // reimplementing its loop. Scoped to this call, so nothing is installed globally.
-    let stage_log = StageLog::new();
+    let stage_log = match &opts.live_stages {
+        Some(live) => StageLog::with_sender(live.clone()),
+        None => StageLog::new(),
+    };
     let subscriber = tracing_subscriber::registry().with(stage_log.clone());
     stage_log.start();
     let result = tracing::subscriber::with_default(subscriber, || {

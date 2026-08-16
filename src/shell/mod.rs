@@ -11,6 +11,7 @@
 //! kept, because the list shows which favourites have a session running and the Quit
 //! dialog must name them.
 
+pub mod dialogs;
 pub mod widgets;
 
 use std::path::PathBuf;
@@ -35,6 +36,32 @@ pub struct SessionHandle {
     pub started: Instant,
 }
 
+/// One line of the child's `--stage-json` stdout protocol, decoded.
+enum ChildEvent {
+    Stage {
+        name: String,
+        elapsed_ms: u64,
+        qualifier: Option<String>,
+    },
+    Connected,
+    Failed(String),
+    /// The pipe closed without a terminal event: the child died mid-connect.
+    Eof,
+}
+
+/// A connect in progress (or failed), driving the Connecting modal.
+struct ConnectFlow {
+    name: String,
+    host: String,
+    port: u16,
+    account: String,
+    child: Option<Child>,
+    rx: std::sync::mpsc::Receiver<ChildEvent>,
+    arrived: Vec<(String, u64, Option<String>)>,
+    started: Instant,
+    failure: Option<dialogs::ConnectFailure>,
+}
+
 /// Which modal sits over the list, if any. Placeholder variants fill in as their
 /// units land.
 enum Modal {
@@ -54,6 +81,7 @@ pub struct LauncherApp {
     /// wizard arrives in its own unit; until then this renders a placeholder.
     wizard: Option<()>,
     modal: Option<Modal>,
+    connect_flow: Option<ConnectFlow>,
     menu: menus::LauncherMenu,
 }
 
@@ -66,6 +94,7 @@ impl LauncherApp {
             running: Vec::new(),
             wizard: None,
             modal: None,
+            connect_flow: None,
             menu,
         }
     }
@@ -81,26 +110,140 @@ impl LauncherApp {
         self.running.iter().find(|s| s.name == name)
     }
 
-    /// Launch a session child for the favourite at `index`.
-    fn connect(&mut self, index: usize) {
+    /// Start connecting the favourite at `index`, showing the Connecting modal.
+    ///
+    /// The child owns the socket and the logon (one process per session); its
+    /// `--stage-json` stdout drives the modal, so the logon happens exactly once.
+    fn connect(&mut self, index: usize, ctx: &egui::Context) {
+        if self.connect_flow.is_some() {
+            return; // One connect at a time; the modal owns the screen anyway.
+        }
         let Some(f) = self.favourites.iter().nth(index) else {
             return;
         };
         let name = f.name.clone();
-        match spawn_session(&name) {
-            Ok(child) => {
-                self.favourites.touch(&name);
-                // Best-effort: a failed save costs a caption, not a session.
-                if let Err(e) = self.favourites.save_to(&self.config_path) {
-                    eprintln!("warning: could not record last-used time: {e}");
-                }
-                self.running.push(SessionHandle {
+        let host = f.host.clone();
+        let port = f.port;
+        let account = f
+            .username
+            .clone()
+            .unwrap_or_else(|| "(no account)".to_owned());
+        match spawn_connect(&name, &[], ctx.clone()) {
+            Ok((child, rx)) => {
+                self.connect_flow = Some(ConnectFlow {
                     name,
-                    child,
+                    host,
+                    port,
+                    account,
+                    child: Some(child),
+                    rx,
+                    arrived: Vec::new(),
                     started: Instant::now(),
+                    failure: None,
                 });
             }
             Err(e) => eprintln!("{e}"),
+        }
+    }
+
+    /// Drain child events and draw the Connecting modal / failure dialog.
+    fn connect_flow_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut flow) = self.connect_flow.take() else {
+            return;
+        };
+        // Drain whatever the reader thread queued since the last frame.
+        while let Ok(event) = flow.rx.try_recv() {
+            match event {
+                ChildEvent::Stage {
+                    name,
+                    elapsed_ms,
+                    qualifier,
+                } => flow.arrived.push((name, elapsed_ms, qualifier)),
+                ChildEvent::Connected => {
+                    let child = flow.child.take().expect("child present until terminal");
+                    self.favourites.touch(&flow.name);
+                    if let Err(e) = self.favourites.save_to(&self.config_path) {
+                        eprintln!("warning: could not record last-used time: {e}");
+                    }
+                    self.running.push(SessionHandle {
+                        name: flow.name.clone(),
+                        child,
+                        started: Instant::now(),
+                    });
+                    return; // Modal closes; the launcher stays open.
+                }
+                ChildEvent::Failed(error) => {
+                    reap(flow.child.take());
+                    flow.failure = Some(dialogs::ConnectFailure {
+                        kind: dialogs::classify(&error),
+                        host: flow.host.clone(),
+                        port: flow.port,
+                        account: flow.account.clone(),
+                        error,
+                    });
+                }
+                ChildEvent::Eof => {
+                    if flow.failure.is_none() {
+                        reap(flow.child.take());
+                        flow.failure = Some(dialogs::ConnectFailure {
+                            kind: dialogs::FailureKind::Other,
+                            host: flow.host.clone(),
+                            port: flow.port,
+                            account: flow.account.clone(),
+                            error: "the session process ended unexpectedly".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+
+        match &flow.failure {
+            None => {
+                let rows = dialogs::stage_rows(&flow.arrived);
+                let elapsed = u64::try_from(flow.started.elapsed().as_millis()).unwrap_or(0);
+                let action = dialogs::connecting(ctx, &flow.name, &rows, elapsed);
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                if action == dialogs::ConnectDialogAction::Cancel {
+                    if let Some(mut child) = flow.child.take() {
+                        // Pre-logon abort: nothing exists on the host yet to abandon.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    return;
+                }
+                self.connect_flow = Some(flow);
+            }
+            Some(failure) => match dialogs::connect_failed(ctx, failure) {
+                dialogs::ConnectDialogAction::Retry => {
+                    let index = self.favourites.iter().position(|f| f.name == flow.name);
+                    if let Some(i) = index {
+                        self.connect(i, ctx);
+                    }
+                }
+                dialogs::ConnectDialogAction::TryDefaultPort => {
+                    if let Ok((child, rx)) = spawn_connect(
+                        &flow.name,
+                        &["--port".to_owned(), "3389".to_owned()],
+                        ctx.clone(),
+                    ) {
+                        self.connect_flow = Some(ConnectFlow {
+                            child: Some(child),
+                            rx,
+                            arrived: Vec::new(),
+                            started: Instant::now(),
+                            failure: None,
+                            port: 3389,
+                            ..flow
+                        });
+                    }
+                }
+                dialogs::ConnectDialogAction::ChangePassword => {
+                    // The credential dialogs land in a later unit.
+                    eprintln!("change-password flow is not built yet");
+                }
+                dialogs::ConnectDialogAction::Close | dialogs::ConnectDialogAction::Cancel => {}
+                dialogs::ConnectDialogAction::None => self.connect_flow = Some(flow),
+            },
         }
     }
 
@@ -113,7 +256,7 @@ impl LauncherApp {
                 Some(menus::MenuAction::RevealFavourites) => reveal(&self.config_path),
                 Some(menus::MenuAction::Connect) => {
                     if let Some(i) = self.selected {
-                        self.connect(i);
+                        self.connect(i, ctx);
                     }
                 }
                 Some(menus::MenuAction::CloseWindow) => {
@@ -125,7 +268,7 @@ impl LauncherApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.modal.is_some() || self.wizard.is_some() {
+        if self.modal.is_some() || self.wizard.is_some() || self.connect_flow.is_some() {
             return; // Each surface owns its own keys.
         }
         let (enter, up, down, n) = ctx.input(|i| {
@@ -145,7 +288,7 @@ impl LauncherApp {
                 self.selected = Some(self.selected.map_or(0, |s| s.saturating_sub(1)));
             }
             if enter && let Some(i) = self.selected {
-                self.connect(i);
+                self.connect(i, ctx);
             }
         }
         if n {
@@ -302,7 +445,8 @@ impl LauncherApp {
                     });
             });
         if let Some(i) = connect_row {
-            self.connect(i);
+            let ctx = ui.ctx().clone();
+            self.connect(i, &ctx);
         }
     }
 
@@ -481,6 +625,7 @@ impl eframe::App for LauncherApp {
             Some(Modal::About) => self.modal_placeholder(&ctx, "About mdrdp"),
             None => {}
         }
+        self.connect_flow_ui(&ctx);
 
         if !self.running.is_empty() {
             // The "connected Xm" captions and liveness pruning need a clock; one
@@ -536,16 +681,67 @@ fn window_icon() -> Option<egui::IconData> {
     })
 }
 
-/// Launch a session for `name` in its own process, keeping the child handle.
+/// Launch a connecting session child with `--stage-json`, and a reader thread that
+/// decodes its stdout protocol into `ChildEvent`s.
 ///
 /// `--` first: a favourite legitimately named like a flag must still parse as a target.
-fn spawn_session(name: &str) -> Result<Child, String> {
+/// The reader stays alive until the child's stdout closes — holding the pipe open for
+/// the child's whole life means a late stray print can never hit a closed pipe.
+fn spawn_connect(
+    name: &str,
+    extra_args: &[String],
+    ctx: egui::Context,
+) -> Result<(Child, std::sync::mpsc::Receiver<ChildEvent>), String> {
+    use std::io::BufRead as _;
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own path: {e}"))?;
-    Command::new(&exe)
+    let mut child = Command::new(&exe)
         .arg("--")
         .arg(name)
+        .arg("--stage-json")
+        .args(extra_args)
+        .stdout(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not start a session for {name:?}: {e}"))
+        .map_err(|e| format!("could not start a session for {name:?}: {e}"))?;
+    let stdout = child.stdout.take().expect("stdout was requested piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let event = match v["event"].as_str() {
+                Some("stage") => ChildEvent::Stage {
+                    name: v["state"].as_str().unwrap_or("?").to_owned(),
+                    elapsed_ms: v["elapsed_ms"].as_f64().unwrap_or(0.0).round() as u64,
+                    qualifier: v["qualifier"].as_str().map(str::to_owned),
+                },
+                Some("connected") => ChildEvent::Connected,
+                Some("failed") => {
+                    ChildEvent::Failed(v["error"].as_str().unwrap_or("unknown error").to_owned())
+                }
+                _ => continue,
+            };
+            if tx.send(event).is_err() {
+                return; // The flow is gone (cancelled); nothing to report to.
+            }
+            ctx.request_repaint();
+        }
+        let _ = tx.send(ChildEvent::Eof);
+        ctx.request_repaint();
+    });
+    Ok((child, rx))
+}
+
+/// Wait out a child that failed to connect, off the UI thread, so it never zombies.
+fn reap(child: Option<Child>) {
+    if let Some(mut child) = child {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Reveal the favourites file in the platform file manager. Best-effort.

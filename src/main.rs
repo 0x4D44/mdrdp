@@ -58,6 +58,7 @@ fn usage() -> &'static str {
      --screenshot <file>    write the final frame to a BMP (session pixels on disk)\n  \
      --metrics-json <file>  write a redacted session metrics report as JSON\n  \
      --input-script <file>  inject scripted keystrokes into the session (for tests)\n  \
+     --stage-json           print machine-readable connect progress on stdout\n  \
      --capture-failures DIR dump undecodable tiles AND the first raw AVC444 frames\n                            (screen content!) for offline debugging\n\n\
      Flags override whatever the chosen favourite specifies. A [defaults] username in\n\
      favourites.toml is used when neither a flag nor a favourite names an account."
@@ -209,6 +210,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut metrics_json: Option<String> = None;
     let mut input_script: Option<String> = None;
     let mut password_stdin = false;
+    let mut stage_json = false;
     let mut list_only = false;
     let mut force_fullscreen = false;
 
@@ -226,6 +228,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--password-stdin" => {
                 password_stdin = true;
+                i += 1;
+                continue;
+            }
+            "--stage-json" => {
+                stage_json = true;
                 i += 1;
                 continue;
             }
@@ -428,6 +435,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // With --stage-json each connect stage goes to stdout as one JSON line, live, so
+    // a launcher can drive a progress display. The forwarder thread ends when the
+    // channel does; stdout carries only this protocol, human chatter stays on stderr.
+    let live_stages = stage_json.then(|| {
+        let (tx, rx) = mpsc::channel::<mdrdp::connect::LiveStage>();
+        std::thread::spawn(move || {
+            while let Ok(stage) = rx.recv() {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "stage",
+                        "state": stage.name,
+                        "elapsed_ms": stage.elapsed_ms,
+                        "qualifier": stage.qualifier,
+                    })
+                );
+            }
+        });
+        tx
+    });
+
     let opts = ConnectOptions {
         host: target.host.clone(),
         port: target.port,
@@ -442,10 +470,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // The same --capture opt-in that dumps undecodable ClearCodec tiles also
         // dumps the first few AVC444 payloads for offline replay.
         avc_capture: capture.as_ref().map(std::path::PathBuf::from),
+        live_stages,
     };
 
     eprintln!("connecting to {}:{} …", target.host, target.port);
-    let established = establish(
+    let established = match establish(
         &opts,
         &secret,
         Channels {
@@ -455,8 +484,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Lets the fullscreen toggle renegotiate the session resolution.
             display_control: true,
         },
-    )?;
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            if stage_json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "event": "failed", "error": e.to_string() })
+                );
+            }
+            return Err(e.into());
+        }
+    };
     let desktop = established.desktop_size;
+    if stage_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "connected",
+                "width": desktop.width,
+                "height": desktop.height,
+            })
+        );
+    }
     eprintln!(
         "connected: {}x{}, {}, {}",
         desktop.width,

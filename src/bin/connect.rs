@@ -80,6 +80,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         known_hosts,
         observe_egfx: egfx,
         avc_capture: None,
+        live_stages: None,
     };
 
     let report = connect(&opts, &secret)?;
