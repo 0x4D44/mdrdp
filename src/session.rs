@@ -311,6 +311,12 @@ fn pump(
                     waker.cursor(CursorUpdate::Hidden);
                 }
                 ActiveStageOutput::PointerBitmap(pointer) => {
+                    // Dimensions only — a pointer bitmap is session content.
+                    tracing::debug!(
+                        width = pointer.width,
+                        height = pointer.height,
+                        "remote cursor shape"
+                    );
                     waker.cursor(CursorUpdate::Bitmap {
                         width: pointer.width,
                         height: pointer.height,
