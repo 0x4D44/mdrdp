@@ -1,3 +1,4 @@
+- Typing latency to quench is ~30ms p50 and lives on the SERVER: client decode is 1.3ms, present 2ms; the metrics `decode`/`present` split proves it (`stats::SessionStats`).
 - A cross-target guard nobody can run is a guard that never ran: the msvc check "verified clean" predated the deps that break it (`scripts/check-windows.sh`).
 - An AVC server DIES rather than falls back when asked for a resolution past H.264's 4096x2304 ceiling; clamp requests (`session::clamp_to_encodable`).
 - A re-entered run_app_on_demand loop parks until an event arrives; prime it with one proxy user event (`ui::end_dialog::show`).

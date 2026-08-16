@@ -2,6 +2,15 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
+- [ ] 2026-08-16: the UI thread spends most of its CPU on a full-frame copy per present
+  (`_platform_memmove` 785 ms + `window::present_into` 294 ms over 75 s, samply against
+  quench) even when one caret changed. softbuffer has `present_with_damage`; plumbing
+  EGFX dirty rects through `SurfaceStore` to it would cut most of that. CPU cost, not
+  latency — present p99 measured 3.6 ms (`src/window.rs:present_into`).
+- [ ] 2026-08-16: upstream `ironrdp_blocking::Framed::read` pulls 1024 bytes per syscall
+  (`~/.cargo/.../ironrdp-blocking-0.10.0/src/framed.rs:119`); at 7 MB/s of AVC that is
+  thousands of read calls/s through rustls. Upstream FIXME acknowledges it. Only worth
+  vendoring if session-thread CPU ever matters (it idles ~1% today).
 - [x] 2026-08-16: ~~the Windows cross-check dies in libz-sys on this Mac~~ — fixed the
   same day, and the diagnosis was shallow: libz-sys came from sspi's smart-card feature
   (now off by default in the vendored connector, not the image stack), and behind it
