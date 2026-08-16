@@ -1,5 +1,32 @@
 # Vendored dependencies
 
+## `ironrdp-session` 0.11.0 — Bandwidth Measure requests are answered
+
+The published crate answers auto-detect RTT requests but logs every Bandwidth Measure
+Start/Stop as "not yet implemented" and drops it. Windows runs continuous network
+detection ([MS-RDPBCGR] 2.2.14): it brackets bursts of its own traffic with Start/Stop
+and expects Bandwidth Measure Results back. A server that never receives Results keeps
+re-probing — quench sent **140 Start/Stop pairs in a 40-second session** — and throttles
+the EGFX pipeline meanwhile: repaints stop partway (frame ids skip), the session dribbles
+at ~2 fps, and input-to-paint latency runs 1–4 s on a 3 ms LAN.
+
+The vendored crate mirrors FreeRDP (`libfreerdp/core/autodetect.c` +
+`rdp_recv_tpkt_pdu`): a Start records the time and starts counting **every inbound
+frame's bytes** (fast-path included — `ActiveStage::process` feeds each frame length to
+`x224::Processor::register_inbound_bytes`), a Stop answers with the elapsed
+milliseconds and byte count, response type 0x0003 for a connect-time stop (0x002B) and
+0x000B otherwise. A Stop with no Start still gets a zeros response — the server is
+blocked on the reply either way.
+
+Measured against quench, same scripted session (open/close Explorer, fullscreen cycle):
+before, the post-resize repaint stopped after 3 frames and the session went silent for
+33 s; after, the repaint runs to completion (18 frames, sub-second) and responses carry
+real numbers (e.g. 44 555 bytes / 7 ms). Tests in `src/x224/mod.rs` (`bandwidth_*`,
+`a_stop_without_a_start_*`, `a_connect_time_stop_*`); each was made to fail by
+re-breaking the fix before being trusted.
+
+Remove when a released `ironrdp-session` answers bandwidth measure requests.
+
 ## `ironrdp-rdpsnd` 0.9.0 — stable negotiated format order
 
 Published IronRDP intersects the server and client format sets through a randomly seeded

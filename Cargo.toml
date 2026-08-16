@@ -46,3 +46,5 @@ ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 ironrdp-pdu = { path = "vendor/ironrdp-pdu" }
 # Preserve the client format order and report the exact negotiated list to playback.
 ironrdp-rdpsnd = { path = "vendor/ironrdp-rdpsnd" }
+# Answer Bandwidth Measure requests; an unanswered probe makes Windows throttle EGFX.
+ironrdp-session = { path = "vendor/ironrdp-session" }
