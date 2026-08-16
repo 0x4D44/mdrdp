@@ -4,6 +4,7 @@
 //! implementation of the things both need to agree on.
 
 pub mod audio;
+pub mod autoinput;
 pub mod clipboard;
 pub mod connect;
 pub mod creds;

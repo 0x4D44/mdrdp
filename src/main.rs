@@ -58,6 +58,7 @@ fn usage() -> &'static str {
      --password-stdin       read the password from stdin instead of the keychain\n  \
      --screenshot <file>    write the final frame to a BMP (session pixels on disk)\n  \
      --metrics-json <file>  write a redacted session metrics report as JSON\n  \
+     --input-script <file>  inject scripted keystrokes into the session (for tests)\n  \
      --capture-failures DIR dump undecodable tiles for offline debugging\n\n\
      Flags override whatever the chosen favourite specifies. A [defaults] username in\n\
      favourites.toml is used when neither a flag nor a favourite names an account."
@@ -207,6 +208,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut duration: Option<u64> = None;
     let mut screenshot: Option<String> = None;
     let mut metrics_json: Option<String> = None;
+    let mut input_script: Option<String> = None;
     let mut password_stdin = false;
     let mut list_only = false;
     let mut force_fullscreen = false;
@@ -240,6 +242,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--duration" => duration = Some(value()?.parse()?),
             "--screenshot" => screenshot = Some(value()?.clone()),
             "--metrics-json" => metrics_json = Some(value()?.clone()),
+            "--input-script" => input_script = Some(value()?.clone()),
             "--size" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--size wants WxH, e.g. 1280x800")?;
@@ -444,6 +447,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if explicit_size {
         // Flags always win: --size names the session resolution, fullscreen or not.
         window_config = window_config.keeping_stated_resolution();
+    }
+    // Parse and arm the input script before the sender moves into the window. A parse
+    // error aborts the run: a scripted test whose script silently did nothing has
+    // already produced hours of misleading "healthy" evidence via window-system paths.
+    if let Some(path) = &input_script {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("input script {path}: {e}"))?;
+        let script = mdrdp::autoinput::Script::parse(&text)
+            .map_err(|e| format!("input script {path}: {e}"))?;
+        script.spawn(input_tx.clone());
     }
     let window = SessionWindow::new(event_loop, window_config, Arc::clone(&store), input_tx)?;
     let session_stats = StatsHandle::new();
