@@ -51,6 +51,12 @@ pub struct WindowConfig {
     pub session_height: u16,
     /// Open the window borderless fullscreen on its current monitor.
     pub fullscreen: bool,
+    /// When opening fullscreen, ask the session for the monitor's native resolution.
+    ///
+    /// Off when an explicit `--size` was given: flags always win, so a scripted
+    /// `--size WxH --fullscreen` keeps its stated resolution. A later interactive
+    /// fullscreen toggle still renegotiates — that is a fresh user action.
+    pub negotiate_native_on_start: bool,
 }
 
 impl WindowConfig {
@@ -60,12 +66,19 @@ impl WindowConfig {
             session_width,
             session_height,
             fullscreen: false,
+            negotiate_native_on_start: true,
         }
     }
 
     /// Set whether the window should open borderless fullscreen.
     pub fn with_fullscreen(mut self, fullscreen: bool) -> Self {
         self.fullscreen = fullscreen;
+        self
+    }
+
+    /// Keep the configured session resolution even when opening fullscreen.
+    pub fn keeping_stated_resolution(mut self) -> Self {
+        self.negotiate_native_on_start = false;
         self
     }
 }
@@ -922,7 +935,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         // A window that *opens* fullscreen — a favourite, or a remembered fullscreen
         // close — negotiates its monitor's native resolution the same way the hotkey
         // does. Best-effort: on a server without Display Control it letterboxes.
-        if self.fullscreen {
+        if self.fullscreen && self.config.negotiate_native_on_start {
             self.request_native_resolution(&window);
         }
     }

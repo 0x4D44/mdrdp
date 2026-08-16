@@ -406,17 +406,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Window on the main thread, before the session thread that needs its waker.
-    let window = SessionWindow::new(
-        event_loop,
-        WindowConfig::new(
-            format!("mdrdp — {display_name}"),
-            desktop.width,
-            desktop.height,
-        )
-        .with_fullscreen(fullscreen),
-        Arc::clone(&store),
-        input_tx,
-    )?;
+    let mut window_config = WindowConfig::new(
+        format!("mdrdp — {display_name}"),
+        desktop.width,
+        desktop.height,
+    )
+    .with_fullscreen(fullscreen);
+    if explicit_size {
+        // Flags always win: --size names the session resolution, fullscreen or not.
+        window_config = window_config.keeping_stated_resolution();
+    }
+    let window = SessionWindow::new(event_loop, window_config, Arc::clone(&store), input_tx)?;
     let session_stats = StatsHandle::new();
     let window = window
         .with_stats(session_stats.clone())
