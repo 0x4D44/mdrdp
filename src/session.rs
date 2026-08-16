@@ -452,6 +452,42 @@ fn notify_if_painted(
     waker.damaged();
 }
 
+/// The largest frame a single H.264 stream can carry: level 5.2's 36 864-macroblock
+/// ceiling, which 4096x2304 hits exactly at 16:9.
+const MAX_ENCODABLE_WIDTH: u32 = 4096;
+const MAX_ENCODABLE_HEIGHT: u32 = 2304;
+
+/// Shrink a resolution request past the encoder ceiling, preserving aspect ratio and
+/// apparent UI size (the scale shrinks by the same ratio).
+///
+/// A full-screen request on a Retina display sends the panel's physical size, and
+/// 5120x2880 is beyond any single H.264 stream. A server running AVC does not fall
+/// back: quench accepted the 5K layout, failed to reinitialise its encoder, and ended
+/// the session with "the server-side graphics subsystem is in an error state"
+/// (2026-08-16). The clamp applies under every codec, not just AVC — a resolution no
+/// encoder refuses beats coupling the resize path to codec negotiation.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn clamp_to_encodable(
+    width: u32,
+    height: u32,
+    scale_percent: Option<u32>,
+) -> (u32, u32, Option<u32>) {
+    if width <= MAX_ENCODABLE_WIDTH && height <= MAX_ENCODABLE_HEIGHT {
+        return (width, height, scale_percent);
+    }
+    let ratio = f64::min(
+        f64::from(MAX_ENCODABLE_WIDTH) / f64::from(width),
+        f64::from(MAX_ENCODABLE_HEIGHT) / f64::from(height),
+    );
+    // Floor to even: H.264 4:2:0 subsampling needs even dimensions on both axes.
+    let width = ((f64::from(width) * ratio) as u32) & !1;
+    let height = ((f64::from(height) * ratio) as u32) & !1;
+    // MS-RDPEDISP ignores a scale below 100, so a sub-100 result pins there: the remote
+    // UI renders a little larger than local, which beats the scale being dropped.
+    let scale_percent = scale_percent.map(|s| ((f64::from(s) * ratio).round() as u32).max(100));
+    (width, height, scale_percent)
+}
+
 /// Try to send the pending resolution request, if the channel is ready for it.
 ///
 /// Split from the pump for the same reason as the clipboard: it has its own retry state,
@@ -472,6 +508,9 @@ fn service_resize(
     else {
         return Ok(());
     };
+
+    let (requested_width, requested_height) = (width, height);
+    let (width, height, scale_percent) = clamp_to_encodable(width, height, scale_percent);
 
     // MS-RDPEDISP bounds: each axis within 200..=8192 and the width even. A monitor
     // reports whatever it likes; the wire has rules.
@@ -510,6 +549,12 @@ fn service_resize(
             // eprintln, not tracing: the client installs no global tracing subscriber,
             // so tracing here is invisible. These are user-facing outcome lines, like
             // the channel report at connect.
+            if requested_width > MAX_ENCODABLE_WIDTH || requested_height > MAX_ENCODABLE_HEIGHT {
+                eprintln!(
+                    "resolution: {requested_width}x{requested_height} exceeds the H.264 \
+                     encoder ceiling; asking for {width}x{height} instead"
+                );
+            }
             eprintln!("resolution: requested {width}x{height} (scale {scale_percent:?})");
             established
                 .framed
@@ -710,6 +755,44 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_resolution_within_the_ceiling_passes_through_untouched() {
+        assert_eq!(
+            clamp_to_encodable(1920, 1080, Some(100)),
+            (1920, 1080, Some(100))
+        );
+        // The ceiling itself is encodable — exactly level 5.2's macroblock budget.
+        assert_eq!(clamp_to_encodable(4096, 2304, None), (4096, 2304, None));
+    }
+
+    #[test]
+    fn retina_fullscreen_clamps_to_the_ceiling_and_shrinks_the_scale() {
+        // The case that killed the quench session: a 5K Retina panel in full screen.
+        // 0.8x on both axes lands exactly on the ceiling; the scale follows, so the
+        // remote UI keeps the same apparent size on the glass.
+        assert_eq!(
+            clamp_to_encodable(5120, 2880, Some(200)),
+            (4096, 2304, Some(160))
+        );
+    }
+
+    #[test]
+    fn a_scale_the_wire_would_ignore_pins_at_100() {
+        // A 5120x1440 super-ultrawide at native scale: the width forces 0.8x, but
+        // MS-RDPEDISP ignores a scale of 80, so it pins at 100.
+        assert_eq!(
+            clamp_to_encodable(5120, 1440, Some(100)),
+            (4096, 1152, Some(100))
+        );
+    }
+
+    #[test]
+    fn clamped_dimensions_are_floored_to_even() {
+        // 1000 * (4096/5121) = 799.8…, which must floor to 798, not round to 800 or
+        // stay odd at 799 — H.264 4:2:0 needs even axes.
+        assert_eq!(clamp_to_encodable(5121, 1000, None), (4096, 798, None));
     }
 
     #[test]
