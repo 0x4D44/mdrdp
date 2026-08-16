@@ -534,7 +534,7 @@ pub fn first_connection(ctx: &egui::Context, info: &CertPromptInfo) -> CertPromp
             );
             ui.label(
                 RichText::new(
-                    "Nothing vouches for this certificate yet. Pinning it means a later                      change — a reinstalled host, or someone in the middle — stops the                      connection and asks.",
+                    "Nothing vouches for this certificate yet. Pinning it means a later change — a reinstalled host, or someone in the middle — stops the connection and asks.",
                 )
                 .font(theme::sans(13.0))
                 .color(theme::TEXT_SECONDARY),
@@ -622,7 +622,7 @@ pub fn certificate_changed(ctx: &egui::Context, failure: &ConnectFailure) -> boo
             });
             ui.label(
                 RichText::new(
-                    "The host is presenting a different certificate from the one pinned.                      That is what a reinstalled host looks like — and also what an                      interception looks like. This connection will not proceed.",
+                    "The host is presenting a different certificate from the one pinned. That is what a reinstalled host looks like — and also what an interception looks like. This connection will not proceed.",
                 )
                 .font(theme::sans(12.0))
                 .color(theme::DANGER_BODY),
@@ -1070,7 +1070,7 @@ pub fn quit_with_sessions(ctx: &egui::Context, sessions: &[(String, u32, u64)]) 
             }
             ui.label(
                 RichText::new(
-                    "Each session is its own process and keeps running; close them from                      their own windows.",
+                    "Each session is its own process and keeps running; close them from their own windows.",
                 )
                 .font(theme::sans(12.0))
                 .color(theme::TEXT_MUTED),
