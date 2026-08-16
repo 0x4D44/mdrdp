@@ -254,6 +254,12 @@ the context's value to every region, so a dissenting region would decode with bo
 wrong band layout and the wrong inverse transform. Latent on this server — every region
 here agrees with the context — but wrong by construction.
 
+## `ironrdp-graphics` 0.9.0 — `ProgressiveDecoder::context_count` test accessor
+
+One additive method exposing how many codec contexts hold tile state, so mdrdp's tests
+can prove that a surface delete discards the deleted surface's progressive state (the
+contexts map is private). No behavioural change.
+
 ## `ironrdp-pdu` 0.9.0 — ClearCodec short-V-bar yOn/yOff were transposed
 
 `src/codecs/clearcodec/bands.rs`, SHORT_VBAR_CACHE_MISS, read the two fields the wrong way

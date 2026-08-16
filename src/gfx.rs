@@ -545,14 +545,13 @@ impl GraphicsPipelineHandler for GfxHandler {
         // ironrdp-egfx 0.3 clears its private surface metadata, but this handler's store is
         // the authoritative pixel state for mdrdp and must follow the wire specification.
         //
-        // CODEC state is the opposite case: the server resets its encoders at this
-        // boundary, so the decoders must restart with it — FreeRDP's gdi_ResetGraphics
-        // calls freerdp_client_codecs_reset at exactly this point. Carrying the
-        // ClearCodec V-bar/glyph caches across a reset replays strips of the OLD
-        // resolution's pixels wherever the restarted encoder signals a cache hit, which
-        // is how a fullscreen resolution change left mis-scaled window fragments behind.
-        self.decoder = ClearCodecDecoder::new();
-        self.progressive.reset();
+        // The ClearCodec caches survive the reset too — measured, not assumed: resetting
+        // the decoder here produced 74 "V-bar cache miss on hit" failures on the very
+        // next repaint, because Windows keeps referencing V-bars it cached before the
+        // reset. FreeRDP resets codec state here (freerdp_client_codecs_reset), but its
+        // ClearCodec reset does not break these hits in practice and ours measurably
+        // does. Codec state dies with the SURFACE (see on_surface_deleted), never with
+        // the reset.
         self.stats
             .note(|s| s.reset_graphics = Some((width, height)));
     }
@@ -1830,12 +1829,12 @@ mod tests {
         );
     }
 
-    /// ResetGraphics is where the server resets its encoders (FreeRDP resets its codec
-    /// contexts there too), so decoder state must restart — while surfaces and the
-    /// bitmap cache persist, which `reset_graphics_preserves_surfaces_and_cache_entries`
-    /// pins separately.
+    /// A reset must NOT discard codec state for surviving surfaces. Measured on quench:
+    /// resetting the ClearCodec decoder at ResetGraphics produced 74 "V-bar cache miss
+    /// on hit" failures on the next repaint — the server keeps referencing state it
+    /// established before the reset. Codec state dies with the surface, never the reset.
     #[test]
-    fn reset_graphics_discards_progressive_codec_state() {
+    fn reset_graphics_keeps_codec_state_for_surviving_surfaces() {
         let mut handler = GfxHandler::new(store());
         handler.on_surface_created(&egfx_surface(4, 64, 64));
         decode_progressive_into(&mut handler, 4);
@@ -1844,8 +1843,8 @@ mod tests {
         handler.on_reset_graphics(1920, 1080);
         assert_eq!(
             handler.progressive.context_count(),
-            0,
-            "a reset must not carry codec state into the new resolution"
+            1,
+            "a surviving surface keeps its codec state across a reset"
         );
     }
 }
