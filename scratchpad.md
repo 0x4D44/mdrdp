@@ -129,3 +129,4 @@ Out-of-scope observations. A separate human-invoked review triages these.
   its own decoder at line 322 uses `UQ_GR`. Encode is server-side and mdrdp never runs
   it, so this is latent, not a shipped defect — but it means the default run of that
   oracle tests decoder agreement over malformed input, not correctness.
+- [ ] 2026-08-16: `cargo check --target x86_64-pc-windows-msvc --all-targets` fails on the UNTOUCHED trunk: ring + libz-sys C builds get "sys/types.h / assert.h not found" (host clang, msvc target, no Windows SDK). Environment drift since the 2026-08-14 "verified clean" note in CLAUDE.md — needs xwin/clang-cl setup or the note revising. Blocks the mandated Windows cross-check for all current work.

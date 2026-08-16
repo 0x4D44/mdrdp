@@ -35,6 +35,10 @@ winit = "0.30.13"
 x509-cert = "0.2.5"
 zeroize = "1.9.0"
 
+[build-dependencies]
+# Embeds assets/icon/windows/mdrdp.ico into the Windows executable; a no-op elsewhere.
+winresource = "0.1"
+
 [patch.crates-io]
 # See vendor/README.md — one flag, without which EGFX never opens.
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
