@@ -533,8 +533,12 @@ pub fn title_line(
     stats: &SessionStats,
     fps: f64,
     mbps: f64,
+    codec: Option<&str>,
 ) -> String {
     let mut title = format!("{base} — {session_width}x{session_height}");
+    if let Some(codec) = codec {
+        title.push_str(&format!(" · {codec}"));
+    }
     if let Some(p) = stats.latency.recent() {
         let p50_ms = f64::from(p.p50) / 1000.0;
         match stats.latency.drift_us() {
@@ -561,6 +565,52 @@ pub fn title_line(
         ));
     }
     title
+}
+
+/// The codec segment of the title bar: what painted pixels since the last title
+/// refresh, dominant first.
+///
+/// Diffs the cumulative painted-bytes counters between two refreshes, so it names
+/// what is carrying the picture *now*, not whatever once painted. A codec under a
+/// tenth of the interval's paint is dropped as noise — a stray Uncompressed blit
+/// rides alongside every stream and would otherwise flicker in and out of the
+/// title. An idle interval returns `None` so the caller keeps the last active mix
+/// instead of blanking the segment.
+pub fn codec_note(
+    painted: &std::collections::BTreeMap<String, u64>,
+    painted_before: &std::collections::BTreeMap<String, u64>,
+) -> Option<String> {
+    let mut deltas: Vec<(&str, u64)> = painted
+        .iter()
+        .map(|(name, &bytes)| {
+            let before = painted_before.get(name).copied().unwrap_or(0);
+            (name.as_str(), bytes.saturating_sub(before))
+        })
+        .filter(|&(_, delta)| delta > 0)
+        .collect();
+    let total: u64 = deltas.iter().map(|&(_, delta)| delta).sum();
+    if total == 0 {
+        return None;
+    }
+    deltas.retain(|&(_, delta)| delta.saturating_mul(10) >= total);
+    deltas.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let names: Vec<&str> = deltas
+        .iter()
+        .map(|&(name, _)| friendly_codec(name))
+        .collect();
+    Some(names.join("+"))
+}
+
+/// Title-bar wording for a stats codec key.
+///
+/// The stats maps key RFX Progressive as `WireToSurface2/RemoteFxProgressive`
+/// (the wire PDU plus the `Codec2Type` debug name); the title has no room for
+/// either half of that.
+fn friendly_codec(name: &str) -> &str {
+    match name.strip_prefix("WireToSurface2/").unwrap_or(name) {
+        "RemoteFxProgressive" => "Progressive",
+        other => other,
+    }
 }
 
 /// A window bound to a surface store, not yet running.
@@ -796,6 +846,10 @@ struct SessionApp {
     last_title_refresh: Instant,
     title_frames: u64,
     title_bytes: u64,
+    /// Painted-bytes counters at the last title refresh, for the codec diff.
+    title_codec_painted: std::collections::BTreeMap<String, u64>,
+    /// The last non-idle codec mix, kept so an idle second doesn't blank it.
+    title_codec: Option<String>,
     /// Remote cursor shapes already turned into OS cursors, keyed by content hash.
     /// Windows re-sends the same few shapes constantly; rebuilding an `NSCursor` for
     /// each would churn for nothing.
@@ -863,6 +917,8 @@ impl SessionApp {
             last_title_refresh: Instant::now(),
             title_frames: 0,
             title_bytes: 0,
+            title_codec_painted: std::collections::BTreeMap::new(),
+            title_codec: None,
             cursor_cache: std::collections::HashMap::new(),
             cursor_hidden: false,
             diagnostics: None,
@@ -1120,6 +1176,10 @@ impl SessionApp {
         self.last_title_refresh = Instant::now();
         self.title_frames = snapshot.frames;
         self.title_bytes = snapshot.bytes_in;
+        if let Some(note) = codec_note(&snapshot.codec_painted, &self.title_codec_painted) {
+            self.title_codec = Some(note);
+        }
+        self.title_codec_painted = snapshot.codec_painted.clone();
         window.set_title(&title_line(
             &self.config.title,
             self.viewport.session_width,
@@ -1127,6 +1187,7 @@ impl SessionApp {
             &snapshot,
             fps,
             mbps,
+            self.title_codec.as_deref(),
         ));
     }
 
@@ -2050,9 +2111,18 @@ mod tests {
             misses: 1,
             ..Default::default()
         };
-        let t = title_line("mdrdp — Temper", 2560, 1440, &s, 24.2, 3.12);
+        let t = title_line(
+            "mdrdp — Temper",
+            2560,
+            1440,
+            &s,
+            24.2,
+            3.12,
+            Some("Avc444v2"),
+        );
         assert!(t.starts_with("mdrdp — Temper"), "got: {t}");
         assert!(t.contains("2560x1440"), "got: {t}");
+        assert!(t.contains("· Avc444v2"), "got: {t}");
         assert!(t.contains("3.5ms"), "got: {t}");
         assert!(t.contains("(+2.5)"), "drift must be visible; got: {t}");
         assert!(t.contains("24 fps"), "got: {t}");
@@ -2064,7 +2134,7 @@ mod tests {
     #[test]
     fn a_quiet_session_title_is_just_the_name_and_resolution() {
         let s = SessionStats::new();
-        let t = title_line("mdrdp — box", 1920, 1080, &s, 0.0, 0.0);
+        let t = title_line("mdrdp — box", 1920, 1080, &s, 0.0, 0.0, None);
         assert_eq!(t, "mdrdp — box — 1920x1080");
     }
 
@@ -2073,8 +2143,54 @@ mod tests {
         let mut s = SessionStats::new();
         s.decode_errors = 2;
         s.undecoded_regions = 3;
-        let t = title_line("mdrdp — box", 800, 600, &s, 0.0, 0.0);
+        let t = title_line("mdrdp — box", 800, 600, &s, 0.0, 0.0, None);
         assert!(t.contains("STALE 5"), "got: {t}");
+    }
+
+    #[test]
+    fn codec_note_names_the_dominant_codec_and_drops_the_noise() {
+        use std::collections::BTreeMap;
+        // Before: AVC painted 1000 bytes, Uncompressed 50. Since: AVC painted 9000
+        // more, Uncompressed 100 more (under a tenth of the interval), ClearCodec
+        // nothing at all.
+        let before = BTreeMap::from([
+            ("Avc444v2".to_owned(), 1000),
+            ("Uncompressed".to_owned(), 50),
+            ("ClearCodec".to_owned(), 700),
+        ]);
+        let now = BTreeMap::from([
+            ("Avc444v2".to_owned(), 10_000),
+            ("Uncompressed".to_owned(), 150),
+            ("ClearCodec".to_owned(), 700),
+        ]);
+        assert_eq!(codec_note(&now, &before), Some("Avc444v2".to_owned()));
+    }
+
+    #[test]
+    fn codec_note_orders_a_real_mix_by_interval_paint_not_lifetime_totals() {
+        use std::collections::BTreeMap;
+        // Lifetime totals favour ClearCodec, but this interval Progressive painted
+        // more — the note must follow the interval.
+        let before = BTreeMap::from([
+            ("ClearCodec".to_owned(), 90_000),
+            ("WireToSurface2/RemoteFxProgressive".to_owned(), 10_000),
+        ]);
+        let now = BTreeMap::from([
+            ("ClearCodec".to_owned(), 92_000),
+            ("WireToSurface2/RemoteFxProgressive".to_owned(), 15_000),
+        ]);
+        assert_eq!(
+            codec_note(&now, &before),
+            Some("Progressive+ClearCodec".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_idle_interval_yields_no_codec_note_rather_than_an_empty_one() {
+        use std::collections::BTreeMap;
+        let counters = BTreeMap::from([("ClearCodec".to_owned(), 5_000_u64)]);
+        assert_eq!(codec_note(&counters, &counters), None);
+        assert_eq!(codec_note(&BTreeMap::new(), &BTreeMap::new()), None);
     }
 
     #[test]

@@ -445,6 +445,7 @@ fn notify_if_painted(
             s.decode_errors = gfx.decode_errors;
             s.undecoded_regions = gfx.undecoded_regions;
             s.codecs = gfx.codec_ids_seen;
+            s.codec_painted = gfx.codec_bytes_painted;
         }
     });
 

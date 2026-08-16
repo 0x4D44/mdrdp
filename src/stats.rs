@@ -383,6 +383,9 @@ pub struct SessionStats {
     pub undecoded_regions: u64,
     /// Surface codec identifiers and the number of updates observed for each.
     pub codecs: BTreeMap<String, u64>,
+    /// Bytes painted per codec, keyed like `codecs`. The title bar diffs this
+    /// between refreshes to name the codec currently carrying the picture.
+    pub codec_painted: BTreeMap<String, u64>,
 }
 
 impl SessionStats {
