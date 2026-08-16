@@ -963,13 +963,6 @@ impl GraphicsPipelineClient {
 
         let mut chroma_skipped: Option<&'static str> = None;
         let mut emit_rects: Vec<ExclusiveRectangle>;
-        // The combination passes index by the frame's claimed dimensions and would
-        // panic (on the DVC thread) on a decoder that returns planes shorter than
-        // its dimensions claim. Not reachable with the in-repo decoders, but
-        // `decode_yuv420` is a public trait method.
-        fn frame_ok(frame: &Yuv420Frame) -> bool {
-            frame.is_well_formed()
-        }
 
         match passes {
             Passes::LumaAndChroma => {
@@ -985,7 +978,11 @@ impl GraphicsPipelineClient {
                     return;
                 }
                 decode_us += decode_started.elapsed().as_micros();
-                if !frame_ok(&self.yuv_scratch.0) {
+                // Well-formedness gates before every combine: the passes index by the
+                // frame's claimed dimensions and would panic (on the DVC thread) on a
+                // decoder returning planes shorter than its claim. Not reachable with
+                // the in-repo decoders, but `decode_yuv420` is a public trait method.
+                if !self.yuv_scratch.0.is_well_formed() {
                     self.handler.on_decode_failure(codec_id, "avc444 malformed decoded frame");
                     return;
                 }
@@ -993,7 +990,7 @@ impl GraphicsPipelineClient {
                 if let Err(e) = decoder.decode_yuv420(stream2.data, &mut self.yuv_scratch.1) {
                     warn!(error = %e, "AVC444 chroma stream decode failed; applying luma only");
                     chroma_skipped = Some("avc444 chroma decode failed");
-                } else if !frame_ok(&self.yuv_scratch.1) {
+                } else if !self.yuv_scratch.1.is_well_formed() {
                     chroma_skipped = Some("avc444 malformed decoded frame");
                 }
                 decode_us += decode_started.elapsed().as_micros();
@@ -1043,7 +1040,7 @@ impl GraphicsPipelineClient {
                     return;
                 }
                 decode_us += decode_started.elapsed().as_micros();
-                if !frame_ok(&self.yuv_scratch.0) {
+                if !self.yuv_scratch.0.is_well_formed() {
                     self.handler.on_decode_failure(codec_id, "avc444 malformed decoded frame");
                     return;
                 }
@@ -1063,7 +1060,7 @@ impl GraphicsPipelineClient {
                     return;
                 }
                 decode_us += decode_started.elapsed().as_micros();
-                if !frame_ok(&self.yuv_scratch.1) {
+                if !self.yuv_scratch.1.is_well_formed() {
                     self.handler.on_decode_failure(codec_id, "avc444 malformed decoded frame");
                     return;
                 }

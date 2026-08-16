@@ -9,6 +9,24 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- Windows sends EGFX AVC bitstreams as ANNEX B (start codes), not the AVCC the upstream ironrdp docs claim (`h264::nal_units`).
+  Measured from captured quench Avc444v2 payloads: `00 00 00 01` start codes, AUD + SPS +
+  PPS + slices. Nobody noticed upstream because ffmpeg/openh264 eat Annex B natively;
+  VideoToolbox needs length-prefixed samples, so the units are split on start codes and
+  re-packed. First live run failed 974/976 frames on exactly this.
+
+- VideoToolbox normalises output to the REQUESTED pixel format's range, ignoring stream VUI — 'f420' is the only correct planar choice (`h264::videotoolbox`).
+  Measured with lossless fixtures: requesting 'y420' (video range) squeezes full-range
+  samples into 16-235 irreversibly, whichever range the stream was encoded in. Also
+  measured: VT always applies SPS cropping (1920x1088 coded -> 1080 rows out), and a
+  session rebuilt mid-GOP fails every P-frame until the next IDR — so session rebuilds
+  must never be routine (one output format for every decode path).
+
+- The shared `ano` account on quench allows ONE session: any fleet agent's connect kicks the current holder mid-run (reason: "Another user connected").
+  Four validation runs were cut at 17-60s before one full window landed. Check the board
+  or coordinate before long measured runs; the disconnect arrives as a graceful
+  server-side Terminate whose reason mdrdp now prints (`session.rs` Terminate arm).
+
 - Windows keys the ClearCodec glyph cache by CONTENT: equal-area hits arrive reshaped (1x6 as 2x3); strict dims checks drop tiles (`clearcodec::decode_over`).
   Measured live during window drag/resize: 24 glyph hits in 90 s, every one an exact area
   match at a different shape. FreeRDP only requires the cached bytes to cover the

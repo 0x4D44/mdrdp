@@ -15,7 +15,7 @@ Out-of-scope observations. A separate human-invoked review triages these.
   policy-enabled host requires AVC444v2 support (next entry). Cheap counter-test worth
   one try: delete AVC444ModePreferred (keep AVCHardwareEncodePreferred) and rerun the
   V10.7 probe — Windows may then choose AVC420, which src/h264.rs already decodes.
-- [ ] 2026-08-16: AVC444 is unimplemented end-to-end: the vendored egfx client forwards
+- [x] (done 2026-08-16, task avc444v2-decode: implemented + validated live, 2933 frames zero errors) AVC444 is unimplemented end-to-end: the vendored egfx client forwards
   Avc444 PDUs to on_unhandled_pdu, and the upstream `H264Decoder` trait (RGBA out) cannot
   express the dual-stream luma+chroma combination AVC444 needs (it must happen in YUV
   space before RGB conversion). Real design work: extend the trait to YUV output or embed
