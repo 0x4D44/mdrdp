@@ -146,6 +146,26 @@ impl DiagnosticsUis {
     }
 }
 
+/// One transient notification card (handoff §8): warn or danger, over the desktop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    /// `true` = warn accent, `false` = danger accent.
+    pub warn: bool,
+    pub title: String,
+    pub body: String,
+}
+
+/// What the transients poll returned: freshly fired toasts, plus the warn line the
+/// Ctrl+Alt+S overlay should carry while a condition persists (`None` when clear).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TransientReport {
+    pub toasts: Vec<Toast>,
+    pub warn_line: Option<String>,
+}
+
+/// How long a toast stays up (handoff §8: 6 s, stacked).
+const TOAST_TTL: Duration = Duration::from_secs(6);
+
 /// How often open diagnostics windows refresh (the handoff's `refresh 1s`).
 const DIAG_REFRESH: Duration = Duration::from_secs(1);
 
@@ -413,6 +433,74 @@ pub fn draw_overlay(dst: &mut [u32], window_width: u32, window_height: u32, line
     }
 }
 
+/// Draw transient toast cards, stacked bottom-right (handoff §8).
+///
+/// Pure so the geometry is testable. Softbuffer gives no vector text, so the cards
+/// use the overlay's bitmap font — colours and geometry per the handoff, typography
+/// approximate (recorded as a deviation in the build journal).
+pub fn draw_toasts(dst: &mut [u32], window_width: u32, window_height: u32, toasts: &[Toast]) {
+    if toasts.is_empty() || window_width == 0 || window_height == 0 {
+        return;
+    }
+    const WIDTH: i32 = 400;
+    const PAD: i32 = 14;
+    const MARGIN: i32 = 16;
+    const GAP: i32 = 10;
+    const BG: u32 = 0x001E2126; // bg.raised
+    const BORDER: u32 = 0x00414A54; // line.strong
+    const WARN: u32 = 0x00FFC93C;
+    const DANGER: u32 = 0x00FF5D4D;
+    const TITLE: u32 = 0x00EAEEF3;
+    const BODY: u32 = 0x00A6AEB9;
+
+    let card_h = PAD * 2 + font::CHAR_H * 2 + 4;
+    let mut bottom = window_height as i32 - MARGIN;
+    for (toast, _) in toasts.iter().rev().map(|t| (t, ())) {
+        let top = bottom - card_h;
+        if top < 0 {
+            break; // A stack taller than the window keeps its newest cards.
+        }
+        let left = (window_width as i32 - MARGIN - WIDTH).max(0);
+        let right = (left + WIDTH).min(window_width as i32);
+        for y in top..bottom {
+            let row = y as usize * window_width as usize;
+            for x in left..right {
+                let Some(px) = dst.get_mut(row + x as usize) else {
+                    continue;
+                };
+                let on_border = y == top || y == bottom - 1 || x == right - 1;
+                let accent = x < left + 2;
+                *px = if accent {
+                    if toast.warn { WARN } else { DANGER }
+                } else if on_border {
+                    BORDER
+                } else {
+                    BG
+                };
+            }
+        }
+        font::draw_text(
+            dst,
+            window_width as usize,
+            window_height as usize,
+            left + PAD,
+            top + PAD,
+            &toast.title,
+            TITLE,
+        );
+        font::draw_text(
+            dst,
+            window_width as usize,
+            window_height as usize,
+            left + PAD,
+            top + PAD + font::CHAR_H + 4,
+            &toast.body,
+            BODY,
+        );
+        bottom = top - GAP;
+    }
+}
+
 /// The title-bar text: the base title plus live diagnostics.
 ///
 /// Pure so the wording is testable without a window. The title is the one always-visible
@@ -469,6 +557,7 @@ pub struct SessionWindow {
     on_exit: Option<Box<dyn FnMut()>>,
     commands: Option<Sender<SessionCommand>>,
     diagnostics: Option<DiagnosticsUis>,
+    transients: Option<Box<dyn FnMut() -> TransientReport>>,
     /// Mirrors the window's fullscreen state for whoever outlives the loop — the exit
     /// path persists it so the next launch can restore it. An atomic rather than a
     /// return value because the Cmd+Q path never returns (see [`Self::on_exit`]).
@@ -514,6 +603,7 @@ impl SessionWindow {
             on_exit: None,
             commands: None,
             diagnostics: None,
+            transients: None,
             fullscreen_state,
         })
     }
@@ -533,6 +623,14 @@ impl SessionWindow {
     /// probe-harness window has no stats to show.
     pub fn with_diagnostics(mut self, diagnostics: DiagnosticsUis) -> Self {
         self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    /// Poll `watch` for transient conditions (a lost audio device, a refused resize):
+    /// fired toasts draw bottom-right for six seconds, and the returned warn line
+    /// rides the Ctrl+Alt+S overlay while the condition lasts.
+    pub fn with_transients(mut self, watch: Box<dyn FnMut() -> TransientReport>) -> Self {
+        self.transients = Some(watch);
         self
     }
 
@@ -587,12 +685,14 @@ impl SessionWindow {
             on_exit,
             commands,
             diagnostics,
+            transients,
             fullscreen_state,
         } = self;
         let mut app = SessionApp::new(config, store, input, stats);
         app.on_exit = on_exit;
         app.commands = commands;
         app.diagnostics = diagnostics;
+        app.transients = transients;
         app.fullscreen_state = fullscreen_state;
         // Menu activations arrive on muda's own channel; forward them into the loop so
         // they are handled on the main thread with the rest of the window state. The
@@ -685,6 +785,12 @@ struct SessionApp {
     menu: Option<session_menu::SessionMenuBar>,
     /// Last 1 Hz diagnostics refresh, used with `ControlFlow::WaitUntil`.
     last_diag_refresh: Instant,
+    /// Transient-condition poll, when the caller wired one up.
+    transients: Option<Box<dyn FnMut() -> TransientReport>>,
+    /// Live toasts with their birth instants; expired ones drop on redraw.
+    toasts: Vec<(Toast, Instant)>,
+    /// The persistent warn line for the overlay, while a condition lasts.
+    warn_line: Option<String>,
 }
 
 impl SessionApp {
@@ -737,6 +843,30 @@ impl SessionApp {
             aux: Vec::new(),
             menu: None,
             last_diag_refresh: Instant::now(),
+            transients: None,
+            toasts: Vec::new(),
+            warn_line: None,
+        }
+    }
+
+    /// Poll the transient watcher: absorb fresh toasts and the overlay warn line.
+    fn poll_transients(&mut self) {
+        let Some(watch) = self.transients.as_mut() else {
+            return;
+        };
+        let report = watch();
+        let now = Instant::now();
+        let changed = !report.toasts.is_empty() || report.warn_line != self.warn_line;
+        for toast in report.toasts {
+            self.toasts.push((toast, now));
+        }
+        self.warn_line = report.warn_line;
+        let had = self.toasts.len();
+        self.toasts.retain(|(_, born)| born.elapsed() < TOAST_TTL);
+        if (changed || self.toasts.len() != had)
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
         }
     }
 
@@ -1080,12 +1210,17 @@ impl SessionApp {
         if self.show_stats
             && let Some(stats) = &self.stats
         {
-            draw_overlay(
-                &mut buffer,
-                size.width,
-                size.height,
-                &stats.snapshot().overlay_lines(),
-            );
+            let mut lines = stats.snapshot().overlay_lines();
+            if let Some(warn) = &self.warn_line {
+                // Transient conditions ride the overlay while they last (§8).
+                lines.push(format!("! {warn}"));
+            }
+            draw_overlay(&mut buffer, size.width, size.height, &lines);
+        }
+        if !self.toasts.is_empty() {
+            self.toasts.retain(|(_, born)| born.elapsed() < TOAST_TTL);
+            let toasts: Vec<Toast> = self.toasts.iter().map(|(t, _)| t.clone()).collect();
+            draw_toasts(&mut buffer, size.width, size.height, &toasts);
         }
 
         window.pre_present_notify();
@@ -1182,6 +1317,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 // Damage is also the clock for the title diagnostics: numbers only move
                 // when frames do.
                 self.maybe_refresh_title();
+                self.poll_transients();
             }
             SessionEvent::Cursor(update) => self.apply_remote_cursor(event_loop, update),
             SessionEvent::Close => event_loop.exit(),
@@ -1189,9 +1325,9 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         }
     }
 
-    /// Drive the 1 Hz refresh for open diagnostics windows.
+    /// Drive the 1 Hz refresh for open diagnostics windows and live toasts.
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
-        if self.aux.is_empty() {
+        if self.aux.is_empty() && self.toasts.is_empty() {
             return;
         }
         if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. })
@@ -1200,6 +1336,14 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             self.last_diag_refresh = Instant::now();
             for (_, win) in &self.aux {
                 win.request_redraw();
+            }
+            self.poll_transients();
+            if !self.toasts.is_empty()
+                && let Some(window) = &self.window
+            {
+                // Expiry is time-driven; without this nudge a toast would linger
+                // until the next damage event.
+                window.request_redraw();
             }
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -1214,7 +1358,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             match event {
                 WindowEvent::CloseRequested | WindowEvent::Destroyed => {
                     self.aux.remove(pos);
-                    if self.aux.is_empty() {
+                    if self.aux.is_empty() && self.toasts.is_empty() {
                         event_loop.set_control_flow(ControlFlow::Wait);
                     }
                 }
@@ -1757,6 +1901,90 @@ mod tests {
 
     fn overlay_lines() -> Vec<String> {
         vec!["latency p50 3.5ms".to_string(), "cache 75% hit".to_string()]
+    }
+
+    // --- toasts -----------------------------------------------------------------------
+
+    #[test]
+    fn a_toast_paints_its_card_bottom_right_with_the_accent_edge() {
+        let (w, h) = (600u32, 400u32);
+        let mut buf = vec![0u32; (w * h) as usize];
+        draw_toasts(
+            &mut buf,
+            w,
+            h,
+            &[Toast {
+                warn: true,
+                title: "Audio device lost".into(),
+                body: "playback stopped".into(),
+            }],
+        );
+        // Card occupies the bottom-right: left edge at 600-16-400=184.
+        let card_left = 184usize;
+        let inside_y = (h - 20) as usize;
+        assert_eq!(
+            buf[inside_y * w as usize + card_left],
+            0x00FFC93C,
+            "the 2px left border carries the warn accent"
+        );
+        assert_eq!(
+            buf[inside_y * w as usize + card_left + 10],
+            0x001E2126,
+            "the card body is bg.raised"
+        );
+        // Far left of the window is untouched desktop.
+        assert_eq!(buf[inside_y * w as usize], 0);
+    }
+
+    #[test]
+    fn a_danger_toast_carries_the_danger_accent() {
+        let (w, h) = (600u32, 400u32);
+        let mut buf = vec![0u32; (w * h) as usize];
+        draw_toasts(
+            &mut buf,
+            w,
+            h,
+            &[Toast {
+                warn: false,
+                title: "t".into(),
+                body: "b".into(),
+            }],
+        );
+        let card_left = 184usize;
+        let inside_y = (h - 20) as usize;
+        assert_eq!(buf[inside_y * w as usize + card_left], 0x00FF5D4D);
+    }
+
+    #[test]
+    fn stacked_toasts_do_not_overlap() {
+        let (w, h) = (600u32, 400u32);
+        let mut buf = vec![0u32; (w * h) as usize];
+        let toast = |title: &str| Toast {
+            warn: true,
+            title: title.into(),
+            body: "b".into(),
+        };
+        draw_toasts(&mut buf, w, h, &[toast("one"), toast("two")]);
+        // Two cards: between them there must be an untouched gap row.
+        let card_h = 14 * 2 + 16 * 2 + 4; // PAD*2 + 2 glyph rows + spacing
+        let gap_y = (h as i32 - 16 - card_h - 5) as usize; // inside the 10px gap
+        let card_left = 184usize;
+        assert_eq!(
+            buf[gap_y * w as usize + card_left + 10],
+            0,
+            "the gap between stacked cards stays desktop"
+        );
+    }
+
+    #[test]
+    fn a_zero_sized_window_and_no_toasts_are_no_ops() {
+        let mut empty: Vec<u32> = Vec::new();
+        draw_toasts(&mut empty, 0, 0, &[]);
+        let (w, h) = (32u32, 32u32);
+        let mut buf = vec![0xAAu32; (w * h) as usize];
+        let before = buf.clone();
+        draw_toasts(&mut buf, w, h, &[]);
+        assert_eq!(buf, before);
     }
 
     // --- title diagnostics ------------------------------------------------------------

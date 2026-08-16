@@ -610,6 +610,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let window = window
         .with_stats(session_stats.clone())
         .with_commands(command_tx)
+        .with_transients({
+            // Watches counters that mean "something the user should know just broke".
+            // Polled on damage and each 1 Hz tick; cheap by construction.
+            let audio = audio_stats.clone();
+            let mut seen_device_errors = 0u64;
+            Box::new(move || {
+                let snapshot = audio.snapshot();
+                let mut report = mdrdp::window::TransientReport::default();
+                if snapshot.device_errors > seen_device_errors {
+                    seen_device_errors = snapshot.device_errors;
+                    report.toasts.push(mdrdp::window::Toast {
+                        warn: true,
+                        title: "Audio device lost".to_owned(),
+                        body: "playback stopped".to_owned(),
+                    });
+                }
+                if snapshot.device_errors > 0 {
+                    report.warn_line = Some("audio   device errors; playback degraded".to_owned());
+                }
+                report
+            })
+        })
         .with_diagnostics(mdrdp::window::DiagnosticsUis {
             cache: {
                 let stats = session_stats.clone();
