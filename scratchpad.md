@@ -2,6 +2,19 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
+- [ ] 2026-08-16: `SurfaceStore::surface_to_surface` (src/surface.rs:323) blits with the
+  UNCLIPPED source width as stride, but `extract` clips — a source rect overhanging the
+  source surface would produce rows narrower than the stride and fail as ShortSource (or
+  shear). Servers do not send such rects, so this is robustness, not a live bug.
+- [ ] 2026-08-16: the session's tracing calls (e.g. clipboard warnings in
+  src/session.rs) go nowhere — main.rs installs no global tracing subscriber; only the
+  connect sequence has a scoped one. Either install a stderr subscriber behind a
+  verbosity flag or convert the load-bearing ones to eprintln (the resolution path
+  already was).
+- [ ] 2026-08-16: `SessionCommand::Resize` reactivation path (DeactivateAll) is written
+  but live-unexercised — quench resizes via EGFX ResetGraphics instead. Worth exercising
+  against a server that takes the DeactivateAll route before trusting it fully.
+
 - [ ] 2026-08-15: the mandated Windows cross-check no longer runs on this Mac.
   `cargo check --target x86_64-pc-windows-msvc --all-targets` dies in `ring`'s build
   script (`cc` targeting windows-msvc cannot find `assert.h`), so the gate

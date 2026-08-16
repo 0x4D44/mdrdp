@@ -9,6 +9,14 @@ Soft target ~25 entries; past ~40, say it is due a prune rather than pruning una
 
 ---
 
+- Windows drops an EDISP monitor layout sent before its caps PDU; gate on `DisplayControlClient::ready` (`session::service_resize`).
+  The Display Control channel being open is not the same state as capabilities having
+  arrived, and `ActiveStage::encode_resize` checks only the former — it happily encodes a
+  layout the server then ignores without any error. The first live fullscreen run sent the
+  layout instantly and the session silently stayed at 1920x1080. Also observed: Windows can
+  complete a resolution change entirely through EGFX ResetGraphics + new surfaces, without
+  any DeactivateAll — do not assume the reactivation path is the only success signature.
+
 - A counter written only on success cannot diagnose failure (`audio::AudioStats::negotiated_formats`).
   `current_format` is set when a wave plays, so a silent-but-healthy session left it `None`
   and the report printed "server negotiated no format" — blaming a stage it had never
