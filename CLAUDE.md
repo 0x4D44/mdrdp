@@ -86,6 +86,12 @@ that is a missing toolchain, not `cfg` drift. Never re-enable the vendored conne
   10-30x slower unoptimised; a debug measurement is noise, not evidence.
 - **A latency or throughput claim needs a number and the conditions it was taken under**
   (host, network, resolution, codec, build profile). "Feels fast" is not a result.
+- **Quote a distribution, never one run.** A number that will be reasoned from later needs
+  n, min, median and max, or it is an anecdote wearing a decimal point. On this WiFi LAN the
+  spread is ~4x: mdrdp connect varies 61-238 ms across 8 consecutive runs
+  (`connect::ConnectReport`). Twice a single sample has been published as a settled figure —
+  the 4.20 ms latency floor, then a 142 ms connect time — and both were wrong enough to
+  mislead.
 - **Protocol changes need a real server.** A change that only passes against a mock has
   not been validated. Never substitute a mock or a Linux RDP server for protocol work.
 - **Soak-class requirements need soak-class evidence.** The clipboard and
