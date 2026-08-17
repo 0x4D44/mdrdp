@@ -7,10 +7,10 @@ Out-of-scope observations. A separate human-invoked review triages these.
   so a mid-GOP joiner is undecodable until the next scheduled IDR
   (`tools/latency-spike/server/src/win/pipeline.rs`; hit live when an `nc -z` probe
   consumed the opening IDR). First item of the hybrid-wire increment.
-- [ ] 2026-08-17: stage-1b control run (Notepad on the 60 Hz physical display) still
-  owed — isolates display-cadence vs echo-target in the stage-1/stage-2 tail gap. Needs
-  ~3 min of unoccluded screen for the viewer window
-  (`baseline/spike-idd-stage1b-control-INVALID-occluded.jsonl` is the failed attempt).
+- [x] 2026-08-17: stage-1b control run DONE same evening: Notepad@60Hz p50 61.6 ms
+  (CI 60.2-63.6), p95 74.5, max 106, 0 timeouts — the 240 Hz IDD is worth 7.3 ms p50
+  and max 106→81 (`baseline/spike-idd-stage1b-control-glass.jsonl`; journal has the
+  isolation analysis).
 - [ ] 2026-08-17: parked design — wezterm-mux pane overlay inside the mdrdp window:
   mdrdp links wezterm's `codec`/`mux` crates, attaches to a quench-side mux domain that
   also backs the local GUI, paints pane interiors from grid deltas over the H.264
