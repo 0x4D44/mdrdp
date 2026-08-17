@@ -79,6 +79,11 @@ copied to `C:\mdrdp-idd`. `Inf2Cat.exe` and `signtool.exe` come from a WDK/SDK i
 on the host (the same `Microsoft.Windows.WDK.x64` package works — it ships
 `bin\10.0.26100.0\x86\Inf2Cat.exe`).
 
+`deploy.ps1` (in this directory — copy it beside the binaries) packages the whole
+sequence as `-Phase pre` (test signing + reboot), `-Phase install`, and
+`-Phase teardown`. The commands below are what it runs, spelled out so the script
+stays auditable.
+
 **Install**
 
 ```powershell
