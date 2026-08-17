@@ -42,10 +42,6 @@ not here.
   The session's 60Hz virtual display floors the cadence at ~16ms — measured at DWMFI=5, no
   gain over 15. Typing keeps a ~33ms server floor either way.
 
-- Quench is UK layout: autoinput `type` US scancodes turn `"` into `@`, so use FORWARD slashes in PowerShell paths (`autoinput`).
-  `\` likewise arrives as `#`. PowerShell registry paths accept forward slashes, which is
-  the layout-safe escape.
-
 - An AVC444 session sends ZERO SurfaceToCache/CacheToSurface PDUs — a quiet cache is the server, not a client bug (`gfx::apply_surface_to_cache`).
   Measured live on quench 2026-08-17: hits/misses/entries all 0 while 117 MB of Avc444v2
   painted. Full-frame H.264 carries everything, so the EGFX bitmap cache sits idle and
@@ -110,12 +106,6 @@ not here.
   Also: VT always applies SPS cropping (1920x1088 coded → 1080 rows out), and a session
   rebuilt mid-GOP fails every P-frame until the next IDR, so rebuilds must never be routine
   (one output format for every decode path).
-
-- The shared `ano` account on quench allows ONE session: another agent's connect kicks the current holder mid-run.
-  The kick arrives with reason "Another user connected".
-  Four validation runs were cut at 17-60s before one full window landed. Check the board or
-  coordinate before long measured runs; the disconnect arrives as a graceful server-side
-  Terminate whose reason mdrdp now prints (`session.rs` Terminate arm).
 
 - Windows keys the ClearCodec glyph cache by CONTENT, not dims: equal-area hits arrive reshaped, 1x6 as 2x3 (`clearcodec::decode_over`).
   Measured live during window drag/resize: 24 glyph hits in 90 s, every one an exact area

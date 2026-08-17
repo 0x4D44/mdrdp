@@ -98,7 +98,7 @@ that is a missing toolchain, not `cfg` drift. Never re-enable the vendored conne
   latency-degradation requirements are about behaviour over hours. A green unit test
   does not discharge them.
 
-## Connecting to the test host without breaking it
+## Connecting to a test host without breaking it
 
 **Always disconnect gracefully.** Abandoning a connection leaves the Windows host holding
 a session it does not reclaim promptly. On 2026-08-14 an evening of test connects — ours
@@ -109,9 +109,10 @@ that hung indefinitely.
 **The signature, measured precisely:** TCP connects, X.224 still selects HYBRID_EX, and
 **the TLS handshake completes normally** (23.5 ms, correct certificate) — then CredSSP
 hangs forever. So the fault is in the host's logon path, not the network, not the
-transport, and not the credential. `probe stages temper` isolates this without sending a
+transport, and not the credential. `probe stages <host>` isolates this without sending a
 credential or holding a session, so it is safe to run against a host that is already
-refusing logons — which is exactly when you need it.
+refusing logons — which is exactly when you need it. The story is temper's, but the failure
+mode is a Windows one and applies to quench equally.
 
 It did not clear on its own over 20 minutes of retries; assume it needs a reboot or a
 session kick.
@@ -127,22 +128,55 @@ settle rather than to retry harder.
 ## The reference client
 
 Every Gauntlet comparison is against **Microsoft's Windows App 11.3.8**
-(`com.microsoft.rdc.macos`, `/Applications/Windows App.app`) on this Mac, connecting to
-`temper`. Confirmed installed 2026-08-14.
+(`com.microsoft.rdc.macos`, `/Applications/Windows App.app`) on this Mac. Confirmed
+installed 2026-08-14.
 
-Record its version alongside any measurement taken against it. A comparison against an
-unnamed version of the reference is not reproducible, and it updates itself.
+Record its version *and which host it connected to* alongside any measurement taken against
+it. A comparison against an unnamed version of the reference is not reproducible, it
+updates itself, and quench and temper differ enough that a figure without a host name is
+ambiguous.
 
-## The test host
+## The test hosts
 
-`temper` (`temper.lan.example`, `192.0.2.171`) on the LAN, port 3389. It is the reference
-target for all protocol work and all comparisons against Microsoft's client.
+Two Windows boxes on the LAN, both on port 3389. **ICMP is blocked on both** (Windows
+Firewall default), so `ping` fails on a perfectly healthy host — test reachability with a
+TCP connect to 3389 instead. Verified on quench 2026-08-17: ping 100% loss, tcp/3389 open.
 
-- **ICMP is blocked** (Windows Firewall default). `ping temper` fails on a perfectly
-  healthy host — test reachability with a TCP connect to 3389 instead.
+### `quench` — our test box
+
+`quench.lan.example`, `192.0.2.240`. Use this one for protocol work, live measurement and
+day-to-day verification unless a task says otherwise.
+
+- **Log in as `ano`**, which has sudo on the box. The password lives in the macOS keychain
+  (service `mdrdp`) — never in a config file, a test fixture, an environment variable, or a
+  commit. Read it through the `keyring` crate; if it is not there, stop and ask Arthur.
+- **One session at a time.** A second connect kicks the current holder mid-run with reason
+  "Another user connected" — this has cut validation runs off at 17-60 s. Check the fleet
+  board or coordinate before a long measured run. The kick arrives as a graceful
+  server-side Terminate whose reason mdrdp prints (`session.rs`, Terminate arm).
+- **UK keyboard layout.** `autoinput`'s `type` maps ASCII to US scancodes, so `"` arrives
+  as `@` and `\` as `#`. PowerShell registry paths accept forward slashes, which is the
+  layout-safe escape.
+- **It runs `DWMFRAMEINTERVAL=15` permanently** (set 2026-08-17): drag frame-gap p50 16.0 ms
+  (~60 fps) against 31.8 ms before. Measurements taken before that date are on the old
+  ~30 fps baseline and are not comparable to later ones.
+- **It sends AVC444v2** (measured at 1920x1080).
+- **No settled TCP RTT baseline yet.** Do not borrow temper's floor for it — different
+  subnet, different hardware.
+
+### `temper` — the second host, and the older evidence base
+
+`temper.lan.example`, `192.0.2.171`. Still live, and the target of every spike document
+written before 2026-08-16. It is measurably laggier than quench under AVC (typing p50
+47.8 ms vs ~33 ms, p95 478 vs 87) and still runs the default ~30 fps frame cap, so the two
+are **not** interchangeable for a latency number — always say which host a figure came
+from.
+
 - **It requires NLA** — it selects HYBRID_EX and rejects legacy RDP security outright.
   There is no unauthenticated path to a first pixel, so the credential path is on the
   critical path for the very first working connection, not a later hardening phase.
+- **Its account authenticates as a bare `user@example.com`** — no `temper\` or
+  `MicrosoftAccount\` prefix. Same keychain rule as quench.
 - **Latency floor: TCP RTT p50 3.31 ms**, 95% CI [3.29, 3.34], n=4000 over 4 distinct UTC
   hours spanning 6.6 h (p95 4.72 ms, **p99 10.82 ms, max 119.9 ms**). Settled — the
   coverage requirement is met.
@@ -167,18 +201,17 @@ target for all protocol work and all comparisons against Microsoft's client.
 
 **Read both of these before designing anything that touches graphics:**
 `wrk_docs/2026.08.14 - SPIKE - P1b server codec negotiation against temper.md` for what
-this server actually sends, and `wrk_docs/2026.08.14 - INVENTORY - P1a IronRDP client
+that server actually sends, and `wrk_docs/2026.08.14 - INVENTORY - P1a IronRDP client
 capability inventory.md` for what IronRDP can and cannot decode. The gap between those two
-documents is the graphics work.
+documents is the graphics work. Both predate quench and describe temper's pre-H.264 era —
+read them for the client-side inventory and the method, not for what a server sends today.
 
 See `wrk_docs/2026.08.14 - SPIKE - P1 protocol posture against temper.md` for the
 security-negotiation evidence.
 
-Credentials for it live in the macOS keychain (service `mdrdp`), never in a config file,
-a test fixture, an environment variable, or a commit. Read them through the `keyring`
-crate. If you need a credential that is not there, stop and ask Arthur. The account
-authenticates as a bare `user@example.com` — no `temper\` or `MicrosoftAccount\`
-prefix.
+**Credentials for either host live in the macOS keychain** (service `mdrdp`), never in a
+config file, a test fixture, an environment variable, or a commit. Read them through the
+`keyring` crate. If you need a credential that is not there, stop and ask Arthur.
 
 **Driving FreeRDP for comparison work:** use `sdl-freerdp`, not `xfreerdp`. The latter is
 the X11 client and fails instantly on this Mac (`failed to open display`; XQuartz is not
