@@ -2,11 +2,16 @@
 //!
 //! Three decisions worth stating up front, because each is load-bearing:
 //!
-//! - **The window never resizes the session.** `CLAUDE.md` is explicit: session
-//!   resolution is decoupled from window size, and a display-configuration change must
-//!   never reflow the remote desktop. So a resize changes only the [`Viewport`] — the
-//!   letterboxed rectangle the session image is scaled into. Nothing here can send a
-//!   resize; there is no path to the protocol from this module at all.
+//! - **Only the user resizes the session.** `CLAUDE.md` is explicit: a
+//!   display-configuration change must never reflow the remote desktop. Every `Resized`
+//!   event first changes only the [`Viewport`] — the letterboxed rectangle the session
+//!   image is scaled into — and is then read by the [`WindowPolicy`], the one component
+//!   able to tell the user dragging from the system rearranging. A resize the policy
+//!   judges to be the user's own act renegotiates the session resolution to match, after
+//!   a settle delay so a drag costs one renegotiation, not a stream of them. A system
+//!   imposition is argued with (the geometry is requested back) and never reaches the
+//!   protocol. Fullscreen toggles renegotiate directly — they are user acts by
+//!   construction.
 //! - **Redraw is driven by change, not by a clock.** [`SurfaceStore::generation`] exists
 //!   precisely so the presenter can tell "changed" from "unchanged". A producer nudges
 //!   the loop with [`Waker::damaged`]; if the generation has not moved we do not even ask
@@ -39,7 +44,7 @@ use crate::session::SessionCommand;
 use crate::stats::{SessionStats, StatsHandle};
 use crate::surface::SurfaceStore;
 use crate::ui::font;
-use crate::window_policy::{Geometry, WindowPolicy};
+use crate::window_policy::{Geometry, ResizeVerdict, WindowPolicy};
 
 /// What the caller must decide before a window exists.
 #[derive(Debug, Clone)]
@@ -66,6 +71,11 @@ pub struct WindowConfig {
     /// division of native resolution (5K → 2560x1440 at 2x) instead of the fractional
     /// best fit (Settings ▸ Graphics). See [`crate::session::fullscreen_request`].
     pub integer_fullscreen_fit: bool,
+    /// After a *user* resize of a windowed window settles, ask the session to match the
+    /// new size, so the desktop renders 1:1 instead of scaling. Off when an explicit
+    /// `--size` was given — a stated resolution is pinned, and dragging the window then
+    /// only changes how much letterbox surrounds it. Requires `dynamic_resolution`.
+    pub follow_window_resize: bool,
 }
 
 impl WindowConfig {
@@ -79,6 +89,7 @@ impl WindowConfig {
             overlay_on_start: false,
             dynamic_resolution: true,
             integer_fullscreen_fit: true,
+            follow_window_resize: true,
         }
     }
 
@@ -107,9 +118,13 @@ impl WindowConfig {
         self
     }
 
-    /// Keep the configured session resolution even when opening fullscreen.
+    /// Keep the configured session resolution: don't renegotiate when opening
+    /// fullscreen, and don't follow window drags. An explicit `--size` means this
+    /// resolution, letterboxed where the window disagrees. (An interactive fullscreen
+    /// *toggle* still renegotiates — that is a fresh, unambiguous user action.)
     pub fn keeping_stated_resolution(mut self) -> Self {
         self.negotiate_native_on_start = false;
+        self.follow_window_resize = false;
         self
     }
 }
@@ -119,6 +134,13 @@ impl WindowConfig {
 /// One is a hiccup; a sustained run means the surface is genuinely unusable and holding
 /// the session open serves nobody.
 const MAX_CONSECUTIVE_PRESENT_FAILURES: u32 = 30;
+
+/// How long after the last user resize before the session is asked to match the window.
+///
+/// A drag delivers a stream of `Resized` events; each renegotiation costs the server a
+/// Deactivate All round, an encoder re-init, and (EGFX state dying with the surface) a
+/// decoder re-init here — so exactly one is sent, once the size has stopped moving.
+const RESIZE_FOLLOW_SETTLE: Duration = Duration::from_millis(500);
 
 /// How often the title-bar diagnostics refresh.
 ///
@@ -847,6 +869,27 @@ fn window_attributes(config: &WindowConfig) -> WindowAttributes {
         .with_decorations(!config.fullscreen)
 }
 
+/// The session resize a settled window size calls for, if any.
+///
+/// `None` for a degenerate size (minimised) and for a window already matching the
+/// session — re-requesting the current resolution would cost a server Deactivate All
+/// round for zero change. Encoder ceilings and MS-RDPEDISP bounds are the session
+/// pump's job (`crate::session::service_resize`), not repeated here.
+fn follow_request(
+    width: u32,
+    height: u32,
+    session_width: u16,
+    session_height: u16,
+) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    if width == u32::from(session_width) && height == u32::from(session_height) {
+        return None;
+    }
+    Some((width, height))
+}
+
 struct SessionApp {
     config: WindowConfig,
     store: Arc<Mutex<SurfaceStore>>,
@@ -894,7 +937,13 @@ struct SessionApp {
     /// [`SessionWindow::fullscreen_state`].
     fullscreen_state: Arc<AtomicBool>,
     /// The session size the user ran windowed at, restored when leaving fullscreen.
+    /// Follows the window when a settled user resize renegotiates the resolution.
     windowed_session: (u16, u16),
+    /// When a settled user resize should renegotiate the session resolution — the
+    /// debounce deadline, re-armed by each `Resized` the policy judges to be the user
+    /// and cancelled by anything that says otherwise (a display event, a restore, a
+    /// fullscreen transition).
+    resize_settle: Option<Instant>,
     /// Title diagnostics bookkeeping: last refresh, and the counters at that refresh so
     /// fps and bitrate are deltas rather than lifetime averages.
     last_title_refresh: Instant,
@@ -973,6 +1022,7 @@ impl SessionApp {
             fullscreen,
             fullscreen_state: Arc::new(AtomicBool::new(fullscreen)),
             windowed_session,
+            resize_settle: None,
             last_title_refresh: Instant::now(),
             title_frames: 0,
             title_bytes: 0,
@@ -1191,6 +1241,9 @@ impl SessionApp {
         let Some(window) = self.window.clone() else {
             return;
         };
+        // The transition sends its own resolution request; a follow armed by a drag
+        // moments ago must not fire into the middle of it.
+        self.resize_settle = None;
         self.fullscreen = on;
         self.fullscreen_state.store(on, Ordering::Relaxed);
         if on {
@@ -1291,12 +1344,12 @@ impl SessionApp {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Consult the geometry policy about a size, and ask for it back if the policy judges
-    /// that the system rather than the user chose it.
+    /// Consult the geometry policy about a size: ask it back if the system chose it,
+    /// arm the resolution-follow timer if the user did.
     ///
     /// Requesting is all we can do — every platform is free to ignore it, which is why the
     /// policy bounds its attempts rather than looping until the sizes agree.
-    fn hold_geometry(&mut self, actual: Geometry) {
+    fn hold_geometry(&mut self, event_loop: &ActiveEventLoop, actual: Geometry) {
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -1304,16 +1357,79 @@ impl SessionApp {
             .current_monitor()
             .map(|m| Geometry::new(m.size().width, m.size().height));
         let now = self.now_ms();
-        if let Some(target) = self.policy.on_resize(actual, now, monitor) {
-            tracing::debug!(
-                actual_w = actual.width,
-                actual_h = actual.height,
-                target_w = target.width,
-                target_h = target.height,
-                "restoring window geometry after a display change"
-            );
-            let _ = window.request_inner_size(PhysicalSize::new(target.width, target.height));
+        match self.policy.on_resize(actual, now, monitor) {
+            ResizeVerdict::Restore(target) => {
+                // A restore in flight must never fire a follow: the size on screen is
+                // the very one we are arguing with.
+                self.resize_settle = None;
+                tracing::debug!(
+                    actual_w = actual.width,
+                    actual_h = actual.height,
+                    target_w = target.width,
+                    target_h = target.height,
+                    "restoring window geometry after a display change"
+                );
+                let _ = window.request_inner_size(PhysicalSize::new(target.width, target.height));
+            }
+            ResizeVerdict::UserResize => {
+                if self.config.dynamic_resolution && self.config.follow_window_resize {
+                    let deadline = Instant::now() + RESIZE_FOLLOW_SETTLE;
+                    self.resize_settle = Some(deadline);
+                    // The loop may be in `Wait` with nothing else due; without a timed
+                    // wake an idle session would never see the deadline pass.
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
+            }
+            ResizeVerdict::Ignore => {
+                // Whatever this was — growth mid-upheaval, a restore landing, a spent
+                // budget — it was not the user, so nothing may reach the session.
+                self.resize_settle = None;
+            }
         }
+    }
+
+    /// Fire the debounced resolution follow, if its deadline has passed.
+    ///
+    /// Called from `new_events`, so it runs whenever the loop wakes — including the
+    /// `WaitUntil` armed for exactly this deadline.
+    fn service_settled_resize(&mut self) {
+        let due = self
+            .resize_settle
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !due {
+            return;
+        }
+        self.resize_settle = None;
+        // Belt and braces: transitions cancel the timer, but a fullscreen window's size
+        // is the monitor's, never a drag's.
+        if self.fullscreen {
+            return;
+        }
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        let Some((width, height)) = follow_request(
+            size.width,
+            size.height,
+            self.viewport.session_width,
+            self.viewport.session_height,
+        ) else {
+            return;
+        };
+        // The next fullscreen round trip should come back to what the user last chose,
+        // not to the connect-time size.
+        self.windowed_session = (
+            u16::try_from(width).unwrap_or(u16::MAX),
+            u16::try_from(height).unwrap_or(u16::MAX),
+        );
+        self.send_command(SessionCommand::Resize {
+            width,
+            height,
+            // Keep the scale the session already has: a mid-session scale change leaves
+            // non-DPI-aware remote apps DWM-stretched and blurry until relaunch.
+            scale_percent: None,
+        });
     }
 
     /// A closed receiver means the session is gone, so there is nothing left to show.
@@ -1529,13 +1645,16 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         }
     }
 
-    /// Drive the 1 Hz refresh for open diagnostics windows and live toasts.
+    /// Drive the timed work — the 1 Hz refresh for open diagnostics windows and live
+    /// toasts, and the settled-resize follow — and arm the wake for whichever is due
+    /// next. With neither pending the loop returns to plain `Wait`.
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
-        if self.aux.is_empty() && self.toasts.is_empty() {
-            return;
-        }
-        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. })
-            || self.last_diag_refresh.elapsed() >= DIAG_REFRESH
+        self.service_settled_resize();
+
+        let diag_active = !self.aux.is_empty() || !self.toasts.is_empty();
+        if diag_active
+            && (matches!(cause, winit::event::StartCause::ResumeTimeReached { .. })
+                || self.last_diag_refresh.elapsed() >= DIAG_REFRESH)
         {
             self.last_diag_refresh = Instant::now();
             for (_, win) in &self.aux {
@@ -1550,9 +1669,17 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 window.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            self.last_diag_refresh + DIAG_REFRESH,
-        ));
+
+        let diag_next = diag_active.then(|| self.last_diag_refresh + DIAG_REFRESH);
+        match (diag_next, self.resize_settle) {
+            (Some(a), Some(b)) => event_loop.set_control_flow(ControlFlow::WaitUntil(a.min(b))),
+            (Some(t), None) | (None, Some(t)) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(t));
+            }
+            // A stale `WaitUntil` left set would spin the loop the moment its instant
+            // passed, so the quiet state is restored explicitly.
+            (None, None) => event_loop.set_control_flow(ControlFlow::Wait),
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -1617,10 +1744,10 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
 
             WindowEvent::RedrawRequested => self.redraw(event_loop),
 
-            // A resize changes the viewport and nothing else. The session keeps its
-            // resolution — see the module note and CLAUDE.md. (A *fullscreen toggle*
-            // may renegotiate the resolution, but that happens in
-            // `set_fullscreen_mode`, on the user's say-so, never here.)
+            // A resize changes the viewport immediately; whether it may also change the
+            // session resolution is the geometry policy's call, made in `hold_geometry`
+            // below — only a resize judged to be the user's own act arms the debounced
+            // follow. See the module note and CLAUDE.md.
             WindowEvent::Resized(size) => {
                 self.viewport = Viewport::letterbox(
                     size.width,
@@ -1634,6 +1761,8 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 if let Some(window) = self.window.clone() {
                     let os_fullscreen = window.fullscreen().is_some();
                     if os_fullscreen != self.fullscreen {
+                        // A transition's sizes are the transition's, not a drag's.
+                        self.resize_settle = None;
                         self.fullscreen = os_fullscreen;
                         self.fullscreen_state
                             .store(os_fullscreen, Ordering::Relaxed);
@@ -1650,7 +1779,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 // size of a *windowed* window. Feeding it fullscreen sizes would teach
                 // it that the monitor size is what the user wants.
                 if !self.fullscreen {
-                    self.hold_geometry(Geometry::new(size.width, size.height));
+                    self.hold_geometry(event_loop, Geometry::new(size.width, size.height));
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -1661,6 +1790,9 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             // rearrange windows around these moments, so the policy uses them to read the
             // resizes that follow as the system's doing rather than the user's.
             WindowEvent::Occluded(occluded) => {
+                // A drag cannot span an occlusion; whatever the timer was watching for
+                // is over, and the sizes that follow a reveal are the system's.
+                self.resize_settle = None;
                 let now = self.now_ms();
                 self.policy.note_occluded(occluded, now);
                 // Becoming visible is the first moment anything can actually be fixed:
@@ -1669,7 +1801,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 if !occluded && let Some(window) = self.window.clone() {
                     if !self.fullscreen {
                         let size = window.inner_size();
-                        self.hold_geometry(Geometry::new(size.width, size.height));
+                        self.hold_geometry(event_loop, Geometry::new(size.width, size.height));
                     }
                     window.request_redraw();
                 }
@@ -1679,6 +1811,9 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             // keeps its logical size and changes physical size, which the policy must not
             // mistake for the user resizing.
             WindowEvent::ScaleFactorChanged { .. } => {
+                // The physical size is about to change without the user touching
+                // anything; an armed follow must not adopt it.
+                self.resize_settle = None;
                 let now = self.now_ms();
                 self.policy.note_display_event(now);
             }
@@ -1894,6 +2029,36 @@ mod tests {
 
     fn rgb(colour: [u8; 4]) -> u32 {
         (u32::from(colour[0]) << 16) | (u32::from(colour[1]) << 8) | u32::from(colour[2])
+    }
+
+    #[test]
+    fn a_settled_size_matching_the_session_asks_for_nothing() {
+        // Re-requesting the current resolution would cost a server Deactivate All
+        // round for zero change — the drag ended where the session already is.
+        assert_eq!(follow_request(1920, 1080, 1920, 1080), None);
+        // Distinct axis values, so a swapped width/height comparison cannot pass.
+        assert_eq!(follow_request(1080, 1920, 1920, 1080), Some((1080, 1920)));
+    }
+
+    #[test]
+    fn a_settled_size_differing_from_the_session_is_requested_verbatim() {
+        // Bounds and encoder ceilings belong to the session pump, not here.
+        assert_eq!(follow_request(1800, 1124, 1920, 1080), Some((1800, 1124)));
+    }
+
+    #[test]
+    fn a_degenerate_size_is_never_requested() {
+        assert_eq!(follow_request(0, 1080, 1920, 1080), None);
+        assert_eq!(follow_request(1920, 0, 1920, 1080), None);
+    }
+
+    #[test]
+    fn an_explicit_size_pins_the_resolution_against_drags() {
+        let config = WindowConfig::new("pinned", 1280, 800).keeping_stated_resolution();
+        assert!(!config.follow_window_resize);
+        assert!(!config.negotiate_native_on_start);
+        // The default, with no --size, follows the window.
+        assert!(WindowConfig::new("free", 1280, 800).follow_window_resize);
     }
 
     #[test]

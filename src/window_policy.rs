@@ -62,6 +62,22 @@ pub const SETTLE_MS: u64 = 2_000;
 /// How many times we will re-assert the geometry before accepting the system's answer.
 pub const MAX_RESTORES: u32 = 3;
 
+/// What a resize event turned out to be, once read in context.
+///
+/// The caller needs more than "argue or not": a resize judged to be the user's own act
+/// is the one thing allowed to renegotiate the *session* resolution, so the policy —
+/// the only component holding the context to tell — must say so explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeVerdict {
+    /// The user chose this size; it has been adopted as the desired geometry.
+    UserResize,
+    /// The system imposed it; ask the window manager for this size back.
+    Restore(Geometry),
+    /// Leave it alone: growth, an occluded screen, a spent budget, or a restore
+    /// landing. Never treat it as the user's intent.
+    Ignore,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Nothing in flight; a resize now is taken at face value.
@@ -122,25 +138,27 @@ impl WindowPolicy {
         }
     }
 
-    /// Consider a resize. Returns the size to request back, if we should argue with it.
+    /// Consider a resize. Says whether it was the user's act, a system imposition to
+    /// argue with, or nothing worth acting on.
     ///
-    /// `monitor` is the current screen size where known; the request is clamped to it.
+    /// `monitor` is the current screen size where known; a restore is clamped to it.
     pub fn on_resize(
         &mut self,
         actual: Geometry,
         now_ms: u64,
         monitor: Option<Geometry>,
-    ) -> Option<Geometry> {
-        // We got what we wanted. Whatever we were doing, we are done doing it.
+    ) -> ResizeVerdict {
+        // We got what we wanted. Whatever we were doing, we are done doing it. Not a
+        // user act even in a quiet period: nothing changed.
         if actual == self.desired {
             self.phase = Phase::Idle;
-            return None;
+            return ResizeVerdict::Ignore;
         }
 
         // Nothing can be fixed on a screen that is off, and trying burns the budget we
         // will want the moment it comes back. Remember, act later.
         if self.occluded {
-            return None;
+            return ResizeVerdict::Ignore;
         }
 
         // A restore in flight keeps the resize suspect however long the round trip takes.
@@ -153,17 +171,17 @@ impl WindowPolicy {
             // what they want, including if it is smaller.
             self.desired = actual;
             self.phase = Phase::Idle;
-            return None;
+            return ResizeVerdict::UserResize;
         }
 
         // Only shrinkage is worth fighting. A window the system made larger still shows
         // the whole session, so leave it be.
         if !actual.shrunk_from(self.desired) {
-            return None;
+            return ResizeVerdict::Ignore;
         }
 
         if self.phase == Phase::GaveUp {
-            return None;
+            return ResizeVerdict::Ignore;
         }
 
         let attempts = match self.phase {
@@ -174,7 +192,7 @@ impl WindowPolicy {
             // The system wins this round. `desired` is deliberately left untouched so the
             // next display event can try again for the size the user actually asked for.
             self.phase = Phase::GaveUp;
-            return None;
+            return ResizeVerdict::Ignore;
         }
 
         let target = self.desired.clamped_to(monitor);
@@ -182,11 +200,11 @@ impl WindowPolicy {
             // The screen cannot hold any more than we already have. Not a fight worth
             // having, and re-requesting the same size would spin.
             self.phase = Phase::GaveUp;
-            return None;
+            return ResizeVerdict::Ignore;
         }
 
         self.phase = Phase::Restoring(attempts + 1);
-        Some(target)
+        ResizeVerdict::Restore(target)
     }
 
     fn within_settle(&self, now_ms: u64) -> bool {
@@ -216,7 +234,7 @@ mod tests {
     fn a_resize_in_a_quiet_period_is_the_user_and_is_adopted() {
         let mut p = policy();
         // No display event has ever happened, so nothing is suspect.
-        assert_eq!(p.on_resize(SMALL, 10_000, None), None);
+        assert_eq!(p.on_resize(SMALL, 10_000, None), ResizeVerdict::UserResize);
         assert_eq!(p.desired(), SMALL, "a user resize becomes the new intent");
     }
 
@@ -226,18 +244,21 @@ mod tests {
         p.note_display_event(1_000);
         assert_eq!(
             p.on_resize(SMALL, 1_100, None),
-            Some(BIG),
+            ResizeVerdict::Restore(BIG),
             "the system shrank us; ask for the size back"
         );
         assert_eq!(p.desired(), BIG, "the user's intent is not overwritten");
     }
 
     #[test]
-    fn a_shrink_long_after_a_display_event_is_left_alone() {
+    fn a_shrink_long_after_a_display_event_is_the_user() {
         let mut p = policy();
         p.note_display_event(1_000);
         // Well outside the settle window: this is the user dragging the window.
-        assert_eq!(p.on_resize(SMALL, 1_000 + SETTLE_MS + 1, None), None);
+        assert_eq!(
+            p.on_resize(SMALL, 1_000 + SETTLE_MS + 1, None),
+            ResizeVerdict::UserResize
+        );
         assert_eq!(p.desired(), SMALL);
     }
 
@@ -247,7 +268,7 @@ mod tests {
         p.note_occluded(true, 1_000);
         assert_eq!(
             p.on_resize(SMALL, 1_100, None),
-            None,
+            ResizeVerdict::Ignore,
             "a screen that is off cannot be fixed"
         );
         assert_eq!(p.desired(), BIG, "and the intent must survive the lock");
@@ -255,17 +276,25 @@ mod tests {
         p.note_occluded(false, 50_000);
         assert_eq!(
             p.on_resize(SMALL, 50_010, None),
-            Some(BIG),
+            ResizeVerdict::Restore(BIG),
             "now that we can see, put it back"
         );
     }
 
     #[test]
-    fn growth_is_never_fought() {
+    fn growth_during_upheaval_is_neither_fought_nor_the_user() {
         let mut p = policy();
         p.note_display_event(1_000);
         let bigger = Geometry::new(3840, 2160);
-        assert_eq!(p.on_resize(bigger, 1_100, None), None);
+        assert_eq!(p.on_resize(bigger, 1_100, None), ResizeVerdict::Ignore);
+    }
+
+    #[test]
+    fn growth_in_a_quiet_period_is_the_user() {
+        let mut p = policy();
+        let bigger = Geometry::new(3840, 2160);
+        assert_eq!(p.on_resize(bigger, 10_000, None), ResizeVerdict::UserResize);
+        assert_eq!(p.desired(), bigger);
     }
 
     #[test]
@@ -275,14 +304,14 @@ mod tests {
         for attempt in 1..=MAX_RESTORES {
             assert_eq!(
                 p.on_resize(SMALL, 1_000 + u64::from(attempt) * 10, None),
-                Some(BIG),
+                ResizeVerdict::Restore(BIG),
                 "attempt {attempt} should still be trying"
             );
         }
         assert_eq!(
             p.on_resize(SMALL, 9_999_999, None),
-            None,
-            "after {MAX_RESTORES} attempts the system wins"
+            ResizeVerdict::Ignore,
+            "after {MAX_RESTORES} attempts the system wins, and giving up is not the user"
         );
         assert_eq!(
             p.desired(),
@@ -295,12 +324,12 @@ mod tests {
     fn a_restore_in_flight_outlasts_the_settle_window() {
         let mut p = policy();
         p.note_display_event(1_000);
-        assert_eq!(p.on_resize(SMALL, 1_100, None), Some(BIG));
+        assert_eq!(p.on_resize(SMALL, 1_100, None), ResizeVerdict::Restore(BIG));
         // The window manager takes its time — far longer than the settle window.
         let late = 1_000 + SETTLE_MS + 60_000;
         assert_eq!(
             p.on_resize(SMALL, late, None),
-            Some(BIG),
+            ResizeVerdict::Restore(BIG),
             "still restoring, so this is not the user"
         );
         assert_eq!(
@@ -317,12 +346,16 @@ mod tests {
         for _ in 0..MAX_RESTORES {
             p.on_resize(SMALL, 1_100, None);
         }
-        assert_eq!(p.on_resize(SMALL, 1_200, None), None, "budget spent");
+        assert_eq!(
+            p.on_resize(SMALL, 1_200, None),
+            ResizeVerdict::Ignore,
+            "budget spent"
+        );
 
         p.note_display_event(500_000);
         assert_eq!(
             p.on_resize(SMALL, 500_100, None),
-            Some(BIG),
+            ResizeVerdict::Restore(BIG),
             "a new upheaval deserves another go"
         );
     }
@@ -334,7 +367,7 @@ mod tests {
         let monitor = Geometry::new(1920, 1080);
         assert_eq!(
             p.on_resize(SMALL, 1_100, Some(monitor)),
-            Some(monitor),
+            ResizeVerdict::Restore(monitor),
             "never ask for a window bigger than the screen"
         );
     }
@@ -345,18 +378,21 @@ mod tests {
         p.note_display_event(1_000);
         let monitor = Geometry::new(1280, 800);
         // We are already exactly the monitor size; asking again would spin.
-        assert_eq!(p.on_resize(monitor, 1_100, Some(monitor)), None);
+        assert_eq!(
+            p.on_resize(monitor, 1_100, Some(monitor)),
+            ResizeVerdict::Ignore
+        );
     }
 
     #[test]
     fn reaching_the_desired_size_settles_and_restores_the_budget() {
         let mut p = policy();
         p.note_display_event(1_000);
-        assert_eq!(p.on_resize(SMALL, 1_100, None), Some(BIG));
-        // The restore landed.
-        assert_eq!(p.on_resize(BIG, 1_200, None), None);
+        assert_eq!(p.on_resize(SMALL, 1_100, None), ResizeVerdict::Restore(BIG));
+        // The restore landed — that is the round trip completing, not the user acting.
+        assert_eq!(p.on_resize(BIG, 1_200, None), ResizeVerdict::Ignore);
         // A later user resize in a quiet period is adopted, proving we left Restoring.
-        assert_eq!(p.on_resize(SMALL, 900_000, None), None);
+        assert_eq!(p.on_resize(SMALL, 900_000, None), ResizeVerdict::UserResize);
         assert_eq!(p.desired(), SMALL);
     }
 
@@ -368,6 +404,6 @@ mod tests {
         p.note_occluded(true, 1_100);
         p.note_occluded(false, 1_200);
         // Now visible: the reveal is the display event, so this shrink is suspect.
-        assert_eq!(p.on_resize(SMALL, 1_250, None), Some(BIG));
+        assert_eq!(p.on_resize(SMALL, 1_250, None), ResizeVerdict::Restore(BIG));
     }
 }

@@ -32,9 +32,14 @@ needs Arthur, not a design-phase judgment call.
 - **Portable by default, platform-specific only at the edges.** Core logic is
   `cfg`-free. Platform code is confined to named modules behind a trait
   (window policy, credential store, hardware video decode).
-- **Session resolution is decoupled from window size by default.** Scale/letterbox in
-  the renderer. A display-configuration change must never reflow the remote desktop.
-  Dynamic resize is opt-in and only ever fires on a *user-initiated* resize.
+- **Only the user resizes the session.** A display-configuration change must never
+  reflow the remote desktop — `window_policy` classifies every `Resized` event, and
+  system-imposed geometry is argued with, never forwarded. A *user-initiated* resize
+  (window drag, fullscreen toggle) renegotiates the session resolution to match, after
+  a settle delay for drags; scale/letterbox in the renderer covers the rest. An
+  explicit `--size` pins the resolution (drags then letterbox only), and Settings ▸
+  Graphics ▸ Dynamic resolution off means letterbox always. (Decided 2026-08-17;
+  before that, windowed drags never renegotiated.)
 - **Credentials live in the OS keychain**, never in a config file, never in a log.
 
 ## Scope
