@@ -2,6 +2,11 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
+- [ ] 2026-08-17: the diag cache window has no explicit "this server is not using the
+  bitmap cache" empty state, so an AVC444 session's blank grid reads as broken rather
+  than idle-by-design (`src/diag/cache.rs:grid_caption`; server behaviour proven in
+  lessons_learnt 2026-08-17). The session-end summary already says it; the live window
+  should too.
 - [ ] 2026-08-17: the launcher's `View` submenu is still built with no items, so it opens
   to nothing — the same defect the Help menus had until today
   (`src/shell/mod.rs:menus::LauncherMenu::install`). Either drop it until the sort toggles
