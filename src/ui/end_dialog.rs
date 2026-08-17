@@ -5,6 +5,7 @@
 //! egui window via [`crate::ui::egui_host::AuxWindow`]. Skipped entirely on the
 //! Cmd+Q path (the process is already gone) and for scripted runs.
 
+use crate::disconnect::ServerFarewell;
 use crate::ui::egui_host::AuxWindow;
 use crate::ui::theme;
 use crate::window::SessionEvent;
@@ -22,10 +23,32 @@ pub enum EndChoice {
     SaveMetricsAndClose,
 }
 
+/// Aux windows are not resizable, so each size is pinned by a fit test below. The two
+/// unexpected endings share a size: both carry a wrapped explanation whose length is
+/// the server's to choose, so both need the same headroom.
+const WARN_WINDOW: [f32; 2] = [480.0, 300.0];
+const ENDED_WINDOW: [f32; 2] = [460.0, 280.0];
+
+/// How the session finished — one dialog variant per case.
+pub enum EndOutcome {
+    /// Ended cleanly: the user closed the window, or we disconnected.
+    Ended,
+    /// The link failed under us; the string is the failure text.
+    Lost(String),
+    /// The server ended it and said why (MS-RDPBCGR Set Error Info).
+    ServerEnded(ServerFarewell),
+}
+
+impl EndOutcome {
+    /// Both unexpected endings get the warning bar and the Reconnect button.
+    fn unexpected(&self) -> bool {
+        !matches!(self, Self::Ended)
+    }
+}
+
 /// What the dialog shows.
 pub struct EndInfo {
-    /// `None` = ended cleanly; `Some(reason)` = lost, with the failure text.
-    pub lost: Option<String>,
+    pub outcome: EndOutcome,
     pub session_name: String,
     pub duration_secs: u64,
     /// Latency drift in milliseconds, when measured.
@@ -55,9 +78,10 @@ impl EndApp {
         if self.window.is_some() {
             return;
         }
-        let (title, size) = match self.info.lost {
-            Some(_) => ("Session lost", [480.0, 300.0]),
-            None => ("Session ended", [460.0, 280.0]),
+        let (title, size) = match self.info.outcome {
+            EndOutcome::Lost(_) => ("Session lost", WARN_WINDOW),
+            EndOutcome::ServerEnded(_) => ("Session ended", WARN_WINDOW),
+            EndOutcome::Ended => ("Session ended", ENDED_WINDOW),
         };
         match AuxWindow::open(event_loop, title, size) {
             Ok(win) => self.window = Some(win),
@@ -162,7 +186,7 @@ fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Option<EndChoice> {
     use crate::shell::widgets;
     use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
     let mut choice = None;
-    let lost = info.lost.is_some();
+    let lost = info.outcome.unexpected();
     Frame::new()
         .fill(theme::BG_WINDOW)
         .inner_margin(Margin::same(0))
@@ -186,8 +210,25 @@ fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Option<EndChoice> {
                 })
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 12.0;
-                    match &info.lost {
-                        Some(reason) => {
+                    match &info.outcome {
+                        // The server told us why, so lead with that instead of a
+                        // dropped-link guess: "Kiln is restarting".
+                        EndOutcome::ServerEnded(farewell) => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} {}",
+                                    info.session_name, farewell.headline
+                                ))
+                                .font(theme::sans_semibold(16.0))
+                                .color(theme::TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                RichText::new(&farewell.detail)
+                                    .font(theme::sans(13.0))
+                                    .color(theme::TEXT_SECONDARY),
+                            );
+                        }
+                        EndOutcome::Lost(reason) => {
                             ui.label(
                                 RichText::new(format!("Session to {} lost", info.session_name))
                                     .font(theme::sans_semibold(16.0))
@@ -207,7 +248,7 @@ fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Option<EndChoice> {
                                     .color(theme::TEXT_MUTED),
                             );
                         }
-                        None => {
+                        EndOutcome::Ended => {
                             ui.label(
                                 RichText::new(format!("Session {} ended", info.session_name))
                                     .font(theme::sans_semibold(16.0))
@@ -314,5 +355,124 @@ mod tests {
         assert_eq!(duration_str(42), "42s");
         assert_eq!(duration_str(750), "12m 30s");
         assert_eq!(duration_str(4320), "1h 12m");
+    }
+
+    fn info(outcome: EndOutcome) -> EndInfo {
+        EndInfo {
+            outcome,
+            session_name: "Kiln".to_owned(),
+            duration_secs: 750,
+            drift_ms: Some(1.4),
+            cache_share: Some(0.62),
+        }
+    }
+
+    /// Lay out one real frame of the dialog at the size it opens at, and return every
+    /// text it drew with the rect that text occupies.
+    fn frame(size: [f32; 2], info: &EndInfo) -> Vec<(String, egui::Rect)> {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(size[0], size[1]),
+            )),
+            ..Default::default()
+        };
+        // Seeded with a choice nothing clicked, so a body that never runs cannot pass
+        // the caller's assert.
+        let mut choice = Some(EndChoice::Reconnect);
+        let output = ctx.run_ui(input, |ui| {
+            choice = draw(ui, info);
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                let size = t.galley.size();
+                let min_x = match t.galley.job.halign {
+                    egui::Align::LEFT => t.pos.x,
+                    egui::Align::Center => t.pos.x - size.x / 2.0,
+                    egui::Align::RIGHT => t.pos.x - size.x,
+                };
+                texts.push((
+                    t.galley.text().to_owned(),
+                    egui::Rect::from_min_size(egui::pos2(min_x, t.pos.y), size),
+                ));
+            }
+        }
+        // Consumed before the asserts: FullOutput's destructor panics on unapplied
+        // deltas, which would turn a plain assert failure into a SIGABRT.
+        output.drop_without_applying_deltas();
+        assert!(choice.is_none(), "an untouched end dialog made a choice");
+        texts
+    }
+
+    /// Nobody can resize an aux window, so anything laid out past its bottom edge is
+    /// simply never seen — that is how a dialog loses its own buttons.
+    ///
+    /// Only the overflow half of the fit is asserted. These §7 dialogs are drawn at a
+    /// fixed size with the footer stacked under the content, so a short message
+    /// legitimately leaves background below it; the length of the message is the
+    /// server's to choose, not ours.
+    fn assert_fits(texts: &[(String, egui::Rect)], size: [f32; 2]) {
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(size[0], size[1]));
+        for (text, rect) in texts {
+            assert!(
+                window.contains_rect(*rect),
+                "{text:?} at {rect:?} falls outside the {size:?} window"
+            );
+        }
+    }
+
+    /// The point of the whole change: a host that restarted says so by name, instead of
+    /// showing the decode error its Set Error Info PDU used to provoke.
+    #[test]
+    fn a_restarting_host_is_named_in_the_headline() {
+        let info = info(EndOutcome::ServerEnded(ServerFarewell {
+            headline: "is restarting",
+            detail: "The host is rebooting. It will take connections again once it is back."
+                .to_owned(),
+        }));
+        let texts = frame(WARN_WINDOW, &info);
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(drawn.contains(&"Kiln is restarting"), "{drawn:?}");
+        assert!(drawn.contains(&"Reconnect"), "{drawn:?}");
+        assert_fits(&texts, WARN_WINDOW);
+    }
+
+    /// The detail line is whatever the protocol says, and the wordiest code in
+    /// MS-RDPBCGR 2.2.5.1.1 runs to three wrapped lines. It has to fit too.
+    #[test]
+    fn the_wordiest_server_reason_still_fits() {
+        let detail = crate::disconnect::classify(
+            &ironrdp::session::GracefulDisconnectReason::ErrorInfo(
+                ironrdp::pdu::rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+                    ironrdp::pdu::rdp::server_error_info::ProtocolIndependentCode::
+                        ServerFreshCredentialsRequired,
+                ),
+            ),
+        )
+        .expect("an error-info reason is a farewell");
+        let texts = frame(WARN_WINDOW, &info(EndOutcome::ServerEnded(detail)));
+        assert_fits(&texts, WARN_WINDOW);
+    }
+
+    #[test]
+    fn a_lost_session_still_fits_its_window() {
+        let info = info(EndOutcome::Lost("connection reset by peer".to_owned()));
+        let texts = frame(WARN_WINDOW, &info);
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(drawn.contains(&"Session to Kiln lost"), "{drawn:?}");
+        assert_fits(&texts, WARN_WINDOW);
+    }
+
+    #[test]
+    fn a_clean_end_still_fits_its_window() {
+        let texts = frame(ENDED_WINDOW, &info(EndOutcome::Ended));
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(drawn.contains(&"Session Kiln ended"), "{drawn:?}");
+        assert!(drawn.contains(&"12m 30s"), "{drawn:?}");
+        assert_fits(&texts, ENDED_WINDOW);
+        assert!(drawn.contains(&"Save metrics JSON"), "{drawn:?}");
     }
 }

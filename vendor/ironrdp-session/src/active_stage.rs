@@ -11,6 +11,7 @@ use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
 use ironrdp_pdu::rdp::client_info::CompressionType as PduCompressionType;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
+use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
 use ironrdp_pdu::slow_path::{self, GraphicsUpdateType};
 use ironrdp_pdu::{Action, mcs};
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages};
@@ -389,7 +390,9 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
                         mcs::DisconnectReason::UserRequested => GracefulDisconnectReason::UserInitiated,
                         other => GracefulDisconnectReason::Other(other.description().to_owned()),
                     },
-                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::Other(info.description()),
+                    // mdrdp patch: carried structured rather than flattened to a string, so
+                    // the client can tell "the host is rebooting" from "you were kicked".
+                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::ErrorInfo(info),
                 };
 
                 Ok(Self::Terminate(desc))
@@ -412,6 +415,9 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
 pub enum GracefulDisconnectReason {
     UserInitiated,
     ServerInitiated,
+    /// The server's Set Error Info code (MS-RDPBCGR 2.2.5.1.1), kept as a code so the
+    /// client can act on it and not only print it.
+    ErrorInfo(ErrorInfo),
     Other(String),
 }
 
@@ -420,6 +426,7 @@ impl GracefulDisconnectReason {
         match self {
             GracefulDisconnectReason::UserInitiated => "user initiated disconnect".to_owned(),
             GracefulDisconnectReason::ServerInitiated => "server initiated disconnect".to_owned(),
+            GracefulDisconnectReason::ErrorInfo(info) => info.description(),
             GracefulDisconnectReason::Other(description) => description.clone(),
         }
     }

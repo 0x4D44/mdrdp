@@ -454,3 +454,38 @@ frame-smaller-than-rect case, which upstream escalated into a channel error) now
 the frame and report through the new `on_decode_failure(codec, reason)` handler seam.
 `ironrdp-graphics` became a path dependency so standalone (in-crate) tests compile
 against the vendored module rather than crates.io.
+
+## `ironrdp-pdu` 0.9.0 — a restarting server no longer fails the decode (2026-08-17)
+
+`ServerSetErrorInfoPdu::decode` rejected any code its `ErrorInfo` table did not list,
+and the table stops at `ERRINFO_SERVER_CSRSS_CRASH` (0x18). MS-RDPBCGR 2.2.5.1.1 defines
+two more — **ERRINFO_SERVER_SHUTDOWN (0x19)** "The remote server is busy shutting down"
+and **ERRINFO_SERVER_REBOOT (0x1A)** "The remote server is busy rebooting" — and those
+are exactly what a host sends on its way down. FreeRDP 3.27.1 is missing them too
+(`freerdp/error.h` also stops at 0x18), so this is not an IronRDP-only gap.
+
+Rebooting a live host therefore produced `errorInfo: unexpected info code` and mdrdp
+reported an unexplained protocol error, where Microsoft's client says the server is
+restarting. Two changes:
+
+- the two codes are added to `ProtocolIndependentCode`, with the spec's own wording;
+- an unrecognised code now decodes to a new `ErrorInfo::Unknown(u32)` instead of failing
+  the PDU. This PDU is the server *explaining why the session is ending*; rejecting it
+  discards the explanation and substitutes a parse error. The next code Microsoft adds
+  will be carried, not fatal.
+
+`ErrorInfo::Unknown` round-trips (`as_u32` returns the raw value) and describes itself as
+`[Unrecognised error code] 0x…`. Pinned by `disconnect::tests::
+a_restarting_host_decodes_instead_of_failing_the_pdu` and
+`an_unknown_code_is_carried_rather_than_rejected`, which decode real four-byte wire
+payloads; both were made to fail first, by moving `ServerReboot`'s discriminant and by
+restoring the reject.
+
+## `ironrdp-session` 0.11.0 — the disconnect reason keeps its code
+
+`GracefulDisconnectReason` flattened a Set Error Info disconnect straight into
+`Other(String)`, so a client could print the reason but never branch on it. The vendored
+crate adds `GracefulDisconnectReason::ErrorInfo(ErrorInfo)`; `description()` returns the
+same text as before, so anything that only logs the reason is unaffected. mdrdp uses the
+code in `src/disconnect.rs` to tell "the host is rebooting" from "somebody else took your
+session". Remove when upstream exposes the code.

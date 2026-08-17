@@ -91,6 +91,7 @@ fn session_end_state(end: &session::SessionEnd) -> &'static str {
     match end {
         session::SessionEnd::Graceful => "graceful",
         session::SessionEnd::WindowClosed => "window_closed",
+        session::SessionEnd::ServerEnded(_) => "server_ended",
         session::SessionEnd::Failed(_) => "failed",
     }
 }
@@ -1254,13 +1255,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match window_result {
         Ok(mut event_loop) => {
             if !scripted && let Some(end) = &end {
-                let lost = match end {
-                    session::SessionEnd::Failed(reason) => Some(reason.to_string()),
-                    session::SessionEnd::Graceful | session::SessionEnd::WindowClosed => None,
+                use mdrdp::ui::end_dialog::EndOutcome;
+                let outcome = match end {
+                    session::SessionEnd::Failed(reason) => EndOutcome::Lost(reason.to_string()),
+                    session::SessionEnd::ServerEnded(farewell) => {
+                        EndOutcome::ServerEnded(farewell.clone())
+                    }
+                    session::SessionEnd::Graceful | session::SessionEnd::WindowClosed => {
+                        EndOutcome::Ended
+                    }
                 };
                 let stats_snapshot = session_stats.snapshot();
                 let info = mdrdp::ui::end_dialog::EndInfo {
-                    lost,
+                    outcome,
                     session_name: display_name.clone(),
                     duration_secs: session_started.elapsed().as_secs(),
                     drift_ms: stats_snapshot.latency.drift_us().map(|d| d as f64 / 1000.0),

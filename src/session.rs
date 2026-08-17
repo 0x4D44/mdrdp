@@ -13,6 +13,7 @@
 
 use crate::clipboard::ClipboardBridge;
 use crate::connect::{ConnectError, Established, describe, send_shutdown};
+use crate::disconnect::{self, ServerFarewell};
 use crate::input::{InputEvent, encode_fastpath_input, to_fastpath};
 use crate::stats::StatsHandle;
 use crate::surface::SurfaceStore;
@@ -110,6 +111,9 @@ pub enum SessionEnd {
     Graceful,
     /// The window closed, so we disconnected.
     WindowClosed,
+    /// The server ended it and said why — a reboot, a shutdown, another logon taking
+    /// the session. Still an orderly end, but one the user is owed an explanation for.
+    ServerEnded(ServerFarewell),
     Failed(ConnectError),
 }
 
@@ -362,8 +366,11 @@ fn pump(
                 ActiveStageOutput::Terminate(reason) => {
                     // The server chose to end the session; the reason is the only
                     // clue to why (idle policy, another logon, server-side error).
-                    eprintln!("server ended the session: {reason:?}");
-                    return SessionEnd::Graceful;
+                    eprintln!("server ended the session: {reason}");
+                    return match disconnect::classify(&reason) {
+                        Some(farewell) => SessionEnd::ServerEnded(farewell),
+                        None => SessionEnd::Graceful,
+                    };
                 }
                 // The remote's pointer shape, mirrored onto the local window. A dead
                 // window is discovered by the input drain, not here.

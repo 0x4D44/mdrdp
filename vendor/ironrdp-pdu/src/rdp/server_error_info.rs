@@ -1,6 +1,4 @@
-use ironrdp_core::{
-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size, invalid_field_err,
-};
+use ironrdp_core::{Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size};
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 
@@ -36,9 +34,12 @@ impl<'de> Decode<'de> for ServerSetErrorInfoPdu {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         ensure_fixed_part_size!(in: src);
 
-        let error_info = src.read_u32();
-        let error_info =
-            ErrorInfo::from_u32(error_info).ok_or_else(|| invalid_field_err!("errorInfo", "unexpected info code"))?;
+        let raw = src.read_u32();
+        // mdrdp patch: an unrecognised code is carried, not rejected. MS-RDPBCGR adds
+        // codes over time (0x19/0x1A postdate this enum), and this PDU is how the
+        // server explains why the session is ending — failing the decode turns a
+        // "the host is rebooting" notice into an unexplained protocol error.
+        let error_info = ErrorInfo::from_u32(raw).unwrap_or(ErrorInfo::Unknown(raw));
 
         Ok(Self(error_info))
     }
@@ -51,6 +52,8 @@ pub enum ErrorInfo {
     ProtocolIndependentLicensingCode(ProtocolIndependentLicensingCode),
     ProtocolIndependentConnectionBrokerCode(ProtocolIndependentConnectionBrokerCode),
     RdpSpecificCode(RdpSpecificCode),
+    /// mdrdp patch: a code this build does not know, kept verbatim.
+    Unknown(u32),
 }
 
 impl ErrorInfo {
@@ -66,6 +69,7 @@ impl ErrorInfo {
                 format!("[Protocol independent connection broker error] {}", c.description())
             }
             Self::RdpSpecificCode(c) => format!("[RDP specific code]: {}", c.description()),
+            Self::Unknown(code) => format!("[Unrecognised error code] 0x{code:08X}"),
         }
     }
 
@@ -75,6 +79,7 @@ impl ErrorInfo {
             Self::ProtocolIndependentLicensingCode(c) => c.as_u32(),
             Self::ProtocolIndependentConnectionBrokerCode(c) => c.as_u32(),
             Self::RdpSpecificCode(c) => c.as_u32(),
+            Self::Unknown(code) => code,
         }
     }
 }
@@ -127,6 +132,10 @@ pub enum ProtocolIndependentCode {
     CloseStackOnDriverIfaceFailure = 0x0000_0012,
     ServerWinlogonCrash = 0x0000_0017,
     ServerCsrssCrash = 0x0000_0018,
+    // mdrdp patch: MS-RDPBCGR 2.2.5.1.1 defines these two; upstream stops at 0x18, so a
+    // host that is restarting could not be decoded at all.
+    ServerShutdown = 0x0000_0019,
+    ServerReboot = 0x0000_001A,
 }
 
 impl ProtocolIndependentCode {
@@ -170,6 +179,8 @@ impl ProtocolIndependentCode {
             }
             Self::ServerWinlogonCrash => "The Winlogon process running in the remote session terminated unexpectedly",
             Self::ServerCsrssCrash => "The CSRSS process running in the remote session terminated unexpectedly",
+            Self::ServerShutdown => "The remote server is busy shutting down",
+            Self::ServerReboot => "The remote server is busy rebooting",
         }
     }
 

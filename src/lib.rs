@@ -11,6 +11,7 @@ pub mod connect;
 pub mod creds;
 pub mod detach;
 pub mod diag;
+pub mod disconnect;
 pub mod display;
 pub mod egfx;
 pub mod favourites;
