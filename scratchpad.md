@@ -11,6 +11,10 @@ Out-of-scope observations. A separate human-invoked review triages these.
   to nothing — the same defect the Help menus had until today
   (`src/shell/mod.rs:menus::LauncherMenu::install`). Either drop it until the sort toggles
   it was reserved for actually exist, or fill it. Left alone because the ask was Help.
+- [ ] 2026-08-17: present p50 measured 1.97ms on 08-16 but 6.4-9.1ms in today's runs
+  (same code path). Suspect display/backlight state during unattended runs throttles
+  the redraw. Worth pinning down before quoting present-segment numbers
+  (`stats::SessionStats::present`).
 - [ ] 2026-08-16: the UI thread spends most of its CPU on a full-frame copy per present
   (`_platform_memmove` 785 ms + `window::present_into` 294 ms over 75 s, samply against
   quench) even when one caret changed. softbuffer has `present_with_damage`; plumbing
