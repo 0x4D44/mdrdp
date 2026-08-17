@@ -1,3 +1,13 @@
+- Advertise DPI scale in the GCC at connect: a mid-session RDPEDISP scale change leaves non-DPI-aware remote apps DWM-blurred (`display::primary_display`).
+  Windows treats a Display Control scale change like a monitor DPI change: per-monitor-
+  DPI-aware processes re-render sharp, everything else is bitmap-stretched by DWM until
+  relaunched — server-side blur no client can undo. So a session that will open
+  fullscreen must connect at its planned scale, not renegotiate after logon. winit
+  cannot supply the monitor pre-connect (monitors are only enumerable inside the running
+  loop, whose single Resumed creates the session window), hence the CoreGraphics probe.
+  Related: past the H.264 ceiling, `session::fullscreen_request` integer-fits (5K →
+  2560x1440@100) because the fractional clamp's 1.25x nearest stretch shreds glyphs.
+
 - A sub-notch RDP wheel PDU scrolls nothing: accumulate macOS's fractional lines/pixels into whole 120s (`input::WheelAccumulator`).
   Windows apps divide arriving rotation by WHEEL_DELTA, so anything under 120 units is
   discarded outright. macOS reports slow wheel travel as fractional *lines* (acceleration)
