@@ -412,14 +412,21 @@ impl KeyLedger {
 ///
 /// RDP counts rotation in notches of [`WHEEL_UNITS_PER_NOTCH`], and Windows applications
 /// overwhelmingly divide the arriving rotation by that constant — so anything under one
-/// notch scrolls nothing at all. macOS hands us far finer input than that: a trackpad or
-/// Magic Mouse reports pixels, and even a detented wheel arrives as an accelerated,
-/// *fractional* line count. Translating each winit event on its own therefore emits a
-/// stream of sub-notch PDUs the remote discards, and the user sees nothing until a fast
-/// flick finally clears the threshold — at which point every event lands a full notch or
-/// two and the scroll runs away. Holding the remainder converts that same travel into
-/// whole notches: slow scrolling moves, and fast scrolling stays proportional to the
-/// gesture instead of arriving in bursts.
+/// notch scrolls nothing at all. macOS hands us far finer input than that, and the two
+/// shapes it arrives in need different treatment:
+///
+/// - A **detented wheel** reports whole physical clicks, but macOS's acceleration curve
+///   shrinks a slowly-turned click to a *fraction* of a line (~0.1). On a native Windows
+///   box every click scrolls, however slowly the wheel turns, so each [`LineDelta`]
+///   event is floored at one whole notch ([`detent_floor`]). Accumulating those
+///   fractions instead — the first version of this fix — left slow scrolling ten
+///   physical clicks per remote notch, which reads as dead.
+/// - A **precise device** (trackpad, Magic Mouse) reports a continuous pixel stream
+///   with no physical click to honour. Its travel accumulates, and whole notches are
+///   spent as they are earned: slow scrolling still moves, fast scrolling stays
+///   proportional, and sub-notch jitter never reaches the wire.
+///
+/// [`LineDelta`]: MouseScrollDelta::LineDelta
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WheelAccumulator {
     vertical: f64,
@@ -440,8 +447,8 @@ impl WheelAccumulator {
     pub fn translate(&mut self, delta: MouseScrollDelta, at: (u16, u16)) -> Vec<InputEvent> {
         let (horizontal, vertical) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (
-                f64::from(x) * f64::from(WHEEL_UNITS_PER_NOTCH),
-                f64::from(y) * f64::from(WHEEL_UNITS_PER_NOTCH),
+                detent_floor(f64::from(x)) * f64::from(WHEEL_UNITS_PER_NOTCH),
+                detent_floor(f64::from(y)) * f64::from(WHEEL_UNITS_PER_NOTCH),
             ),
             MouseScrollDelta::PixelDelta(pos) => (
                 pos.x / PIXELS_PER_NOTCH * f64::from(WHEEL_UNITS_PER_NOTCH),
@@ -457,6 +464,25 @@ impl WheelAccumulator {
             spend(axis, units, held, at, &mut out);
         }
         out
+    }
+}
+
+/// Floor one axis of a discrete wheel event at a whole line, keeping its direction.
+///
+/// A [`MouseScrollDelta::LineDelta`] event is a physical detent click — winit only emits
+/// it for non-precise devices — but macOS's scroll acceleration reports a slowly-turned
+/// click as a fraction of a line. The click happened; the user is owed a notch for it.
+/// Values of a line or more pass through untouched, so a fast spin keeps the
+/// acceleration curve and its fractional part still accumulates.
+///
+/// The trade-off, accepted deliberately: a driver that splits one detent into several
+/// sub-line events (some high-resolution wheels) will over-scroll here. That shape has
+/// not been seen from macOS, and a dead slow scroll is the worse failure.
+fn detent_floor(lines: f64) -> f64 {
+    if lines != 0.0 && lines.abs() < 1.0 {
+        lines.signum()
+    } else {
+        lines
     }
 }
 
@@ -1136,23 +1162,75 @@ mod tests {
     }
 
     #[test]
-    fn slow_travel_accumulates_until_it_buys_a_whole_notch() {
-        // The bug this guards: macOS reports slow scrolling in fractions of a line (and
-        // trackpads in single pixels). Emitted per event, each is a sub-notch PDU the
-        // remote discards, so a slow scroll moves nothing at all.
+    fn a_slow_wheel_detent_is_a_whole_notch_however_small_macos_reports_it() {
+        // The bug this guards: macOS's acceleration curve reports a slowly-turned
+        // detent as ~0.1 of a line. Accumulating those fractions left slow scrolling
+        // ten physical clicks per remote notch — which the hand reads as dead. On a
+        // native Windows box every click scrolls; every click must scroll here too.
+        let mut wheel = WheelAccumulator::new();
+        for _ in 0..3 {
+            let per_click = wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.1), (0, 0));
+            assert_eq!(
+                per_click,
+                vec![notch(120)],
+                "every physical click scrolls exactly one notch, at any speed"
+            );
+        }
+
+        let down = wheel.translate(MouseScrollDelta::LineDelta(0.0, -0.1), (0, 0));
+        assert_eq!(down, vec![notch(-120)]);
+
+        let sideways = wheel.translate(MouseScrollDelta::LineDelta(-0.3, 0.0), (0, 0));
+        assert_eq!(
+            sideways,
+            vec![InputEvent::Scroll {
+                axis: ScrollAxis::Horizontal,
+                units: -120,
+                x: 0,
+                y: 0,
+            }],
+            "a tilt-wheel detent gets the same floor"
+        );
+    }
+
+    #[test]
+    fn a_fast_wheel_spin_keeps_its_fractional_acceleration() {
+        // The floor only applies below one line: past it, the accelerated value and
+        // its remainder still count, so a fast spin stays proportional.
+        let mut wheel = WheelAccumulator::new();
+        let first = wheel.translate(MouseScrollDelta::LineDelta(0.0, 1.4), (0, 0));
+        assert_eq!(first, vec![notch(120)], "1.4 lines spends one, holds 0.4");
+
+        let second = wheel.translate(MouseScrollDelta::LineDelta(0.0, 1.4), (0, 0));
+        assert_eq!(second, vec![notch(120)], "2.8 lines spends two in total");
+
+        let third = wheel.translate(MouseScrollDelta::LineDelta(0.0, 1.4), (0, 0));
+        assert_eq!(
+            third,
+            vec![notch(120), notch(120)],
+            "4.2 lines spends four in total — the fractions were not floored away"
+        );
+    }
+
+    #[test]
+    fn slow_trackpad_travel_accumulates_until_it_buys_a_whole_notch() {
+        // Precise devices have no detent to honour, so their pixel stream accumulates:
+        // eight events of 5px make one 40px notch, and nothing sub-notch hits the wire.
         let mut wheel = WheelAccumulator::new();
         let mut sent = Vec::new();
-        for _ in 0..9 {
-            sent.extend(wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.1), (0, 0)));
+        for _ in 0..7 {
+            sent.extend(wheel.translate(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 5.0)),
+                (0, 0),
+            ));
         }
-        assert!(sent.is_empty(), "0.9 of a line is not yet a notch");
+        assert!(sent.is_empty(), "35px is not yet a notch");
 
-        sent.extend(wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.1), (0, 0)));
-        assert_eq!(
-            sent,
-            vec![notch(120)],
-            "the tenth tenth completes the notch"
-        );
+        sent.extend(wheel.translate(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 5.0)),
+            (0, 0),
+        ));
+        assert_eq!(sent, vec![notch(120)], "the eighth 5px completes the notch");
     }
 
     #[test]
@@ -1162,19 +1240,28 @@ mod tests {
         let mut wheel = WheelAccumulator::new();
         assert!(
             wheel
-                .translate(MouseScrollDelta::LineDelta(0.0, 0.9), (0, 0))
+                .translate(
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 36.0)),
+                    (0, 0)
+                )
                 .is_empty()
         );
         assert!(
             wheel
-                .translate(MouseScrollDelta::LineDelta(0.0, -0.5), (0, 0))
+                .translate(
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -20.0)),
+                    (0, 0)
+                )
                 .is_empty()
         );
-        let events = wheel.translate(MouseScrollDelta::LineDelta(0.0, -0.5), (0, 0));
+        let events = wheel.translate(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -20.0)),
+            (0, 0),
+        );
         assert_eq!(
             events,
             vec![notch(-120)],
-            "one full line down, held from zero"
+            "a full notch of downward travel, held from zero"
         );
     }
 
@@ -1188,7 +1275,10 @@ mod tests {
         assert_eq!(huge.len(), MAX_NOTCHES_PER_EVENT as usize);
 
         // The dropped remainder must not reappear on the next tiny nudge.
-        let next = wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.1), (0, 0));
+        let next = wheel.translate(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 4.0)),
+            (0, 0),
+        );
         assert!(next.is_empty(), "a backlog would keep scrolling on its own");
     }
 
@@ -1196,14 +1286,20 @@ mod tests {
     fn each_axis_holds_its_own_remainder() {
         // A shared remainder would let horizontal jitter fund a vertical notch.
         let mut wheel = WheelAccumulator::new();
-        let none = wheel.translate(MouseScrollDelta::LineDelta(0.6, 0.6), (0, 0));
+        let none = wheel.translate(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(25.0, 25.0)),
+            (0, 0),
+        );
         assert!(none.is_empty());
 
-        let vertical_only = wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.4), (0, 0));
+        let vertical_only = wheel.translate(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 15.0)),
+            (0, 0),
+        );
         assert_eq!(
             vertical_only,
             vec![notch(120)],
-            "only the vertical axis had a full line"
+            "only the vertical axis reached a full notch"
         );
     }
 
