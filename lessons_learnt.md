@@ -1,3 +1,9 @@
+- An AVC444 session sends ZERO SurfaceToCache/CacheToSurface PDUs — a quiet cache display is the server, not a client bug (`gfx::apply_surface_to_cache`).
+  Measured live on quench 2026-08-17: hits/misses/entries all 0 while 117 MB of Avc444v2
+  painted. Full-frame H.264 carries everything, so the EGFX bitmap cache sits idle and
+  `hit_rate()` correctly returns None (no `· cache %` title segment, empty diag grid).
+  The sibling symptom — no codec name in the title — WAS a client bug: `on_bitmap_updated`
+  never attributed painted bytes (fixed, see `gfx.rs` regression test).
 - A non-resizable egui window needs a two-sided fit test; the 440px About dialog already overflowed unseen (`ui::help` tests).
   Aux windows open at a fixed size, so content that grows clips the Close button off the
   bottom and content that shrinks strands the chrome strip in mid-air. Laying out one real
