@@ -314,11 +314,90 @@ pub fn from_key_event(event: &KeyEvent) -> Option<InputEvent> {
     let PhysicalKey::Code(code) = event.physical_key else {
         return None;
     };
+    #[cfg(target_os = "macos")]
+    let scancode = if code == KeyCode::Backquote {
+        macos_backquote_scancode(event)
+    } else {
+        scancode_for(code)?
+    };
+    #[cfg(not(target_os = "macos"))]
     let scancode = scancode_for(code)?;
     Some(InputEvent::Key {
         scancode,
         down: event.state == ElementState::Pressed,
     })
+}
+
+/// Recover the ISO 102nd key that winit's macOS backend loses.
+///
+/// winit 0.30 maps both macOS corner keycodes — `kVK_ISO_Section` (0x0A) and
+/// `kVK_ANSI_Grave` (0x32) — to `KeyCode::Backquote`, and never emits
+/// `IntlBackslash` on macOS. On an ISO keyboard that folds the 102nd key (right
+/// of left Shift; `\|` on a UK PC layout) into the backquote scancode, so it
+/// types ` on the server instead of \.
+///
+/// The unmodified character still tells the two keys apart: winit derives
+/// `key_without_modifiers` from the *raw* native keycode via UCKeyTranslate
+/// before the collapse, so the top-left key and the 102nd key carry distinct
+/// characters even though their `KeyCode` is the same.
+#[cfg(target_os = "macos")]
+fn macos_backquote_scancode(event: &KeyEvent) -> Scancode {
+    use winit::keyboard::Key;
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+
+    let unmodified = match event.key_without_modifiers() {
+        Key::Character(s) => s.chars().next(),
+        Key::Dead(c) => c,
+        _ => None,
+    };
+    backquote_scancode(unmodified, keyboard_is_iso())
+}
+
+/// Classify a key macOS reported as `Backquote`: top-left of the main block
+/// (scancode 0x29) or the ISO 102nd key next to left Shift (0x56).
+///
+/// Layout survey of what the two keys type unmodified:
+///
+/// | layout               | top-left | 102nd |
+/// |----------------------|----------|-------|
+/// | British, US (on ISO) | §        | `     |
+/// | British – PC         | `        | \     |
+/// | German, Nordic       | ^ / §    | <     |
+///
+/// `` ` `` therefore reads as the 102nd key on ISO hardware: that is where
+/// Apple's own layouts put it. The one loser is a PC-emulating layout's
+/// top-left backtick, which arrives as \ — accepted until Mac-faithful Unicode
+/// input exists. ANSI and JIS keyboards have no 102nd key, so everything stays
+/// at 0x29 there.
+// Compiled on every platform so the classifier stays unit-tested and the
+// Windows type-check guards it against drift; only macOS calls it at runtime.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn backquote_scancode(unmodified: Option<char>, iso_keyboard: bool) -> Scancode {
+    if !iso_keyboard {
+        return Scancode::plain(0x29);
+    }
+    match unmodified {
+        Some('\\' | '|' | '<' | '>' | '`' | '~') => Scancode::plain(0x56),
+        _ => Scancode::plain(0x29),
+    }
+}
+
+/// Whether the physical keyboard is ISO (has the 102nd key next to left Shift).
+///
+/// Asked fresh on every corner-key press — two cheap Carbon calls — so swapping
+/// keyboards mid-session is picked up. Both functions are the same ones winit
+/// itself links from Carbon for its key translation.
+#[cfg(target_os = "macos")]
+fn keyboard_is_iso() -> bool {
+    // kKeyboardISO, a four-char code (HIToolbox Events.h).
+    const K_KEYBOARD_ISO: u32 = u32::from_be_bytes(*b"ISO ");
+
+    #[link(name = "Carbon", kind = "framework")]
+    unsafe extern "C" {
+        fn LMGetKbdType() -> u8;
+        fn KBGetLayoutType(kbd_type: i16) -> u32;
+    }
+    unsafe { KBGetLayoutType(i16::from(LMGetKbdType())) == K_KEYBOARD_ISO }
 }
 
 /// Translate a winit mouse button. `at` is the session pixel the pointer is on.
@@ -645,6 +724,44 @@ mod tests {
     use super::*;
 
     use winit::event::MouseButton as WButton;
+
+    /// The ISO corner-key classifier: winit macOS folds both `kVK_ISO_Section` and
+    /// `kVK_ANSI_Grave` into `Backquote`, so the unmodified character is the only
+    /// signal separating the top-left key (0x29) from the 102nd key (0x56). A wrong
+    /// verdict types ` where the user meant \ — the exact bug this classifier fixes.
+    #[test]
+    fn iso_corner_keys_classify_by_unmodified_character() {
+        // 102nd key next to left Shift, per layout: Apple British / US-on-ISO (` ~),
+        // British – PC (\ |), German and Nordic (< >).
+        for ch in ['`', '~', '\\', '|', '<', '>'] {
+            assert_eq!(
+                backquote_scancode(Some(ch), true),
+                Scancode::plain(0x56),
+                "{ch:?} on ISO must be the 102nd key"
+            );
+        }
+        // Top-left section key: British (§ ±), German (^), French (@), and the
+        // no-character fallbacks.
+        for ch in ['§', '±', '^', '@'] {
+            assert_eq!(
+                backquote_scancode(Some(ch), true),
+                Scancode::plain(0x29),
+                "{ch:?} on ISO must stay the backquote position"
+            );
+        }
+        assert_eq!(backquote_scancode(None, true), Scancode::plain(0x29));
+    }
+
+    /// ANSI and JIS keyboards have no 102nd key: everything stays at 0x29, even the
+    /// backtick a US layout puts top-left. Regressing this would make every US-Mac
+    /// user's ` key type \.
+    #[test]
+    fn non_iso_keyboards_never_produce_the_102nd_key() {
+        for ch in ['`', '~', '\\', '|', '<', '>', '§'] {
+            assert_eq!(backquote_scancode(Some(ch), false), Scancode::plain(0x29));
+        }
+        assert_eq!(backquote_scancode(None, false), Scancode::plain(0x29));
+    }
 
     /// Every winit button maps to the right RDP button.
     ///
