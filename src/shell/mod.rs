@@ -546,6 +546,9 @@ impl LauncherApp {
                 Some(menus::MenuAction::CopyAvc444Script) => {
                     ctx.copy_text(crate::hostscripts::ENABLE_AVC444.to_owned());
                 }
+                Some(menus::MenuAction::Copy60FpsScript) => {
+                    ctx.copy_text(crate::hostscripts::ENABLE_60FPS.to_owned());
+                }
                 Some(menus::MenuAction::CloseWindow) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1269,6 +1272,7 @@ mod menus {
         Remove,
         CopyCommandLine,
         CopyAvc444Script,
+        Copy60FpsScript,
         CloseWindow,
     }
 
@@ -1337,6 +1341,7 @@ mod menus {
             let remove = item("Remove…", MenuAction::Remove);
             let copy_cli = item("Copy command line", MenuAction::CopyCommandLine);
             let copy_avc444 = item("Copy AVC444 enable script", MenuAction::CopyAvc444Script);
+            let copy_60fps = item("Copy 60 fps enable script", MenuAction::Copy60FpsScript);
             let _ = connection.append_items(&[
                 &connect,
                 &edit,
@@ -1345,6 +1350,7 @@ mod menus {
                 &PredefinedMenuItem::separator(),
                 &copy_cli,
                 &copy_avc444,
+                &copy_60fps,
             ]);
             let _ = menu.append(&connection);
 

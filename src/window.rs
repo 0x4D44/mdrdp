@@ -1054,6 +1054,13 @@ impl SessionApp {
                     eprintln!("could not copy the AVC444 script: {e}");
                 }
             }
+            session_menu::COPY_60FPS => {
+                let copied = arboard::Clipboard::new()
+                    .and_then(|mut c| c.set_text(crate::hostscripts::ENABLE_60FPS));
+                if let Err(e) = copied {
+                    eprintln!("could not copy the 60 fps script: {e}");
+                }
+            }
             session_menu::FULLSCREEN => self.set_fullscreen_mode(!self.fullscreen),
             session_menu::DISCONNECT => event_loop.exit(),
             _ => {}
@@ -1724,6 +1731,7 @@ mod session_menu {
 
     pub const DISCONNECT: &str = "session.disconnect";
     pub const COPY_AVC444: &str = "session.copy_avc444_script";
+    pub const COPY_60FPS: &str = "session.copy_60fps_script";
     pub const FULLSCREEN: &str = "view.fullscreen";
     pub const DIAG_CACHE: &str = "diag.cache";
     pub const DIAG_LATENCY: &str = "diag.latency";
@@ -1756,6 +1764,7 @@ mod session_menu {
         let session = Submenu::new("Session", true);
         let _ = session.append_items(&[
             &MenuItem::with_id(COPY_AVC444, "Copy AVC444 enable script", true, None),
+            &MenuItem::with_id(COPY_60FPS, "Copy 60 fps enable script", true, None),
             &PredefinedMenuItem::separator(),
             &MenuItem::with_id(DISCONNECT, "Disconnect", true, None),
         ]);
