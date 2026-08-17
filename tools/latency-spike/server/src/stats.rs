@@ -63,6 +63,10 @@ pub struct Header {
     /// surprising encode stage, so it must be visible without a debugger.
     pub codec_api_applied: Vec<String>,
     pub codec_api_refused: Vec<String>,
+    /// The rect fast-path predicate this server ran with (0/0 when disabled).
+    /// Tuning knobs, reported so every archived run names its own thresholds.
+    pub rect_max_count: u32,
+    pub rect_max_bytes: u64,
     /// How SPS/PPS reach the wire: see `annexb`.
     pub parameter_set_route: &'static str,
     /// Whether the out-of-band `MF_MT_MPEG_SEQUENCE_HEADER` was available as a
@@ -94,6 +98,8 @@ impl Header {
             encoder_kind: "unknown",
             codec_api_applied: Vec::new(),
             codec_api_refused: Vec::new(),
+            rect_max_count: 0,
+            rect_max_bytes: 0,
             parameter_set_route: "in-band, out-of-band fallback",
             sequence_header_available: false,
         }
@@ -160,6 +166,35 @@ impl FrameRecord {
     pub fn new() -> Self {
         Self {
             record: "frame",
+            ..Default::default()
+        }
+    }
+}
+
+/// One rect fast-path update: the raw pixels the wire carried ahead of the same
+/// frame's access unit. `frame` is the capture sequence number, shared with the
+/// frame's own row and the `MSG_RECTS` message.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct RectRecord {
+    pub record: &'static str,
+    pub frame: u64,
+    pub rect_count: u32,
+    /// Pixel payload bytes (the wire message adds per-rect headers on top).
+    pub rect_bytes: u64,
+    /// Immediately before the GPU→CPU readback began.
+    pub pack_start_us: i64,
+    /// When the packed payload was handed to the sender.
+    pub pack_end_us: i64,
+    /// When the socket write returned (filled by the sender thread).
+    pub send_done_us: i64,
+    /// Cumulative rect messages dropped because the send queue was full.
+    pub dropped_rects: u64,
+}
+
+impl RectRecord {
+    pub fn new() -> Self {
+        Self {
+            record: "rects",
             ..Default::default()
         }
     }
