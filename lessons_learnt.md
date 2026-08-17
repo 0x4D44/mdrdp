@@ -1,3 +1,10 @@
+- IronRDP AND FreeRDP 3.27 stop at ERRINFO 0x18, so a rebooting host's 0x1A failed the whole PDU decode (`server_error_info`).
+  MS-RDPBCGR 2.2.5.1.1 defines ERRINFO_SERVER_SHUTDOWN (0x19) and ERRINFO_SERVER_REBOOT
+  (0x1A); both reference clients are missing them, so a missing code is not evidence the
+  spec lacks one — check the spec, not another client. Worse than the gap was the shape of
+  the failure: `ServerSetErrorInfoPdu::decode` rejected unknown codes, so the one PDU that
+  says *why* a session is ending was turned into a parse error. Any decoder for an
+  explanatory field should carry what it does not recognise.
 - Advertise DPI scale in the GCC at connect: a mid-session RDPEDISP scale change leaves non-DPI-aware remote apps DWM-blurred (`display::primary_display`).
   Windows treats a Display Control scale change like a monitor DPI change: per-monitor-
   DPI-aware processes re-render sharp, everything else is bitmap-stretched by DWM until
