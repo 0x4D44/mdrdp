@@ -77,6 +77,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             width: size.0,
             height: size.1,
         },
+        desktop_scale_percent: None,
         known_hosts,
         observe_egfx: egfx,
         avc_capture: None,

@@ -83,6 +83,10 @@ pub struct GraphicsSettings {
     pub rfx_progressive: bool,
     pub allow_uncompressed: bool,
     pub dynamic_resolution: bool,
+    /// On a monitor past the H.264 encoder ceiling (4096x2304), fullscreen drops to an
+    /// integer division of native resolution for pixel-exact 2x presentation, instead
+    /// of the fractional best fit. See `session::fullscreen_request`.
+    pub integer_fullscreen_fit: bool,
 }
 
 impl Default for GraphicsSettings {
@@ -92,6 +96,7 @@ impl Default for GraphicsSettings {
             rfx_progressive: true,
             allow_uncompressed: false,
             dynamic_resolution: true,
+            integer_fullscreen_fit: true,
         }
     }
 }
@@ -282,6 +287,7 @@ mod tests {
         assert!(s.graphics.rfx_progressive);
         assert!(!s.graphics.allow_uncompressed);
         assert!(s.graphics.dynamic_resolution);
+        assert!(s.graphics.integer_fullscreen_fit);
         assert!(s.audio.playback);
         assert_eq!(s.audio.device, "default");
         assert_eq!(s.clipboard.direction, ClipboardDirection::Both);
@@ -343,6 +349,7 @@ stage_log = "stages"
         s.defaults.reconnect_last = true;
         s.graphics.clear_codec = false;
         s.graphics.allow_uncompressed = true;
+        s.graphics.integer_fullscreen_fit = false;
         s.audio.playback = false;
         s.audio.device = "USB Audio".to_owned();
         s.clipboard.direction = ClipboardDirection::ToRemote;

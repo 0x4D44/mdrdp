@@ -32,6 +32,12 @@ pub struct ConnectOptions {
     pub username: String,
     pub domain: Option<String>,
     pub desktop_size: DesktopSize,
+    /// Desktop scale percent (100–500) to advertise in the GCC core data, so the server
+    /// renders the session at that DPI from logon. `None` advertises nothing (the wire
+    /// carries 0, which servers ignore). Advertising at connect matters because a
+    /// mid-session DPI change is answered by DWM bitmap-stretching every window whose
+    /// process is not per-monitor-DPI-aware — blur no client can undo.
+    pub desktop_scale_percent: Option<u32>,
     pub known_hosts: PathBuf,
     /// Open the graphics channel and observe what the server negotiates, for how long.
     /// `None` connects and disconnects without touching EGFX (P2 behaviour).
@@ -332,6 +338,10 @@ pub struct Established {
     pub stage: ironrdp::session::ActiveStage,
     pub socket: TcpStream,
     pub desktop_size: DesktopSize,
+    /// The desktop scale the server was last told to use: the connect-time
+    /// advertisement, then updated by each Display Control resize that goes out.
+    /// `None` = never advertised.
+    pub desktop_scale_percent: Option<u32>,
     pub report: ConnectReport,
     /// Kept so the caller can snapshot AFTER observing, not before.
     pub probe: Option<EgfxProbe>,
@@ -455,7 +465,7 @@ pub fn establish(
         autologon: false,
         enable_audio_playback: wants_audio,
         performance_flags: performance_flags(),
-        desktop_scale_factor: 0,
+        desktop_scale_factor: opts.desktop_scale_percent.unwrap_or(0),
         license_cache: None,
         timezone_info: Default::default(),
         compression_type: None,
@@ -682,6 +692,7 @@ pub fn establish(
         stage,
         socket,
         desktop_size,
+        desktop_scale_percent: opts.desktop_scale_percent,
         report,
         probe,
         activation_factory,

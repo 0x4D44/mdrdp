@@ -657,15 +657,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         tx
     });
 
+    // A session that will open fullscreen connects AT the resolution and scale the
+    // window would otherwise renegotiate to. Two wins: the server renders at the right
+    // DPI from logon (a mid-session DPI change leaves every non-DPI-aware remote app
+    // DWM-stretched and blurry until relaunch), and there is no resize round at all —
+    // the window's start-up request matches the session state and is skipped. Probe
+    // failure (headless, non-macOS) falls back to today's connect-then-renegotiate.
+    // The probe reads the *primary* monitor; if the window actually opens elsewhere,
+    // the start-up renegotiation still corrects it.
+    let fullscreen_plan = (fullscreen && !explicit_size && settings.graphics.dynamic_resolution)
+        .then(mdrdp::display::primary_display)
+        .flatten()
+        .map(|d| {
+            mdrdp::session::fullscreen_request(
+                d.width,
+                d.height,
+                d.scale_percent,
+                settings.graphics.integer_fullscreen_fit,
+            )
+        });
+
+    #[allow(clippy::cast_possible_truncation)]
     let opts = ConnectOptions {
         host: target.host.clone(),
         port: target.port,
         username: target.user.clone(),
         domain: target.domain.clone(),
-        desktop_size: DesktopSize {
-            width: target.size.0,
-            height: target.size.1,
+        // fullscreen_request only returns encodable sizes (≤ 4096x2304), so u16 holds.
+        desktop_size: match fullscreen_plan {
+            Some((width, height, _)) => DesktopSize {
+                width: width as u16,
+                height: height as u16,
+            },
+            None => DesktopSize {
+                width: target.size.0,
+                height: target.size.1,
+            },
         },
+        desktop_scale_percent: fullscreen_plan.and_then(|(_, _, scale)| scale),
         known_hosts: KnownHosts::default_path()?,
         observe_egfx: None,
         // The same --capture opt-in that dumps undecodable ClearCodec tiles also
@@ -761,7 +790,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_fullscreen(fullscreen)
     .with_overlay_on_start(settings.diagnostics.overlay_on_connect)
-    .with_dynamic_resolution(settings.graphics.dynamic_resolution);
+    .with_dynamic_resolution(settings.graphics.dynamic_resolution)
+    .with_integer_fullscreen_fit(settings.graphics.integer_fullscreen_fit);
     if explicit_size {
         // Flags always win: --size names the session resolution, fullscreen or not.
         window_config = window_config.keeping_stated_resolution();

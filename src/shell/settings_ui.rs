@@ -500,6 +500,15 @@ impl SettingsModal {
             "Dynamic resolution on window resize",
             None,
         );
+        toggle_row(
+            ui,
+            &mut self.working.graphics.integer_fullscreen_fit,
+            "Integer scaling on 5K+ displays",
+            Some(
+                "Fullscreen past the H.264 ceiling uses half resolution at an exact \
+                 2x instead of a fractional stretch",
+            ),
+        );
     }
 
     fn audio_pane(&mut self, ui: &mut Ui) {

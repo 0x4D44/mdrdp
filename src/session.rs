@@ -18,6 +18,7 @@ use crate::stats::StatsHandle;
 use crate::surface::SurfaceStore;
 use crate::wake::{self, Doorbell, DoorbellReceiver};
 use crate::window::{CursorUpdate, Waker};
+use ironrdp::connector::DesktopSize;
 use ironrdp::session::{ActiveStageOutput, image::DecodedImage};
 use ironrdp_blocking::Framed;
 use ironrdp_cliprdr::CliprdrClient;
@@ -524,6 +525,51 @@ fn notify_if_painted(
 const MAX_ENCODABLE_WIDTH: u32 = 4096;
 const MAX_ENCODABLE_HEIGHT: u32 = 2304;
 
+/// What a fullscreen window should ask of the session, for a monitor of
+/// `width`x`height` physical pixels at `scale_percent` UI scale.
+///
+/// - A monitor that fits under the H.264 encoder ceiling gets its native resolution
+///   and scale: every remote pixel maps 1:1 onto a screen pixel — true Retina.
+/// - Past the ceiling with `integer_fit` (the default), the request drops to the
+///   smallest integer division that fits: a 5K panel becomes 2560x1440 at 100%,
+///   which the presenter blows up 2x — uniform pixel-doubling, no fractional
+///   raggedness. The scale divides with the resolution so the remote UI keeps its
+///   apparent size (MS-RDPEDISP ignores a scale below 100, so it pins there).
+/// - Past the ceiling without `integer_fit`, the request is the fractional best
+///   fit ([`clamp_to_encodable`]): more pixels than the integer fit, but presented
+///   through a non-integer stretch. Kept reachable (Settings ▸ Graphics) so the two
+///   can be compared on a live session.
+///
+/// Returned values are always encodable, so a caller can also *connect* at them.
+/// A scale outside MS-RDPEDISP's 100–500 becomes `None` (advertise nothing).
+pub fn fullscreen_request(
+    width: u32,
+    height: u32,
+    scale_percent: u32,
+    integer_fit: bool,
+) -> (u32, u32, Option<u32>) {
+    let scale = (100..=500)
+        .contains(&scale_percent)
+        .then_some(scale_percent);
+    if width <= MAX_ENCODABLE_WIDTH && height <= MAX_ENCODABLE_HEIGHT {
+        return (width, height, scale);
+    }
+    if !integer_fit {
+        return clamp_to_encodable(width, height, scale);
+    }
+    let Some(divisor) =
+        (2u32..=8).find(|d| width / d <= MAX_ENCODABLE_WIDTH && height / d <= MAX_ENCODABLE_HEIGHT)
+    else {
+        // No plausible monitor needs more than /8; fractional-fit rather than divide
+        // a pathological size down to a postage stamp.
+        return clamp_to_encodable(width, height, scale);
+    };
+    // Floor to even: H.264 4:2:0 subsampling needs even dimensions on both axes.
+    let (width, height) = ((width / divisor) & !1, (height / divisor) & !1);
+    let scale = scale.map(|s| (s / divisor).max(100));
+    (width, height, scale)
+}
+
 /// Shrink a resolution request past the encoder ceiling, preserving aspect ratio and
 /// apparent UI size (the scale shrinks by the same ratio).
 ///
@@ -584,6 +630,20 @@ fn service_resize(
     let (width, height) =
         ironrdp::displaycontrol::pdu::MonitorLayoutEntry::adjust_display_size(width, height);
 
+    // A session that connected at this exact resolution and scale (the fullscreen-at-
+    // start path) has nothing to renegotiate; asking anyway costs a server round of
+    // Deactivate All / reactivation for zero change.
+    if resize_is_redundant(
+        width,
+        height,
+        scale_percent,
+        established.desktop_size,
+        established.desktop_scale_percent,
+    ) {
+        *pending = None;
+        return Ok(());
+    }
+
     // A monitor layout may only be sent after the server's capabilities PDU has arrived
     // (MS-RDPEDISP 3.3.5.2) — the channel being open is NOT enough, and a layout sent
     // early is silently ignored by Windows. `encode_resize` checks only that the channel
@@ -613,6 +673,9 @@ fn service_resize(
     {
         Some(Ok(frame)) => {
             *pending = None;
+            // Optimistic: the size lands at reactivation, but the scale has no
+            // confirmation PDU, so the request is the best record of it there is.
+            established.desktop_scale_percent = scale_percent;
             // eprintln, not tracing: the client installs no global tracing subscriber,
             // so tracing here is invisible. These are user-facing outcome lines, like
             // the channel report at connect.
@@ -651,6 +714,23 @@ fn service_resize(
             Ok(())
         }
     }
+}
+
+/// Whether a resize request names the state the session is already in.
+///
+/// Pure so it is testable without an [`Established`]. `scale` compares exactly:
+/// `None` (nothing advertised) is not the same state as `Some(100)`, because the
+/// server treats an absent scale as "keep whatever you had".
+fn resize_is_redundant(
+    width: u32,
+    height: u32,
+    scale: Option<u32>,
+    current: DesktopSize,
+    current_scale: Option<u32>,
+) -> bool {
+    width == u32::from(current.width)
+        && height == u32::from(current.height)
+        && scale == current_scale
 }
 
 /// Run the [MS-RDPBCGR] Deactivation-Reactivation sequence after a Server Deactivate All.
@@ -884,6 +964,94 @@ mod tests {
         // 1000 * (4096/5121) = 799.8…, which must floor to 798, not round to 800 or
         // stay odd at 799 — H.264 4:2:0 needs even axes.
         assert_eq!(clamp_to_encodable(5121, 1000, None), (4096, 798, None));
+    }
+
+    #[test]
+    fn a_monitor_under_the_ceiling_gets_native_resolution_and_scale() {
+        // A MacBook panel: true Retina, 1:1, whatever the fit mode.
+        assert_eq!(
+            fullscreen_request(3456, 2234, 200, true),
+            (3456, 2234, Some(200))
+        );
+        assert_eq!(
+            fullscreen_request(3456, 2234, 200, false),
+            (3456, 2234, Some(200))
+        );
+    }
+
+    #[test]
+    fn a_5k_monitor_integer_fits_to_half_resolution_at_100() {
+        // The whole point of the feature: 5120x2880 cannot ride one H.264 stream, so
+        // the request halves to 2560x1440 and the scale halves with it — the
+        // presenter's 2x stretch is then a uniform pixel-doubling, and 100% is an
+        // integer DPI Windows renders crisply.
+        assert_eq!(
+            fullscreen_request(5120, 2880, 200, true),
+            (2560, 1440, Some(100))
+        );
+    }
+
+    #[test]
+    fn a_5k_monitor_without_integer_fit_keeps_the_fractional_clamp() {
+        // The A/B alternative (Settings ▸ Graphics): most pixels a stream can carry,
+        // at the cost of a 1.25x fractional stretch on the glass.
+        assert_eq!(
+            fullscreen_request(5120, 2880, 200, false),
+            (4096, 2304, Some(160))
+        );
+    }
+
+    #[test]
+    fn an_integer_fit_scale_never_drops_below_the_wire_minimum() {
+        // A 5K panel run at 1x: halving 100% would ask for 50%, which MS-RDPEDISP
+        // ignores; it pins at 100 like the fractional path does.
+        assert_eq!(
+            fullscreen_request(5120, 2880, 100, true),
+            (2560, 1440, Some(100))
+        );
+    }
+
+    #[test]
+    fn a_scale_outside_the_wire_range_is_not_advertised() {
+        // MS-RDPEDISP allows 100–500; anything else advertises nothing.
+        assert_eq!(fullscreen_request(1920, 1080, 0, true), (1920, 1080, None));
+        assert_eq!(
+            fullscreen_request(1920, 1080, 600, true),
+            (1920, 1080, None)
+        );
+    }
+
+    #[test]
+    fn a_redundant_resize_is_recognised_and_a_scale_change_is_not() {
+        let current = DesktopSize {
+            width: 2560,
+            height: 1440,
+        };
+        // The fullscreen-at-start path: connected at the plan, the window's start-up
+        // request matches, nothing to renegotiate.
+        assert!(resize_is_redundant(
+            2560,
+            1440,
+            Some(100),
+            current,
+            Some(100)
+        ));
+        // Same size but a scale the server has not been told about must still go out.
+        assert!(!resize_is_redundant(2560, 1440, Some(100), current, None));
+        assert!(!resize_is_redundant(
+            2560,
+            1440,
+            Some(200),
+            current,
+            Some(100)
+        ));
+        assert!(!resize_is_redundant(
+            1920,
+            1080,
+            Some(100),
+            current,
+            Some(100)
+        ));
     }
 
     #[test]

@@ -62,6 +62,10 @@ pub struct WindowConfig {
     /// Allow fullscreen transitions to renegotiate the session resolution
     /// (Settings ▸ Graphics ▸ Dynamic resolution). Off = letterbox only, ever.
     pub dynamic_resolution: bool,
+    /// On a monitor past the H.264 encoder ceiling, fullscreen asks for an integer
+    /// division of native resolution (5K → 2560x1440 at 2x) instead of the fractional
+    /// best fit (Settings ▸ Graphics). See [`crate::session::fullscreen_request`].
+    pub integer_fullscreen_fit: bool,
 }
 
 impl WindowConfig {
@@ -74,6 +78,7 @@ impl WindowConfig {
             negotiate_native_on_start: true,
             overlay_on_start: false,
             dynamic_resolution: true,
+            integer_fullscreen_fit: true,
         }
     }
 
@@ -86,6 +91,13 @@ impl WindowConfig {
     /// Permit or forbid resolution renegotiation on fullscreen transitions.
     pub fn with_dynamic_resolution(mut self, on: bool) -> Self {
         self.dynamic_resolution = on;
+        self
+    }
+
+    /// Integer-divide (rather than fractionally clamp) fullscreen requests on a
+    /// monitor past the H.264 encoder ceiling.
+    pub fn with_integer_fullscreen_fit(mut self, on: bool) -> Self {
+        self.integer_fullscreen_fit = on;
         self
     }
 
@@ -1203,12 +1215,19 @@ impl SessionApp {
         let size = monitor.size();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let scale = (monitor.scale_factor() * 100.0).round() as u32;
-        // MS-RDPEDISP: the server ignores a scale outside 100–500.
-        let scale = (100..=500).contains(&scale).then_some(scale);
+        // The out-of-range-scale gating (MS-RDPEDISP allows 100–500) and the encoder
+        // ceiling both live in the shared decision, so the fullscreen toggle and the
+        // fullscreen-at-start connect always agree on what to ask for.
+        let (width, height, scale_percent) = crate::session::fullscreen_request(
+            size.width,
+            size.height,
+            scale,
+            self.config.integer_fullscreen_fit,
+        );
         self.send_command(SessionCommand::Resize {
-            width: size.width,
-            height: size.height,
-            scale_percent: scale,
+            width,
+            height,
+            scale_percent,
         });
     }
 
