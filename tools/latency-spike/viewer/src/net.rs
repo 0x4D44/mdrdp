@@ -21,11 +21,18 @@ const READ_CHUNK: usize = 64 * 1024;
 
 /// What [`pump`] hands each complete message to.
 pub trait MessageSink {
-    /// One H.264 access unit, Annex B. `recv_done_us` is stamped immediately after
-    /// the `read` that completed the message returned — the client's stage 1.
-    fn on_video(&mut self, au: &[u8], recv_done_us: u64);
+    /// One H.264 access unit, Annex B. `seq` is the server's capture sequence
+    /// number when the stream is wire v2 (`MSG_VIDEO_SEQ`), `None` on a legacy
+    /// `MSG_VIDEO` stream. `recv_done_us` is stamped immediately after the `read`
+    /// that completed the message returned — the client's stage 1.
+    fn on_video(&mut self, au: &[u8], seq: Option<u64>, recv_done_us: u64);
     /// One server stats line (JSON, no trailing newline).
     fn on_stats(&mut self, payload: &[u8]);
+    /// One raw dirty-rect update (`MSG_RECTS` payload, undecoded). Default: skip —
+    /// a sink that does not composite simply never sees painted rects.
+    fn on_rects(&mut self, payload: &[u8], recv_done_us: u64) {
+        let _ = (payload, recv_done_us);
+    }
     /// A message type this build does not know. The length prefix means an unknown
     /// type costs nothing to skip, which is the whole reason it is a length prefix.
     fn on_unknown(&mut self, msg_type: u8, payload_len: usize) {
@@ -41,6 +48,10 @@ pub enum PumpEnd {
     /// The stream lost sync. Terminal: a bare length-prefixed format has no
     /// resynchronisation point, so the only honest move is to stop.
     Framing(framing::FramingError),
+    /// A known message type carried a payload that violates its own contract
+    /// (e.g. `MSG_VIDEO_SEQ` too short for its sequence prefix). As terminal as a
+    /// framing error: the peer is not speaking the protocol it declared.
+    Protocol(String),
     Io(std::io::Error),
 }
 
@@ -49,6 +60,7 @@ impl std::fmt::Display for PumpEnd {
         match self {
             PumpEnd::Eof => write!(f, "server closed the connection"),
             PumpEnd::Framing(e) => write!(f, "{e}"),
+            PumpEnd::Protocol(e) => write!(f, "protocol: {e}"),
             PumpEnd::Io(e) => write!(f, "{e}"),
         }
     }
@@ -74,7 +86,18 @@ pub fn pump<R: Read>(reader: &mut R, clock: &Clock, sink: &mut dyn MessageSink) 
         loop {
             match re.next_message() {
                 Ok(Some(msg)) => match msg.msg_type {
-                    framing::MSG_VIDEO => sink.on_video(&msg.payload, recv_done_us),
+                    framing::MSG_VIDEO => sink.on_video(&msg.payload, None, recv_done_us),
+                    framing::MSG_VIDEO_SEQ => {
+                        let Some(seq_bytes) = msg.payload.get(..8) else {
+                            return PumpEnd::Protocol(format!(
+                                "MSG_VIDEO_SEQ of {} bytes cannot hold its sequence prefix",
+                                msg.payload.len()
+                            ));
+                        };
+                        let seq = u64::from_le_bytes(seq_bytes.try_into().expect("8-byte slice"));
+                        sink.on_video(&msg.payload[8..], Some(seq), recv_done_us);
+                    }
+                    framing::MSG_RECTS => sink.on_rects(&msg.payload, recv_done_us),
                     framing::MSG_STATS => sink.on_stats(&msg.payload),
                     other => sink.on_unknown(other, msg.payload.len()),
                 },
@@ -91,17 +114,21 @@ mod tests {
 
     #[derive(Default)]
     struct Recorder {
-        video: Vec<(Vec<u8>, u64)>,
+        video: Vec<(Vec<u8>, Option<u64>, u64)>,
+        rects: Vec<Vec<u8>>,
         stats: Vec<Vec<u8>>,
         unknown: Vec<(u8, usize)>,
     }
 
     impl MessageSink for Recorder {
-        fn on_video(&mut self, au: &[u8], recv_done_us: u64) {
-            self.video.push((au.to_vec(), recv_done_us));
+        fn on_video(&mut self, au: &[u8], seq: Option<u64>, recv_done_us: u64) {
+            self.video.push((au.to_vec(), seq, recv_done_us));
         }
         fn on_stats(&mut self, payload: &[u8]) {
             self.stats.push(payload.to_vec());
+        }
+        fn on_rects(&mut self, payload: &[u8], _recv_done_us: u64) {
+            self.rects.push(payload.to_vec());
         }
         fn on_unknown(&mut self, msg_type: u8, payload_len: usize) {
             self.unknown.push((msg_type, payload_len));
@@ -132,8 +159,41 @@ mod tests {
         assert_eq!(sink.stats[0], br#"{"record":"header"}"#);
         assert_eq!(sink.video.len(), 2);
         assert_eq!(sink.video[0].0, vec![0, 0, 0, 1, 0x65, 0xAA]);
+        assert_eq!(sink.video[0].1, None, "bare MSG_VIDEO carries no seq");
         assert_eq!(sink.video[1].0, vec![0, 0, 0, 1, 0x41, 0xBB, 0xCC]);
         assert!(sink.unknown.is_empty());
+    }
+
+    #[test]
+    fn a_seq_prefixed_video_message_yields_the_seq_and_the_bare_au() {
+        // Distinct seq and payload bytes so a transposed slice boundary shows.
+        let mut payload = 0x0102_0304_0506_0708u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x99]);
+        let bytes = wire(&[(framing::MSG_VIDEO_SEQ, payload)]);
+        let mut sink = Recorder::default();
+        let end = pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
+        assert!(matches!(end, PumpEnd::Eof), "{end}");
+        assert_eq!(sink.video.len(), 1);
+        assert_eq!(sink.video[0].1, Some(0x0102_0304_0506_0708));
+        assert_eq!(sink.video[0].0, vec![0, 0, 0, 1, 0x65, 0x99]);
+    }
+
+    #[test]
+    fn a_video_seq_message_too_short_for_its_prefix_is_terminal() {
+        let bytes = wire(&[(framing::MSG_VIDEO_SEQ, vec![1, 2, 3])]);
+        let mut sink = Recorder::default();
+        let end = pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
+        assert!(matches!(end, PumpEnd::Protocol(_)), "{end}");
+        assert!(sink.video.is_empty(), "nothing decodable was delivered");
+    }
+
+    #[test]
+    fn a_rects_message_reaches_the_rects_callback_undecoded() {
+        let bytes = wire(&[(framing::MSG_RECTS, vec![9, 8, 7])]);
+        let mut sink = Recorder::default();
+        pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
+        assert_eq!(sink.rects, vec![vec![9, 8, 7]]);
+        assert!(sink.video.is_empty());
     }
 
     #[test]
@@ -195,9 +255,9 @@ mod tests {
         let mut sink = Recorder::default();
         pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
         assert_eq!(sink.video.len(), 2);
-        assert!(sink.video[0].1 > 0, "a stamp was taken");
+        assert!(sink.video[0].2 > 0, "a stamp was taken");
         assert_eq!(
-            sink.video[0].1, sink.video[1].1,
+            sink.video[0].2, sink.video[1].2,
             "both arrived in the same read, so both carry that read's stamp"
         );
     }

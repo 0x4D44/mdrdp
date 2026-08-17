@@ -15,13 +15,17 @@
 //! never silent.
 
 use super::{convert, dxgi, encode, input, qpc, send, Result};
-use crate::annexb;
+use crate::annexb::{self, ParameterSets};
 use crate::cli::{Config, DECLARED_FPS};
 use crate::stats::{self, FrameRecord, Header, QpcClock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+/// Encoded frames to wait after a connect-edge keyframe request before asking
+/// again — one second at the declared rate.
+const KEYFRAME_RETRY_FRAMES: u32 = DECLARED_FPS;
 
 /// Frames in flight between the encoder and the socket. Two is enough to overlap a
 /// write with the next encode and small enough that a stall shows up as a drop
@@ -230,13 +234,112 @@ fn build_header(
     h
 }
 
+/// Everything [`emit_au`] mutates across access units. Split from [`CaptureState`]
+/// so the emit closure can borrow it while the encoder (which lives in
+/// `CaptureState`) is itself mutably borrowed by `encode`/`pump`.
+struct EmitCtx {
+    clock: QpcClock,
+    tx: SyncSender<send::Outbound>,
+    /// Cumulative frames dropped because the send queue was full.
+    dropped: u64,
+    /// SPS/PPS scanned out of the stream's own access units — the fallback when
+    /// the encoder publishes no out-of-band sequence header (Quick Sync). Updated
+    /// on every in-band sighting; cleared when the encoder's config epoch moves.
+    stream_sets: Option<ParameterSets>,
+    /// The encoder's own out-of-band sets, snapshotted before each encode call
+    /// (the encoder is unborrowable from inside the sink).
+    encoder_sets: Option<ParameterSets>,
+    /// `Some(n)` while a keyframe request is outstanding: n non-keyframe AUs seen
+    /// since. Drives the §4 "verify the connect-edge IDR" retry.
+    awaiting_keyframe: Option<u32>,
+    /// Set inside the sink; acted on by the loop (which owns the encoder).
+    rerequest_keyframe: bool,
+    /// A frame was dropped from the send queue; the decoder is desynced until the
+    /// next IDR, so ask for one.
+    drop_wants_keyframe: bool,
+}
+
+/// Hand one encoded access unit to the sender, with its own frame's stamps.
+fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
+    // The in-band SPS/PPS cache: update on *every* sighting (a first-sight-only
+    // cache would go stale across an encoder reconfigure), consume via
+    // `ensure_parameter_sets` below.
+    if ctx.encoder_sets.is_none() && annexb::has_parameter_sets(&au.data) {
+        if let Some(sets) = ParameterSets::from_sequence_header(&au.data) {
+            ctx.stream_sets = Some(sets);
+        }
+    }
+    let sets = ctx.encoder_sets.as_ref().or(ctx.stream_sets.as_ref());
+    let (bytes, prepended) = annexb::ensure_parameter_sets(&au.data, sets, au.keyframe);
+
+    let mut record = FrameRecord::new();
+    record.frame = au.meta.seq;
+    record.present_qpc_us = ctx.clock.micros(au.meta.present_qpc);
+    record.acquire_qpc_us = ctx.clock.micros(au.meta.acquire_qpc);
+    record.convert_start_us = ctx.clock.micros(au.meta.convert_start_qpc);
+    record.convert_end_us = ctx.clock.micros(au.meta.convert_end_qpc);
+    record.encode_submit_us = ctx.clock.micros(au.submit_qpc);
+    record.encode_out_us = ctx.clock.micros(au.out_qpc);
+    record.au_bytes = bytes.len();
+    record.keyframe = au.keyframe;
+    record.param_sets_prepended = prepended;
+    record.dropped_frames = ctx.dropped;
+    record.stamp_mismatches = au.stamp_mismatches;
+    if au.meta.change_valid {
+        record.dirty_rect_count = Some(au.meta.dirty_rect_count);
+        record.dirty_bytes = Some(au.meta.dirty_bytes);
+        record.move_rect_count = Some(au.meta.move_rect_count);
+    }
+
+    match ctx.awaiting_keyframe {
+        Some(n) if au.keyframe => {
+            record.keyframe_wait_frames = Some(n);
+            ctx.awaiting_keyframe = None;
+        }
+        Some(n) if n + 1 >= KEYFRAME_RETRY_FRAMES => {
+            // A second's worth of frames and no IDR: the request was ignored.
+            ctx.rerequest_keyframe = true;
+            ctx.awaiting_keyframe = Some(0);
+        }
+        Some(n) => ctx.awaiting_keyframe = Some(n + 1),
+        None => {}
+    }
+
+    match ctx.tx.try_send(send::Outbound::Frame(
+        Box::new(record),
+        au.meta.seq,
+        bytes.into_owned(),
+    )) {
+        Ok(()) => Ok(()),
+        // Full means the socket is behind. Drop the newest rather than queue it: a
+        // late frame is worse than a missing one here. But a dropped AU desyncs
+        // the viewer's decoder until the next IDR, so request one.
+        Err(TrySendError::Full(_)) => {
+            ctx.dropped += 1;
+            ctx.drop_wants_keyframe = true;
+            Ok(())
+        }
+        Err(TrySendError::Disconnected(_)) => Err("sender thread has gone away".to_owned().into()),
+    }
+}
+
 fn capture_loop(state: CaptureState<'_>) -> Result<()> {
-    let mut frame_index: u64 = 0;
-    let mut dropped: u64 = 0;
+    let mut frame_seq: u64 = 0;
     let mut was_connected = false;
     let mut want_keyframe = true;
+    let mut last_epoch = state.encoder.config_epoch();
     let frame_duration_hns = HNS_PER_SECOND / DECLARED_FPS.max(1) as i64;
     let start_qpc = qpc::now();
+    let mut ctx = EmitCtx {
+        clock: state.clock,
+        tx: state.tx.clone(),
+        dropped: 0,
+        stream_sets: None,
+        encoder_sets: None,
+        awaiting_keyframe: None,
+        rerequest_keyframe: false,
+        drop_wants_keyframe: false,
+    };
 
     loop {
         let connected = state.connected.load(Ordering::Acquire);
@@ -254,17 +357,27 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
         }
         if want_keyframe {
             state.encoder.request_keyframe();
+            ctx.awaiting_keyframe = Some(0);
             want_keyframe = false;
         }
 
         let acquired = state.capture.acquire(ACQUIRE_TIMEOUT_MS)?;
-        let (texture, present_qpc, acquire_qpc) = match acquired {
+        let (texture, present_qpc, acquire_qpc, change) = match acquired {
             dxgi::Acquired::Frame {
                 texture,
                 present_qpc,
                 acquire_qpc,
-            } => (texture, present_qpc, acquire_qpc),
-            dxgi::Acquired::Timeout | dxgi::Acquired::PointerOnly => continue,
+                change,
+            } => (texture, present_qpc, acquire_qpc, change),
+            dxgi::Acquired::Timeout => {
+                // No new frame, but the async MFT may be holding a finished AU it
+                // only delivers when pumped — on a static desktop that AU would
+                // otherwise never leave the transform.
+                state.encoder.pump(&mut |au| emit_au(au, &mut ctx))?;
+                housekeep(&state, &mut ctx, &mut want_keyframe, &mut last_epoch);
+                continue;
+            }
+            dxgi::Acquired::PointerOnly => continue,
             dxgi::Acquired::Recreated => {
                 eprintln!("capture: duplication lost and rebuilt (desktop switch)");
                 want_keyframe = true;
@@ -272,9 +385,25 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
             }
         };
 
+        frame_seq += 1;
         let convert_start = qpc::now();
         let nv12 = state.converter.convert(&texture)?;
         let convert_end = qpc::now();
+
+        let mut meta = encode::FrameMeta {
+            seq: frame_seq,
+            present_qpc,
+            acquire_qpc,
+            convert_start_qpc: convert_start,
+            convert_end_qpc: convert_end,
+            ..Default::default()
+        };
+        if let Some(change) = &change {
+            meta.change_valid = true;
+            meta.dirty_rect_count = change.rects.len() as u32;
+            meta.dirty_bytes = change.dirty_bytes();
+            meta.move_rect_count = change.move_rects;
+        }
 
         let time_hns = state
             .clock
@@ -282,40 +411,37 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
             .saturating_mul(10);
         let sample = encode::sample_from_texture(&nv12, time_hns, frame_duration_hns)?;
 
-        let clock = state.clock;
-        let tx = state.tx.clone();
-        let sets = state.encoder.parameter_sets().cloned();
-        let mut sink = |au: encode::EncodedAu| -> Result<()> {
-            let (bytes, prepended) =
-                annexb::ensure_parameter_sets(&au.data, sets.as_ref(), au.keyframe);
-            let mut record = FrameRecord::new();
-            record.frame = frame_index;
-            record.present_qpc_us = clock.micros(present_qpc);
-            record.acquire_qpc_us = clock.micros(acquire_qpc);
-            record.convert_start_us = clock.micros(convert_start);
-            record.convert_end_us = clock.micros(convert_end);
-            record.encode_submit_us = clock.micros(au.submit_qpc);
-            record.encode_out_us = clock.micros(au.out_qpc);
-            record.au_bytes = bytes.len();
-            record.keyframe = au.keyframe;
-            record.param_sets_prepended = prepended;
-            record.dropped_frames = dropped;
-            frame_index += 1;
+        ctx.encoder_sets = state.encoder.parameter_sets().cloned();
+        state
+            .encoder
+            .encode(&sample, meta, &mut |au| emit_au(au, &mut ctx))?;
+        housekeep(&state, &mut ctx, &mut want_keyframe, &mut last_epoch);
+    }
+}
 
-            match tx.try_send(send::Outbound::Frame(Box::new(record), bytes.into_owned())) {
-                Ok(()) => Ok(()),
-                // Full means the socket is behind. Drop the newest rather than
-                // queue it: a late frame is worse than a missing one here.
-                Err(TrySendError::Full(_)) => {
-                    dropped += 1;
-                    Ok(())
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    Err("sender thread has gone away".to_owned().into())
-                }
-            }
-        };
-
-        state.encoder.encode(&sample, &mut sink)?;
+/// Post-emission actions that need the encoder, which the sink cannot borrow.
+fn housekeep(
+    state: &CaptureState<'_>,
+    ctx: &mut EmitCtx,
+    want_keyframe: &mut bool,
+    last_epoch: &mut u64,
+) {
+    let epoch = state.encoder.config_epoch();
+    if epoch != *last_epoch {
+        // The encoder renegotiated its output type; sets scanned from the old
+        // stream would poison the new one.
+        *last_epoch = epoch;
+        ctx.stream_sets = None;
+    }
+    if ctx.rerequest_keyframe {
+        ctx.rerequest_keyframe = false;
+        eprintln!(
+            "encode: keyframe request ignored for {KEYFRAME_RETRY_FRAMES} frames; asking again"
+        );
+        *want_keyframe = true;
+    }
+    if ctx.drop_wants_keyframe {
+        ctx.drop_wants_keyframe = false;
+        *want_keyframe = true;
     }
 }

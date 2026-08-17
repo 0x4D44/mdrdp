@@ -11,6 +11,7 @@ pub mod cli;
 pub mod colorspace;
 pub mod framing;
 pub mod input_proto;
+pub mod rects;
 pub mod stats;
 
 #[cfg(windows)]

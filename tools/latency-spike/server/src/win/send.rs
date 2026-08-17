@@ -25,9 +25,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the sender thread consumes.
 pub enum Outbound {
-    /// An encoded access unit plus the stats row it belongs to. `send_done_us` is
-    /// filled in here, because only this thread knows when the write returned.
-    Frame(Box<FrameRecord>, Vec<u8>),
+    /// An encoded access unit plus the stats row it belongs to and its capture
+    /// sequence number (the `MSG_VIDEO_SEQ` prefix). `send_done_us` is filled in
+    /// here, because only this thread knows when the write returned.
+    Frame(Box<FrameRecord>, u64, Vec<u8>),
     /// A pre-serialised JSONL line (the header, or an input event).
     Line(String),
 }
@@ -124,6 +125,51 @@ impl Sender {
         }
     }
 
+    /// One access unit as `MSG_VIDEO_SEQ`: the capture sequence, then the bytes.
+    fn write_video(&mut self, seq: u64, au: &[u8]) {
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        self.scratch.clear();
+        let length = (8 + au.len() + 1) as u32;
+        self.scratch.extend_from_slice(&length.to_le_bytes());
+        self.scratch.push(framing::MSG_VIDEO_SEQ);
+        self.scratch.extend_from_slice(&seq.to_le_bytes());
+        self.scratch.extend_from_slice(au);
+        let outcome = client
+            .write_all(&self.scratch)
+            .and_then(|()| client.flush());
+        if let Err(e) = outcome {
+            self.drop_client(&e.to_string());
+        }
+    }
+
+    /// Notice a viewer that closed its end without waiting for a write to fail.
+    /// On a static desktop nothing is ever written, so without this poll a
+    /// departed client holds the single slot forever and `poll_accept` refuses
+    /// every successor.
+    fn poll_client_eof(&mut self) {
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        let mut probe = [0u8; 1];
+        if client.set_nonblocking(true).is_err() {
+            return;
+        }
+        let outcome = client.peek(&mut probe);
+        let _ = client.set_nonblocking(false);
+        match outcome {
+            Ok(0) => self.drop_client("viewer closed"),
+            // The viewer never sends on this socket; inbound bytes are ignored.
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                let why = e.to_string();
+                self.drop_client(&why);
+            }
+        }
+    }
+
     fn write_stats(&mut self, line: &str) {
         if let Some(file) = self.stats.as_mut() {
             // Flushed per line: the operator kills this process with Ctrl-C, and a
@@ -139,10 +185,11 @@ impl Sender {
     /// Consume the channel until the producers are gone.
     pub fn run(mut self, rx: Receiver<Outbound>) {
         loop {
+            self.poll_client_eof();
             self.poll_accept();
             match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(Outbound::Frame(mut record, au)) => {
-                    self.write_message(framing::MSG_VIDEO, &au);
+                Ok(Outbound::Frame(mut record, seq, au)) => {
+                    self.write_video(seq, &au);
                     record.send_done_us = self.clock.micros(qpc::now());
                     let line = crate::stats::to_line(&*record);
                     self.write_stats(&line);

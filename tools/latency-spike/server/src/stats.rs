@@ -40,6 +40,9 @@ pub struct Header {
     pub record: &'static str,
     /// Bumped whenever a field changes meaning, so an archived file stays readable.
     pub schema: u32,
+    /// Wire dialect this server speaks. 2 = video rides `MSG_VIDEO_SEQ` (sequence
+    /// prefix) and `MSG_RECTS` may appear.
+    pub wire_version: u32,
     pub qpc_frequency: i64,
     pub video_port: u16,
     pub input_port: u16,
@@ -67,13 +70,15 @@ pub struct Header {
     pub sequence_header_available: bool,
 }
 
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
+pub const WIRE_VERSION: u32 = 2;
 
 impl Header {
     pub fn new() -> Self {
         Self {
             record: "header",
             schema: SCHEMA,
+            wire_version: WIRE_VERSION,
             qpc_frequency: 0,
             video_port: 0,
             input_port: 0,
@@ -117,6 +122,9 @@ impl Default for Header {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct FrameRecord {
     pub record: &'static str,
+    /// Capture sequence number, assigned when the frame was acquired — the same
+    /// value the wire carries on `MSG_VIDEO_SEQ`/`MSG_RECTS`, so client and server
+    /// rows join exactly. (Schema 1 counted emitted access units instead.)
     pub frame: u64,
     pub present_qpc_us: i64,
     pub acquire_qpc_us: i64,
@@ -131,6 +139,21 @@ pub struct FrameRecord {
     pub param_sets_prepended: bool,
     /// Cumulative count of frames dropped because the send queue was full.
     pub dropped_frames: u64,
+    /// Cumulative count of encoder outputs whose sample timestamp matched no
+    /// pending submission — each one is a stamp pairing taken on faith (FIFO).
+    pub stamp_mismatches: u64,
+    /// Dirty-rect metadata from the duplication, when the frame carried any
+    /// (`None` = metadata unavailable, which is NOT the same as zero rects).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty_rect_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_rect_count: Option<u32>,
+    /// How many encoded frames a connect-edge keyframe request waited before the
+    /// keyframe actually arrived. Present only on the keyframe that answered one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyframe_wait_frames: Option<u32>,
 }
 
 impl FrameRecord {
@@ -233,6 +256,11 @@ mod tests {
         r.keyframe = true;
         r.param_sets_prepended = true;
         r.dropped_frames = 3;
+        r.stamp_mismatches = 2;
+        r.dirty_rect_count = Some(4);
+        r.dirty_bytes = Some(8192);
+        r.move_rect_count = Some(1);
+        r.keyframe_wait_frames = Some(17);
 
         let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
         assert_eq!(v["record"], "frame");
@@ -248,9 +276,28 @@ mod tests {
         assert_eq!(v["keyframe"], true);
         assert_eq!(v["param_sets_prepended"], true);
         assert_eq!(v["dropped_frames"], 3);
+        assert_eq!(v["stamp_mismatches"], 2);
+        assert_eq!(v["dirty_rect_count"], 4);
+        assert_eq!(v["dirty_bytes"], 8192);
+        assert_eq!(v["move_rect_count"], 1);
+        assert_eq!(v["keyframe_wait_frames"], 17);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 13, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 18, "unexpected field count: {keys:?}");
+    }
+
+    #[test]
+    fn absent_dirty_metadata_is_omitted_not_zero() {
+        // `None` must vanish from the line entirely: a consumer that read a 0 here
+        // would conflate "metadata unavailable" with "nothing changed", which is
+        // exactly the fast-path predicate hazard the design calls out.
+        let r = FrameRecord::new();
+        let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("dirty_rect_count"));
+        assert!(!obj.contains_key("dirty_bytes"));
+        assert!(!obj.contains_key("move_rect_count"));
+        assert!(!obj.contains_key("keyframe_wait_frames"));
     }
 
     #[test]
@@ -286,6 +333,7 @@ mod tests {
         let v: Value = serde_json::from_str(&to_line(&h)).unwrap();
         assert_eq!(v["record"], "header");
         assert_eq!(v["schema"], SCHEMA);
+        assert_eq!(v["wire_version"], WIRE_VERSION);
         assert_eq!(v["qpc_frequency"], 10_000_000);
         assert_eq!(v["encoder"], "NVIDIA H.264 Encoder MFT");
         assert_eq!(v["encoder_kind"], "async-hardware");

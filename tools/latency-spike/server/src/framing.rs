@@ -13,10 +13,20 @@
 //!
 //! Portable on purpose: the macOS viewer decodes with this same module.
 
-/// One H.264 access unit, Annex B, exactly one per message.
+/// One H.264 access unit, Annex B, exactly one per message. Legacy (wire v1):
+/// carries no sequence number. Kept decodable so an archived capture stays
+/// readable; a v2 server sends [`MSG_VIDEO_SEQ`] instead.
 pub const MSG_VIDEO: u8 = 1;
 /// One server stats line (JSON, no trailing newline).
 pub const MSG_STATS: u8 = 2;
+/// Raw dirty rects for one captured frame — the hybrid wire's fast path. Payload
+/// layout lives in `crate::rects`.
+pub const MSG_RECTS: u8 = 3;
+/// One H.264 access unit prefixed by its `u64` LE capture sequence number. A new
+/// type rather than a new `MSG_VIDEO` payload on purpose: a reader that predates it
+/// skips it via the length prefix instead of misparsing eight bytes of sequence
+/// number as the start of an access unit.
+pub const MSG_VIDEO_SEQ: u8 = 4;
 
 /// Header bytes ahead of the payload: the length field plus the type byte.
 pub const HEADER_LEN: usize = 5;

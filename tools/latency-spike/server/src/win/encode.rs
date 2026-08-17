@@ -49,8 +49,11 @@
 //! ## Output order
 //!
 //! B-frames are disabled (`CODECAPI_AVEncMPVDefaultBPictureCount = 0`), so encoded
-//! output comes out in submission order. That is what makes the submit-stamp FIFO in
-//! [`Mft::submitted`] correct; with B-frames it would mis-pair stamps to frames.
+//! output *should* come out in submission order — but [`Mft::submitted`] no longer
+//! relies on that: each output is matched to its submission by the MF sample
+//! timestamp, with front-of-queue FIFO as a counted fallback
+//! (`stamp_mismatches`). An encoder that reorders or coalesces shows up in stats
+//! instead of silently mis-pairing stamps to frames.
 
 use super::{qpc, Result};
 use crate::annexb::ParameterSets;
@@ -63,14 +66,41 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 
+/// Everything the capture loop knew about a frame at submission time. It rides
+/// through the encoder with the submission and comes back attached to the matching
+/// access unit, so an AU's stats row always carries *its own* frame's stamps — the
+/// async MFT pipelines, and pairing an output with "whatever the loop is holding
+/// right now" mis-attributes every stage the moment it runs one frame behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameMeta {
+    /// Capture sequence number — the wire and stats join key.
+    pub seq: u64,
+    pub present_qpc: i64,
+    pub acquire_qpc: i64,
+    pub convert_start_qpc: i64,
+    pub convert_end_qpc: i64,
+    /// Duplication change metadata, summarised (the rect list itself is consumed
+    /// at capture time by the fast path; the AU's stats row needs only counts).
+    /// `change_valid == false` means metadata was unavailable for this frame.
+    pub change_valid: bool,
+    pub dirty_rect_count: u32,
+    pub dirty_bytes: u64,
+    pub move_rect_count: u32,
+}
+
 /// One encoded access unit, with the two stamps only the encoder can take.
 pub struct EncodedAu {
     pub data: Vec<u8>,
     pub keyframe: bool,
+    /// The submission this output was matched to (by MF sample timestamp).
+    pub meta: FrameMeta,
     /// QPC at the moment `ProcessInput` was called for this frame.
     pub submit_qpc: i64,
     /// QPC at the moment `ProcessOutput` handed the bytes back.
     pub out_qpc: i64,
+    /// Cumulative count of outputs whose timestamp matched no pending submission
+    /// (paired FIFO on faith instead). Snapshot at emission time.
+    pub stamp_mismatches: u64,
 }
 
 /// The encode stage, with the async and sync drivers behind one interface so the
@@ -91,8 +121,18 @@ pub trait Encoder {
     fn encode(
         &mut self,
         sample: &IMFSample,
+        meta: FrameMeta,
         sink: &mut dyn FnMut(EncodedAu) -> Result<()>,
     ) -> Result<()>;
+    /// Deliver anything the encoder has finished without feeding it a new frame.
+    /// The async MFT's event queue is pumped only from inside [`Encoder::encode`],
+    /// so on a static desktop the final access unit would otherwise sit inside the
+    /// transform until the next screen change.
+    fn pump(&mut self, sink: &mut dyn FnMut(EncodedAu) -> Result<()>) -> Result<()>;
+    /// Bumped whenever the encoder renegotiates its output type mid-stream. A
+    /// consumer caching stream-derived state (the in-band SPS/PPS cache) must
+    /// invalidate it when this changes.
+    fn config_epoch(&self) -> u64;
     /// Drain and stop streaming. Best-effort; failures here cannot be acted on.
     fn shutdown(&mut self);
 }
@@ -198,9 +238,23 @@ struct Mft {
     applied: Vec<String>,
     refused: Vec<String>,
     parameter_sets: Option<ParameterSets>,
-    /// Submit stamps in submission order. Correct only because B-frames are off.
-    submitted: VecDeque<i64>,
+    /// Pending submissions, keyed by the sample time each carried. Matched back to
+    /// outputs by `GetSampleTime`, with front-of-queue FIFO as the counted
+    /// fallback: B-frames are off, so FIFO *should* hold, but "should" is an
+    /// assumption and the timestamp is a contract.
+    submitted: VecDeque<Submission>,
+    /// Outputs whose timestamp matched nothing pending (paired FIFO on faith).
+    stamp_mismatches: u64,
+    /// Bumped on every mid-stream output-type renegotiation.
+    config_epoch: u64,
     scratch: Vec<u8>,
+}
+
+/// One `ProcessInput` not yet matched to a `ProcessOutput`.
+struct Submission {
+    time_hns: i64,
+    submit_qpc: i64,
+    meta: FrameMeta,
 }
 
 impl Mft {
@@ -244,11 +298,14 @@ impl Mft {
             Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(false),
             Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                 // The encoder renegotiated. Accept its first proposal and refresh the
-                // stored parameter sets, which may have changed with it.
+                // stored parameter sets, which may have changed with it. The epoch
+                // bump tells the pipeline to discard any stream-scanned SPS/PPS
+                // cache — sets from the old configuration would poison the new one.
                 // SAFETY: the transform is live.
                 let new_type = unsafe { self.transform.GetOutputAvailableType(0, 0) }?;
                 unsafe { self.transform.SetOutputType(0, &new_type, 0) }?;
                 self.parameter_sets = read_sequence_header(&new_type);
+                self.config_epoch += 1;
                 return Ok(false);
             }
             Err(e) => return Err(e.into()),
@@ -257,7 +314,38 @@ impl Mft {
         let Some(sample) = produced else {
             return Ok(false);
         };
-        let submit_qpc = self.submitted.pop_front().unwrap_or(out_qpc);
+        // Match the output back to its submission by sample time. The encoder is
+        // required to preserve the input timestamp on the output sample; when it
+        // does not (or the time matches nothing pending), fall back to FIFO and
+        // count it, so a broken pairing is visible in stats rather than silent.
+        // SAFETY: `sample` is live.
+        let out_time = unsafe { sample.GetSampleTime() }.ok();
+        let matched = out_time
+            .and_then(|t| self.submitted.iter().position(|s| s.time_hns == t))
+            .map(|idx| {
+                // Anything queued ahead of the match produced no output of its own
+                // (coalesced or swallowed); those stamps can never pair now.
+                self.stamp_mismatches += idx as u64;
+                self.submitted.drain(..idx);
+                self.submitted
+                    .pop_front()
+                    .expect("position() proved presence")
+            });
+        let matched = match matched {
+            Some(s) => Some(s),
+            None => {
+                if !self.submitted.is_empty() {
+                    self.stamp_mismatches += 1;
+                }
+                self.submitted.pop_front()
+            }
+        };
+        let (submit_qpc, meta) = match matched {
+            Some(s) => (s.submit_qpc, s.meta),
+            // Nothing pending at all — an output from a drain after shutdown
+            // started. Stamps are meaningless; mark them so instead of inventing.
+            None => (out_qpc, FrameMeta::default()),
+        };
         // `MFSampleExtension_CleanPoint` is how MF marks an IDR.
         // SAFETY: `sample` is live; a missing attribute is an error, not a crash.
         let keyframe = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) == 1;
@@ -279,17 +367,26 @@ impl Mft {
         sink(EncodedAu {
             data: std::mem::take(&mut self.scratch),
             keyframe,
+            meta,
             submit_qpc,
             out_qpc,
+            stamp_mismatches: self.stamp_mismatches,
         })?;
         Ok(true)
     }
 
-    fn deliver(&mut self, stream_id: u32, sample: &IMFSample) -> Result<()> {
+    fn deliver(&mut self, stream_id: u32, sample: &IMFSample, meta: FrameMeta) -> Result<()> {
+        // The sample time is the correlation key `process_output` matches on.
+        // SAFETY: `sample` is live.
+        let time_hns = unsafe { sample.GetSampleTime() }.unwrap_or(0);
         let submit_qpc = qpc::now();
         // SAFETY: transform and sample are live.
         unsafe { self.transform.ProcessInput(stream_id, sample, 0) }?;
-        self.submitted.push_back(submit_qpc);
+        self.submitted.push_back(Submission {
+            time_hns,
+            submit_qpc,
+            meta,
+        });
         Ok(())
     }
 
@@ -401,6 +498,7 @@ impl Encoder for AsyncEncoder {
     fn encode(
         &mut self,
         sample: &IMFSample,
+        meta: FrameMeta,
         sink: &mut dyn FnMut(EncodedAu) -> Result<()>,
     ) -> Result<()> {
         // Spend a credit if we already hold one; otherwise block until the encoder
@@ -408,7 +506,7 @@ impl Encoder for AsyncEncoder {
         // an encoder that has both work to give and room to take must not deadlock.
         if self.credits > 0 {
             self.credits -= 1;
-            self.mft.deliver(0, sample)?;
+            self.mft.deliver(0, sample, meta)?;
         } else {
             loop {
                 // SAFETY: `events` is live; flags 0 means block until an event.
@@ -417,7 +515,7 @@ impl Encoder for AsyncEncoder {
                         .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))
                 }?;
                 if let Dispatched::NeedInput(id) = self.dispatch(&event, sink)? {
-                    self.mft.deliver(id, sample)?;
+                    self.mft.deliver(id, sample, meta)?;
                     break;
                 }
             }
@@ -425,6 +523,14 @@ impl Encoder for AsyncEncoder {
         // Anything the encoder finished while we were busy goes out now rather than
         // waiting for the next frame to pump it.
         self.drain_queued(sink)
+    }
+
+    fn pump(&mut self, sink: &mut dyn FnMut(EncodedAu) -> Result<()>) -> Result<()> {
+        self.drain_queued(sink)
+    }
+
+    fn config_epoch(&self) -> u64 {
+        self.mft.config_epoch
     }
 
     fn shutdown(&mut self) {
@@ -506,12 +612,22 @@ impl Encoder for SyncEncoder {
     fn encode(
         &mut self,
         sample: &IMFSample,
+        meta: FrameMeta,
         sink: &mut dyn FnMut(EncodedAu) -> Result<()>,
     ) -> Result<()> {
-        self.mft.deliver(0, sample)?;
+        self.mft.deliver(0, sample, meta)?;
         // A sync MFT is drained by polling until it says it needs more input.
         while self.mft.process_output(sink)? {}
         Ok(())
+    }
+
+    fn pump(&mut self, _sink: &mut dyn FnMut(EncodedAu) -> Result<()>) -> Result<()> {
+        // A sync MFT is fully drained inside `encode`; it holds nothing back.
+        Ok(())
+    }
+
+    fn config_epoch(&self) -> u64 {
+        self.mft.config_epoch
     }
 
     fn shutdown(&mut self) {
@@ -769,6 +885,8 @@ fn configure(
             refused: settings.refused,
             parameter_sets,
             submitted: VecDeque::new(),
+            stamp_mismatches: 0,
+            config_epoch: 0,
             scratch: Vec::new(),
         },
         is_async,

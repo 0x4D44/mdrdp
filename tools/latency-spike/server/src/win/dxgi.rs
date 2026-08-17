@@ -23,7 +23,7 @@
 use super::{qpc, wide_to_string, Result};
 use std::time::Duration;
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_UNSUPPORTED,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, DXGI_OUTPUT_DESC,
 };
 
 /// `DXGI_ERROR_UNAVAILABLE` — another process already holds the duplication, or the
@@ -123,6 +123,39 @@ pub fn enumerate() -> Result<Vec<OutputInfo>> {
     Ok(list)
 }
 
+/// One changed region of a frame, in desktop coordinates, clamped to the desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Per-frame change metadata from the duplication.
+///
+/// `None` at the `acquire` call site means **unavailable** — the frame
+/// accumulated more than one present, or the metadata calls failed — which the
+/// fast-path predicate must treat as "assume everything changed", never as "zero
+/// rects". Move rects contribute their *destination* rectangles: the pixels are
+/// read from the current frame, so destination readback carries the final content.
+#[derive(Debug, Clone, Default)]
+pub struct ChangeInfo {
+    pub rects: Vec<DirtyRect>,
+    /// How many of `rects` came from move regions (diagnostic).
+    pub move_rects: u32,
+}
+
+impl ChangeInfo {
+    /// Total bytes a raw BGRA readback of every rect would carry.
+    pub fn dirty_bytes(&self) -> u64 {
+        self.rects
+            .iter()
+            .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
+            .sum()
+    }
+}
+
 /// What one `acquire` call produced.
 pub enum Acquired {
     Frame {
@@ -132,6 +165,8 @@ pub enum Acquired {
         present_qpc: i64,
         /// When `AcquireNextFrame` returned to us.
         acquire_qpc: i64,
+        /// Change metadata, when this frame carried a trustworthy set.
+        change: Option<ChangeInfo>,
     },
     /// Nothing was presented within the timeout.
     Timeout,
@@ -316,11 +351,94 @@ impl Capture {
         let Some(resource) = resource else {
             return Ok(Acquired::PointerOnly);
         };
+        let change = self.read_change_info(&dupl, &info);
         let texture: ID3D11Texture2D = resource.cast()?;
         Ok(Acquired::Frame {
             texture,
             present_qpc: info.LastPresentTime,
             acquire_qpc,
+            change,
+        })
+    }
+
+    /// Fetch the frame's dirty/move rects while it is still held. `None` means the
+    /// metadata cannot be trusted for a "what changed" decision: the frame
+    /// accumulated more than one present (rects from different presents union into
+    /// an over- or under-statement of the final image) or a metadata call failed.
+    fn read_change_info(
+        &self,
+        dupl: &IDXGIOutputDuplication,
+        info: &DXGI_OUTDUPL_FRAME_INFO,
+    ) -> Option<ChangeInfo> {
+        if info.AccumulatedFrames != 1 || info.TotalMetadataBufferSize == 0 {
+            return None;
+        }
+        let capacity = info.TotalMetadataBufferSize as usize;
+
+        let mut dirty: Vec<RECT> = vec![RECT::default(); capacity / std::mem::size_of::<RECT>()];
+        let mut dirty_bytes_required = 0u32;
+        // SAFETY: the buffer is `capacity` bytes of RECTs and we pass that size; the
+        // frame is held (this runs between AcquireNextFrame and ReleaseFrame), which
+        // is the API's validity window for metadata.
+        unsafe {
+            dupl.GetFrameDirtyRects(
+                (dirty.len() * std::mem::size_of::<RECT>()) as u32,
+                dirty.as_mut_ptr(),
+                &mut dirty_bytes_required,
+            )
+        }
+        .ok()?;
+        dirty.truncate(dirty_bytes_required as usize / std::mem::size_of::<RECT>());
+
+        let mut moves: Vec<DXGI_OUTDUPL_MOVE_RECT> =
+            vec![
+                DXGI_OUTDUPL_MOVE_RECT::default();
+                capacity / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()
+            ];
+        let mut move_bytes_required = 0u32;
+        // SAFETY: as above, with the move-rect element size.
+        unsafe {
+            dupl.GetFrameMoveRects(
+                (moves.len() * std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()) as u32,
+                moves.as_mut_ptr(),
+                &mut move_bytes_required,
+            )
+        }
+        .ok()?;
+        moves
+            .truncate(move_bytes_required as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>());
+
+        let mut out = ChangeInfo {
+            rects: Vec::with_capacity(dirty.len() + moves.len()),
+            move_rects: moves.len() as u32,
+        };
+        for r in &dirty {
+            if let Some(dr) = self.clamp(r) {
+                out.rects.push(dr);
+            }
+        }
+        for m in &moves {
+            if let Some(dr) = self.clamp(&m.DestinationRect) {
+                out.rects.push(dr);
+            }
+        }
+        Some(out)
+    }
+
+    /// Desktop-clamp one RECT; degenerate or fully off-screen rects vanish.
+    fn clamp(&self, r: &RECT) -> Option<DirtyRect> {
+        let x0 = r.left.max(0) as u32;
+        let y0 = r.top.max(0) as u32;
+        let x1 = (r.right.max(0) as u32).min(self.width);
+        let y1 = (r.bottom.max(0) as u32).min(self.height);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(DirtyRect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
         })
     }
 

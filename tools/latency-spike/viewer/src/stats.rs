@@ -17,7 +17,9 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 /// Bumped whenever a field changes meaning, so an archived file stays readable.
-pub const SCHEMA: u32 = 1;
+/// Schema 2: frames gained `seq` — the server's capture sequence number from
+/// `MSG_VIDEO_SEQ`, the exact cross-file join key (`null` on a v1 stream).
+pub const SCHEMA: u32 = 2;
 
 /// First line of the file: what this run was, and on which clock.
 #[derive(Debug, Clone, Serialize)]
@@ -51,7 +53,10 @@ impl Header {
 /// window thread so `present_done_us` can close the line where it is actually taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameStamps {
+    /// Arrival ordinal on this client (counts every video message seen).
     pub frame: u64,
+    /// The server's capture sequence number, when the stream carried one.
+    pub seq: Option<u64>,
     /// When the `read` that completed this message returned.
     pub recv_done_us: u64,
     /// Immediately before `H264Decoder::decode`.
@@ -75,6 +80,8 @@ pub struct FrameRecord {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub frame: u64,
+    /// `null` only on a v1 stream that sent bare `MSG_VIDEO`.
+    pub seq: Option<u64>,
     pub recv_done_us: u64,
     pub decode_in_us: u64,
     pub decode_out_us: u64,
@@ -91,6 +98,7 @@ impl FrameRecord {
         Self {
             kind: "frame",
             frame: stamps.frame,
+            seq: stamps.seq,
             recv_done_us: stamps.recv_done_us,
             decode_in_us: stamps.decode_in_us,
             decode_out_us: stamps.decode_out_us,
@@ -272,6 +280,7 @@ mod tests {
         // two fields being written from the same variable.
         let stamps = FrameStamps {
             frame: 7,
+            seq: Some(42),
             recv_done_us: 1_000,
             decode_in_us: 1_100,
             decode_out_us: 3_400,
@@ -283,6 +292,10 @@ mod tests {
         let v = parse(&to_line(&FrameRecord::new(&stamps, Some(5_000))));
         assert_eq!(v["type"], "frame");
         assert_eq!(v["frame"], 7);
+        assert_eq!(
+            v["seq"], 42,
+            "seq must be the server's number, not the ordinal"
+        );
         assert_eq!(v["recv_done_us"], 1_000);
         assert_eq!(v["decode_in_us"], 1_100);
         assert_eq!(v["decode_out_us"], 3_400);
@@ -298,6 +311,7 @@ mod tests {
     fn a_frame_with_no_present_stamp_is_marked_dropped() {
         let stamps = FrameStamps {
             frame: 8,
+            seq: None,
             recv_done_us: 1,
             decode_in_us: 2,
             decode_out_us: 3,
@@ -309,6 +323,7 @@ mod tests {
         let v = parse(&to_line(&FrameRecord::new(&stamps, None)));
         assert_eq!(v["present_done_us"], Value::Null);
         assert_eq!(v["dropped"], true);
+        assert_eq!(v["seq"], Value::Null, "a v1 stream has no seq to invent");
     }
 
     #[test]

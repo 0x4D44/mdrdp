@@ -134,7 +134,7 @@ impl DecodeSink {
 }
 
 impl MessageSink for DecodeSink {
-    fn on_video(&mut self, au: &[u8], recv_done_us: u64) {
+    fn on_video(&mut self, au: &[u8], seq: Option<u64>, recv_done_us: u64) {
         self.frames += 1;
         let frame = self.frames;
         // The server's own keyframe flag rides its stats line, not the video message,
@@ -167,6 +167,7 @@ impl MessageSink for DecodeSink {
 
         let stamps = FrameStamps {
             frame,
+            seq,
             recv_done_us,
             decode_in_us,
             decode_out_us,
@@ -200,6 +201,7 @@ mod tests {
     fn stamps(frame: u64) -> FrameStamps {
         FrameStamps {
             frame,
+            seq: Some(frame + 100),
             recv_done_us: frame * 10,
             decode_in_us: frame * 10 + 1,
             decode_out_us: frame * 10 + 2,
