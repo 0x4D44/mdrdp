@@ -13,6 +13,16 @@ not here.
 
 ---
 
+- Focus-routed CGEvent injection silently loses keystrokes to focus theft: pin delivery with `probe glass --target-pid` (CGEventPostToPid).
+  On a busy desktop 25/30 glass trials timed out because another app took frontmost
+  mid-run and the HID-tap events followed it. Posting to the target pid makes
+  misrouting impossible; the window still has to be visible and unoccluded
+  (`probe::glass::inject::Injector`).
+- ScreenCaptureKit sees ZERO displays at the macOS lock screen, and inter-run pauses let the display sleep: glass runs now hold an IOPM display-wake assertion.
+  Injected CGEvents reset the idle timer during a run, but the gaps between runs do
+  not; the display slept and locked between sessions and ended the whole measurement
+  phase (`probe::glass::wakelock::DisplayWake`, wrk_journals 2026.08.17).
+
 - Accumulating macOS's ~0.1-line slow wheel clicks still reads as DEAD: floor each LineDelta detent at one notch (`input::detent_floor`).
   Second attempt at the slow-scroll bug. The 0.1.48 `WheelAccumulator` stopped *dropping*
   sub-notch travel, but macOS's acceleration curve reports a slowly-turned click as ~0.1
