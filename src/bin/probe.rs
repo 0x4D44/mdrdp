@@ -31,7 +31,8 @@ fn usage() -> &'static str {
      probe rtt <host> [--port N] [--samples N] [--interval-ms N] [--out FILE]\n  \
      probe glass --region X,Y,WxH [--samples N] [--key CODE] [--erase-key CODE]\n              \
                  [--fps N] [--settle-ms N] [--quiet-ms N] [--gap-ms N] [--jitter-ms N]\n              \
-                 [--threshold N] [--min-pixels N] [--timeout-ms N] [--out FILE]\n              \
+                 [--threshold N] [--min-pixels N] [--timeout-ms N] [--target-pid N]\n              \
+                 [--out FILE]\n              \
                  [--note key=value]...\n  \
      probe glass --locate\n  \
      probe summarise <file>"
@@ -109,6 +110,7 @@ fn cmd_glass(args: &[String]) -> Result<ExitCode, Box<dyn std::error::Error>> {
             "--threshold" => cfg.threshold = value()?.parse()?,
             "--min-pixels" => cfg.min_pixels = value()?.parse()?,
             "--timeout-ms" => cfg.timeout_ms = value()?.parse()?,
+            "--target-pid" => cfg.target_pid = Some(value()?.parse()?),
             "--out" => cfg.out = Some(value()?.clone()),
             "--note" => {
                 let note = value()?;

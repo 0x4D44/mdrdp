@@ -139,6 +139,10 @@ pub struct Config {
     pub threshold: u8,
     pub min_pixels: usize,
     pub timeout_ms: u64,
+    /// Post keystrokes straight to this process id instead of to the focused window.
+    /// See [`inject::Injector`] — on a busy desktop, focus-routed injection is how a run
+    /// silently types into the wrong application.
+    pub target_pid: Option<i32>,
     pub out: Option<String>,
     pub notes: Vec<(String, String)>,
 }
@@ -158,6 +162,7 @@ impl Config {
             threshold: 24,
             min_pixels: 6,
             timeout_ms: 2_000,
+            target_pid: None,
             out: None,
             notes: Vec::new(),
         }
@@ -380,7 +385,7 @@ pub fn run(cfg: &Config) -> Result<(), Error> {
         return Err(format!("nonsensical capture rate {fps} fps").into());
     }
 
-    let injector = Injector::new()?;
+    let injector = Injector::new(cfg.target_pid)?;
     let capture = Capture::start(&target, cfg.region, fps)?;
 
     // Timebase sanity check, before anything is measured. If frame timestamps and the
@@ -640,6 +645,7 @@ fn header_json(
             "configured_interval_us": interval_us,
         },
         "timebase_skew_us": skew_us,
+        "target_pid": cfg.target_pid,
         "vrr_note": VRR_NOTE,
         "notes": notes,
     })
@@ -701,7 +707,14 @@ fn print_preamble(
     }
     println!("  BEFORE YOU TRUST THIS: disable ProMotion / variable refresh on the display");
     println!("  ({VRR_NOTE}).");
-    println!("  Focus the target window now; the probe types into whatever has focus.\n");
+    match cfg.target_pid {
+        Some(pid) => println!(
+            "  Keystrokes go straight to pid {pid}; keep its window visible and unoccluded.\n"
+        ),
+        None => {
+            println!("  Focus the target window now; the probe types into whatever has focus.\n");
+        }
+    }
 }
 
 fn build_profile() -> &'static str {
