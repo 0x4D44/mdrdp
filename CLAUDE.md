@@ -152,9 +152,12 @@ target for all protocol work and all comparisons against Microsoft's client.
   hour boundaries tick three labels inside ninety minutes while sampling one time of day.
   A proxy you can satisfy by waiting for a clock to roll over measures the clock.
 
-- **It sends ClearCodec and RFX Progressive over EGFX — not H.264, and not RemoteFX.**
-  Measured, with AVC permitted on both sides and still unused. Neither codec is wired into
-  IronRDP's client decode path, so decoding them is our work.
+- **It sends AVC444v2 by default since the host's H.264 policy was enabled** (measured
+  2026-08-17; before that it sent ClearCodec + RFX Progressive, and the 2026.08.14 spike
+  documents that era). `--no-avc` withholds the client's AVC capability and forces the
+  old ClearCodec/RFX mix — measured 2026-08-17, that mode has a ~416 ms p50 typing
+  round trip (vs ~48 ms under AVC444): the non-AVC server pipeline coalesces small
+  updates aggressively, so prefer AVC for latency and use `--no-avc` for diagnosis only.
 
 **Read both of these before designing anything that touches graphics:**
 `wrk_docs/2026.08.14 - SPIKE - P1b server codec negotiation against temper.md` for what

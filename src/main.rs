@@ -248,6 +248,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut screenshot: Option<String> = None;
     let mut metrics_json: Option<String> = None;
     let mut input_script: Option<String> = None;
+    let mut no_avc = false;
     let mut password_stdin = false;
     let mut ask_password = false;
     let mut stage_json = false;
@@ -287,6 +288,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--stage-json" => {
                 stage_json = true;
+                i += 1;
+                continue;
+            }
+            "--no-avc" => {
+                no_avc = true;
                 i += 1;
                 continue;
             }
@@ -553,11 +559,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Advertise AVC (AVC444 via V10.7, AVC420 via V8.1) only where connect() will
     // actually configure a decoder, or the server sends H.264 into a void and every
     // video region goes black.
-    let handler = if mdrdp::h264::hardware_decode_available() {
+    // --no-avc withholds the AVC capability sets entirely, so the server falls
+    // back to its non-AVC mix (ClearCodec / RFX Progressive). A diagnostic lever:
+    // codec A/B comparisons on the same host, and triage when an AVC decode bug
+    // is suspected. The decoder requirement is unchanged when it is off.
+    let handler = if !no_avc && mdrdp::h264::hardware_decode_available() {
         handler.advertising_avc()
     } else {
         handler
     };
+    if no_avc {
+        eprintln!("AVC withheld (--no-avc): the server will fall back to its non-AVC codecs");
+    }
     let handler = match &capture {
         Some(dir) => {
             eprintln!("capturing undecodable tiles to {dir} (session content — your call)");

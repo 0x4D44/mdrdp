@@ -123,6 +123,10 @@ const OPTIONS: &[(&str, &str)] = &[
         "print machine-readable connect progress on stdout",
     ),
     (
+        "--no-avc",
+        "do not advertise H.264/AVC, forcing the server's non-AVC\ncodecs (for codec comparisons and AVC triage)",
+    ),
+    (
         "--capture-failures <dir>",
         "dump undecodable tiles AND the first raw AVC444 frames\n(screen content!) for offline debugging",
     ),
@@ -245,6 +249,7 @@ mod tests {
             "--metrics-json",
             "--input-script",
             "--stage-json",
+            "--no-avc",
             "--capture-failures",
             "--version",
             "--help",

@@ -1,3 +1,4 @@
+- The non-AVC path is a latency TRAP on modern Windows: ClearCodec typing round-trips ~416ms p50 vs ~48ms under AVC444 on the same host — 6x fewer bytes, 9x more lag (`--no-avc`, wrk_journals 2026.08.17).
 - DWMFRAMEINTERVAL=15 on the host doubles sustained RDP fps and halves motion RTT, but typing keeps a ~33ms server floor (wrk_journals 2026.08.17).
 - Quench is UK layout: autoinput `type` US scancodes turn `"` into `@` and `\` into `#`; PowerShell registry paths accept FORWARD slashes as the layout-safe escape (`autoinput`).
 - An AVC444 session sends ZERO SurfaceToCache/CacheToSurface PDUs — a quiet cache display is the server, not a client bug (`gfx::apply_surface_to_cache`).
