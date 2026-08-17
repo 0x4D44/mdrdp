@@ -1,3 +1,4 @@
+- DWMFRAMEINTERVAL below 15 is dead weight: the session's 60Hz virtual display floors the cadence at ~16ms (measured at DWMFI=5, wrk_journals 2026.08.17).
 - The non-AVC path is a latency TRAP on modern Windows: ClearCodec typing round-trips ~416ms p50 vs ~48ms under AVC444 on the same host — 6x fewer bytes, 9x more lag (`--no-avc`, wrk_journals 2026.08.17).
 - DWMFRAMEINTERVAL=15 on the host doubles sustained RDP fps and halves motion RTT, but typing keeps a ~33ms server floor (wrk_journals 2026.08.17).
 - Quench is UK layout: autoinput `type` US scancodes turn `"` into `@` and `\` into `#`; PowerShell registry paths accept FORWARD slashes as the layout-safe escape (`autoinput`).
