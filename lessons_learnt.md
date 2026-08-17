@@ -13,6 +13,15 @@ not here.
 
 ---
 
+- Accumulating macOS's ~0.1-line slow wheel clicks still reads as DEAD: floor each LineDelta detent at one notch (`input::detent_floor`).
+  Second attempt at the slow-scroll bug. The 0.1.48 `WheelAccumulator` stopped *dropping*
+  sub-notch travel, but macOS's acceleration curve reports a slowly-turned click as ~0.1
+  of a line, so accumulation charged ten physical clicks per remote notch — correct
+  arithmetic on the wrong model. A `LineDelta` event is a physical detent (winit emits it
+  only for non-precise devices) and is owed a whole notch, as native Windows gives; ≥1-line
+  values pass through so a fast spin keeps its acceleration and fractions. Precise pixel
+  streams keep pure accumulation. iTerm2 and Chromium floor non-precise scrolls the same way.
+
 - IronRDP AND FreeRDP 3.27 stop at ERRINFO 0x18, so a rebooting host's 0x1A failed the whole PDU decode (`disconnect`, `server_error_info`).
   MS-RDPBCGR 2.2.5.1.1 defines ERRINFO_SERVER_SHUTDOWN (0x19) and ERRINFO_SERVER_REBOOT
   (0x1A); both reference clients are missing them, so a missing code is not evidence the
