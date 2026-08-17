@@ -26,6 +26,7 @@
 pub mod capture;
 pub mod detect;
 pub mod inject;
+pub mod wakelock;
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -386,6 +387,15 @@ pub fn run(cfg: &Config) -> Result<(), Error> {
     }
 
     let injector = Injector::new(cfg.target_pid)?;
+
+    // Held for the whole run: an idle display sleeps mid-measurement otherwise — the
+    // injected keystrokes reset the idle timer, but the pauses between runs do not, and
+    // a locked screen has no photons to time.
+    let wake = wakelock::DisplayWake::acquire();
+    if wake.held() {
+        println!("  display sleep prevented for the duration of the run (as caffeinate -d)");
+    }
+
     let capture = Capture::start(&target, cfg.region, fps)?;
 
     // Timebase sanity check, before anything is measured. If frame timestamps and the
