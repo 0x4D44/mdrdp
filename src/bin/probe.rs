@@ -7,6 +7,7 @@
 //!     probe stages <host> [port]      how far a connection gets, without a credential
 //!     probe negotiate <host> [port]
 //!     probe rtt <host> [--samples N] [--interval-ms N] [--out FILE]
+//!     probe glass --region X,Y,WxH    keypress-to-photon latency (macOS only)
 //!     probe summarise <file>
 
 use mdrdp::probe::{negotiation, rtt, stats, wire};
@@ -28,6 +29,11 @@ fn usage() -> &'static str {
      probe stages <host> [port]\n  \
      probe negotiate <host> [port]\n  \
      probe rtt <host> [--port N] [--samples N] [--interval-ms N] [--out FILE]\n  \
+     probe glass --region X,Y,WxH [--samples N] [--key CODE] [--erase-key CODE]\n              \
+                 [--fps N] [--settle-ms N] [--quiet-ms N] [--gap-ms N] [--jitter-ms N]\n              \
+                 [--threshold N] [--min-pixels N] [--timeout-ms N] [--out FILE]\n              \
+                 [--note key=value]...\n  \
+     probe glass --locate\n  \
      probe summarise <file>"
 }
 
@@ -37,6 +43,10 @@ fn main() -> ExitCode {
         Some("stages") => cmd_stages(&args[1..]),
         Some("negotiate") => cmd_negotiate(&args[1..]),
         Some("rtt") => cmd_rtt(&args[1..]),
+        Some("glass") => match cmd_glass(&args[1..]) {
+            Ok(code) => return code,
+            Err(e) => Err(e),
+        },
         Some("summarise") | Some("summarize") => cmd_summarise(&args[1..]),
         _ => {
             eprintln!("{}", usage());
@@ -51,6 +61,83 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Keypress-to-photon latency.
+///
+/// Returns its own exit code because the failure modes are not all the same: a missing
+/// privacy grant exits 1 with instructions, and an unsupported platform exits 2, the
+/// same as a usage error.
+#[cfg(target_os = "macos")]
+fn cmd_glass(args: &[String]) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    use mdrdp::probe::glass;
+
+    if args.iter().any(|a| a == "--locate") {
+        glass::locate()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // The region is required and cannot be defaulted: there is no sane guess at which
+    // part of the screen the operator wants watched.
+    let region_index = args
+        .iter()
+        .position(|a| a == "--region")
+        .ok_or_else(|| format!("glass needs --region X,Y,WxH (or --locate)\n{}", usage()))?;
+    let region = glass::Region::parse(
+        args.get(region_index + 1)
+            .ok_or("--region needs a value")?
+            .as_str(),
+    )?;
+
+    let mut cfg = glass::Config::new(region);
+    let mut i = 0;
+    while i < args.len() {
+        let value = || -> Result<&String, String> {
+            args.get(i + 1)
+                .ok_or_else(|| format!("{} needs a value", args[i]))
+        };
+        match args[i].as_str() {
+            "--region" => {}
+            "--samples" => cfg.samples = value()?.parse()?,
+            "--key" => cfg.key = value()?.parse()?,
+            "--erase-key" => cfg.erase_key = value()?.parse()?,
+            "--fps" => cfg.fps = Some(value()?.parse()?),
+            "--settle-ms" => cfg.settle_ms = value()?.parse()?,
+            "--quiet-ms" => cfg.quiet_ms = value()?.parse()?,
+            "--gap-ms" => cfg.gap_ms = value()?.parse()?,
+            "--jitter-ms" => cfg.jitter_ms = value()?.parse()?,
+            "--threshold" => cfg.threshold = value()?.parse()?,
+            "--min-pixels" => cfg.min_pixels = value()?.parse()?,
+            "--timeout-ms" => cfg.timeout_ms = value()?.parse()?,
+            "--out" => cfg.out = Some(value()?.clone()),
+            "--note" => {
+                let note = value()?;
+                let (k, v) = note
+                    .split_once('=')
+                    .ok_or_else(|| format!("--note must be key=value (got {note:?})"))?;
+                cfg.notes.push((k.to_owned(), v.to_owned()));
+            }
+            other => return Err(format!("unknown flag {other}\n{}", usage()).into()),
+        }
+        i += 2;
+    }
+
+    match glass::run(&cfg) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(e) => {
+            eprintln!("{e}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// The instrument is built on ScreenCaptureKit, the CoreMedia host clock and CGEvent
+/// injection. There is no Windows equivalent that would produce a comparable number, so
+/// this refuses rather than pretending.
+#[cfg(not(target_os = "macos"))]
+fn cmd_glass(_args: &[String]) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    eprintln!("glass: macOS only");
+    Ok(ExitCode::from(2))
 }
 
 /// Send one connection request and report what the server answers.
@@ -246,6 +333,15 @@ fn cmd_rtt(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_summarise(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let path = args.first().ok_or("summarise needs a file")?;
+
+    // Which file this is, is decided by what is in it, not by its name. A glass file
+    // carries `type` on every record; an rtt file carries bare `{unix_ms, micros}`.
+    #[cfg(target_os = "macos")]
+    if let Some(report) = mdrdp::probe::glass::resummarise(path)? {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
     let reader = BufReader::new(File::open(path)?);
 
     let mut samples = Vec::new();
