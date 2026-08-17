@@ -6,6 +6,17 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A CGEvent built with a NULL source is silently dropped by CGEventPostToPid; create it from a HIDSystemState source (`glass::inject::Injector`).
+  Cost two burned quench sessions: python ctypes CGEventCreateKeyboardEvent(None, …) posted "successfully"
+  (permission preflight true, no error) yet the target app never saw a keystroke. Same call with
+  CGEventSourceCreate(kCGEventSourceStateHIDSystemState) delivered every tap.
+- winit macOS folds BOTH ISO corner keys into Backquote and never emits IntlBackslash; split on the unmodified char (`input::backquote_scancode`).
+  winit 0.30 `platform_impl/macos/event.rs` maps kVK_ISO_Section (0x0A) and kVK_ANSI_Grave (0x32) to
+  `KeyCode::Backquote`, so the 102nd key next to left Shift sent scancode 0x29 and typed ` where a UK PC
+  layout has \. `key_without_modifiers` is computed from the raw keycode before the collapse, so the two
+  keys still differ there (§/± = top-left, `/~/\/|/</> = 102nd on ISO hardware per KBGetLayoutType).
+  Validated live on quench: keycode 50 now types \, keycode 10 types `, matching Windows App 11.3.8.
+
 A lesson is **never dropped to make room** for a new one — prepend it and let the oldest
 fall out of the injected window. Soft target ~25 entries; past ~40, say it is due a prune
 rather than pruning unasked. Durable project facts and conventions belong in `CLAUDE.md`,
