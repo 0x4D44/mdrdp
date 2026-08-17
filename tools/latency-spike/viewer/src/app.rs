@@ -29,8 +29,8 @@ use crate::input_link::InputLink;
 use crate::interrupt;
 use crate::keymap;
 use crate::present::one_to_one;
-use crate::sink::{Frame, FrameSlot};
-use crate::stats::{FrameRecord, InputRecord, StatsLog};
+use crate::sink::{Frame, FrameSlot, PaintStamps};
+use crate::stats::{FrameRecord, InputRecord, RectRecord, StatsLog};
 
 /// The window before the first frame tells us the stream's coded size.
 const PLACEHOLDER: PhysicalSize<u32> = PhysicalSize::new(640, 360);
@@ -199,12 +199,19 @@ impl ViewerApp {
         }
         let present_done_us = self.clock.now_us();
 
-        // One frame record per frame, written where its last stage actually completes.
+        // One record per presented snapshot, written where its last stage actually
+        // completes — in whichever shape the message that painted it uses.
         if let Some(frame) = self.current.as_mut() {
             if presentable && frame.stamps_pending {
                 frame.stamps_pending = false;
-                self.stats
-                    .record(&FrameRecord::new(&frame.stamps, Some(present_done_us)));
+                match frame.stamps {
+                    PaintStamps::Au(s) => self
+                        .stats
+                        .record(&FrameRecord::new(&s, Some(present_done_us))),
+                    PaintStamps::Rects(s) => self
+                        .stats
+                        .record(&RectRecord::painted(&s, Some(present_done_us))),
+                }
             }
         }
     }

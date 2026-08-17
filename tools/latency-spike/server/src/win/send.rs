@@ -10,7 +10,7 @@
 
 use super::{qpc, Result};
 use crate::framing;
-use crate::stats::{FrameRecord, QpcClock};
+use crate::stats::{FrameRecord, QpcClock, RectRecord};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -23,12 +23,22 @@ use std::time::Duration;
 /// is treated as gone. Generous next to a frame interval, short next to a human.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Further messages one wakeup pulls off the channel before writing the batch out.
+/// The queue between capture and sender is two frames deep, so this is generous
+/// next to what can actually be waiting; it bounds the reordering pass rather than
+/// tuning throughput.
+const DRAIN_BATCH: usize = 8;
+
 /// What the sender thread consumes.
 pub enum Outbound {
     /// An encoded access unit plus the stats row it belongs to and its capture
     /// sequence number (the `MSG_VIDEO_SEQ` prefix). `send_done_us` is filled in
     /// here, because only this thread knows when the write returned.
     Frame(Box<FrameRecord>, u64, Vec<u8>),
+    /// One captured frame's raw dirty rects — a complete `MSG_RECTS` payload as
+    /// `crate::rects::encode` produced it — plus its stats row. `send_done_us` is
+    /// filled in here for the same reason as [`Outbound::Frame`]'s.
+    Rects(Box<RectRecord>, Vec<u8>),
     /// A pre-serialised JSONL line (the header, or an input event).
     Line(String),
 }
@@ -182,21 +192,63 @@ impl Sender {
         self.write_message(framing::MSG_STATS, line.as_bytes());
     }
 
+    /// Write one message and its stats row.
+    fn handle(&mut self, msg: Outbound) {
+        match msg {
+            Outbound::Frame(mut record, seq, au) => {
+                self.write_video(seq, &au);
+                record.send_done_us = self.clock.micros(qpc::now());
+                let line = crate::stats::to_line(&*record);
+                self.write_stats(&line);
+            }
+            Outbound::Rects(mut record, payload) => {
+                self.write_message(framing::MSG_RECTS, &payload);
+                record.send_done_us = self.clock.micros(qpc::now());
+                let line = crate::stats::to_line(&*record);
+                self.write_stats(&line);
+            }
+            Outbound::Line(line) => self.write_stats(&line),
+        }
+    }
+
     /// Consume the channel until the producers are gone.
+    ///
+    /// Each wakeup drains a small batch and writes every **rect** message in it
+    /// before any access unit: a queued rect update waiting behind a queued AU is
+    /// precisely the latency the fast path exists to remove, and the AU is a hundred
+    /// times its size. (An AU already mid-write is head-of-line cost this cannot
+    /// touch — the HLD accepts it and measures it rather than fixing it.) The batch
+    /// is bounded so a flooded channel cannot starve the stats lines behind an
+    /// endless reordering pass; both passes keep arrival order within themselves.
     pub fn run(mut self, rx: Receiver<Outbound>) {
+        let mut batch: Vec<Outbound> = Vec::with_capacity(DRAIN_BATCH + 1);
         loop {
             self.poll_client_eof();
             self.poll_accept();
             match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(Outbound::Frame(mut record, seq, au)) => {
-                    self.write_video(seq, &au);
-                    record.send_done_us = self.clock.micros(qpc::now());
-                    let line = crate::stats::to_line(&*record);
-                    self.write_stats(&line);
-                }
-                Ok(Outbound::Line(line)) => self.write_stats(&line),
-                Err(RecvTimeoutError::Timeout) => {}
+                Ok(msg) => batch.push(msg),
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
+            }
+            for _ in 0..DRAIN_BATCH {
+                match rx.try_recv() {
+                    Ok(msg) => batch.push(msg),
+                    // Empty or disconnected: either way there is nothing more to
+                    // add now. A disconnect is noticed by the blocking recv above
+                    // on the next lap, after this batch has been written out.
+                    Err(_) => break,
+                }
+            }
+            let mut i = 0;
+            while i < batch.len() {
+                if matches!(batch[i], Outbound::Rects(..)) {
+                    self.handle(batch.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            for msg in batch.drain(..) {
+                self.handle(msg);
             }
         }
         if let Some(file) = self.stats.as_mut() {

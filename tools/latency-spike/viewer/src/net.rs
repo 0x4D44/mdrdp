@@ -30,8 +30,14 @@ pub trait MessageSink {
     fn on_stats(&mut self, payload: &[u8]);
     /// One raw dirty-rect update (`MSG_RECTS` payload, undecoded). Default: skip —
     /// a sink that does not composite simply never sees painted rects.
-    fn on_rects(&mut self, payload: &[u8], recv_done_us: u64) {
+    ///
+    /// `Err` means the payload violated its own format. The pump turns that into
+    /// [`PumpEnd::Protocol`]: a rect payload is walked by length fields that choose
+    /// offsets into a framebuffer, so a malformed one is as terminal as a framing
+    /// error and for the same reason — there is nothing to resynchronise to.
+    fn on_rects(&mut self, payload: &[u8], recv_done_us: u64) -> Result<(), String> {
         let _ = (payload, recv_done_us);
+        Ok(())
     }
     /// A message type this build does not know. The length prefix means an unknown
     /// type costs nothing to skip, which is the whole reason it is a length prefix.
@@ -97,7 +103,11 @@ pub fn pump<R: Read>(reader: &mut R, clock: &Clock, sink: &mut dyn MessageSink) 
                         let seq = u64::from_le_bytes(seq_bytes.try_into().expect("8-byte slice"));
                         sink.on_video(&msg.payload[8..], Some(seq), recv_done_us);
                     }
-                    framing::MSG_RECTS => sink.on_rects(&msg.payload, recv_done_us),
+                    framing::MSG_RECTS => {
+                        if let Err(e) = sink.on_rects(&msg.payload, recv_done_us) {
+                            return PumpEnd::Protocol(e);
+                        }
+                    }
                     framing::MSG_STATS => sink.on_stats(&msg.payload),
                     other => sink.on_unknown(other, msg.payload.len()),
                 },
@@ -118,6 +128,9 @@ mod tests {
         rects: Vec<Vec<u8>>,
         stats: Vec<Vec<u8>>,
         unknown: Vec<(u8, usize)>,
+        /// Makes `on_rects` refuse every payload, so the pump's handling of a sink
+        /// error is testable without a real compositor.
+        refuse_rects: bool,
     }
 
     impl MessageSink for Recorder {
@@ -127,8 +140,12 @@ mod tests {
         fn on_stats(&mut self, payload: &[u8]) {
             self.stats.push(payload.to_vec());
         }
-        fn on_rects(&mut self, payload: &[u8], _recv_done_us: u64) {
+        fn on_rects(&mut self, payload: &[u8], _recv_done_us: u64) -> Result<(), String> {
             self.rects.push(payload.to_vec());
+            if self.refuse_rects {
+                return Err("rects: refused by the test sink".to_owned());
+            }
+            Ok(())
         }
         fn on_unknown(&mut self, msg_type: u8, payload_len: usize) {
             self.unknown.push((msg_type, payload_len));
@@ -194,6 +211,27 @@ mod tests {
         pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
         assert_eq!(sink.rects, vec![vec![9, 8, 7]]);
         assert!(sink.video.is_empty());
+    }
+
+    #[test]
+    fn a_sink_that_refuses_a_rects_payload_ends_the_pump_as_protocol() {
+        // The video message after it is the point: a malformed rect update is
+        // terminal, so nothing behind it may be delivered.
+        let bytes = wire(&[
+            (framing::MSG_RECTS, vec![9, 8, 7]),
+            (framing::MSG_VIDEO, vec![0x11]),
+        ]);
+        let mut sink = Recorder {
+            refuse_rects: true,
+            ..Default::default()
+        };
+        let end = pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
+        assert!(matches!(end, PumpEnd::Protocol(_)), "{end}");
+        assert_eq!(sink.rects.len(), 1, "the refused payload was offered once");
+        assert!(
+            sink.video.is_empty(),
+            "nothing after the refusal is delivered"
+        );
     }
 
     #[test]

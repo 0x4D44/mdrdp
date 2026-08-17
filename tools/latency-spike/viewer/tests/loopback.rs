@@ -157,6 +157,46 @@ fn the_receive_path_handles_a_stats_line_and_a_garbage_access_unit() {
 }
 
 #[test]
+fn a_malformed_rects_message_ends_the_connection_rather_than_being_survived() {
+    // The opposite of the test above, and deliberately so. A refused access unit is
+    // recoverable — the stream heals at the next keyframe. A rect payload is not: its
+    // own length fields choose offsets into a framebuffer, and there is no
+    // resynchronisation point, so it is terminal like a framing error. The trailing
+    // stats line is the proof: it must never be delivered.
+    let stats_file = TempStats::new("rects-terminal");
+    let stats = Arc::new(StatsLog::create(Some(stats_file.path())).expect("create stats"));
+
+    let wire = encoded(&[
+        (framing::MSG_RECTS, vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        (
+            framing::MSG_STATS,
+            br#"{"record":"frame","frame":1}"#.to_vec(),
+        ),
+    ]);
+    let addr = serve_once(wire);
+
+    let mut sink = DecodeSink::new(
+        mdrdp::h264::hardware_decoder(),
+        Arc::new(FrameSlot::new()),
+        stats.clone(),
+        Box::new(|| {}),
+    );
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    let end = net::pump(&mut stream, &Clock::new(), &mut sink);
+
+    assert!(
+        matches!(end, PumpEnd::Protocol(_)),
+        "a malformed rects payload is terminal, not an EOF or a survivable skip: {end}"
+    );
+    stats.flush();
+    assert!(
+        stats_file.lines().is_empty(),
+        "nothing behind the malformed message was processed: {:?}",
+        stats_file.lines()
+    );
+}
+
+#[test]
 fn a_server_that_hangs_up_mid_message_ends_the_pump_without_a_panic() {
     // Half a message: the reassembler must wait for bytes that never come and then
     // report EOF. A viewer that panicked here would take a whole run with it.

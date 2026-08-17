@@ -74,7 +74,9 @@ pub struct Header {
     pub sequence_header_available: bool,
 }
 
-pub const SCHEMA: u32 = 2;
+/// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
+/// gained `dropped_rects`, and `record: "rects"` rows exist at all.
+pub const SCHEMA: u32 = 3;
 pub const WIRE_VERSION: u32 = 2;
 
 impl Header {
@@ -145,6 +147,10 @@ pub struct FrameRecord {
     pub param_sets_prepended: bool,
     /// Cumulative count of frames dropped because the send queue was full.
     pub dropped_frames: u64,
+    /// Cumulative count of rect messages dropped for the same reason. Carried on
+    /// every frame row — not only on `rects` rows — so a socket so far behind that
+    /// *no* rect message survives still shows its fast-path losses somewhere.
+    pub dropped_rects: u64,
     /// Cumulative count of encoder outputs whose sample timestamp matched no
     /// pending submission — each one is a stamp pairing taken on faith (FIFO).
     pub stamp_mismatches: u64,
@@ -291,6 +297,7 @@ mod tests {
         r.keyframe = true;
         r.param_sets_prepended = true;
         r.dropped_frames = 3;
+        r.dropped_rects = 5;
         r.stamp_mismatches = 2;
         r.dirty_rect_count = Some(4);
         r.dirty_bytes = Some(8192);
@@ -311,6 +318,7 @@ mod tests {
         assert_eq!(v["keyframe"], true);
         assert_eq!(v["param_sets_prepended"], true);
         assert_eq!(v["dropped_frames"], 3);
+        assert_eq!(v["dropped_rects"], 5);
         assert_eq!(v["stamp_mismatches"], 2);
         assert_eq!(v["dirty_rect_count"], 4);
         assert_eq!(v["dirty_bytes"], 8192);
@@ -318,7 +326,7 @@ mod tests {
         assert_eq!(v["keyframe_wait_frames"], 17);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 18, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 19, "unexpected field count: {keys:?}");
     }
 
     #[test]

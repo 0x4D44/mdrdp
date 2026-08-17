@@ -17,10 +17,12 @@
 use super::{convert, dxgi, encode, input, qpc, send, Result};
 use crate::annexb::{self, ParameterSets};
 use crate::cli::{Config, DECLARED_FPS};
+use crate::rects;
 use crate::stats::{self, FrameRecord, Header, QpcClock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 /// Encoded frames to wait after a connect-edge keyframe request before asking
@@ -38,6 +40,21 @@ const ACQUIRE_TIMEOUT_MS: u32 = 8;
 
 /// 100-nanosecond units per second — Media Foundation's time base.
 const HNS_PER_SECOND: i64 = 10_000_000;
+
+/// Most dirty rects a frame may carry and still take the raw fast path.
+///
+/// **Provisional until the §5a telemetry run.** The constant is a tuning knob, not
+/// a promise: it is reported in the stats header so every archived measurement
+/// names the thresholds it ran under.
+const RECT_MAX_COUNT: usize = 32;
+
+/// Most raw pixel bytes a frame may carry and still take the fast path — ≈2.6 ms of
+/// wire time on this LAN, against typing-class updates of 1–10 KB. Beyond it the
+/// raw copy costs more than the encode it is avoiding.
+///
+/// **Provisional until the §5a telemetry run**, on the same terms as
+/// [`RECT_MAX_COUNT`].
+const RECT_MAX_BYTES: u64 = 96 * 1024;
 
 /// `--list-outputs`.
 pub fn list_outputs() -> Result<()> {
@@ -125,7 +142,21 @@ pub fn run(cfg: &Config) -> Result<()> {
         );
     }
 
-    let header = build_header(cfg, clock, &capture, encoder.as_ref());
+    // The wire's rect coordinates are u16, so a desktop wider or taller than that
+    // cannot be addressed by the fast path at all. Decided once here rather than
+    // re-tested per frame, and announced when it silently costs the operator the
+    // path they asked for.
+    let rects_enabled =
+        cfg.rects && capture.width <= u16::MAX as u32 && capture.height <= u16::MAX as u32;
+    if cfg.rects && !rects_enabled {
+        eprintln!(
+            "capture: {}x{} exceeds the u16 rect coordinates on the wire; \
+             the raw dirty-rect fast path is disabled for this output",
+            capture.width, capture.height
+        );
+    }
+
+    let header = build_header(cfg, clock, &capture, encoder.as_ref(), rects_enabled);
     let header_line = stats::to_line(&header);
 
     let connected = Arc::new(AtomicBool::new(false));
@@ -172,6 +203,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         clock,
         tx,
         connected,
+        rects_enabled,
     ));
     // Only reached when the loop fails; the happy path never returns. Draining the
     // MFT before `MFShutdown` runs (via `_mf`'s Drop) keeps the driver's own logs
@@ -188,6 +220,9 @@ struct CaptureState<'a> {
     clock: QpcClock,
     tx: SyncSender<send::Outbound>,
     connected: Arc<AtomicBool>,
+    /// Whether the raw dirty-rect fast path may run at all: `--no-rects` and a
+    /// desktop too large for the wire's u16 coordinates both switch it off.
+    rects_enabled: bool,
 }
 
 fn capture_state<'a>(
@@ -197,6 +232,7 @@ fn capture_state<'a>(
     clock: QpcClock,
     tx: SyncSender<send::Outbound>,
     connected: Arc<AtomicBool>,
+    rects_enabled: bool,
 ) -> CaptureState<'a> {
     CaptureState {
         capture,
@@ -205,6 +241,7 @@ fn capture_state<'a>(
         clock,
         tx,
         connected,
+        rects_enabled,
     }
 }
 
@@ -213,6 +250,7 @@ fn build_header(
     clock: QpcClock,
     capture: &dxgi::Capture,
     encoder: &dyn encode::Encoder,
+    rects_enabled: bool,
 ) -> Header {
     let mut h = Header::new();
     h.qpc_frequency = clock.freq();
@@ -230,6 +268,15 @@ fn build_header(
     h.encoder_kind = encoder.kind();
     h.codec_api_applied = encoder.codec_api_applied().to_vec();
     h.codec_api_refused = encoder.codec_api_refused().to_vec();
+    // 0/0 when the path is off, so a reader never mistakes a control-arm capture
+    // for one whose predicate simply never fired.
+    let (max_count, max_bytes) = if rects_enabled {
+        (RECT_MAX_COUNT as u32, RECT_MAX_BYTES)
+    } else {
+        (0, 0)
+    };
+    h.rect_max_count = max_count;
+    h.rect_max_bytes = max_bytes;
     h.sequence_header_available = encoder.parameter_sets().is_some();
     h
 }
@@ -242,6 +289,9 @@ struct EmitCtx {
     tx: SyncSender<send::Outbound>,
     /// Cumulative frames dropped because the send queue was full.
     dropped: u64,
+    /// Cumulative rect messages dropped for the same reason. Counted separately so
+    /// fast-path pressure is visible on its own.
+    dropped_rects: u64,
     /// SPS/PPS scanned out of the stream's own access units — the fallback when
     /// the encoder publishes no out-of-band sequence header (Quick Sync). Updated
     /// on every in-band sighting; cleared when the encoder's config epoch moves.
@@ -284,6 +334,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     record.keyframe = au.keyframe;
     record.param_sets_prepended = prepended;
     record.dropped_frames = ctx.dropped;
+    record.dropped_rects = ctx.dropped_rects;
     record.stamp_mismatches = au.stamp_mismatches;
     if au.meta.change_valid {
         record.dirty_rect_count = Some(au.meta.dirty_rect_count);
@@ -323,10 +374,80 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     }
 }
 
+/// Does this frame's change metadata put it on the raw fast path?
+///
+/// Called only with `Some(change)`: metadata that is **absent** must never satisfy
+/// this predicate as `rect_count = 0`, because "we do not know what changed" is not
+/// "nothing changed" — treating the two alike would ship a stale canvas as a fresh
+/// one. `dxgi::acquire` already keeps the two states distinct; this function only
+/// has to not undo that.
+fn takes_fast_path(change: &dxgi::ChangeInfo) -> bool {
+    !change.rects.is_empty()
+        && change.rects.len() <= RECT_MAX_COUNT
+        && change.dirty_bytes() <= RECT_MAX_BYTES
+}
+
+/// Read one frame's dirty rects back raw and hand them to the sender, ahead of the
+/// access unit for the same frame.
+///
+/// This runs while the duplication frame is still held and *before* the converter
+/// touches it: not waiting for convert+encode is the entire latency win.
+fn emit_rects(
+    capture: &mut dxgi::Capture,
+    texture: &ID3D11Texture2D,
+    change: &dxgi::ChangeInfo,
+    frame_seq: u64,
+    ctx: &mut EmitCtx,
+) -> Result<()> {
+    let pack_start = qpc::now();
+    let rect_pixels = capture.read_rects(texture, change)?;
+    let rect_count = rect_pixels.len() as u32;
+    let rect_bytes: u64 = rect_pixels.iter().map(|r| r.pixels.len() as u64).sum();
+    let update = rects::RectUpdate {
+        frame_seq,
+        frame_width: capture.width,
+        frame_height: capture.height,
+        rects: rect_pixels,
+    };
+    let mut payload = Vec::with_capacity(rects::encoded_len(&update));
+    rects::encode(&update, &mut payload);
+    let pack_end = qpc::now();
+
+    let mut record = stats::RectRecord::new();
+    record.frame = frame_seq;
+    record.rect_count = rect_count;
+    record.rect_bytes = rect_bytes;
+    record.pack_start_us = ctx.clock.micros(pack_start);
+    record.pack_end_us = ctx.clock.micros(pack_end);
+    record.dropped_rects = ctx.dropped_rects;
+
+    match ctx
+        .tx
+        .try_send(send::Outbound::Rects(Box::new(record), payload))
+    {
+        Ok(()) => Ok(()),
+        // Full means the socket is behind. Unlike a dropped access unit this costs
+        // no correctness and needs no keyframe: the same frame's AU is still on its
+        // way down the ordinary path and repaints exactly this content.
+        Err(TrySendError::Full(_)) => {
+            ctx.dropped_rects += 1;
+            Ok(())
+        }
+        Err(TrySendError::Disconnected(_)) => Err("sender thread has gone away".to_owned().into()),
+    }
+}
+
 fn capture_loop(state: CaptureState<'_>) -> Result<()> {
     let mut frame_seq: u64 = 0;
     let mut was_connected = false;
     let mut want_keyframe = true;
+    // HLD §5: the first frame after a rebuilt duplication is forced down the
+    // full-frame path. Its dirty metadata describes change since the *new*
+    // duplication's baseline, and whatever changed between the last delivered
+    // frame and that baseline is described by nothing — a small rect here would
+    // lie by omission. The AU has no such gap: the encoder references the last
+    // frame it actually encoded, so the difference it ships is complete.
+    let mut suppress_rects_once = false;
     let mut last_epoch = state.encoder.config_epoch();
     let frame_duration_hns = HNS_PER_SECOND / DECLARED_FPS.max(1) as i64;
     let start_qpc = qpc::now();
@@ -334,6 +455,7 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
         clock: state.clock,
         tx: state.tx.clone(),
         dropped: 0,
+        dropped_rects: 0,
         stream_sets: None,
         encoder_sets: None,
         awaiting_keyframe: None,
@@ -381,11 +503,22 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
             dxgi::Acquired::Recreated => {
                 eprintln!("capture: duplication lost and rebuilt (desktop switch)");
                 want_keyframe = true;
+                suppress_rects_once = true;
                 continue;
             }
         };
 
         frame_seq += 1;
+
+        // The fast path is an overlay, not a branch: whatever happens here, the
+        // frame still goes on to convert, encode and send as H.264 below.
+        if state.rects_enabled && !suppress_rects_once {
+            if let Some(change) = change.as_ref().filter(|c| takes_fast_path(c)) {
+                emit_rects(state.capture, &texture, change, frame_seq, &mut ctx)?;
+            }
+        }
+        suppress_rects_once = false;
+
         let convert_start = qpc::now();
         let nv12 = state.converter.convert(&texture)?;
         let convert_end = qpc::now();

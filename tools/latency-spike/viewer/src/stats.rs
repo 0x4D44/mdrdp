@@ -19,7 +19,9 @@ use serde::Serialize;
 /// Bumped whenever a field changes meaning, so an archived file stays readable.
 /// Schema 2: frames gained `seq` — the server's capture sequence number from
 /// `MSG_VIDEO_SEQ`, the exact cross-file join key (`null` on a v1 stream).
-pub const SCHEMA: u32 = 2;
+/// Schema 3: adds `rects` records (the raw dirty-rect fast path) and `suppressed`
+/// on frame records — so `dropped` no longer means "not presented" on its own.
+pub const SCHEMA: u32 = 3;
 
 /// First line of the file: what this run was, and on which clock.
 #[derive(Debug, Clone, Serialize)]
@@ -69,12 +71,30 @@ pub struct FrameStamps {
     pub height: u32,
 }
 
+/// The client-side stamps of one `MSG_RECTS` update, carried from the network thread
+/// to the window thread exactly as [`FrameStamps`] is — a canvas snapshot published by
+/// the rect path still owes the file a line, and only the presenter knows when it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RectStamps {
+    /// The server's capture sequence number for the frame these rects belong to.
+    /// Always present: `MSG_RECTS` is a wire-v2 message, so there is no legacy case.
+    pub seq: u64,
+    /// When the `read` that completed this message returned.
+    pub recv_done_us: u64,
+    /// Immediately after the last rect was blitted into the canvas.
+    pub paint_done_us: u64,
+    pub rect_count: u32,
+    /// Pixel bytes across all the rects, excluding the per-rect headers.
+    pub rect_bytes: usize,
+}
+
 /// One frame, end to end on the client.
 ///
-/// `present_done_us` is `null` exactly when `dropped` is true: the decode thread had a
-/// newer frame before the window thread ever presented this one. Dropped frames are
-/// recorded rather than discarded — a file that silently omits them would overstate
-/// how well the pipeline kept up.
+/// `dropped` is `present_done_us.is_none() && !suppressed`. A suppressed frame was
+/// never a candidate to present — the rect path had already painted its content, so
+/// the ordering rule withheld the decoded picture on purpose — and counting it as
+/// dropped would overstate how much the pipeline actually lost. A genuine drop is
+/// still recorded rather than discarded, for the same reason.
 #[derive(Debug, Clone, Serialize)]
 pub struct FrameRecord {
     #[serde(rename = "type")]
@@ -91,6 +111,10 @@ pub struct FrameRecord {
     pub width: u32,
     pub height: u32,
     pub dropped: bool,
+    /// The decoded picture was withheld from the canvas by the ordering rule: rects
+    /// for this same frame had already painted it. The decoder still ran, so the
+    /// decode stamps on this line are real.
+    pub suppressed: bool,
 }
 
 impl FrameRecord {
@@ -108,6 +132,93 @@ impl FrameRecord {
             width: stamps.width,
             height: stamps.height,
             dropped: present_done_us.is_none(),
+            suppressed: false,
+        }
+    }
+
+    /// A decoded access unit the ordering rule kept off the canvas. It has no present
+    /// stamp and never will, and that is not a loss.
+    pub fn suppressed(stamps: &FrameStamps) -> Self {
+        Self {
+            kind: "frame",
+            frame: stamps.frame,
+            seq: stamps.seq,
+            recv_done_us: stamps.recv_done_us,
+            decode_in_us: stamps.decode_in_us,
+            decode_out_us: stamps.decode_out_us,
+            present_done_us: None,
+            au_bytes: stamps.au_bytes,
+            keyframe: stamps.keyframe,
+            width: stamps.width,
+            height: stamps.height,
+            dropped: false,
+            suppressed: true,
+        }
+    }
+}
+
+/// One `MSG_RECTS` update, end to end on the client — the fast path's own line.
+///
+/// `skipped` is the visible counter the HLD demands: a rect update the viewer could
+/// not composite is never silently discarded, because "the fast path was not taken"
+/// is exactly the thing a run has to be able to measure.
+#[derive(Debug, Clone, Serialize)]
+pub struct RectRecord {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub seq: u64,
+    pub recv_done_us: u64,
+    /// `null` when the update was skipped: nothing was painted.
+    pub paint_done_us: Option<u64>,
+    pub present_done_us: Option<u64>,
+    pub rect_count: u32,
+    pub rect_bytes: usize,
+    /// Why this update painted nothing, or `null` when it painted.
+    pub skipped: Option<&'static str>,
+    pub dropped: bool,
+}
+
+impl RectRecord {
+    /// An update that was blitted into the canvas. `present_done_us` is `None` when a
+    /// newer snapshot displaced this one before the window thread ever showed it.
+    pub fn painted(stamps: &RectStamps, present_done_us: Option<u64>) -> Self {
+        Self {
+            kind: "rects",
+            seq: stamps.seq,
+            recv_done_us: stamps.recv_done_us,
+            paint_done_us: Some(stamps.paint_done_us),
+            present_done_us,
+            rect_count: stamps.rect_count,
+            rect_bytes: stamps.rect_bytes,
+            skipped: None,
+            dropped: present_done_us.is_none(),
+        }
+    }
+
+    /// An update the viewer refused to composite. `reason` is `"before_base"` (no
+    /// canvas yet — rects can beat the first decodable keyframe), `"size_mismatch"`
+    /// (the update's declared frame size is not the canvas's), `"gap"` / `"stale"`
+    /// (the seq is not adjacent to the canvas's exactness — see
+    /// `sink::Canvas::rects_skip_reason`), or `"empty"` (zero rects: painting
+    /// nothing must not claim a frame's content). Not a drop: nothing was painted,
+    /// so nothing was lost between paint and present.
+    pub fn skipped(
+        seq: u64,
+        recv_done_us: u64,
+        rect_count: u32,
+        rect_bytes: usize,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            kind: "rects",
+            seq,
+            recv_done_us,
+            paint_done_us: None,
+            present_done_us: None,
+            rect_count,
+            rect_bytes,
+            skipped: Some(reason),
+            dropped: false,
         }
     }
 }
@@ -305,6 +416,7 @@ mod tests {
         assert_eq!(v["width"], 1920);
         assert_eq!(v["height"], 1080);
         assert_eq!(v["dropped"], false);
+        assert_eq!(v["suppressed"], false);
     }
 
     #[test]
@@ -323,7 +435,94 @@ mod tests {
         let v = parse(&to_line(&FrameRecord::new(&stamps, None)));
         assert_eq!(v["present_done_us"], Value::Null);
         assert_eq!(v["dropped"], true);
+        assert_eq!(v["suppressed"], false);
         assert_eq!(v["seq"], Value::Null, "a v1 stream has no seq to invent");
+    }
+
+    #[test]
+    fn a_suppressed_frame_is_not_counted_as_dropped() {
+        // The distinction the schema exists for: this access unit was decoded and then
+        // deliberately withheld, so calling it dropped would inflate pipeline loss.
+        let stamps = FrameStamps {
+            frame: 9,
+            seq: Some(31),
+            recv_done_us: 11,
+            decode_in_us: 22,
+            decode_out_us: 33,
+            au_bytes: 44,
+            keyframe: false,
+            width: 1280,
+            height: 720,
+        };
+        let v = parse(&to_line(&FrameRecord::suppressed(&stamps)));
+        assert_eq!(v["type"], "frame");
+        assert_eq!(v["frame"], 9);
+        assert_eq!(v["seq"], 31);
+        assert_eq!(v["decode_in_us"], 22, "the decoder really did run");
+        assert_eq!(v["decode_out_us"], 33);
+        assert_eq!(v["present_done_us"], Value::Null);
+        assert_eq!(v["suppressed"], true);
+        assert_eq!(v["dropped"], false, "suppressed is not dropped");
+    }
+
+    #[test]
+    fn a_painted_and_presented_rect_update_carries_both_stages() {
+        // Every field a different value, so a line built from the wrong stamp shows.
+        let stamps = RectStamps {
+            seq: 77,
+            recv_done_us: 2_000,
+            paint_done_us: 2_150,
+            rect_count: 3,
+            rect_bytes: 9_600,
+        };
+        let v = parse(&to_line(&RectRecord::painted(&stamps, Some(2_900))));
+        assert_eq!(v["type"], "rects");
+        assert_eq!(v["seq"], 77);
+        assert_eq!(v["recv_done_us"], 2_000);
+        assert_eq!(v["paint_done_us"], 2_150);
+        assert_eq!(v["present_done_us"], 2_900);
+        assert_eq!(v["rect_count"], 3);
+        assert_eq!(v["rect_bytes"], 9_600);
+        assert_eq!(v["skipped"], Value::Null);
+        assert_eq!(v["dropped"], false);
+    }
+
+    #[test]
+    fn a_painted_rect_update_that_was_never_presented_is_dropped() {
+        let stamps = RectStamps {
+            seq: 78,
+            recv_done_us: 3_000,
+            paint_done_us: 3_050,
+            rect_count: 1,
+            rect_bytes: 64,
+        };
+        let v = parse(&to_line(&RectRecord::painted(&stamps, None)));
+        assert_eq!(v["paint_done_us"], 3_050, "it was painted, just not shown");
+        assert_eq!(v["present_done_us"], Value::Null);
+        assert_eq!(v["dropped"], true);
+    }
+
+    #[test]
+    fn a_skipped_rect_update_names_its_reason_and_is_not_a_drop() {
+        let v = parse(&to_line(&RectRecord::skipped(
+            5,
+            700,
+            2,
+            512,
+            "before_base",
+        )));
+        assert_eq!(v["type"], "rects");
+        assert_eq!(v["seq"], 5);
+        assert_eq!(v["recv_done_us"], 700);
+        assert_eq!(v["rect_count"], 2);
+        assert_eq!(v["rect_bytes"], 512, "the size is counted even unpainted");
+        assert_eq!(v["skipped"], "before_base");
+        assert_eq!(v["paint_done_us"], Value::Null);
+        assert_eq!(v["present_done_us"], Value::Null);
+        assert_eq!(
+            v["dropped"], false,
+            "nothing was painted, so nothing was lost after painting"
+        );
     }
 
     #[test]

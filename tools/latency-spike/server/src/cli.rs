@@ -1,7 +1,7 @@
 //! Hand-rolled argument parsing, in the style of `src/bin/probe.rs`.
 //!
 //! No clap: this crate is meant to cross-compile with nothing in the tree that
-//! cannot be read in an afternoon, and the flag surface is eight options wide.
+//! cannot be read in an afternoon, and the flag surface is nine options wide.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -13,6 +13,9 @@ pub struct Config {
     pub gop: u32,
     pub out: Option<String>,
     pub list_outputs: bool,
+    /// Send small dirty regions as raw BGRA rects beside the H.264 stream. On by
+    /// default; `--no-rects` turns it off to give a measurement its control arm.
+    pub rects: bool,
 }
 
 pub const DEFAULT_VIDEO_PORT: u16 = 9500;
@@ -37,6 +40,7 @@ impl Default for Config {
             gop: DEFAULT_GOP,
             out: None,
             list_outputs: false,
+            rects: true,
         }
     }
 }
@@ -44,8 +48,12 @@ impl Default for Config {
 pub fn usage() -> &'static str {
     "usage:\n  \
      spike-server --output N [--video-port 9500] [--input-port 9501]\n               \
-                  [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]\n  \
+                  [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]\n               \
+                  [--no-rects]\n  \
      spike-server --list-outputs\n\n\
+     --no-rects withholds the raw dirty-rect fast path, forcing every update down\n  \
+     the H.264-only path. That is the control arm for a measurement, not a tuning\n  \
+     knob: quote it whenever a figure is compared against the hybrid wire.\n\n\
      Both listeners bind 127.0.0.1 only. Reach them over an SSH tunnel:\n  \
      ssh -L 9500:127.0.0.1:9500 -L 9501:127.0.0.1:9501 user@host"
 }
@@ -60,6 +68,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         // Bare flags first: they consume no value, so the cursor advances by one.
         if flag == "--list-outputs" {
             cfg.list_outputs = true;
+            i += 1;
+            continue;
+        }
+        if flag == "--no-rects" {
+            cfg.rects = false;
             i += 1;
             continue;
         }
@@ -144,12 +157,17 @@ mod tests {
         assert_eq!(cfg.gop, 120);
         assert_eq!(cfg.out, None);
         assert!(!cfg.list_outputs);
+        // The fast path is the default: a run has to opt *out* of it, so a forgotten
+        // flag never silently produces the control arm's numbers.
+        assert!(cfg.rects);
     }
 
     #[test]
     fn every_flag_lands_in_its_own_field() {
         // All five numeric values distinct: a fixture reusing one number could not
-        // catch two flags writing the same field.
+        // catch two flags writing the same field. `--no-rects` sits in the middle of
+        // the list, where a bare flag that wrongly consumed a value would derail
+        // every flag after it.
         let cfg = parse(&args(&[
             "--output",
             "2",
@@ -157,6 +175,7 @@ mod tests {
             "19500",
             "--input-port",
             "19501",
+            "--no-rects",
             "--bitrate-kbps",
             "8000",
             "--gop",
@@ -171,6 +190,23 @@ mod tests {
         assert_eq!(cfg.bitrate_kbps, 8000);
         assert_eq!(cfg.gop, 30);
         assert_eq!(cfg.out.as_deref(), Some("/tmp/x.jsonl"));
+        assert!(!cfg.rects);
+    }
+
+    #[test]
+    fn no_rects_turns_the_fast_path_off_and_consumes_no_value() {
+        // The trailing `--out` proves the cursor advanced by one: had `--no-rects`
+        // eaten a value it would have swallowed `--out` and left `out` unset.
+        let cfg = parse(&args(&[
+            "--output",
+            "0",
+            "--no-rects",
+            "--out",
+            "/tmp/y.jsonl",
+        ]))
+        .unwrap();
+        assert!(!cfg.rects);
+        assert_eq!(cfg.out.as_deref(), Some("/tmp/y.jsonl"));
     }
 
     #[test]
