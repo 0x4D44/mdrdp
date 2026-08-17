@@ -1,3 +1,11 @@
+- A sub-notch RDP wheel PDU scrolls nothing: accumulate macOS's fractional lines/pixels into whole 120s (`input::WheelAccumulator`).
+  Windows apps divide arriving rotation by WHEEL_DELTA, so anything under 120 units is
+  discarded outright. macOS reports slow wheel travel as fractional *lines* (acceleration)
+  and trackpads as pixels, so translating each winit event on its own sent a stream of
+  sub-notch PDUs the remote threw away — slow scrolling did nothing until a fast flick
+  crossed the threshold and then jumped. Holding the remainder per axis is the fix; the
+  same event stream also proved that emitting one PDU per notch beats one clamped PDU,
+  since 3 lines is 360 units and the 9-bit wire field silently truncates it to 255.
 - DWMFRAMEINTERVAL below 15 is dead weight: the session's 60Hz virtual display floors the cadence at ~16ms (measured at DWMFI=5, wrk_journals 2026.08.17).
 - The non-AVC path is a latency TRAP on modern Windows: ClearCodec typing round-trips ~416ms p50 vs ~48ms under AVC444 on the same host — 6x fewer bytes, 9x more lag (`--no-avc`, wrk_journals 2026.08.17).
 - DWMFRAMEINTERVAL=15 on the host doubles sustained RDP fps and halves motion RTT, but typing keeps a ~33ms server floor (wrk_journals 2026.08.17).

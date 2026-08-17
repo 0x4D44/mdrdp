@@ -41,6 +41,11 @@ pub const WHEEL_UNITS_MAX: i32 = 255;
 /// has to pick the ratio.
 pub const PIXELS_PER_NOTCH: f64 = 40.0;
 
+/// Most notches one winit event may spend. Beyond this the rest of that event's travel
+/// is dropped rather than held, so the remote can never keep scrolling after the user's
+/// hand has stopped.
+pub const MAX_NOTCHES_PER_EVENT: i32 = 32;
+
 /// A PS/2 Set 1 make code, plus whether it is reached through the `E0` prefix.
 ///
 /// Fast-path carries the code as a single byte and the prefix as a flag, so those are
@@ -344,44 +349,102 @@ pub fn from_cursor_moved<M: PointerMap + ?Sized>(x: f64, y: f64, map: &M) -> Opt
     Some(InputEvent::MouseMove { x, y })
 }
 
-/// Translate a scroll. A diagonal trackpad gesture legitimately yields two events.
+/// Sub-notch scroll travel, carried across events so a slow gesture still reaches the
+/// remote.
 ///
-/// Zero-unit axes are dropped: a wheel PDU carrying no rotation is pure wire noise, and
-/// trackpads produce a great deal of it.
-pub fn from_mouse_wheel(delta: MouseScrollDelta, at: (u16, u16)) -> Vec<InputEvent> {
-    let (horizontal, vertical) = match delta {
-        MouseScrollDelta::LineDelta(x, y) => (
-            f64::from(x) * f64::from(WHEEL_UNITS_PER_NOTCH),
-            f64::from(y) * f64::from(WHEEL_UNITS_PER_NOTCH),
-        ),
-        MouseScrollDelta::PixelDelta(pos) => (
-            pos.x / PIXELS_PER_NOTCH * f64::from(WHEEL_UNITS_PER_NOTCH),
-            pos.y / PIXELS_PER_NOTCH * f64::from(WHEEL_UNITS_PER_NOTCH),
-        ),
-    };
+/// RDP counts rotation in notches of [`WHEEL_UNITS_PER_NOTCH`], and Windows applications
+/// overwhelmingly divide the arriving rotation by that constant — so anything under one
+/// notch scrolls nothing at all. macOS hands us far finer input than that: a trackpad or
+/// Magic Mouse reports pixels, and even a detented wheel arrives as an accelerated,
+/// *fractional* line count. Translating each winit event on its own therefore emits a
+/// stream of sub-notch PDUs the remote discards, and the user sees nothing until a fast
+/// flick finally clears the threshold — at which point every event lands a full notch or
+/// two and the scroll runs away. Holding the remainder converts that same travel into
+/// whole notches: slow scrolling moves, and fast scrolling stays proportional to the
+/// gesture instead of arriving in bursts.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WheelAccumulator {
+    vertical: f64,
+    horizontal: f64,
+}
 
-    let mut out = Vec::new();
-    for (axis, units) in [
-        (ScrollAxis::Vertical, vertical),
-        (ScrollAxis::Horizontal, horizontal),
-    ] {
-        let units = clamp_wheel_units(units);
-        if units != 0 {
-            out.push(InputEvent::Scroll {
-                axis,
-                units,
-                x: at.0,
-                y: at.1,
-            });
-        }
+impl WheelAccumulator {
+    pub fn new() -> Self {
+        Self::default()
     }
-    out
+
+    /// Translate a scroll into whole wheel notches, one PDU each — the shape a detented
+    /// wheel produces, and the only shape the remote reliably acts on.
+    ///
+    /// A diagonal trackpad gesture legitimately yields events on both axes. Axes with no
+    /// whole notch to spend yet are dropped: a wheel PDU carrying no rotation is pure
+    /// wire noise, and trackpads produce a great deal of it.
+    pub fn translate(&mut self, delta: MouseScrollDelta, at: (u16, u16)) -> Vec<InputEvent> {
+        let (horizontal, vertical) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (
+                f64::from(x) * f64::from(WHEEL_UNITS_PER_NOTCH),
+                f64::from(y) * f64::from(WHEEL_UNITS_PER_NOTCH),
+            ),
+            MouseScrollDelta::PixelDelta(pos) => (
+                pos.x / PIXELS_PER_NOTCH * f64::from(WHEEL_UNITS_PER_NOTCH),
+                pos.y / PIXELS_PER_NOTCH * f64::from(WHEEL_UNITS_PER_NOTCH),
+            ),
+        };
+
+        let mut out = Vec::new();
+        for (axis, units, held) in [
+            (ScrollAxis::Vertical, vertical, &mut self.vertical),
+            (ScrollAxis::Horizontal, horizontal, &mut self.horizontal),
+        ] {
+            spend(axis, units, held, at, &mut out);
+        }
+        out
+    }
+}
+
+/// Add one axis of travel to its held remainder and emit whatever whole notches that buys.
+fn spend(axis: ScrollAxis, units: f64, held: &mut f64, at: (u16, u16), out: &mut Vec<InputEvent>) {
+    if !units.is_finite() || units == 0.0 {
+        return;
+    }
+    // Travel held from the other direction is stale the moment the user reverses:
+    // spending it would eat the start of the new gesture.
+    if units.signum() != held.signum() {
+        *held = 0.0;
+    }
+    *held += units;
+
+    let per_notch = f64::from(WHEEL_UNITS_PER_NOTCH);
+    let notches = (*held / per_notch).trunc().clamp(
+        f64::from(-MAX_NOTCHES_PER_EVENT),
+        f64::from(MAX_NOTCHES_PER_EVENT),
+    ) as i32;
+    if notches == 0 {
+        return;
+    }
+    *held -= f64::from(notches) * per_notch;
+    // A whole notch can only survive the subtraction when the cap bit. Drop it: banking
+    // it would keep the remote scrolling after the gesture ended.
+    if held.abs() >= per_notch {
+        *held = 0.0;
+    }
+
+    let step = clamp_wheel_units(per_notch * f64::from(notches.signum()));
+    for _ in 0..notches.abs() {
+        out.push(InputEvent::Scroll {
+            axis,
+            units: step,
+            x: at.0,
+            y: at.1,
+        });
+    }
 }
 
 /// Round and clamp wheel rotation into the 9-bit two's-complement wire range.
 ///
-/// Clamping is not cosmetic: `MousePdu::encode` debug-asserts this range, so an
-/// unclamped three-notch flick panics a debug build.
+/// Clamping is not cosmetic: `MousePdu::encode` debug-asserts this range, so a rotation
+/// past it panics a debug build and silently truncates a release one. Every
+/// [`InputEvent::Scroll`] is built through here so no path can produce one.
 pub fn clamp_wheel_units(units: f64) -> i16 {
     if !units.is_finite() {
         return 0;
@@ -933,9 +996,20 @@ mod tests {
 
     // --- scrolling ----------------------------------------------------------------
 
+    /// A vertical scroll event of `units`, at the origin unless a test says otherwise.
+    fn notch(units: i16) -> InputEvent {
+        InputEvent::Scroll {
+            axis: ScrollAxis::Vertical,
+            units,
+            x: 0,
+            y: 0,
+        }
+    }
+
     #[test]
     fn one_wheel_line_is_one_notch_in_each_direction() {
-        let up = from_mouse_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), (7, 8));
+        let mut wheel = WheelAccumulator::new();
+        let up = wheel.translate(MouseScrollDelta::LineDelta(0.0, 1.0), (7, 8));
         assert_eq!(
             up,
             vec![InputEvent::Scroll {
@@ -946,7 +1020,7 @@ mod tests {
             }]
         );
 
-        let down = from_mouse_wheel(MouseScrollDelta::LineDelta(0.0, -1.0), (7, 8));
+        let down = wheel.translate(MouseScrollDelta::LineDelta(0.0, -1.0), (7, 8));
         assert_eq!(
             down,
             vec![InputEvent::Scroll {
@@ -991,33 +1065,101 @@ mod tests {
     }
 
     #[test]
-    fn a_fast_flick_is_clamped_into_the_wire_range() {
-        // Three notches is 360 units, which does not fit a 9-bit field. Unclamped, the
-        // encoder's debug_assert fires and a release build silently sends garbage.
-        let events = from_mouse_wheel(MouseScrollDelta::LineDelta(0.0, 3.0), (0, 0));
-        assert_eq!(
-            events,
-            vec![InputEvent::Scroll {
-                axis: ScrollAxis::Vertical,
-                units: 255,
-                x: 0,
-                y: 0,
-            }]
-        );
+    fn a_multi_line_event_spends_every_notch_rather_than_clamping_them_away() {
+        // Three lines is 360 units, which does not fit the 9-bit wire field. Sent as one
+        // PDU it clamps to 255 — the user asked for three notches and the remote scrolls
+        // two. One PDU per notch keeps the travel and stays inside the field.
+        let mut wheel = WheelAccumulator::new();
+        let events = wheel.translate(MouseScrollDelta::LineDelta(0.0, 3.0), (0, 0));
+        assert_eq!(events, vec![notch(120), notch(120), notch(120)]);
+
         assert_eq!(clamp_wheel_units(-100_000.0), -256);
         assert_eq!(clamp_wheel_units(f64::NAN), 0);
     }
 
     #[test]
+    fn slow_travel_accumulates_until_it_buys_a_whole_notch() {
+        // The bug this guards: macOS reports slow scrolling in fractions of a line (and
+        // trackpads in single pixels). Emitted per event, each is a sub-notch PDU the
+        // remote discards, so a slow scroll moves nothing at all.
+        let mut wheel = WheelAccumulator::new();
+        let mut sent = Vec::new();
+        for _ in 0..9 {
+            sent.extend(wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.1), (0, 0)));
+        }
+        assert!(sent.is_empty(), "0.9 of a line is not yet a notch");
+
+        sent.extend(wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.1), (0, 0)));
+        assert_eq!(
+            sent,
+            vec![notch(120)],
+            "the tenth tenth completes the notch"
+        );
+    }
+
+    #[test]
+    fn reversing_direction_drops_the_travel_held_the_other_way() {
+        // Otherwise the first half of the new gesture is spent cancelling the old one,
+        // and a flick down then up feels dead in the up direction.
+        let mut wheel = WheelAccumulator::new();
+        assert!(
+            wheel
+                .translate(MouseScrollDelta::LineDelta(0.0, 0.9), (0, 0))
+                .is_empty()
+        );
+        assert!(
+            wheel
+                .translate(MouseScrollDelta::LineDelta(0.0, -0.5), (0, 0))
+                .is_empty()
+        );
+        let events = wheel.translate(MouseScrollDelta::LineDelta(0.0, -0.5), (0, 0));
+        assert_eq!(
+            events,
+            vec![notch(-120)],
+            "one full line down, held from zero"
+        );
+    }
+
+    #[test]
+    fn a_runaway_flick_is_capped_and_not_banked_for_later() {
+        let mut wheel = WheelAccumulator::new();
+        let huge = wheel.translate(
+            MouseScrollDelta::LineDelta(0.0, MAX_NOTCHES_PER_EVENT as f32 * 10.0),
+            (0, 0),
+        );
+        assert_eq!(huge.len(), MAX_NOTCHES_PER_EVENT as usize);
+
+        // The dropped remainder must not reappear on the next tiny nudge.
+        let next = wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.1), (0, 0));
+        assert!(next.is_empty(), "a backlog would keep scrolling on its own");
+    }
+
+    #[test]
+    fn each_axis_holds_its_own_remainder() {
+        // A shared remainder would let horizontal jitter fund a vertical notch.
+        let mut wheel = WheelAccumulator::new();
+        let none = wheel.translate(MouseScrollDelta::LineDelta(0.6, 0.6), (0, 0));
+        assert!(none.is_empty());
+
+        let vertical_only = wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.4), (0, 0));
+        assert_eq!(
+            vertical_only,
+            vec![notch(120)],
+            "only the vertical axis had a full line"
+        );
+    }
+
+    #[test]
     fn a_diagonal_gesture_produces_one_event_per_axis_and_drops_the_still_ones() {
-        let both = from_mouse_wheel(MouseScrollDelta::LineDelta(1.0, 1.0), (0, 0));
+        let mut wheel = WheelAccumulator::new();
+        let both = wheel.translate(MouseScrollDelta::LineDelta(1.0, 1.0), (0, 0));
         assert_eq!(both.len(), 2, "one event per moving axis");
 
-        let neither = from_mouse_wheel(MouseScrollDelta::LineDelta(0.0, 0.0), (0, 0));
+        let neither = wheel.translate(MouseScrollDelta::LineDelta(0.0, 0.0), (0, 0));
         assert!(neither.is_empty(), "a zero scroll is pure wire noise");
 
-        // Sub-threshold trackpad jitter rounds to zero units and must be dropped too.
-        let jitter = from_mouse_wheel(
+        // A single pixel of trackpad jitter buys no notch, so it stays off the wire.
+        let jitter = wheel.translate(
             MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.1)),
             (0, 0),
         );
@@ -1026,7 +1168,8 @@ mod tests {
 
     #[test]
     fn a_full_notch_of_trackpad_travel_is_a_full_notch_of_rotation() {
-        let ev = from_mouse_wheel(
+        let mut wheel = WheelAccumulator::new();
+        let ev = wheel.translate(
             MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, PIXELS_PER_NOTCH)),
             (0, 0),
         );

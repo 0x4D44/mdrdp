@@ -847,6 +847,9 @@ struct SessionApp {
     /// Last pointer position, in session pixels. Buttons and scrolls need coordinates
     /// and winit does not repeat them.
     cursor: Option<(u16, u16)>,
+    /// Sub-notch scroll travel held between wheel events. See
+    /// [`input::WheelAccumulator`].
+    wheel: input::WheelAccumulator,
     /// The store generation last put on screen. `None` until the first frame.
     presented: Option<u64>,
     failure: Option<WindowError>,
@@ -940,6 +943,7 @@ impl SessionApp {
             surface: None,
             viewport,
             cursor: None,
+            wheel: input::WheelAccumulator::new(),
             presented: None,
             failure: None,
             policy,
@@ -1710,7 +1714,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(at) = self.cursor {
-                    for translated in input::from_mouse_wheel(delta, at) {
+                    for translated in self.wheel.translate(delta, at) {
                         self.send(event_loop, translated);
                     }
                 }
