@@ -1,3 +1,9 @@
+- A non-resizable egui window needs a two-sided fit test; the 440px About dialog already overflowed unseen (`ui::help` tests).
+  Aux windows open at a fixed size, so content that grows clips the Close button off the
+  bottom and content that shrinks strands the chrome strip in mid-air. Laying out one real
+  frame with `Context::run_ui` at exactly the window size and asserting every text rect sits
+  inside it — and that the lowest one is within 30px of the bottom — caught a Vendored row
+  that had been running 35px past the launcher's dialog edge since the dialog shipped.
 - Quench's encoder ticks at ~60Hz but sustains ~30fps (the remote-session cap), and Windows App runs plain TCP on this LAN — no UDP advantage (`stats::SessionStats::frame_gap`).
 - Typing latency to quench is ~30ms p50 and lives on the SERVER: client decode is 1.3ms, present 2ms; the metrics `decode`/`present` split proves it (`stats::SessionStats`).
 - A cross-target guard nobody can run is a guard that never ran: the msvc check "verified clean" predated the deps that break it (`scripts/check-windows.sh`).
