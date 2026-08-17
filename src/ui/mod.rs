@@ -9,9 +9,11 @@
 //!   the transient toasts straight into the softbuffer frame;
 //! - [`theme`] — the handoff's design tokens, egui fonts and visuals;
 //! - [`egui_host`] — auxiliary egui windows on an existing winit loop;
-//! - [`end_dialog`] — the Session-ended/lost epilogue dialogs.
+//! - [`end_dialog`] — the Session-ended/lost epilogue dialogs;
+//! - [`help`] — the About facts and shortcut tables both Help menus draw from.
 
 pub mod egui_host;
 pub mod end_dialog;
 pub mod font;
+pub mod help;
 pub mod theme;

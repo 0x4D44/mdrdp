@@ -1112,60 +1112,36 @@ pub fn quit_with_sessions(ctx: &egui::Context, sessions: &[(String, u32, u64)]) 
 }
 
 /// About mdrdp (§7, 440): icon, version, and the rows the spec names.
+///
+/// The content is [`crate::ui::help::about_body`], shared with the session process's
+/// Help ▸ About window so the two can never disagree about what this build is.
 pub fn about(ctx: &egui::Context, icon: Option<&egui::TextureHandle>) -> bool {
+    closable(ctx, "about-mdrdp", 440.0, |ui| {
+        crate::ui::help::about_body(ui, icon)
+    })
+}
+
+/// Keyboard shortcuts: the launcher's own keys, from the shared table.
+pub fn shortcuts(ctx: &egui::Context) -> bool {
+    closable(ctx, "keyboard-shortcuts", 460.0, |ui| {
+        ui.label(
+            RichText::new("Keyboard shortcuts")
+                .font(theme::sans_semibold(16.0))
+                .color(theme::TEXT_PRIMARY),
+        );
+        crate::ui::help::shortcuts_body(ui, &crate::ui::help::launcher_shortcuts());
+    })
+}
+
+/// A read-only dialog whose only control is Close. Returns `true` once it should go —
+/// the button, or Escape.
+fn closable(ctx: &egui::Context, id: &str, width: f32, body: impl FnOnce(&mut egui::Ui)) -> bool {
     let (_, close) = dialog(
         ctx,
-        "about-mdrdp",
-        440.0,
+        id,
+        width,
         false,
-        |ui| {
-            ui.vertical_centered(|ui| {
-                if let Some(icon) = icon {
-                    ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(72.0, 72.0)));
-                }
-                ui.label(
-                    RichText::new("mdrdp")
-                        .font(theme::sans_semibold(18.0))
-                        .color(theme::TEXT_PRIMARY),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {} {}",
-                        env!("CARGO_PKG_VERSION"),
-                        std::env::consts::OS,
-                        std::env::consts::ARCH
-                    ))
-                    .font(theme::mono(12.0))
-                    .color(theme::TEXT_MUTED),
-                );
-            });
-            ui.add_space(6.0);
-            for (label, value) in [
-                ("Licence", "MIT OR Apache-2.0"),
-                ("Protocol", "IronRDP 0.17"),
-                (
-                    "Vendored",
-                    "ironrdp-connector (one flag, or EGFX never opens)",
-                ),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [90.0, 18.0],
-                        egui::Label::new(
-                            RichText::new(label)
-                                .font(theme::sans(12.0))
-                                .color(theme::TEXT_MUTED),
-                        ),
-                    );
-                    ui.label(
-                        RichText::new(value)
-                            .font(theme::mono(12.0))
-                            .color(theme::TEXT_SECONDARY),
-                    );
-                });
-            }
-            false
-        },
+        body,
         |ui| {
             let mut close = false;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

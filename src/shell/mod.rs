@@ -84,6 +84,7 @@ struct ConnectFlow {
 enum Modal {
     Settings(Box<settings_ui::SettingsModal>),
     About,
+    Shortcuts,
     Edit(dialogs::EditState),
     Remove(dialogs::RemoveState),
     /// Confirm quitting while sessions run.
@@ -519,6 +520,7 @@ impl LauncherApp {
                 Some(menus::MenuAction::NewConnection) => self.open_wizard(),
                 Some(menus::MenuAction::Settings) => self.open_settings(),
                 Some(menus::MenuAction::About) => self.modal = Some(Modal::About),
+                Some(menus::MenuAction::Shortcuts) => self.modal = Some(Modal::Shortcuts),
                 Some(menus::MenuAction::RevealFavourites) => reveal(&self.config_path),
                 Some(menus::MenuAction::Connect) => {
                     if let Some(i) = self.selected {
@@ -950,9 +952,14 @@ impl LauncherApp {
             },
             Modal::About => {
                 if self.about_icon.is_none() {
-                    self.about_icon = about_icon_texture(ctx);
+                    self.about_icon = crate::ui::help::icon_texture(ctx);
                 }
                 if !dialogs::about(ctx, self.about_icon.as_ref()) {
+                    self.modal = Some(modal);
+                }
+            }
+            Modal::Shortcuts => {
+                if !dialogs::shortcuts(ctx) {
                     self.modal = Some(modal);
                 }
             }
@@ -1069,7 +1076,7 @@ pub fn run(
     settings: crate::settings::Settings,
     settings_path: Option<PathBuf>,
 ) -> Result<(), String> {
-    let icon = window_icon();
+    let icon = crate::ui::help::app_icon();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(WINDOW_SIZE)
         .with_min_inner_size(WINDOW_SIZE)
@@ -1099,34 +1106,6 @@ pub fn run(
         }),
     )
     .map_err(|e| format!("launcher window failed: {e}"))
-}
-
-/// The About dialog's icon as an egui texture. `None` on decode failure.
-fn about_icon_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let icon = window_icon()?;
-    let image = egui::ColorImage::from_rgba_unmultiplied(
-        [icon.width as usize, icon.height as usize],
-        &icon.rgba,
-    );
-    Some(ctx.load_texture("about-icon", image, egui::TextureOptions::LINEAR))
-}
-
-/// Decode the embedded window icon. `None` on decode failure — cosmetic, never fatal.
-fn window_icon() -> Option<egui::IconData> {
-    let bytes: &[u8] = include_bytes!("../../assets/icon/macos/icon-256.png");
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder.read_info().ok()?;
-    let mut buf = vec![0; reader.output_buffer_size()?];
-    let info = reader.next_frame(&mut buf).ok()?;
-    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
-        return None;
-    }
-    buf.truncate(info.buffer_size());
-    Some(egui::IconData {
-        rgba: buf,
-        width: info.width,
-        height: info.height,
-    })
 }
 
 /// Launch a connecting session child with `--stage-json`, and a reader thread that
@@ -1282,6 +1261,7 @@ mod menus {
         NewConnection,
         Settings,
         About,
+        Shortcuts,
         RevealFavourites,
         Connect,
         Edit,
@@ -1343,9 +1323,10 @@ mod menus {
             ]);
             #[cfg(not(target_os = "macos"))]
             {
+                // No app menu off macOS, so Settings lands in File. About does not:
+                // Windows and Linux both expect it under Help, where it now lives.
                 let settings = item("Settings…", MenuAction::Settings);
-                let about = item("About mdrdp", MenuAction::About);
-                let _ = file.append_items(&[&PredefinedMenuItem::separator(), &settings, &about]);
+                let _ = file.append_items(&[&PredefinedMenuItem::separator(), &settings]);
             }
             let _ = menu.append(&file);
 
@@ -1369,7 +1350,17 @@ mod menus {
 
             let view = Submenu::new("View", true);
             let _ = menu.append(&view);
+
+            // Help is the last submenu and the only one every platform agrees on. On
+            // macOS About stays in the app menu, where the platform puts it.
             let help = Submenu::new("Help", true);
+            let shortcuts = item("Keyboard shortcuts…", MenuAction::Shortcuts);
+            let _ = help.append(&shortcuts);
+            #[cfg(not(target_os = "macos"))]
+            {
+                let about = item("About mdrdp", MenuAction::About);
+                let _ = help.append_items(&[&PredefinedMenuItem::separator(), &about]);
+            }
             let _ = menu.append(&help);
 
             #[cfg(target_os = "macos")]

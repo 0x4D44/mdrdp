@@ -147,6 +147,40 @@ impl DiagKind {
     }
 }
 
+/// Every extra window the session process can open beside the desktop: the three
+/// diagnostics screens and the two Help windows.
+///
+/// One enum for all of them because they share everything that matters — one window
+/// per kind, the same Esc/close key handling, the same removal path. What differs is
+/// only which body is drawn, and that is one `match` in the redraw arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuxKind {
+    Diag(DiagKind),
+    About,
+    Shortcuts,
+}
+
+impl AuxKind {
+    fn title(self) -> &'static str {
+        match self {
+            AuxKind::Diag(kind) => kind.title(),
+            AuxKind::About => "About mdrdp",
+            AuxKind::Shortcuts => "Keyboard shortcuts",
+        }
+    }
+
+    /// The window size this kind opens at. Aux windows are not resizable, so these
+    /// have to fit their content; the Help sizes live beside the bodies they have to
+    /// hold, where a layout test can lay out a real frame at exactly them.
+    fn size(self) -> [f32; 2] {
+        match self {
+            AuxKind::Diag(_) => [900.0, 700.0],
+            AuxKind::About => crate::ui::help::ABOUT_WINDOW,
+            AuxKind::Shortcuts => crate::ui::help::SHORTCUTS_WINDOW,
+        }
+    }
+}
+
 /// The UI bodies for the three diagnostics windows, supplied by whoever holds the
 /// stats handles (`main.rs`). The window module stays ignorant of what they draw;
 /// each returns `true` when its Close control was used and the window should go.
@@ -859,8 +893,11 @@ struct SessionApp {
     cursor_hidden: bool,
     /// UI bodies for the diagnostics windows, when the caller supplied any.
     diagnostics: Option<DiagnosticsUis>,
-    /// Open diagnostics windows. At most one per [`DiagKind`].
-    aux: Vec<(DiagKind, crate::ui::egui_host::AuxWindow)>,
+    /// Open auxiliary windows. At most one per [`AuxKind`].
+    aux: Vec<(AuxKind, crate::ui::egui_host::AuxWindow)>,
+    /// The About window's icon texture, loaded on its first frame. Belongs to that
+    /// window's egui context, so it is dropped with the window.
+    about_icon: Option<egui::TextureHandle>,
     /// The native session menu bar; dropping it removes the menu.
     menu: Option<session_menu::SessionMenuBar>,
     /// Last 1 Hz diagnostics refresh, used with `ControlFlow::WaitUntil`.
@@ -924,6 +961,7 @@ impl SessionApp {
             cursor_hidden: false,
             diagnostics: None,
             aux: Vec::new(),
+            about_icon: None,
             menu: None,
             last_diag_refresh: Instant::now(),
             transients: None,
@@ -953,22 +991,42 @@ impl SessionApp {
         }
     }
 
-    /// Open (or focus) the diagnostics window of `kind`.
+    /// Open the diagnostics window of `kind`, if any diagnostics are wired up.
     fn open_diagnostics(&mut self, event_loop: &ActiveEventLoop, kind: DiagKind) {
         if self.diagnostics.is_none() {
             eprintln!("no diagnostics are wired into this window");
             return;
         }
+        self.open_aux(event_loop, AuxKind::Diag(kind));
+    }
+
+    /// Open the auxiliary window of `kind`. A second request for one already open is
+    /// ignored — nothing focuses a window portably, and one is enough.
+    fn open_aux(&mut self, event_loop: &ActiveEventLoop, kind: AuxKind) {
         if self.aux.iter().any(|(k, _)| *k == kind) {
-            return; // Already open; nothing focuses it portably, and one is enough.
+            return;
         }
-        match crate::ui::egui_host::AuxWindow::open(event_loop, kind.title(), [900.0, 700.0]) {
+        match crate::ui::egui_host::AuxWindow::open(event_loop, kind.title(), kind.size()) {
             Ok(win) => {
                 self.aux.push((kind, win));
                 event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + DIAG_REFRESH));
             }
-            // A diagnostics window that cannot open must never take the session down.
+            // An extra window that cannot open must never take the session down.
             Err(e) => eprintln!("could not open the {} window: {e}", kind.title()),
+        }
+    }
+
+    /// Drop the aux window at `pos` and settle the loop's control flow.
+    ///
+    /// Every close path goes through here so the About window's texture cannot
+    /// outlive the egui context that owns it.
+    fn close_aux(&mut self, event_loop: &ActiveEventLoop, pos: usize) {
+        let (kind, _) = self.aux.remove(pos);
+        if kind == AuxKind::About {
+            self.about_icon = None;
+        }
+        if self.aux.is_empty() && self.toasts.is_empty() {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -979,6 +1037,8 @@ impl SessionApp {
             session_menu::DIAG_CHANNELS => {
                 self.open_diagnostics(event_loop, DiagKind::Channels);
             }
+            session_menu::HELP_ABOUT => self.open_aux(event_loop, AuxKind::About),
+            session_menu::HELP_SHORTCUTS => self.open_aux(event_loop, AuxKind::Shortcuts),
             session_menu::STATS_OVERLAY => {
                 self.show_stats = !self.show_stats;
                 if let Some(window) = &self.window {
@@ -1389,7 +1449,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         self.menu = Some(session_menu::install(&window));
 
         // Scripted runs cannot click a native menu, so `MDRDP_OPEN_DIAG=cache,latency,
-        // channels` opens the named diagnostics windows at startup — the automated
+        // channels,about,shortcuts` opens the named windows at startup — the automated
         // verification path for windows that are otherwise menu-only.
         if let Ok(names) = std::env::var("MDRDP_OPEN_DIAG") {
             for name in names.split(',') {
@@ -1397,6 +1457,8 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                     "cache" => self.open_diagnostics(event_loop, DiagKind::Cache),
                     "latency" => self.open_diagnostics(event_loop, DiagKind::Latency),
                     "channels" => self.open_diagnostics(event_loop, DiagKind::Channels),
+                    "about" => self.open_aux(event_loop, AuxKind::About),
+                    "shortcuts" => self.open_aux(event_loop, AuxKind::Shortcuts),
                     "" => {}
                     other => eprintln!("MDRDP_OPEN_DIAG: unknown window {other:?}"),
                 }
@@ -1459,40 +1521,53 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        // Diagnostics windows first: their events must not fall through to the
-        // session handling below (a stray CloseRequested would end the session).
+        // Auxiliary windows first: their events must not fall through to the session
+        // handling below (a stray CloseRequested would end the session).
         if let Some(pos) = self.aux.iter().position(|(_, w)| w.window_id() == id) {
             match event {
                 WindowEvent::CloseRequested | WindowEvent::Destroyed => {
-                    self.aux.remove(pos);
-                    if self.aux.is_empty() && self.toasts.is_empty() {
-                        event_loop.set_control_flow(ControlFlow::Wait);
-                    }
+                    self.close_aux(event_loop, pos);
                 }
                 WindowEvent::RedrawRequested => {
                     let (kind, win) = &mut self.aux[pos];
                     let mut close = false;
-                    match self.diagnostics.as_mut() {
-                        Some(uis) => {
-                            let body = uis.ui_for(*kind);
-                            win.redraw(|ui| {
-                                close |= body(ui);
-                                // Cmd+W (Ctrl+W elsewhere) and Escape close too: over
-                                // a fullscreen session the window may have no OS
-                                // titlebar, so the button must not be the only way.
-                                close |= ui.input(|i| {
-                                    i.key_pressed(egui::Key::Escape)
-                                        || (i.modifiers.command && i.key_pressed(egui::Key::W))
+                    // Cmd+W (Ctrl+W elsewhere) and Escape close every aux window: over
+                    // a fullscreen session the window may have no OS titlebar, so the
+                    // button must not be the only way out.
+                    let key_closed = |ui: &egui::Ui| {
+                        ui.input(|i| {
+                            i.key_pressed(egui::Key::Escape)
+                                || (i.modifiers.command && i.key_pressed(egui::Key::W))
+                        })
+                    };
+                    match *kind {
+                        AuxKind::Diag(diag) => match self.diagnostics.as_mut() {
+                            Some(uis) => {
+                                let body = uis.ui_for(diag);
+                                win.redraw(|ui| {
+                                    close |= body(ui);
+                                    close |= key_closed(ui);
                                 });
+                            }
+                            None => win.redraw(|_| {}),
+                        },
+                        AuxKind::About => {
+                            let icon = &mut self.about_icon;
+                            win.redraw(|ui| {
+                                close |= crate::ui::help::about_window(ui, icon);
+                                close |= key_closed(ui);
                             });
                         }
-                        None => win.redraw(|_| {}),
+                        AuxKind::Shortcuts => {
+                            let groups = crate::ui::help::session_shortcuts();
+                            win.redraw(|ui| {
+                                close |= crate::ui::help::shortcuts_window(ui, &groups);
+                                close |= key_closed(ui);
+                            });
+                        }
                     }
                     if close {
-                        self.aux.remove(pos);
-                        if self.aux.is_empty() && self.toasts.is_empty() {
-                            event_loop.set_control_flow(ControlFlow::Wait);
-                        }
+                        self.close_aux(event_loop, pos);
                     }
                 }
                 other => {
@@ -1654,6 +1729,8 @@ mod session_menu {
     pub const DIAG_LATENCY: &str = "diag.latency";
     pub const DIAG_CHANNELS: &str = "diag.channels";
     pub const STATS_OVERLAY: &str = "diag.overlay";
+    pub const HELP_SHORTCUTS: &str = "help.shortcuts";
+    pub const HELP_ABOUT: &str = "help.about";
 
     /// Holds the muda objects alive; dropping this removes the native menu.
     pub struct SessionMenuBar {
@@ -1665,8 +1742,14 @@ mod session_menu {
 
         #[cfg(target_os = "macos")]
         {
+            // About lives in the app menu on macOS, the way the platform expects —
+            // off macOS it goes under Help with the shortcuts.
             let app = Submenu::new("mdrdp", true);
-            let _ = app.append_items(&[&PredefinedMenuItem::quit(None)]);
+            let _ = app.append_items(&[
+                &MenuItem::with_id(HELP_ABOUT, "About mdrdp", true, None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::quit(None),
+            ]);
             let _ = menu.append(&app);
         }
 
@@ -1698,6 +1781,19 @@ mod session_menu {
         let _ = menu.append(&diagnostics);
 
         let help = Submenu::new("Help", true);
+        let _ = help.append(&MenuItem::with_id(
+            HELP_SHORTCUTS,
+            "Keyboard shortcuts…",
+            true,
+            None,
+        ));
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = help.append_items(&[
+                &PredefinedMenuItem::separator(),
+                &MenuItem::with_id(HELP_ABOUT, "About mdrdp", true, None),
+            ]);
+        }
         let _ = menu.append(&help);
 
         #[cfg(target_os = "macos")]
