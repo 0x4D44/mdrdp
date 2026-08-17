@@ -18,6 +18,7 @@ pub mod h264;
 pub mod hostscripts;
 pub mod input;
 pub mod metrics;
+pub mod presence;
 pub mod probe;
 pub mod process_metrics;
 pub mod screenshot;

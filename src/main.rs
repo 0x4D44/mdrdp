@@ -230,7 +230,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if args.first().is_some_and(|a| a == "--") {
             (args.get(1).cloned(), args.iter().skip(2).cloned().collect())
         } else {
-            let p = args.first().filter(|h| !h.starts_with("--")).cloned();
+            let p = args.first().filter(|h| !h.starts_with('-')).cloned();
             let rest: Vec<String> = if p.is_some() {
                 args.iter().skip(1).cloned().collect()
             } else {
@@ -252,9 +252,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut ask_password = false;
     let mut stage_json = false;
     let mut list_only = false;
+    let mut sessions_only = false;
     let mut force_fullscreen = false;
     let mut foreground = false;
 
+    // Human-typed flags carry a single-letter short code as well; harness-facing ones
+    // (--stage-json, --metrics-json, …) stay long-only — a script types them once.
     let mut i = 0usize;
     while i < args.len() {
         let value = || -> Result<&String, String> {
@@ -262,8 +265,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or_else(|| format!("{} needs a value", args[i]))
         };
         match args[i].as_str() {
-            "--list" => {
+            "--list" | "-l" => {
                 list_only = true;
+                i += 1;
+                continue;
+            }
+            "--sessions" | "-S" => {
+                sessions_only = true;
                 i += 1;
                 continue;
             }
@@ -282,25 +290,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 continue;
             }
-            "--fullscreen" => {
+            "--fullscreen" | "-f" => {
                 force_fullscreen = true;
                 i += 1;
                 continue;
             }
-            "--foreground" => {
+            "--foreground" | "-F" => {
                 foreground = true;
                 i += 1;
                 continue;
             }
-            "--user" => user = Some(value()?.clone()),
-            "--port" => port = Some(value()?.parse()?),
-            "--domain" => domain = Some(value()?.clone()),
+            "--user" | "-u" => user = Some(value()?.clone()),
+            "--port" | "-p" => port = Some(value()?.parse()?),
+            "--domain" | "-d" => domain = Some(value()?.clone()),
             "--capture-failures" => capture = Some(value()?.clone()),
-            "--duration" => duration = Some(value()?.parse()?),
+            "--duration" | "-t" => duration = Some(value()?.parse()?),
             "--screenshot" => screenshot = Some(value()?.clone()),
             "--metrics-json" => metrics_json = Some(value()?.clone()),
             "--input-script" => input_script = Some(value()?.clone()),
-            "--size" => {
+            "--size" | "-s" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--size wants WxH, e.g. 1280x800")?;
                 size = Some((w.parse()?, h.parse()?));
@@ -314,6 +322,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--ask-password needs --stage-json (a driving launcher); \
              for a scripted run use --password-stdin"
             .into());
+    }
+
+    // The sessions listing needs no favourites, no credential, and no window: read the
+    // presence files, print, done. Handled before the detach decision so it always
+    // stays on the invoking terminal.
+    if sessions_only {
+        let dir = mdrdp::presence::default_dir()
+            .ok_or("no config directory, so no sessions can be recorded")?;
+        let now = mdrdp::presence::unix_now();
+        let sessions = mdrdp::presence::list_from(&dir, now);
+        if sessions.is_empty() {
+            println!("no active sessions");
+        } else {
+            print!("{}", mdrdp::presence::render_table(&sessions, now));
+        }
+        return Ok(());
     }
 
     // A GUI run started from a terminal gives the prompt back: re-spawn detached and
@@ -904,7 +928,57 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state_key_for_exit = state_key.clone();
     let state_path_for_exit = state_path.clone();
     let fullscreen_for_exit = Arc::clone(&fullscreen_at_exit);
+    // Keep a presence file alive for `mdrdp --sessions` in other processes. The exit
+    // hook both stops the writer and removes the file itself: on macOS Cmd+Q the
+    // process exits without unwinding, so the writer thread may never see the flag.
+    let presence_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let presence_dir = mdrdp::presence::default_dir();
+    if let Some(dir) = presence_dir.clone() {
+        let stats = session_stats.clone();
+        let store = Arc::clone(&store);
+        let name = display_name.clone();
+        let host = target.host.clone();
+        let user = target.user.clone();
+        let port = target.port;
+        let pid = std::process::id();
+        let started_unix = mdrdp::presence::unix_now();
+        let (mut width, mut height) = (desktop.width, desktop.height);
+        mdrdp::presence::spawn_writer(dir, Arc::clone(&presence_stop), move || {
+            let s = stats.snapshot();
+            if let Some(surface) = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .output_surface()
+            {
+                (width, height) = (surface.width, surface.height);
+            }
+            mdrdp::presence::SessionPresence {
+                pid,
+                name: name.clone(),
+                host: host.clone(),
+                port,
+                user: user.clone(),
+                width,
+                height,
+                started_unix,
+                updated_unix: mdrdp::presence::unix_now(),
+                frames: s.frames,
+                bytes_in: s.bytes_in,
+                cache_hits: s.cache.hits,
+                cache_misses: s.cache.misses,
+                latency_p50_us: s.latency.recent().map(|p| p.p50),
+                frame_gap_p50_us: s.frame_gap.recent().map(|p| p.p50),
+                decode_errors: s.decode_errors,
+                codecs: s.codecs.clone(),
+            }
+        });
+    }
+    let presence_stop_for_exit = Arc::clone(&presence_stop);
     let window = window.on_exit(move || {
+        presence_stop_for_exit.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(dir) = &presence_dir {
+            mdrdp::presence::remove_from(dir, std::process::id());
+        }
         // Remember how the window closed, fullscreen-wise, so the next launch of this
         // target can open the same way. Best-effort: a failed save costs one toggle.
         if let Some(path) = &state_path_for_exit {

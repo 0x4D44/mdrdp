@@ -70,24 +70,32 @@ const USAGE: &[(&str, &str)] = &[
         "mdrdp <host> --user <account>",
         "connect to a host directly",
     ),
+    ("mdrdp --sessions", "list the live sessions and their stats"),
 ];
 
 const OPTIONS: &[(&str, &str)] = &[
-    ("--user <account>", "keychain account holding the password"),
-    ("--port <n>", "default 3389"),
-    ("--domain <d>", "Windows domain"),
-    ("--size WxH", "session resolution, e.g. 1920x1080"),
     (
-        "--fullscreen",
+        "--user, -u <account>",
+        "keychain account holding the password",
+    ),
+    ("--port, -p <n>", "default 3389"),
+    ("--domain, -d <d>", "Windows domain"),
+    ("--size, -s WxH", "session resolution, e.g. 1920x1080"),
+    (
+        "--fullscreen, -f",
         "open fullscreen (and renegotiate to the native resolution)",
     ),
     (
-        "--foreground",
+        "--foreground, -F",
         "stay attached to the terminal (a GUI run normally detaches\nand logs under the config directory)",
     ),
-    ("--list", "print saved favourites and exit"),
+    ("--list, -l", "print saved favourites and exit"),
     (
-        "--duration <secs>",
+        "--sessions, -S",
+        "list this machine's live sessions, one line of stats each",
+    ),
+    (
+        "--duration, -t <secs>",
         "disconnect cleanly after N seconds (for scripted runs)",
     ),
     (
@@ -229,6 +237,7 @@ mod tests {
             "--fullscreen",
             "--foreground",
             "--list",
+            "--sessions",
             "--duration",
             "--password-stdin",
             "--ask-password",
@@ -243,6 +252,43 @@ mod tests {
             assert!(text.contains(flag), "help is missing {flag}");
         }
         assert!(!text.contains('\x1b'), "plain help must carry no colour");
+    }
+
+    #[test]
+    fn help_documents_every_short_code_next_to_its_long_flag() {
+        let text = help_text(false);
+        for pair in [
+            "--user, -u",
+            "--port, -p",
+            "--domain, -d",
+            "--size, -s",
+            "--fullscreen, -f",
+            "--foreground, -F",
+            "--list, -l",
+            "--sessions, -S",
+            "--duration, -t",
+            "--version, -V",
+            "--help, -h",
+        ] {
+            assert!(text.contains(pair), "help is missing {pair}");
+        }
+    }
+
+    #[test]
+    fn no_short_code_is_claimed_twice() {
+        let text = help_text(false);
+        let mut seen = std::collections::HashSet::new();
+        for token in text.split_whitespace() {
+            let token = token.trim_end_matches(',');
+            if token.len() == 2
+                && token.starts_with('-')
+                && !token.starts_with("--")
+                && !seen.insert(token.to_owned())
+            {
+                panic!("short code {token} appears against two flags");
+            }
+        }
+        assert!(seen.len() >= 11, "expected the full short-code set");
     }
 
     #[test]
