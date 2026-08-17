@@ -137,11 +137,21 @@ pub struct DirtyRect {
 
 /// Per-frame change metadata from the duplication.
 ///
-/// `None` at the `acquire` call site means **unavailable** — the frame
-/// accumulated more than one present, or the metadata calls failed — which the
-/// fast-path predicate must treat as "assume everything changed", never as "zero
-/// rects". Move rects contribute their *destination* rectangles: the pixels are
-/// read from the current frame, so destination readback carries the final content.
+/// `None` at the `acquire` call site means **unavailable** — the frame carried
+/// no metadata, or a metadata call failed — which the fast-path predicate must
+/// treat as "assume everything changed", never as "zero rects".
+///
+/// Accumulated frames (`AccumulatedFrames > 1`) are fine, deliberately: this
+/// scheme never replays moves — it reads the **final pixels** of the current
+/// frame at every covered rectangle — so what it needs from the metadata is
+/// coverage, not a replayable sequence. Any pixel that changed across the
+/// accumulated presents is inside some accumulated dirty rect or some move's
+/// destination, and the union of those is exactly what this returns (move rects
+/// contribute their *destination* rectangles). Order never matters to coverage.
+/// The first cut gated on `AccumulatedFrames == 1`; the §5a telemetry showed a
+/// keystroke on the 240 Hz IDD is a ~100 ms burst of presents the ~8 ms capture
+/// loop cannot drain one-by-one, so that gate starved the fast path to a 4-in-49
+/// hit rate while the accumulated union stayed small and correct.
 #[derive(Debug, Clone, Default)]
 pub struct ChangeInfo {
     pub rects: Vec<DirtyRect>,
@@ -371,15 +381,16 @@ impl Capture {
     }
 
     /// Fetch the frame's dirty/move rects while it is still held. `None` means the
-    /// metadata cannot be trusted for a "what changed" decision: the frame
-    /// accumulated more than one present (rects from different presents union into
-    /// an over- or under-statement of the final image) or a metadata call failed.
+    /// metadata is unavailable: the frame carried none, or a metadata call failed.
+    /// Accumulated frames are accepted — the union is coverage, and coverage is all
+    /// this scheme needs (see [`ChangeInfo`]); the buffers below are sized to
+    /// `TotalMetadataBufferSize`, which spans the whole accumulated set.
     fn read_change_info(
         &self,
         dupl: &IDXGIOutputDuplication,
         info: &DXGI_OUTDUPL_FRAME_INFO,
     ) -> Option<ChangeInfo> {
-        if info.AccumulatedFrames != 1 || info.TotalMetadataBufferSize == 0 {
+        if info.TotalMetadataBufferSize == 0 {
             return None;
         }
         let capacity = info.TotalMetadataBufferSize as usize;
