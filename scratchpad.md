@@ -2,6 +2,21 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
+- [ ] 2026-08-17: spike-server must force an IDR on every new video client connect —
+  Quick Sync exposes no out-of-band sequence header (`sequence_header_available:false`),
+  so a mid-GOP joiner is undecodable until the next scheduled IDR
+  (`tools/latency-spike/server/src/win/pipeline.rs`; hit live when an `nc -z` probe
+  consumed the opening IDR). First item of the hybrid-wire increment.
+- [ ] 2026-08-17: stage-1b control run (Notepad on the 60 Hz physical display) still
+  owed — isolates display-cadence vs echo-target in the stage-1/stage-2 tail gap. Needs
+  ~3 min of unoccluded screen for the viewer window
+  (`baseline/spike-idd-stage1b-control-INVALID-occluded.jsonl` is the failed attempt).
+- [ ] 2026-08-17: parked design — wezterm-mux pane overlay inside the mdrdp window:
+  mdrdp links wezterm's `codec`/`mux` crates, attaches to a quench-side mux domain that
+  also backs the local GUI, paints pane interiors from grid deltas over the H.264
+  desktop (pane-geometry side channel needed), routes keys via mux when a pane has
+  focus. ~10-20 ms terminal echo potential. Judged too complex for now; revisit after
+  the hybrid-wire + IddCx-direct increments land.
 - [ ] 2026-08-17: the diag cache window has no explicit "this server is not using the
   bitmap cache" empty state, so an AVC444 session's blank grid reads as broken rather
   than idle-by-design (`src/diag/cache.rs:grid_caption`; server behaviour proven in

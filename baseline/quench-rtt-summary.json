@@ -1,0 +1,26 @@
+{
+  "baseline_status": "MEETS the baseline requirement (>=1000 samples, >=3 distinct UTC hours, >=6h wall-clock span)",
+  "coverage": {
+    "distinct_utc_hours": 4,
+    "meets_requirement": true,
+    "required_distinct_hours": 3,
+    "required_samples": 1000,
+    "required_span_ms": 21600000,
+    "samples": 4000,
+    "span_ms": 26850261
+  },
+  "malformed_lines": 0,
+  "source": "~/worktrees/mdrdp/20260817-TSK-HUM-p3-idd-driver-spike/baseline/quench-rtt.jsonl",
+  "span_hours": "7.46",
+  "summary_micros": {
+    "max": 8075,
+    "mean": 1311.79275,
+    "min": 352,
+    "n": 4000,
+    "p50": 1320,
+    "p50_ci_high": 1335,
+    "p50_ci_low": 1306,
+    "p95": 1935,
+    "p99": 4390
+  }
+}

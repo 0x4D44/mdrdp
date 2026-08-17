@@ -13,6 +13,19 @@ not here.
 
 ---
 
+- A UMDF driver installs under Secure Boot with cert trust alone (Root+TrustedPublisher) — no testsigning, no reboot (idd/deploy.ps1).
+  `bcdedit /set testsigning on` is refused outright under Secure Boot, but that gate
+  only exists for kernel code integrity: pnputil accepted the self-signed-and-trusted
+  mdrdp-idd package and WUDFHost loaded it. `tools/latency-spike/idd/install-notest.ps1`
+  on quench is the working runbook; signtool comes from the
+  `Microsoft.Windows.SDK.BuildTools` NuGet, not the WDK one.
+- Windows SSH sessions see no displays: user32 enumerates empty and DXGI duplication cannot run — use tscon + an Interactive scheduled task.
+  sshd sessions are non-interactive (though fully elevated for admins). The working
+  pattern on quench: `tscon <id> /dest:console` to put the user's session on the
+  unlocked console, then run display-facing work via Register-ScheduledTask with
+  `-LogonType Interactive` so it executes inside that session. Also: PowerShell `$null`
+  as EnumDisplayDevices' first arg marshals wrongly — pass `[NullString]::Value`.
+
 - Focus-routed CGEvent injection silently loses keystrokes to focus theft: pin delivery with `probe glass --target-pid` (CGEventPostToPid).
   On a busy desktop 25/30 glass trials timed out because another app took frontmost
   mid-run and the HID-tap events followed it. Posting to the target pid makes
