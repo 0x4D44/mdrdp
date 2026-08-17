@@ -349,6 +349,64 @@ pub fn from_cursor_moved<M: PointerMap + ?Sized>(x: f64, y: f64, map: &M) -> Opt
     Some(InputEvent::MouseMove { x, y })
 }
 
+/// The keys currently held down on the server, so focus loss can release them.
+///
+/// The stuck-modifier bug this exists for: press Ctrl, then hit an OS chord that steals
+/// focus — Cmd+Tab, Ctrl+Arrow switching Spaces, or a click on another app. The Ctrl
+/// *down* was already forwarded; the *up* is delivered to whatever has focus afterwards,
+/// never to us (macOS sends no key event at all for it — winit's `windowDidResignKey`
+/// documents the case). The server then holds Ctrl until the same physical key is
+/// pressed and released inside the session again, which the user experiences as a stuck
+/// modifier. mstsc and Windows App release every held key when their window deactivates;
+/// the ledger is what lets us do the same.
+///
+/// It also settles what to do with winit's *synthetic* key events (Windows replays key
+/// state across focus changes): a synthetic press re-asserts keys that went down while
+/// we were unfocused — forwarding it would type into the session — but a synthetic
+/// release of a key *we* forwarded down is the only notification that the key came up
+/// while unfocused, and dropping it is exactly the stuck-key bug. Filtering releases by
+/// "is the key actually held" answers both without caring which platform sent what.
+#[derive(Debug, Default)]
+pub struct KeyLedger {
+    held: std::collections::HashSet<Scancode>,
+}
+
+impl KeyLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decide whether a key event should be forwarded, updating the ledger.
+    ///
+    /// Presses are forwarded unless synthetic — auto-repeat included, since RDP expects
+    /// the client to send repeats. A release is forwarded only if the key is actually
+    /// held, synthetic or not: a release for a key the server never saw go down is wire
+    /// noise (the local hotkeys claim presses, so their releases can otherwise leak
+    /// through unpaired).
+    pub fn on_key(&mut self, scancode: Scancode, down: bool, synthetic: bool) -> bool {
+        if down {
+            if synthetic {
+                return false;
+            }
+            self.held.insert(scancode);
+            true
+        } else {
+            self.held.remove(&scancode)
+        }
+    }
+
+    /// Release everything held. Call on focus loss and send each returned event.
+    pub fn release_all(&mut self) -> Vec<InputEvent> {
+        self.held
+            .drain()
+            .map(|scancode| InputEvent::Key {
+                scancode,
+                down: false,
+            })
+            .collect()
+    }
+}
+
 /// Sub-notch scroll travel, carried across events so a slow gesture still reaches the
 /// remote.
 ///
@@ -1180,6 +1238,90 @@ mod tests {
                 units: 120,
                 x: 0,
                 y: 0,
+            }]
+        );
+    }
+
+    // --- the key ledger ------------------------------------------------------------
+
+    #[test]
+    fn focus_loss_releases_exactly_the_keys_still_held() {
+        // The stuck-Ctrl bug: Ctrl down forwarded, then Ctrl+Arrow switches Spaces and
+        // the release goes to another app. release_all is the server's only way out.
+        let mut keys = KeyLedger::new();
+        assert!(keys.on_key(Scancode::plain(0x1D), true, false)); // Ctrl down
+        assert!(keys.on_key(Scancode::extended(0x5B), true, false)); // Win down
+        assert!(keys.on_key(Scancode::plain(0x1E), true, false)); // A down
+        assert!(keys.on_key(Scancode::plain(0x1E), false, false)); // A up
+
+        let mut released: Vec<Scancode> = keys
+            .release_all()
+            .into_iter()
+            .map(|ev| match ev {
+                InputEvent::Key { scancode, down } => {
+                    assert!(!down, "release_all must only ever release");
+                    scancode
+                }
+                other => panic!("release_all produced a non-key event: {other:?}"),
+            })
+            .collect();
+        released.sort_by_key(|sc| (sc.code, sc.extended));
+        assert_eq!(
+            released,
+            vec![Scancode::plain(0x1D), Scancode::extended(0x5B)],
+            "only the keys still held go up, the already-released A does not"
+        );
+        assert!(
+            keys.release_all().is_empty(),
+            "the ledger must be empty after a release-all"
+        );
+    }
+
+    #[test]
+    fn a_synthetic_press_is_dropped_but_a_synthetic_release_of_a_held_key_is_not() {
+        let mut keys = KeyLedger::new();
+        // Focus-gain replay of a key held elsewhere: forwarding it would type into the
+        // session.
+        assert!(!keys.on_key(Scancode::plain(0x1D), true, true));
+        // But a synthetic release of a key we sent down (Windows, WM_KILLFOCUS) is the
+        // only notification the key came up; dropping it is the stuck-key bug.
+        assert!(keys.on_key(Scancode::plain(0x1D), true, false));
+        assert!(keys.on_key(Scancode::plain(0x1D), false, true));
+        assert!(keys.release_all().is_empty(), "nothing left held");
+    }
+
+    #[test]
+    fn a_release_for_a_key_never_forwarded_down_is_dropped() {
+        // The local hotkeys claim presses; without this filter their releases leak to
+        // the server unpaired.
+        let mut keys = KeyLedger::new();
+        assert!(!keys.on_key(Scancode::plain(0x1F), false, false));
+    }
+
+    #[test]
+    fn auto_repeat_presses_keep_flowing() {
+        // RDP expects the client to send key repeats, so a second press of a held key
+        // is not filtered as a duplicate.
+        let mut keys = KeyLedger::new();
+        assert!(keys.on_key(Scancode::plain(0x1E), true, false));
+        assert!(keys.on_key(Scancode::plain(0x1E), true, false));
+    }
+
+    #[test]
+    fn left_and_right_variants_are_distinct_in_the_ledger() {
+        // ControlLeft is plain 0x1D and ControlRight is E0 1D. Conflating them would
+        // release the wrong key — the server distinguishes them.
+        let mut keys = KeyLedger::new();
+        assert!(keys.on_key(Scancode::plain(0x1D), true, false));
+        assert!(
+            !keys.on_key(Scancode::extended(0x1D), false, false),
+            "right-Ctrl release must not discharge a held left Ctrl"
+        );
+        assert_eq!(
+            keys.release_all(),
+            vec![InputEvent::Key {
+                scancode: Scancode::plain(0x1D),
+                down: false,
             }]
         );
     }

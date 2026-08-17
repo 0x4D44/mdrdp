@@ -862,6 +862,10 @@ struct SessionApp {
     /// Sub-notch scroll travel held between wheel events. See
     /// [`input::WheelAccumulator`].
     wheel: input::WheelAccumulator,
+    /// Keys forwarded down and not yet up, released en masse on focus loss so the
+    /// server never keeps a modifier the OS stole the release of. See
+    /// [`input::KeyLedger`].
+    keys: input::KeyLedger,
     /// The store generation last put on screen. `None` until the first frame.
     presented: Option<u64>,
     failure: Option<WindowError>,
@@ -956,6 +960,7 @@ impl SessionApp {
             viewport,
             cursor: None,
             wheel: input::WheelAccumulator::new(),
+            keys: input::KeyLedger::new(),
             presented: None,
             failure: None,
             policy,
@@ -1703,10 +1708,27 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                     }
                     return;
                 }
-                // Synthetic events are the platform replaying key state across a focus
-                // change. Forwarding them double-presses keys.
-                if !is_synthetic && let Some(translated) = input::from_key_event(&event) {
-                    self.send(event_loop, translated);
+                // The ledger drops the synthetic presses the platform replays across a
+                // focus change (forwarding them double-presses keys) but keeps synthetic
+                // releases of keys we hold, and never sends a release the server has no
+                // press for.
+                if let Some(InputEvent::Key { scancode, down }) = input::from_key_event(&event)
+                    && self.keys.on_key(scancode, down, is_synthetic)
+                {
+                    self.send(event_loop, InputEvent::Key { scancode, down });
+                }
+            }
+
+            // Focus leaving with keys held is how modifiers get stuck: the OS chord that
+            // stole focus (Cmd+Tab, Ctrl+Arrow switching Spaces) delivers the key-up to
+            // whatever gains focus, never to us, and the server holds the key until the
+            // same physical key is pressed again in-session. Release everything we
+            // forwarded down, exactly as mstsc does on deactivate.
+            WindowEvent::Focused(focused) => {
+                if !focused {
+                    for release in self.keys.release_all() {
+                        self.send(event_loop, release);
+                    }
                 }
             }
 
