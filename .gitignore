@@ -11,6 +11,9 @@ tools/**/target/
 # xwin defaults --cache-dir to ./.xwin-cache; scripts/check-windows.sh documents
 # --temp instead. This is the backstop for a bare xwin run in the repo root.
 /.xwin-cache/
+# Per-machine agent permissions — absolute paths, meaningless on another box.
+# A shared .claude/settings.json would be committed; the .local.json never is.
+/.claude/settings.local.json
 
 # Never commit connection credentials or captured session data
 /favourites.local.toml
