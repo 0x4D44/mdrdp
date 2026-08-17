@@ -1,0 +1,59 @@
+[package]
+name = "spike-viewer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "macOS viewer for the mdrdp latency spike — mdrdp's own decode and present path"
+
+[[bin]]
+name = "spike-viewer"
+path = "src/main.rs"
+
+[dependencies]
+# The repository root library. The point of the spike is to hold the *client* side
+# constant against mdrdp itself, so decode (`mdrdp::h264`) and present
+# (`mdrdp::window::present_into`) must be the very same code, not a re-implementation.
+mdrdp = { path = "../../.." }
+
+# The server's portable half — framing, the input record. One implementation of the
+# wire format, shared, rather than two that can drift.
+spike-server = { path = "../server" }
+
+# Same versions as the repository root Cargo.toml: presenting through softbuffer
+# exactly as mdrdp's window thread does is the measurement, so a different version
+# would be a different presenter.
+softbuffer = "0.4.8"
+winit = "0.30.13"
+
+# `H264Decoder` — the trait `mdrdp::h264::hardware_decoder()` returns. Named directly
+# because a trait must be in scope to be called; the `[patch]` table below makes it the
+# same vendored crate mdrdp itself links.
+ironrdp-egfx = "0.3.0"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SIGINT/SIGTERM only (src/interrupt.rs). Already in mdrdp's own tree on unix, so this
+# adds nothing to the dependency graph.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+debug = 1
+
+# mdrdp's own `[patch.crates-io]` table is ignored here: patches apply only from the
+# workspace root, and this crate is its own root (the empty `[workspace]` below). The
+# vendored forks are not optional — see `vendor/README.md`; without them this binary
+# would link a *different* IronRDP from the client it is measuring against, which is
+# exactly the confound the spike exists to avoid. So the table is repeated verbatim
+# with the paths rebased.
+[patch.crates-io]
+ironrdp-connector = { path = "../../../vendor/ironrdp-connector" }
+ironrdp-egfx = { path = "../../../vendor/ironrdp-egfx" }
+ironrdp-graphics = { path = "../../../vendor/ironrdp-graphics" }
+ironrdp-pdu = { path = "../../../vendor/ironrdp-pdu" }
+ironrdp-rdpsnd = { path = "../../../vendor/ironrdp-rdpsnd" }
+ironrdp-session = { path = "../../../vendor/ironrdp-session" }
+
+# Standalone: never a member of the mdrdp package above it.
+[workspace]
