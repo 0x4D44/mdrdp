@@ -1,0 +1,82 @@
+;
+; mdrdp-idd.inf
+;
+; UMDF indirect display driver for the mdrdp latency spike.
+; Structure modelled on IddSampleDriver.inf from
+; microsoft/Windows-driver-samples@717778a2 (MIT).
+;
+; Plain ASCII, no BOM: pnputil accepts an ANSI INF, and the sample's UTF-16
+; encoding buys nothing here. DriverVer and the architecture decoration are
+; written out literally because this INF is not run through stampinf.
+;
+
+[Version]
+PnpLockDown=1
+Signature="$Windows NT$"
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=mdrdp-idd.cat
+DriverVer=08/17/2026,0.1.0.0
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64.10.0...22000
+
+[Standard.NTamd64.10.0...22000]
+%DeviceName%=MdrdpIdd_Install, Root\mdrdp_idd ; used by devcon/VS remote debugging
+%DeviceName%=MdrdpIdd_Install, mdrdp_idd      ; used by mdrdp-idd-create.exe
+
+[SourceDisksFiles]
+mdrdp_idd.dll=1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+; =================== UMDF Device ==================================
+
+[MdrdpIdd_Install.NT]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
+CopyFiles=UMDriverCopy
+
+[MdrdpIdd_Install.NT.hw]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
+AddReg=MdrdpIdd_HardwareDeviceSettings
+
+[MdrdpIdd_HardwareDeviceSettings]
+HKR,, "UpperFilters",  %REG_MULTI_SZ%, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "mdrdpIddGroup"
+
+[MdrdpIdd_Install.NT.Services]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
+
+[MdrdpIdd_Install.NT.Wdf]
+UmdfService=mdrdp_idd,mdrdp_idd_Install
+UmdfServiceOrder=mdrdp_idd
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+
+[mdrdp_idd_Install]
+UmdfLibraryVersion=2.25
+ServiceBinary=%12%\UMDF\mdrdp_idd.dll
+; IddCx0102 is the extension CONTRACT id every IddCx driver binds to, regardless of
+; which IddCx header version the driver was compiled against. There is no IddCx0106.
+UmdfExtensions=IddCx0102
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF ; copy to drivers\umdf
+
+[UMDriverCopy]
+mdrdp_idd.dll
+
+; =================== Generic ==================================
+
+[Strings]
+ManufacturerName="mdrdp"
+DiskName="mdrdp indirect display driver installation disk"
+DeviceName="mdrdp latency-spike display"
+
+REG_MULTI_SZ  = 0x00010000
+REG_SZ        = 0x00000000
