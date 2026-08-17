@@ -211,36 +211,106 @@ fn fmt_bytes(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-/// The columns one session renders to, in table order.
-fn row_cells(p: &SessionPresence, now_unix: u64) -> Vec<String> {
-    let up = fmt_duration(now_unix.saturating_sub(p.started_unix));
-    let fps = p
-        .frame_gap_p50_us
-        .filter(|&gap| gap > 0)
-        .map(|gap| format!("{}", (1_000_000.0 / f64::from(gap)).round() as u64))
-        .unwrap_or_else(|| "-".to_owned());
-    let lookups = p.cache_hits + p.cache_misses;
-    let cache = if lookups > 0 {
-        format!("{:.0}%", (p.cache_hits as f64 / lookups as f64) * 100.0)
+/// One rendered cell: its text, plus the SGR parameters to wrap it in when the output
+/// is coloured. An empty code means the terminal's default.
+struct Cell {
+    text: String,
+    sgr: &'static str,
+}
+
+impl Cell {
+    fn new(text: impl Into<String>, sgr: &'static str) -> Self {
+        Cell {
+            text: text.into(),
+            sgr,
+        }
+    }
+}
+
+/// Identity columns borrow the `--help` screen's palette so the two screens read as one
+/// tool: bold for the name you typed, cyan for the address, dim for the bookkeeping.
+const IDENTITY: &str = "1";
+const ADDRESS: &str = "36";
+const SECONDARY: &str = "2";
+const HEADING: &str = "1;33";
+
+/// The three grades a health column can land in.
+const GOOD: &str = "32";
+const WARN: &str = "33";
+const BAD: &str = "1;31";
+/// Never measured. Not a verdict, so it stays quiet rather than claiming green.
+const UNMEASURED: &str = "2";
+
+/// Grade a measurement where **higher is better** (fps, cache hit rate).
+fn grade_high(value: f64, good: f64, warn: f64) -> &'static str {
+    if value >= good {
+        GOOD
+    } else if value >= warn {
+        WARN
     } else {
-        "-".to_owned()
+        BAD
+    }
+}
+
+/// Grade a measurement where **lower is better** (input round-trip latency).
+fn grade_low(value: f64, good: f64, warn: f64) -> &'static str {
+    if value <= good {
+        GOOD
+    } else if value <= warn {
+        WARN
+    } else {
+        BAD
+    }
+}
+
+/// The columns one session renders to, in table order.
+///
+/// The four health columns — FPS, CACHE, P50, ERRS — carry a grade; the rest carry a
+/// fixed identity colour. The thresholds are set from what this codebase has actually
+/// measured: a remote session's encoder tops out near 30 fps, and a healthy input round
+/// trip is tens of milliseconds (~30 ms to quench, ~48 ms to temper under AVC444) while
+/// the non-AVC path's ~416 ms is the case a user calls "laggy".
+fn row_cells(p: &SessionPresence, now_unix: u64) -> Vec<Cell> {
+    let up = fmt_duration(now_unix.saturating_sub(p.started_unix));
+    let (fps, fps_sgr) = match p.frame_gap_p50_us.filter(|&gap| gap > 0) {
+        Some(gap) => {
+            let fps = 1_000_000.0 / f64::from(gap);
+            (
+                format!("{}", fps.round() as u64),
+                grade_high(fps, 20.0, 10.0),
+            )
+        }
+        None => ("-".to_owned(), UNMEASURED),
     };
-    let p50 = p
-        .latency_p50_us
-        .map(|us| format!("{:.1}ms", f64::from(us) / 1000.0))
-        .unwrap_or_else(|| "-".to_owned());
+    let lookups = p.cache_hits + p.cache_misses;
+    let (cache, cache_sgr) = if lookups > 0 {
+        let hit_rate = (p.cache_hits as f64 / lookups as f64) * 100.0;
+        (format!("{hit_rate:.0}%"), grade_high(hit_rate, 75.0, 40.0))
+    } else {
+        // An AVC444 session sends no cache PDUs at all, so a bare "-" is normal here.
+        ("-".to_owned(), UNMEASURED)
+    };
+    let (p50, p50_sgr) = match p.latency_p50_us {
+        Some(us) => {
+            let ms = f64::from(us) / 1000.0;
+            (format!("{ms:.1}ms"), grade_low(ms, 80.0, 200.0))
+        }
+        None => ("-".to_owned(), UNMEASURED),
+    };
+    // Zero decode errors is the expected state, not an achievement: stay quiet.
+    let errs_sgr = if p.decode_errors > 0 { BAD } else { SECONDARY };
     vec![
-        p.name.clone(),
-        format!("{}@{}:{}", p.user, p.host, p.port),
-        p.pid.to_string(),
-        up,
-        format!("{}x{}", p.width, p.height),
-        fps,
-        p.frames.to_string(),
-        fmt_bytes(p.bytes_in),
-        cache,
-        p50,
-        p.decode_errors.to_string(),
+        Cell::new(p.name.clone(), IDENTITY),
+        Cell::new(format!("{}@{}:{}", p.user, p.host, p.port), ADDRESS),
+        Cell::new(p.pid.to_string(), SECONDARY),
+        Cell::new(up, ""),
+        Cell::new(format!("{}x{}", p.width, p.height), ""),
+        Cell::new(fps, fps_sgr),
+        Cell::new(p.frames.to_string(), SECONDARY),
+        Cell::new(fmt_bytes(p.bytes_in), SECONDARY),
+        Cell::new(cache, cache_sgr),
+        Cell::new(p50, p50_sgr),
+        Cell::new(p.decode_errors.to_string(), errs_sgr),
     ]
 }
 
@@ -249,24 +319,50 @@ const HEADER: &[&str] = &[
 ];
 
 /// Render the sessions table, one line per session, columns sized to the content.
-/// Plain text, stdout-parseable — the caller decides what "empty" prints.
-pub fn render_table(rows: &[SessionPresence], now_unix: u64) -> String {
-    let table: Vec<Vec<String>> = std::iter::once(HEADER.iter().map(|h| h.to_string()).collect())
-        .chain(rows.iter().map(|p| row_cells(p, now_unix)))
-        .collect();
+///
+/// The layout is identical with and without colour — widths come from the plain text
+/// and the escapes wrap the already-padded cell — so the coloured form with its escapes
+/// stripped is byte-for-byte the plain form a script parses. The caller decides what
+/// "empty" prints, and (via [`crate::cli::stdout_wants_color`]) whether colour is wanted.
+pub fn render_table(rows: &[SessionPresence], now_unix: u64, color: bool) -> String {
+    let table: Vec<Vec<Cell>> = std::iter::once(
+        HEADER
+            .iter()
+            .map(|h| Cell::new(h.to_string(), HEADING))
+            .collect(),
+    )
+    .chain(rows.iter().map(|p| row_cells(p, now_unix)))
+    .collect();
     let widths: Vec<usize> = (0..HEADER.len())
-        .map(|col| table.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .map(|col| {
+            table
+                .iter()
+                .map(|row| row[col].text.len())
+                .max()
+                .unwrap_or(0)
+        })
         .collect();
+    let last = HEADER.len() - 1;
     table
         .iter()
         .map(|row| {
             let line = row
                 .iter()
                 .zip(&widths)
-                .map(|(cell, w)| format!("{cell:<w$}"))
+                .enumerate()
+                .map(|(col, (cell, w))| {
+                    // The last column is never padded, so there is no trailing run of
+                    // spaces to trim back off from underneath the escape sequences.
+                    let padded = if col == last {
+                        cell.text.clone()
+                    } else {
+                        format!("{:<w$}", cell.text)
+                    };
+                    crate::cli::sgr(&padded, cell.sgr, color)
+                })
                 .collect::<Vec<_>>()
                 .join("  ");
-            format!("{}\n", line.trim_end())
+            format!("{line}\n")
         })
         .collect()
 }
@@ -397,7 +493,7 @@ mod tests {
     #[test]
     fn the_table_renders_each_stat_in_its_own_column() {
         let now = unix_now();
-        let text = render_table(&[presence(4242, now)], now);
+        let text = render_table(&[presence(4242, now)], now, false);
         let mut lines = lines_of(&text);
         let header = lines.next().expect("header line");
         let row = lines.next().expect("one session row");
@@ -438,7 +534,7 @@ mod tests {
         idle.frame_gap_p50_us = None;
         idle.cache_hits = 0;
         idle.cache_misses = 0;
-        let text = render_table(&[idle], now);
+        let text = render_table(&[idle], now, false);
         let row = lines_of(&text).nth(1).expect("session row").to_owned();
         assert_eq!(
             row.split_whitespace().filter(|c| *c == "-").count(),
@@ -471,5 +567,163 @@ mod tests {
 
     fn lines_of(text: &str) -> impl Iterator<Item = &str> {
         text.lines().filter(|l| !l.is_empty())
+    }
+
+    /// Every escape-wrapped run in one coloured line as `(sgr, text)`, padding trimmed.
+    /// Cells left at the terminal default carry no escapes and so do not appear.
+    fn coloured_runs(line: &str) -> Vec<(String, String)> {
+        let mut runs = Vec::new();
+        let mut rest = line;
+        while let Some(start) = rest.find("\x1b[") {
+            let after = &rest[start + 2..];
+            let Some(m) = after.find('m') else { break };
+            let (code, body) = (&after[..m], &after[m + 1..]);
+            let end = body.find("\x1b[0m").unwrap_or(body.len());
+            runs.push((code.to_owned(), body[..end].trim_end().to_owned()));
+            // Step over the reset as well, or the next run's text is read as its code.
+            rest = body[end..].strip_prefix("\x1b[0m").unwrap_or(&body[end..]);
+        }
+        runs
+    }
+
+    #[test]
+    fn the_coloured_table_is_the_plain_table_underneath() {
+        let now = unix_now();
+        let rows = [presence(1, now), presence(22222, now)];
+        assert_eq!(
+            crate::cli::strip_ansi(&render_table(&rows, now, true)),
+            render_table(&rows, now, false),
+            "colour must not move a column or a character"
+        );
+        assert!(
+            !render_table(&rows, now, false).contains('\x1b'),
+            "the plain table is what a script parses"
+        );
+        assert!(render_table(&rows, now, true).contains('\x1b'));
+    }
+
+    #[test]
+    fn identity_columns_reuse_the_help_screens_palette() {
+        let now = unix_now();
+        let text = render_table(&[presence(4242, now)], now, true);
+        let mut lines = lines_of(&text);
+        let header = coloured_runs(lines.next().expect("header"));
+        assert!(
+            header.iter().all(|(sgr, _)| sgr == "1;33"),
+            "every header label wears the --help heading colour: {header:?}"
+        );
+
+        let row = coloured_runs(lines.next().expect("session row"));
+        assert!(
+            row.contains(&("1".to_owned(), "quench".to_owned())),
+            "{row:?}"
+        );
+        assert!(
+            row.contains(&("36".to_owned(), "ano@quench.lan.example:3390".to_owned())),
+            "{row:?}"
+        );
+        assert!(
+            row.contains(&("2".to_owned(), "4242".to_owned())),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn health_columns_grade_the_measurement_not_the_column() {
+        let now = unix_now();
+        let mut healthy = presence(1, now);
+        healthy.frame_gap_p50_us = Some(33_333); // 30 fps — the remote-session cap
+        healthy.cache_hits = 95;
+        healthy.cache_misses = 5;
+        healthy.latency_p50_us = Some(30_000); // measured-normal typing round trip
+        healthy.decode_errors = 0;
+
+        let mut sick = presence(2, now);
+        sick.frame_gap_p50_us = Some(500_000); // 2 fps
+        sick.cache_hits = 1;
+        sick.cache_misses = 9;
+        sick.latency_p50_us = Some(416_000); // the non-AVC path's p50
+        sick.decode_errors = 12;
+
+        let text = render_table(&[healthy, sick], now, true);
+        let mut lines = lines_of(&text).skip(1);
+        let good = coloured_runs(lines.next().expect("healthy row"));
+        let bad = coloured_runs(lines.next().expect("sick row"));
+
+        for cell in ["30", "95%", "30.0ms"] {
+            assert!(
+                good.contains(&("32".to_owned(), cell.to_owned())),
+                "{cell} should read as healthy: {good:?}"
+            );
+        }
+        assert!(
+            good.contains(&("2".to_owned(), "0".to_owned())),
+            "no decode errors is the normal state, not an achievement: {good:?}"
+        );
+        for cell in ["2", "10%", "416.0ms", "12"] {
+            assert!(
+                bad.contains(&("1;31".to_owned(), cell.to_owned())),
+                "{cell} should read as unhealthy: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_middle_band_warns_rather_than_condemning() {
+        let now = unix_now();
+        let mut middling = presence(1, now);
+        middling.frame_gap_p50_us = Some(66_667); // 15 fps
+        middling.cache_hits = 50;
+        middling.cache_misses = 50;
+        middling.latency_p50_us = Some(150_000); // 150 ms
+        let text = render_table(&[middling], now, true);
+        let row = coloured_runs(lines_of(&text).nth(1).expect("session row"));
+        for cell in ["15", "50%", "150.0ms"] {
+            assert!(
+                row.contains(&("33".to_owned(), cell.to_owned())),
+                "{cell} sits between good and bad: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_stat_is_dim_rather_than_green() {
+        let now = unix_now();
+        let mut idle = presence(1, now);
+        idle.latency_p50_us = None;
+        idle.frame_gap_p50_us = None;
+        idle.cache_hits = 0;
+        idle.cache_misses = 0;
+        let text = render_table(&[idle], now, true);
+        let row = coloured_runs(lines_of(&text).nth(1).expect("session row"));
+        assert_eq!(
+            row.iter().filter(|(sgr, t)| sgr == "2" && t == "-").count(),
+            3,
+            "fps, cache and p50 are unknown, and unknown is not a pass: {row:?}"
+        );
+        assert!(
+            !row.iter().any(|(sgr, t)| sgr == "32" && t == "-"),
+            "an unmeasured stat must never read as good: {row:?}"
+        );
+    }
+
+    #[test]
+    fn the_grades_sit_on_the_boundary_they_claim() {
+        assert_eq!(
+            grade_high(20.0, 20.0, 10.0),
+            GOOD,
+            "the good bound is inclusive"
+        );
+        assert_eq!(grade_high(19.9, 20.0, 10.0), WARN);
+        assert_eq!(
+            grade_high(10.0, 20.0, 10.0),
+            WARN,
+            "the warn bound is inclusive"
+        );
+        assert_eq!(grade_high(9.9, 20.0, 10.0), BAD);
+        assert_eq!(grade_low(80.0, 80.0, 200.0), GOOD);
+        assert_eq!(grade_low(80.1, 80.0, 200.0), WARN);
+        assert_eq!(grade_low(200.0, 80.0, 200.0), WARN);
+        assert_eq!(grade_low(200.1, 80.0, 200.0), BAD);
     }
 }

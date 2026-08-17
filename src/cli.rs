@@ -34,12 +34,38 @@ pub fn stderr_wants_color() -> bool {
     std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
 }
 
-fn sgr(text: &str, code: &str, color: bool) -> String {
-    if color {
+/// Wrap `text` in one SGR sequence, or hand it back untouched when `color` is false.
+///
+/// An empty `code` means "the terminal's default" and is also left untouched, so a
+/// caller can hold a table of per-cell codes without special-casing the plain ones.
+pub(crate) fn sgr(text: &str, code: &str, color: bool) -> String {
+    if color && !code.is_empty() {
         format!("\x1b[{code}m{text}\x1b[0m")
     } else {
         text.to_owned()
     }
+}
+
+/// Drop every SGR escape, leaving the text a coloured string prints.
+///
+/// Shared by the colour tests in this crate: every coloured renderer owes the same
+/// proof — that its plain form is exactly its coloured form with the escapes removed.
+#[cfg(test)]
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for e in chars.by_ref() {
+                if e == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `mdrdp v0.1.29`, each visible character stepping through the rainbow when coloured.
@@ -176,23 +202,6 @@ pub fn help_text(color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn strip_ansi(s: &str) -> String {
-        let mut out = String::new();
-        let mut chars = s.chars();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                for e in chars.by_ref() {
-                    if e == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
 
     #[test]
     fn the_plain_banner_is_name_and_version_and_nothing_else() {

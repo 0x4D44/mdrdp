@@ -342,7 +342,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if sessions.is_empty() {
             println!("no active sessions");
         } else {
-            print!("{}", mdrdp::presence::render_table(&sessions, now));
+            print!(
+                "{}",
+                mdrdp::presence::render_table(&sessions, now, mdrdp::cli::stdout_wants_color())
+            );
         }
         return Ok(());
     }
