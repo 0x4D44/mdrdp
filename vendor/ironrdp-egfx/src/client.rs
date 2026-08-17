@@ -205,6 +205,28 @@ pub struct BitmapUpdate {
     pub height: u16,
 }
 
+impl BitmapUpdate {
+    /// mdrdp patch: the struct is `#[non_exhaustive]`, so a handler crate cannot
+    /// build one field-by-field to exercise its `on_bitmap_updated` in tests.
+    pub fn new(
+        surface_id: u16,
+        destination_rectangle: ExclusiveRectangle,
+        codec_id: Codec1Type,
+        data: Vec<u8>,
+        width: u16,
+        height: u16,
+    ) -> Self {
+        Self {
+            surface_id,
+            destination_rectangle,
+            codec_id,
+            data,
+            width,
+            height,
+        }
+    }
+}
+
 // ============================================================================
 // Handler Trait
 // ============================================================================

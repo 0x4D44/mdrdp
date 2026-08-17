@@ -771,6 +771,17 @@ impl GraphicsPipelineHandler for GfxHandler {
         let stride = dest.width();
         let result =
             self.with_store(|store| store.blit_rgba(update.surface_id, dest, &update.data, stride));
+        if result.is_ok() {
+            // Painted bytes are attributed per rect for every codec on this path
+            // (AVC444 included) — the one-per-PDU rule above is about codec_ids_seen
+            // only. Without this the title bar's codec segment never names AVC444:
+            // codec_note diffs codec_bytes_painted, and a pure-AVC444 session left
+            // that map empty.
+            self.note_painted(
+                codec_name(update.codec_id),
+                u64::from(dest.width()) * u64::from(dest.height()),
+            );
+        }
         self.absorb(result);
     }
 
@@ -1610,6 +1621,55 @@ mod tests {
         assert_eq!(stats.unhandled_pdus, 1);
         assert_eq!(stats.decode_errors, 0, "we never fed it to the decoder");
         assert_eq!(pixel_at(&store, 1, 0, 0), [0, 0, 0, 0]);
+    }
+
+    /// An AVC444 paint must land in `codec_bytes_painted`, or the title bar's codec
+    /// segment (which diffs that map) never names the codec carrying the picture.
+    /// A live quench session (2026-08-17) painted 117 MB of Avc444v2 and left the
+    /// map empty — this is that regression pinned.
+    #[test]
+    fn a_decoded_bitmap_update_attributes_its_painted_bytes_to_its_codec() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 4, 4));
+
+        handler.on_bitmap_updated(&BitmapUpdate::new(
+            1,
+            rect(0, 0, 4, 2),
+            Codec1Type::Avc444v2,
+            vec![0xAAu8; 4 * 2 * BPP],
+            4,
+            2,
+        ));
+
+        let stats = handler.stats().snapshot();
+        assert_eq!(
+            stats.codec_bytes_painted.get("Avc444v2"),
+            Some(&(4 * 2 * BPP as u64)),
+            "the blitted rect's bytes must be attributed to the painting codec"
+        );
+        // The one-per-PDU codec tally stays with on_avc444_frame; this path must
+        // not double-count it.
+        assert_eq!(stats.codec_ids_seen.get("Avc444v2"), None);
+    }
+
+    /// A refused blit painted nothing and must not claim bytes.
+    #[test]
+    fn a_bitmap_update_for_a_missing_surface_attributes_nothing() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+
+        handler.on_bitmap_updated(&BitmapUpdate::new(
+            9,
+            rect(0, 0, 2, 2),
+            Codec1Type::Uncompressed,
+            vec![0u8; 2 * 2 * BPP],
+            2,
+            2,
+        ));
+
+        let stats = handler.stats().snapshot();
+        assert!(stats.codec_bytes_painted.is_empty());
     }
 
     /// The DWT's i32 -> i16 narrowing must SATURATE, not wrap.
