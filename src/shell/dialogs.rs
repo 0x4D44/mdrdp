@@ -1136,22 +1136,15 @@ pub fn shortcuts(ctx: &egui::Context) -> bool {
 /// A read-only dialog whose only control is Close. Returns `true` once it should go —
 /// the button, or Escape.
 fn closable(ctx: &egui::Context, id: &str, width: f32, body: impl FnOnce(&mut egui::Ui)) -> bool {
-    let (_, close) = dialog(
-        ctx,
-        id,
-        width,
-        false,
-        body,
-        |ui| {
-            let mut close = false;
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::primary_button(ui, "Close", 34.0).clicked() {
-                    close = true;
-                }
-            });
-            close
-        },
-    );
+    let (_, close) = dialog(ctx, id, width, false, body, |ui| {
+        let mut close = false;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::primary_button(ui, "Close", 34.0).clicked() {
+                close = true;
+            }
+        });
+        close
+    });
     close || ctx.input(|i| i.key_pressed(egui::Key::Escape))
 }
 
