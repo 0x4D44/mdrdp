@@ -389,6 +389,15 @@ pub struct SessionStats {
     /// painted. One slot: a newer paint overwrites an unpresented older one, so
     /// the measurement always tracks the freshest content.
     pending_present: Option<(u64, Instant)>,
+    /// Wall-clock gap between successive paints — the server's frame cadence as
+    /// the client receives it. Raw and unfiltered: idle stretches record as huge
+    /// gaps, so analysis must filter (active cadence is the small-gap mode). The
+    /// SHAPE is the diagnostic — gaps clustered at one value mean a frame-rate
+    /// cap; a bimodal spread means the encoder coalesces small updates on a
+    /// timer, which a cap change would not fix.
+    pub frame_gap: Latency,
+    /// When the previous paint landed, for `frame_gap`.
+    last_paint_at: Option<Instant>,
     pub cache: CacheStats,
     pub frames: u64,
     pub bytes_in: u64,
@@ -408,7 +417,13 @@ impl SessionStats {
 
     /// The session thread painted `generation` into the store just now.
     pub fn mark_painted(&mut self, generation: u64) {
-        self.pending_present = Some((generation, Instant::now()));
+        let now = Instant::now();
+        if let Some(previous) = self.last_paint_at.replace(now) {
+            let micros =
+                u32::try_from(now.duration_since(previous).as_micros()).unwrap_or(u32::MAX);
+            self.frame_gap.record(micros);
+        }
+        self.pending_present = Some((generation, now));
     }
 
     /// The window put `generation` on screen; close the pending handoff if this
@@ -730,6 +745,27 @@ mod tests {
         );
         s.mark_presented(5);
         assert_eq!(s.present.count(), 1);
+    }
+
+    #[test]
+    fn the_first_paint_records_no_gap_and_each_later_paint_records_one() {
+        let mut s = SessionStats::new();
+        s.mark_painted(1);
+        assert_eq!(
+            s.frame_gap.count(),
+            0,
+            "one paint has no predecessor to measure from"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.mark_painted(2);
+        assert_eq!(s.frame_gap.count(), 1);
+        assert!(
+            s.frame_gap.min().unwrap() >= 4_000,
+            "the gap must measure the wall clock between paints, got {:?} µs",
+            s.frame_gap.min()
+        );
+        s.mark_painted(3);
+        assert_eq!(s.frame_gap.count(), 2, "every subsequent paint adds a gap");
     }
 
     #[test]

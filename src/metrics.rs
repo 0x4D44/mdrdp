@@ -59,6 +59,11 @@ pub struct LatencySnapshot {
     pub baseline_p95_us: Option<u32>,
     pub baseline_p99_us: Option<u32>,
     pub drift_us: Option<i64>,
+    /// The rolling window itself, oldest first. Percentiles cannot show a
+    /// distribution's SHAPE — a fixed encoder cadence versus a bimodal
+    /// coalescing pattern needs the raw samples to tell apart. Bounded by the
+    /// window size (512), so at most ~3 KB per snapshot. Timings only.
+    pub recent_samples_us: Vec<u32>,
 }
 
 impl From<&Latency> for LatencySnapshot {
@@ -76,6 +81,7 @@ impl From<&Latency> for LatencySnapshot {
             baseline_p95_us: baseline.map(|p| p.p95),
             baseline_p99_us: baseline.map(|p| p.p99),
             drift_us: latency.drift_us(),
+            recent_samples_us: latency.recent_samples(),
         }
     }
 }
@@ -182,6 +188,9 @@ pub struct SessionMetricsReport {
     pub decode: LatencySnapshot,
     /// Painted-in-store → presented-by-the-window handoff, per frame.
     pub present: LatencySnapshot,
+    /// Wall-clock gap between successive paints — the server's frame cadence as
+    /// received. Unfiltered: idle stretches appear as huge gaps.
+    pub frame_gap: LatencySnapshot,
     pub session: SessionMetrics,
     pub gfx: GfxStats,
     pub audio: AudioStats,
@@ -217,6 +226,7 @@ impl SessionMetricsReport {
             latency: LatencySnapshot::from(&session.latency),
             decode: LatencySnapshot::from(&session.decode),
             present: LatencySnapshot::from(&session.present),
+            frame_gap: LatencySnapshot::from(&session.frame_gap),
             session: SessionMetrics::from(session),
             gfx: gfx.clone(),
             audio: audio.clone(),
