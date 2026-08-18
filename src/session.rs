@@ -92,9 +92,10 @@ pub enum SessionCommand {
     ///
     /// Maps to the Suppress Output PDU (MS-RDPBCGR 2.2.11.3): a fully occluded window
     /// asks the server to stop sending graphics; becoming visible again asks for them
-    /// back, with the full desktop rect, which prompts a full repaint of it. Sent
-    /// best-effort — a server that ignores it just keeps streaming, and the window
-    /// keeps discarding.
+    /// back, followed by a Refresh Rect PDU for the full desktop — allowing updates
+    /// alone resumes only *future* changes, so the explicit repaint request is what
+    /// recovers everything missed while suppressed. Sent best-effort — a server that
+    /// ignores it just keeps streaming, and the window keeps discarding.
     SetVisibility { visible: bool },
 }
 
@@ -758,22 +759,9 @@ fn service_visibility(
         return Ok(());
     };
 
-    let pdu = suppress_output_pdu(visible, established.desktop_size);
     let mut buf = ironrdp::core::WriteBuf::new();
-    match established.stage.encode_static(&mut buf, pdu) {
-        Ok(_) => {
-            *pending = None;
-            if visible {
-                eprintln!("display: window visible again; asked the server to resume updates");
-            } else {
-                eprintln!("display: window hidden; asked the server to suppress updates");
-            }
-            established
-                .framed
-                .write_all(buf.filled())
-                .map_err(ConnectError::Io)
-        }
-        Err(e) => {
+    for pdu in visibility_pdus(visible, established.desktop_size) {
+        if let Err(e) = established.stage.encode_static(&mut buf, pdu) {
             // Losing one suppression is not worth losing the desktop: the only cost of
             // a server that keeps streaming is the idle CPU this was meant to save.
             *pending = None;
@@ -781,32 +769,60 @@ fn service_visibility(
                 "display: could not encode the visibility change ({}); updates keep flowing",
                 describe(&e)
             );
-            Ok(())
+            return Ok(());
         }
     }
+    *pending = None;
+    if visible {
+        eprintln!("display: window visible again; asked the server to resume and repaint");
+    } else {
+        eprintln!("display: window hidden; asked the server to suppress updates");
+    }
+    established
+        .framed
+        .write_all(buf.filled())
+        .map_err(ConnectError::Io)
 }
 
-/// Build the Suppress Output PDU for a visibility state.
+/// Build the PDUs a visibility change owes the server.
 ///
-/// Pure so it is testable without an [`Established`]. Hidden sends no rectangle (that
-/// IS the suppression, per MS-RDPBCGR 2.2.11.3); visible sends the full desktop as an
-/// *inclusive* rectangle, which also prompts the server to repaint all of it — the
-/// frames discarded while hidden must not leave a stale picture behind.
-fn suppress_output_pdu(
+/// Pure so it is testable without an [`Established`]. Hidden sends Suppress Output with
+/// no rectangle (that IS the suppression, per MS-RDPBCGR 2.2.11.3). Visible sends the
+/// allow form with the full desktop as an *inclusive* rectangle — and then a Refresh
+/// Rect PDU (2.2.11.2) for the same rectangle, because allowing updates alone does NOT
+/// make the server repaint: Windows under the graphics pipeline resumes forwarding only
+/// *future* changes, so a desktop that went on changing while suppressed and then sat
+/// still would never be sent at all. A session that connected occluded showed exactly
+/// that as a permanent black window (kiln, 2026-08-18).
+fn visibility_pdus(
     visible: bool,
     desktop: DesktopSize,
-) -> ironrdp::pdu::rdp::headers::ShareDataPdu {
+) -> Vec<ironrdp::pdu::rdp::headers::ShareDataPdu> {
     use ironrdp::pdu::geometry::InclusiveRectangle;
     use ironrdp::pdu::rdp::headers::ShareDataPdu;
+    use ironrdp::pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
     use ironrdp::pdu::rdp::suppress_output::SuppressOutputPdu;
 
-    let desktop_rect = visible.then(|| InclusiveRectangle {
+    let full_desktop = || InclusiveRectangle {
         left: 0,
         top: 0,
         right: desktop.width.saturating_sub(1),
         bottom: desktop.height.saturating_sub(1),
-    });
-    ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect })
+    };
+    if visible {
+        vec![
+            ShareDataPdu::SuppressOutput(SuppressOutputPdu {
+                desktop_rect: Some(full_desktop()),
+            }),
+            ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+                areas_to_refresh: vec![full_desktop()],
+            }),
+        ]
+    } else {
+        vec![ShareDataPdu::SuppressOutput(SuppressOutputPdu {
+            desktop_rect: None,
+        })]
+    }
 }
 
 /// Whether a resize request names the state the session is already in.
@@ -1013,7 +1029,9 @@ mod tests {
             width: 2560,
             height: 1440,
         };
-        match suppress_output_pdu(false, desktop) {
+        let pdus = visibility_pdus(false, desktop);
+        assert_eq!(pdus.len(), 1, "hiding owes the server exactly one PDU");
+        match &pdus[0] {
             ShareDataPdu::SuppressOutput(pdu) => assert!(pdu.desktop_rect.is_none()),
             other => panic!("wrong PDU kind: {other:?}"),
         }
@@ -1029,14 +1047,48 @@ mod tests {
             width: 2560,
             height: 1440,
         };
-        match suppress_output_pdu(true, desktop) {
+        match &visibility_pdus(true, desktop)[0] {
             ShareDataPdu::SuppressOutput(pdu) => {
-                let rect = pdu.desktop_rect.expect("visible must carry the rect");
+                let rect = pdu
+                    .desktop_rect
+                    .as_ref()
+                    .expect("visible must carry the rect");
                 assert_eq!((rect.left, rect.top), (0, 0));
                 assert_eq!((rect.right, rect.bottom), (2559, 1439));
             }
             other => panic!("wrong PDU kind: {other:?}"),
         }
+    }
+
+    #[test]
+    fn revealing_also_requests_a_repaint_of_the_full_desktop() {
+        // Allowing updates alone does not repaint: the server resumes forwarding only
+        // FUTURE changes, so everything that changed while suppressed — including the
+        // whole first paint of a session that connected occluded — stays unsent and the
+        // window stays black (kiln, 2026-08-18). The reveal must carry an explicit
+        // Refresh Rect PDU for the full desktop, after the allow (a refresh sent while
+        // output is still suppressed would itself be suppressed).
+        use ironrdp::pdu::rdp::headers::ShareDataPdu;
+        let desktop = DesktopSize {
+            width: 2560,
+            height: 1440,
+        };
+        let pdus = visibility_pdus(true, desktop);
+        assert_eq!(pdus.len(), 2, "reveal owes allow + refresh");
+        match &pdus[1] {
+            ShareDataPdu::RefreshRectangle(pdu) => {
+                assert_eq!(pdus.len(), 2);
+                let [rect] = pdu.areas_to_refresh.as_slice() else {
+                    panic!("one rectangle covering the desktop, got {pdu:?}");
+                };
+                assert_eq!((rect.left, rect.top), (0, 0));
+                assert_eq!((rect.right, rect.bottom), (2559, 1439));
+            }
+            other => panic!("the second PDU must be the refresh, got: {other:?}"),
+        }
+        // Hiding must NOT request a repaint: the refresh would fight the suppression
+        // it rides along with.
+        assert_eq!(visibility_pdus(false, desktop).len(), 1);
     }
 
     /// A framed sink that records what was written, so the input path can be tested
