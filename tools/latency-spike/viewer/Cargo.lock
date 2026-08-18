@@ -4399,6 +4399,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhydra"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5028,25 +5037,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "spike-server"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "windows 0.62.2",
-]
-
-[[package]]
 name = "spike-viewer"
 version = "0.0.0"
 dependencies = [
  "ironrdp-egfx",
  "libc",
  "mdrdp",
+ "rhydra",
  "serde",
  "serde_json",
  "softbuffer",
- "spike-server",
  "winit",
 ]
 
