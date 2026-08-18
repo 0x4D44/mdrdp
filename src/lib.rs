@@ -21,6 +21,7 @@ pub mod hostscripts;
 pub mod input;
 pub mod metrics;
 pub mod presence;
+pub mod present;
 pub mod probe;
 pub mod process_metrics;
 pub mod screenshot;

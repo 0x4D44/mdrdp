@@ -855,9 +855,6 @@ impl SessionWindow {
     }
 }
 
-type SbContext = softbuffer::Context<Arc<Window>>;
-type SbSurface = softbuffer::Surface<Arc<Window>, Arc<Window>>;
-
 fn window_attributes(config: &WindowConfig) -> WindowAttributes {
     Window::default_attributes()
         .with_title(config.title.clone())
@@ -895,9 +892,7 @@ struct SessionApp {
     store: Arc<Mutex<SurfaceStore>>,
     input: WakingSender<InputEvent>,
     window: Option<Arc<Window>>,
-    // Held for as long as the surface: dropping the context invalidates it.
-    _context: Option<SbContext>,
-    surface: Option<SbSurface>,
+    presenter: Option<crate::present::Presenter>,
     viewport: Viewport,
     /// Last pointer position, in session pixels. Buttons and scrolls need coordinates
     /// and winit does not repeat them.
@@ -1008,8 +1003,7 @@ impl SessionApp {
             store,
             input,
             window: None,
-            _context: None,
-            surface: None,
+            presenter: None,
             viewport,
             cursor: None,
             wheel: input::WheelAccumulator::new(),
@@ -1475,7 +1469,7 @@ impl SessionApp {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(window), Some(surface)) = (self.window.clone(), self.surface.as_mut()) else {
+        let (Some(window), Some(presenter)) = (self.window.clone(), self.presenter.as_mut()) else {
             return;
         };
         let size = window.inner_size();
@@ -1485,16 +1479,16 @@ impl SessionApp {
             return; // Minimised. Nothing to draw into.
         };
 
-        if let Err(e) = surface.resize(width, height) {
+        if let Err(e) = presenter.resize(width, height) {
             // Transient: skip this frame. Only a sustained run of failures is fatal —
             // ending an RDP session because one present hiccuped is a bad trade.
-            self.note_present_failure(event_loop, e.to_string());
+            self.note_present_failure(event_loop, e);
             return;
         }
-        let mut buffer = match surface.buffer_mut() {
+        let mut buffer = match presenter.frame() {
             Ok(b) => b,
             Err(e) => {
-                self.note_present_failure(event_loop, e.to_string());
+                self.note_present_failure(event_loop, e);
                 return;
             }
         };
@@ -1544,7 +1538,7 @@ impl SessionApp {
 
         window.pre_present_notify();
         if let Err(e) = buffer.present() {
-            self.note_present_failure(event_loop, e.to_string());
+            self.note_present_failure(event_loop, e);
             return;
         }
         // Streak counts CONSECUTIVE failures: without this reset, 30 unrelated hiccups
@@ -1583,25 +1577,20 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             }
         };
 
-        let context = match softbuffer::Context::new(window.clone()) {
-            Ok(c) => c,
+        let presenter = match crate::present::Presenter::new(window.clone()) {
+            Ok(p) => p,
             Err(e) => {
-                self.fail(event_loop, WindowError::Os(e.to_string()));
+                self.fail(event_loop, WindowError::Os(e));
                 return;
             }
         };
-        let surface = match softbuffer::Surface::new(&context, window.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                self.fail(event_loop, WindowError::Os(e.to_string()));
-                return;
-            }
-        };
+        // One line of provenance for every measurement taken against this session:
+        // a CPU or latency figure without the present backend named is ambiguous.
+        eprintln!("present: {} backend", presenter.backend());
 
         window.request_redraw();
         self.window = Some(window.clone());
-        self._context = Some(context);
-        self.surface = Some(surface);
+        self.presenter = Some(presenter);
         self.menu = Some(session_menu::install(&window));
 
         // Scripted runs cannot click a native menu, so `MDRDP_OPEN_DIAG=cache,latency,

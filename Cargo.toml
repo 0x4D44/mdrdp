@@ -67,6 +67,11 @@ objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2-screen-capture-kit = "0.3.2"
+# The IOSurface present path (src/present.rs): frames composite on the GPU instead of
+# softbuffer's per-present CPU colorspace re-render (MDR-BUG-FLUX-00005). Both crates
+# were already in the tree transitively (softbuffer, objc2-core-video) at this version.
+objc2-io-surface = "0.3.2"
+objc2-quartz-core = "0.3.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
