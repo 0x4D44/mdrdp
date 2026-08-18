@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00005 — Idle session burns 20-90% of a core: full-frame CPU colorspace conversion on every present
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** render
 - **Raised:** 2026-08-18T18:02:47Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260818T180323Z-p53431-n173223000-c1
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00005-run-fix-20260818T180323Z-p53431-n173223000-c1
-- **Owner base:** d3443c1a40952b54c86207c8e5b8576ae8a4b843
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-18T18:03:23Z
-- **Owner until:** 2026-08-18T20:03:23Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-18T18:02:47Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-18T18:02:47Z, raised via `deltic bugs new`) -> Fixed (2026-08-18T18:51:12Z, deltic:auto role=fix run=fix-20260818T180323Z-p53431-n173223000-c1 branch=task/bug-MDR-BUG-FLUX-00005-run-fix-20260818T180323Z-p53431-n173223000-c1 code=e9575e8 gate=manual)
 
 ## Observation
 
