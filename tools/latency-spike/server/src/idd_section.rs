@@ -382,13 +382,20 @@ pub fn ready_slots(records: &[Option<SlotRecord>], last_consumed: u64) -> Vec<us
 /// * `dirty_since_frame_seq` is ahead of the last frame this consumer took, so the
 ///   list starts after a gap it does not describe.
 ///
-/// The first frame of a generation needs no special case: `last_consumed` starts
-/// at 0 and the driver's first publish carries `dirty_since = 0`, so `0 >= 0`
-/// holds — and if the server missed that first publish, `dirty_since` is above 0
-/// and the same comparison refuses it.
+/// `last_consumed == 0` — no baseline at all — is refused outright, even against
+/// the generation's first publish (`dirty_since = 0`). That record's list truly
+/// covers `(0, 1]`, but the consumer's real gap is the whole surface, not one
+/// frame's delta: a caret-blink rect offered as "complete" there would seed the
+/// exactness chain with a lie. The pipeline's `Recreated` handling and the
+/// viewer's before-base skip both happen to mask this today; the invariant must
+/// not depend on either of them (review, M2).
 pub fn coverage_for(slot: &SlotRecord, last_consumed: u64) -> Option<&[SectionRect]> {
     match &slot.coverage {
-        Coverage::Rects(rects) if last_consumed >= slot.dirty_since_frame_seq => Some(rects),
+        Coverage::Rects(rects)
+            if last_consumed > 0 && last_consumed >= slot.dirty_since_frame_seq =>
+        {
+            Some(rects)
+        }
         _ => None,
     }
 }
@@ -721,10 +728,14 @@ mod tests {
     }
 
     #[test]
-    fn the_first_frame_of_a_generation_is_covered_without_a_special_case() {
-        // dirty_since 0 against a fresh consumer: the general rule already says yes.
-        assert!(coverage_for(&record(1, 0, one_rect()), 0).is_some());
-        // …and says no when the server missed the generation's first publish.
+    fn a_consumer_with_no_baseline_is_refused_even_by_the_generations_first_publish() {
+        // The record's list truly covers (0, 1], but a consumer at last_consumed 0
+        // has no baseline at all — its gap is the whole surface, and one frame's
+        // delta offered as "complete" would seed the exactness chain with a lie.
+        assert!(coverage_for(&record(1, 0, one_rect()), 0).is_none());
+        // With a baseline, the same record is honest coverage.
+        assert!(coverage_for(&record(2, 1, one_rect()), 1).is_some());
+        // And a missed first publish is refused whatever the baseline state.
         assert!(coverage_for(&record(4, 3, one_rect()), 0).is_none());
     }
 

@@ -90,7 +90,7 @@ namespace Microsoft
         class SwapChainProcessor
         {
         public:
-            SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, SharedSection* pSection);
+            SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, std::shared_ptr<SharedSection> Section);
             ~SwapChainProcessor();
 
         private:
@@ -105,9 +105,13 @@ namespace Microsoft
             Microsoft::WRL::Wrappers::Thread m_hThread;
             Microsoft::WRL::Wrappers::Event m_hTerminateEvent;
 
-            // Null, or unusable, when the section could not be created or was squatted; the
-            // loop then behaves exactly as it did before the pool existed.
-            SharedSection* m_pSection;
+            // Null, or unusable, when the section could not be created; the loop then
+            // behaves exactly as it did before the pool existed. A shared_ptr rather
+            // than a raw pointer because the swap-chain thread writes through it on
+            // every frame, and WDF's cleanup ordering between the device object (which
+            // holds the section) and the monitor object (which joins this thread) is
+            // not something this code should have to be right about (review, M6).
+            std::shared_ptr<SharedSection> m_Section;
             SharedFramePool m_Pool;
         };
 
@@ -127,17 +131,18 @@ namespace Microsoft
             WDFDEVICE m_WdfDevice;
             IDDCX_ADAPTER m_Adapter;
 
-            // Created once at adapter start and held open for the life of the device, so
-            // the one well-known name survives every swap-chain assignment. Monitors get a
-            // raw pointer to it; they are children of this device object and so never
-            // outlive it.
-            SharedSection m_SharedSection;
+            // Created once at adapter start and held open at least for the life of the
+            // device, so the one well-known name survives every swap-chain assignment.
+            // Shared with every monitor and swap-chain processor, so the section always
+            // outlives whichever thread last writes through it - whatever order WDF
+            // runs the cleanup callbacks in.
+            std::shared_ptr<SharedSection> m_SharedSection;
         };
 
         class IndirectMonitorContext
         {
         public:
-            IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor, SharedSection* pSection);
+            IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor, std::shared_ptr<SharedSection> Section);
             virtual ~IndirectMonitorContext();
 
             void AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent);
@@ -145,7 +150,7 @@ namespace Microsoft
 
         private:
             IDDCX_MONITOR m_Monitor;
-            SharedSection* m_pSection;
+            std::shared_ptr<SharedSection> m_Section;
             std::unique_ptr<SwapChainProcessor> m_ProcessingThread;
         } ;
     }

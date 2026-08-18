@@ -81,6 +81,10 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Gap between open attempts while waiting for the section or a pool.
 const OPEN_RETRY: Duration = Duration::from_millis(250);
 
+/// How long a generation may keep refusing to open (`adopt`) before it stops
+/// being a rebuild race and becomes a fault worth dying over.
+const ADOPT_RETRY_LIMIT: Duration = Duration::from_secs(10);
+
 /// Seqlock read attempts before a record is given up on for this tick. The driver
 /// holds a record odd for a memcpy of at most 1 KB, so any real write finishes
 /// inside one of these; the bound exists so a wedged writer cannot spin us.
@@ -292,15 +296,15 @@ impl Pool {
     }
 }
 
-impl Drop for Pool {
+impl Drop for Slot {
     fn drop(&mut self) {
-        for slot in &self.slots {
-            // SAFETY: each handle came from this type's own `OpenEventW` and is not
-            // used again. `events` holds copies of the same handles, never closed
-            // separately.
-            unsafe {
-                let _ = CloseHandle(slot.event);
-            }
+        // SAFETY: the handle came from `Pool::open`'s own `OpenEventW` and is not
+        // used again. `Pool::events` holds copies of the same handles, never closed
+        // separately. Ownership sits on the slot rather than the pool so a
+        // `Pool::open` that fails partway (the retrying adopt path) still closes
+        // the events of the slots it did build.
+        unsafe {
+            let _ = CloseHandle(self.event);
         }
     }
 }
@@ -335,7 +339,10 @@ pub struct IddSource {
     /// cannot be adopted: the converter and the encoder are already built on this
     /// device.
     luid: u64,
-    section: Section,
+    /// `None` only transiently, inside [`IddSource::reopen`]: `OpenFileMappingW`
+    /// on a name we still hold open returns the same kernel object, so the old
+    /// mapping must be gone before a reopen can observe a new world (review, M4).
+    section: Option<Section>,
     pool: Pool,
     /// Our own copy target. One texture, not a pool: the copy into it and the
     /// converter's read out of it are both submitted to the same immediate
@@ -349,6 +356,9 @@ pub struct IddSource {
     last_consumed: u64,
     /// A malformed slot record is logged once per generation, not per frame.
     warned_bad_slot: bool,
+    /// Start of the current streak of `Pool::open` failures inside [`adopt`];
+    /// `None` while healthy. See `ADOPT_RETRY_LIMIT`.
+    adopt_failing_since: Option<Instant>,
 }
 
 impl IddSource {
@@ -394,12 +404,13 @@ impl IddSource {
             width: header.width,
             height: header.height,
             luid: header.render_adapter_luid,
-            section,
+            section: Some(section),
             pool,
             private,
             readback: RectReadback::new(header.width, header.height),
             last_consumed: 0,
             warned_bad_slot: false,
+            adopt_failing_since: None,
         })
     }
 
@@ -409,7 +420,11 @@ impl IddSource {
     /// what cannot change under us is the adapter or the geometry, because the
     /// converter and the encoder were built against both. Refusing loudly beats
     /// silently encoding a differently-sized desktop.
-    fn adopt(&mut self, header: &PoolHeader) -> Result<()> {
+    ///
+    /// `Ok(true)` = adopted; `Ok(false)` = the pool would not open just now (a
+    /// rebuild race) — keep the old pool and retry next tick; `Err` = a fault
+    /// worth dying over.
+    fn adopt(&mut self, header: &PoolHeader) -> Result<bool> {
         if header.render_adapter_luid != self.luid {
             return Err(format!(
                 "the IDD pool moved to adapter LUID {:#x} from {:#x}; the converter and encoder \
@@ -433,32 +448,64 @@ impl IddSource {
             )
             .into());
         }
-        // Drop the old pool's handles before opening the new generation's: the
-        // names are generation-qualified, so they cannot collide, but a redeploy
-        // that reuses a suffix would.
-        self.pool = Pool::open(&self.device1, header)?;
+        // The new pool opens BEFORE the old one drops — deliberately. Names are
+        // generation-qualified so they cannot collide, and an open that fails
+        // must leave the old pool in place: a second rebuild can land between our
+        // header read and these opens (Windows issues unassign/assign pairs in
+        // quick succession on a mode change), and killing the server over that
+        // race would be wrong. The failure is retried tick by tick and only
+        // escalates once it has persisted long enough to be a real fault.
+        match Pool::open(&self.device1, header) {
+            Ok(pool) => {
+                self.pool = pool;
+                self.adopt_failing_since = None;
+            }
+            Err(e) => {
+                let since = *self.adopt_failing_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > ADOPT_RETRY_LIMIT {
+                    return Err(format!(
+                        "the IDD pool (generation {}) has refused to open for {:?}: {e}",
+                        header.generation, ADOPT_RETRY_LIMIT
+                    )
+                    .into());
+                }
+                return Ok(false);
+            }
+        }
         self.output_name = pool_name(header.generation);
         // A rebuilt pool has its own frame numbering, and we have seen none of it.
-        // The coverage invariant then refuses metadata until a frame arrives whose
-        // `dirty_since` is 0 — which is exactly the "first frame after Recreated
-        // takes the full-frame path" rule, falling out of the general case.
+        // The coverage invariant then refuses metadata until this consumer has a
+        // baseline again — the first frame after a rebuild always takes the
+        // full-frame path, falling out of the general rule.
         self.last_consumed = 0;
         self.warned_bad_slot = false;
-        Ok(())
+        Ok(true)
     }
 
     /// The section itself went away — a `pnputil` redeploy, or the driver
     /// unloading. Remap it and adopt whatever pool comes back.
     fn reopen(&mut self) -> Result<()> {
+        // The old mapping goes first: `OpenFileMappingW` on a name this process
+        // still holds open returns the same kernel object, and a "reopen" that
+        // remaps the dead section would wait 30 s staring at its own stale header.
+        self.section = None;
         let (section, header) = wait_for_pool()?;
-        self.section = section;
-        self.adopt(&header)
+        self.section = Some(section);
+        // A transient adopt failure here is retried on the next tick like any
+        // other: the generation mismatch persists until a pool opens.
+        self.adopt(&header).map(|_| ())
+    }
+
+    fn section(&self) -> &Section {
+        self.section
+            .as_ref()
+            .expect("the section is only None inside reopen, which never yields")
     }
 
     fn read_slot_records(&mut self) -> Vec<Option<SlotRecord>> {
         let mut out = Vec::with_capacity(idd_section::SLOT_COUNT);
         for i in 0..idd_section::SLOT_COUNT {
-            match self.section.read_slot(i) {
+            match self.section().read_slot(i) {
                 Some(Ok(record)) => out.push(Some(record)),
                 Some(Err(e)) => {
                     if !self.warned_bad_slot {
@@ -508,7 +555,7 @@ impl IddSource {
             // pixels we are about to copy. A record that will not parse under the
             // mutex means the writer died mid-write — the slot is as untrustworthy
             // as an abandoned one.
-            record = match self.section.read_slot(slot) {
+            record = match self.section().read_slot(slot) {
                 Some(Ok(r)) => Some(r),
                 Some(Err(_)) | None => None,
             };
@@ -533,7 +580,7 @@ impl IddSource {
     }
 
     fn acquire_frame(&mut self, timeout_ms: u32) -> Result<Acquired> {
-        match self.section.read_header() {
+        match self.section().read_header() {
             Some(Ok(header)) if header.generation == self.pool.generation => {}
             // A torn-down pool with none published yet. Nothing to consume; the
             // generation bump that follows is what triggers the rebuild.
@@ -543,8 +590,14 @@ impl IddSource {
                     "capture: IDD pool rebuilt (generation {} → {})",
                     self.pool.generation, header.generation
                 );
-                self.adopt(&header)?;
-                return Ok(Acquired::Recreated);
+                return Ok(if self.adopt(&header)? {
+                    Acquired::Recreated
+                } else {
+                    // The new generation's objects were not openable this tick —
+                    // a rebuild race. The mismatch persists, so we land here
+                    // again next tick.
+                    Acquired::Timeout
+                });
             }
             // Mid-write, or a seqlock that never settled: a rebuild in flight.
             // Nothing to do but come back next tick.

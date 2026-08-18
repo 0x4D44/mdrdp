@@ -30,9 +30,12 @@ using namespace Microsoft::WRL;
 #pragma region helpers
 
 // How long the swap-chain thread will wait for the GPU to finish a slot copy before giving
-// up on it. Chosen as "far longer than a 1080p CopyResource but far shorter than a frame
-// interval at any mode we advertise" - if we ever hit it, the log says so.
-static constexpr LONGLONG MDRDP_IDD_COPY_WAIT_LIMIT_US = 8000;
+// up on it. The wait holds the slot's keyed mutex, so it must sit UNDER the consumer's own
+// 4 ms mutex timeout as well as under the 4.17 ms frame interval of the 240 Hz mode this
+// driver advertises - a 1080p CopyResource is ~0.2 ms, so 2 ms is already ten times the
+// common case. If we ever hit it, the log says so and the frame is not published (a copy
+// that never provably finished would publish torn pixels as a complete frame).
+static constexpr LONGLONG MDRDP_IDD_COPY_WAIT_LIMIT_US = 2000;
 
 // Seqlock, writer side. The sequence is odd while a write is in flight and even when the
 // record is stable, so a reader that samples the same even value either side of its read
@@ -90,7 +93,7 @@ static UINT64 MintNameSuffix()
 SharedSection::SharedSection() :
     m_pView(nullptr),
     m_pDescriptor(nullptr),
-    m_Squatted(false)
+    m_LastGeneration(0)
 {
     m_SecurityAttributes = {};
 }
@@ -115,8 +118,10 @@ SharedSection::~SharedSection()
 void SharedSection::Create()
 {
     // Idempotent: EvtDeviceD0Entry fires on every power transition, and the section is
-    // meant to outlive all of them.
-    if (m_pView != nullptr || m_Squatted)
+    // meant to outlive all of them. A refused name is retried on the next call rather
+    // than latched: the common holder of a stale name is a still-running server from
+    // before a driver redeploy, and that clears itself.
+    if (m_pView != nullptr)
     {
         return;
     }
@@ -152,18 +157,6 @@ void SharedSection::Create()
         return;
     }
 
-    if (Error == ERROR_ALREADY_EXISTS)
-    {
-        // Somebody else already owns the one well-known name in this design. Writing
-        // frames into a section we did not create would hand the desktop to whoever put it
-        // there, so the pool stays off for the life of this driver instance and the
-        // swap-chain thread keeps its original acquire-and-release-immediately behaviour.
-        CloseHandle(hSection);
-        m_Squatted = true;
-        OutputDebugStringW(L"mdrdp-idd: Global\\mdrdp-idd already existed - SHARED POOL DISABLED (name squatted); publishing nothing\n");
-        return;
-    }
-
     m_hSection.Attach(hSection);
 
     m_pView = static_cast<BYTE*>(MapViewOfFile(
@@ -171,21 +164,75 @@ void SharedSection::Create()
 
     if (m_pView == nullptr)
     {
+        // Includes the squatter-with-a-smaller-section case: a view of our full size
+        // cannot be mapped over an object that is not shaped like ours.
         LogHresult(L"MapViewOfFile(Global\\mdrdp-idd)", HRESULT_FROM_WIN32(GetLastError()));
         m_hSection.Close();
         return;
     }
 
-    // A new section is zero-filled, so generation 0 ("no pool yet") is already true. Stamp
-    // the version and slot count so a server that opens before the first swap-chain
-    // assignment reads a valid, empty header rather than guessing.
     MdrdpSharedHeader* pHeader = Header();
+
+    if (Error == ERROR_ALREADY_EXISTS)
+    {
+        // Somebody already holds the one well-known name. The overwhelmingly common
+        // holder is our own previous section, kept alive by a still-running server's
+        // open handle across a driver redeploy - creating in Global\ needs
+        // SeCreateGlobalPrivilege, so an actual squatter must already be privileged.
+        // Adopt it if it is shaped like ours (version 0 = zero-filled and never
+        // stamped, version 1 = ours); refuse anything else, and retry on a later
+        // D0Entry rather than latching off forever.
+        const UINT32 Version = pHeader->LayoutVersion;
+        if (Version != 0 && Version != MDRDP_IDD_LAYOUT_VERSION)
+        {
+            UnmapViewOfFile(m_pView);
+            m_pView = nullptr;
+            m_hSection.Close();
+            OutputDebugStringW(L"mdrdp-idd: Global\\mdrdp-idd already existed with a foreign layout - SHARED POOL DISABLED for now (squatting?); will retry on the next power-up\n");
+            return;
+        }
+
+        // Generations must keep moving forward through the adopted header so a consumer
+        // holding the old pool sees the next build as a bump.
+        m_LastGeneration = pHeader->Generation;
+        OutputDebugStringW(L"mdrdp-idd: adopted the existing Global\\mdrdp-idd section (a consumer held it across a driver restart)\n");
+    }
+
+    // Stamp the version and slot count (a fresh section is zero-filled), and force the
+    // generation to 0: whatever pool the header used to advertise, its textures and
+    // events died with the driver instance that owned them, and 0 is the header state a
+    // consumer already treats as "no pool yet - wait".
     SeqlockBegin(&pHeader->HeaderSequence);
     pHeader->LayoutVersion = MDRDP_IDD_LAYOUT_VERSION;
     pHeader->SlotCount = MDRDP_IDD_SLOT_COUNT;
+    pHeader->Generation = 0;
     SeqlockEnd(&pHeader->HeaderSequence);
 
-    OutputDebugStringW(L"mdrdp-idd: shared section Global\\mdrdp-idd created\n");
+    OutputDebugStringW(L"mdrdp-idd: shared section Global\\mdrdp-idd ready\n");
+}
+
+// The next pool generation. Monotonic across every pool build this driver instance
+// performs, and seeded from an adopted header so it stays monotonic across the driver
+// restart a held-open section survives.
+UINT32 SharedSection::NextGeneration()
+{
+    return ++m_LastGeneration;
+}
+
+// The header state a consumer treats as "no pool - wait". Called when a pool is torn
+// down, because a header that keeps advertising a dead generation strands a consumer
+// that opens mid-gap on names whose objects no longer exist.
+void SharedSection::AdvertiseNoPool()
+{
+    if (m_pView == nullptr)
+    {
+        return;
+    }
+
+    MdrdpSharedHeader* pHeader = Header();
+    SeqlockBegin(&pHeader->HeaderSequence);
+    pHeader->Generation = 0;
+    SeqlockEnd(&pHeader->HeaderSequence);
 }
 
 MdrdpSharedSlot* SharedSection::Slot(UINT32 Index) const
@@ -205,7 +252,6 @@ MdrdpSharedSlot* SharedSection::Slot(UINT32 Index) const
 SharedFramePool::SharedFramePool() :
     m_pSection(nullptr),
     m_FrameSeq(0),
-    m_Generation(0),
     m_Started(false)
 {
     m_PerfFrequency = {};
@@ -245,9 +291,11 @@ HRESULT SharedFramePool::Start(
     m_Stats = {};
 
     // The generation the consumer watches for invalidation. It only ever goes up, and it
-    // lives in the section rather than in this object because the section outlives every
-    // swap-chain assignment.
-    const UINT32 Generation = pSection->Header()->Generation + 1;
+    // lives with the section rather than in this object because the section outlives
+    // every swap-chain assignment. It is NOT read back from the header: teardown
+    // advertises generation 0 there, and a counter that dipped would let two distinct
+    // pools share a generation number.
+    const UINT32 Generation = pSection->NextGeneration();
     const UINT64 Suffix = MintNameSuffix();
 
     // Match the acquired surface exactly - the copy is a straight CopyResource, so any
@@ -342,8 +390,31 @@ HRESULT SharedFramePool::Start(
         return hr;
     }
 
+    // Wipe every slot record BEFORE the new generation becomes visible. The records
+    // carry no generation field, and the previous pool's final frame numbers are still
+    // in these pages - a consumer that adopted the new generation and then read a stale
+    // record would latch its frame counter onto a number the new pool will not reach
+    // for as long as the old one ran, and go silent for exactly that long (review, C1).
+    // FrameSeq 0 is a state the consumer's slot selection already filters out.
+    for (UINT32 i = 0; i < MDRDP_IDD_SLOT_COUNT; i++)
+    {
+        MdrdpSharedSlot* pSlot = pSection->Slot(i);
+        if (pSlot == nullptr)
+        {
+            continue;
+        }
+        volatile UINT32* pSlotSequence = reinterpret_cast<volatile UINT32*>(&pSlot->Sequence);
+        SeqlockBegin(pSlotSequence);
+        pSlot->FrameSeq = 0;
+        pSlot->DirtySinceFrameSeq = 0;
+        pSlot->PresentQpc = 0;
+        pSlot->CoverageRectCount = MDRDP_IDD_COVERAGE_ABSENT;
+        SeqlockEnd(pSlotSequence);
+    }
+
     // Published LAST, and only now: a generation a server can see is a generation whose
-    // textures and events already exist under the names derived from it.
+    // textures and events already exist under the names derived from it, behind slot
+    // records that are provably not another generation's.
     MdrdpSharedHeader* pHeader = pSection->Header();
     SeqlockBegin(&pHeader->HeaderSequence);
     pHeader->LayoutVersion = MDRDP_IDD_LAYOUT_VERSION;
@@ -359,7 +430,7 @@ HRESULT SharedFramePool::Start(
     pHeader->Reserved = 0;
     SeqlockEnd(&pHeader->HeaderSequence);
 
-    m_Generation = Generation;
+
     m_FrameSeq = 0;
     m_Started = true;
 
@@ -378,6 +449,14 @@ HRESULT SharedFramePool::Start(
 
 void SharedFramePool::Stop()
 {
+    // First word out: "no pool". A header that kept advertising this generation would
+    // strand a consumer that opens mid-gap on names whose objects die with the ComPtrs
+    // below (review, M3). Generation 0 is the state the consumer waits out.
+    if (m_pSection != nullptr)
+    {
+        m_pSection->AdvertiseNoPool();
+    }
+
     for (UINT32 i = 0; i < MDRDP_IDD_SLOT_COUNT; i++)
     {
         m_Slots[i].Mutex.Reset();
@@ -443,21 +522,30 @@ void SharedFramePool::ProcessFrame(
 
     // The keyed mutex protects the destination; NOTHING protects the source, which goes
     // back to the swap-chain as soon as we return. Order the copy against that or DWM
-    // composites into a surface the GPU is still reading.
-    WaitForCopy();
+    // composites into a surface the GPU is still reading. A copy that never provably
+    // finished is NOT published - torn pixels under a record that calls them complete
+    // would defeat the whole contract; the frame is simply lost and counted.
+    const bool CopyProven = WaitForCopy();
 
-    // The record is written INSIDE the mutex, before the release: the pixels and the
-    // record that describes them must be one atomic unit to any holder. Published after
-    // the release, a consumer that acquired the instant we let go could pair this
-    // frame's pixels with the PREVIOUS record - and its coverage list would then
-    // under-claim, which the client's exactness invariant turns into permanently stale
-    // canvas regions. The consumer re-reads the record under the same mutex.
-    PublishSlot(Index, m_FrameSeq, PresentQpc);
+    if (CopyProven)
+    {
+        // The record is written INSIDE the mutex, before the release: the pixels and the
+        // record that describes them must be one atomic unit to any holder. Published
+        // after the release, a consumer that acquired the instant we let go could pair
+        // this frame's pixels with the PREVIOUS record - and its coverage list would
+        // then under-claim, which the client's exactness invariant turns into
+        // permanently stale canvas regions. The consumer re-reads the record under the
+        // same mutex.
+        PublishSlot(Index, m_FrameSeq, PresentQpc);
+    }
 
     Target.Mutex->ReleaseSync(0);
-    SetEvent(Target.hEvent.Get());
 
-    m_Stats.Published++;
+    if (CopyProven)
+    {
+        SetEvent(Target.hEvent.Get());
+        m_Stats.Published++;
+    }
 }
 
 void SharedFramePool::TakeWindowStats(WindowStats& Stats)

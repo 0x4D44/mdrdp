@@ -297,8 +297,8 @@ HRESULT Direct3DDevice::Init()
 
 #pragma region SwapChainProcessor
 
-SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, SharedSection* pSection)
-    : m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent), m_pSection(pSection)
+SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, shared_ptr<SharedSection> Section)
+    : m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent), m_Section(std::move(Section))
 {
     m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
 
@@ -374,7 +374,7 @@ void SwapChainProcessor::RunCore()
     // section (creation failed, or the well-known name was squatted) leaves the pool
     // permanently unstarted, and the loop below degrades to the null consumer it used to
     // be rather than failing the display.
-    const bool PoolWanted = (m_pSection != nullptr) && m_pSection->Usable();
+    const bool PoolWanted = (m_Section != nullptr) && m_Section->Usable();
     bool PoolStartTried = false;
 
     // Acquire and release buffers in a loop
@@ -433,7 +433,7 @@ void SwapChainProcessor::RunCore()
                         D3D11_TEXTURE2D_DESC SourceDesc = {};
                         AcquiredTexture->GetDesc(&SourceDesc);
 
-                        m_Pool.Start(m_pSection, m_Device->Device.Get(), m_Device->DeviceContext.Get(), m_Device->AdapterLuid, SourceDesc);
+                        m_Pool.Start(m_Section.get(), m_Device->Device.Get(), m_Device->DeviceContext.Get(), m_Device->AdapterLuid, SourceDesc);
                     }
 
                     // Copies into the next slot if the server is not holding it, folds this
@@ -520,7 +520,11 @@ void IndirectDeviceContext::InitAdapter()
     // able to find the section across those rebuilds. Idempotent, because D0Entry can fire
     // more than once. If it cannot be claimed, the swap-chain loop publishes nothing and
     // the display still works.
-    m_SharedSection.Create();
+    if (m_SharedSection == nullptr)
+    {
+        m_SharedSection = std::make_shared<SharedSection>();
+    }
+    m_SharedSection->Create();
 
     // The strings and version numbers below are used for telemetry and may be displayed to
     // the user in some situations. This is also where static per-adapter capabilities are
@@ -605,7 +609,7 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
     {
         // Create a new monitor context object and attach it to the Idd monitor object
         auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject);
-        pMonitorContextWrapper->pContext = new IndirectMonitorContext(MonitorCreateOut.MonitorObject, &m_SharedSection);
+        pMonitorContextWrapper->pContext = new IndirectMonitorContext(MonitorCreateOut.MonitorObject, m_SharedSection);
 
         // Tell the OS that the monitor has been plugged in
         IDARG_OUT_MONITORARRIVAL ArrivalOut;
@@ -613,9 +617,9 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
     }
 }
 
-IndirectMonitorContext::IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor, SharedSection* pSection) :
+IndirectMonitorContext::IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor, std::shared_ptr<SharedSection> Section) :
     m_Monitor(Monitor),
-    m_pSection(pSection)
+    m_Section(std::move(Section))
 {
 }
 
@@ -638,7 +642,7 @@ void IndirectMonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID Ren
     else
     {
         // Create a new swap-chain processing thread
-        m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent, m_pSection));
+        m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent, m_Section));
     }
 }
 

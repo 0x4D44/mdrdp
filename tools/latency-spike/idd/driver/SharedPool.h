@@ -138,9 +138,11 @@ namespace Microsoft
         /// <summary>
         /// The one well-known named section. Created once at adapter start and held open
         /// across swap-chain assignments, because its name is the only thing a server can
-        /// find without being told. Creation succeeding with ERROR_ALREADY_EXISTS means
-        /// something else owns the name - that is squatting, and the driver then publishes
-        /// nothing rather than writing frames into a stranger's memory.
+        /// find without being told. `ERROR_ALREADY_EXISTS` usually means our own previous
+        /// section, kept alive by a consumer's open handle across a driver restart - that
+        /// is adopted if its layout validates as ours (creating in `Global\` needs
+        /// SeCreateGlobalPrivilege, so a genuine squatter is already privileged); a
+        /// foreign layout is refused, loudly, and retried on the next power-up.
         /// </summary>
         class SharedSection
         {
@@ -148,10 +150,11 @@ namespace Microsoft
             SharedSection();
             ~SharedSection();
 
-            // Idempotent: D0Entry can fire more than once over a device's life.
+            // Idempotent: D0Entry can fire more than once over a device's life. A name
+            // held by a foreign object is retried on the next call, never latched off.
             void Create();
 
-            bool Usable() const { return m_pView != nullptr && !m_Squatted; }
+            bool Usable() const { return m_pView != nullptr; }
 
             // The SD every texture and event in the pool is created with, so the server
             // that can open the section can open everything it names.
@@ -159,6 +162,14 @@ namespace Microsoft
 
             MdrdpSharedHeader* Header() const { return reinterpret_cast<MdrdpSharedHeader*>(m_pView); }
             MdrdpSharedSlot* Slot(UINT32 Index) const;
+
+            // Monotonic across pool builds AND across a driver restart whose section a
+            // consumer held open (the adopted header seeds it).
+            UINT32 NextGeneration();
+
+            // Header generation back to 0 - "no pool, wait" - so a torn-down pool never
+            // strands a late-opening consumer on names whose objects are gone.
+            void AdvertiseNoPool();
 
         private:
             SharedSection(const SharedSection&) = delete;
@@ -168,7 +179,7 @@ namespace Microsoft
             BYTE* m_pView;
             PSECURITY_DESCRIPTOR m_pDescriptor;
             SECURITY_ATTRIBUTES m_SecurityAttributes;
-            bool m_Squatted;
+            UINT32 m_LastGeneration;
         };
 
         /// <summary>
@@ -269,7 +280,6 @@ namespace Microsoft
 
             LARGE_INTEGER m_PerfFrequency;
             UINT64 m_FrameSeq;
-            UINT32 m_Generation;
             bool m_Started;
 
             WindowStats m_Stats;
