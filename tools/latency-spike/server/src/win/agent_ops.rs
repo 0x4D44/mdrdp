@@ -28,7 +28,7 @@ pub const DISPLAY_DEVICE_STRING: &str = "mdrdp latency-spike display";
 /// The images the agent owns on the box. Swept at start, killed at shutdown.
 /// Deliberately does NOT include the agent's own image (an uninstall would kill
 /// itself) or the rig's `spike-server-inc3.exe`.
-const OWNED_IMAGES: [&str; 2] = ["rhydra-server.exe", "mdrdp-idd-create.exe"];
+pub const OWNED_IMAGES: [&str; 2] = ["rhydra-server.exe", "mdrdp-idd-create.exe"];
 
 pub struct WinOps {
     /// Directory holding the sibling exes; logs go to `<root>\logs\`.

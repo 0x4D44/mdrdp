@@ -42,7 +42,7 @@ mod win {
 
     use rhydra::agent::{Reconciler, TICK_SECS};
     use rhydra::control::{self, Request, CONTROL_PORT};
-    use rhydra::win::agent_ops::{exe_root, WinOps};
+    use rhydra::win::agent_ops::{exe_root, WinOps, OWNED_IMAGES};
 
     const TASK_NAME: &str = "rhydra-agent";
 
@@ -256,7 +256,7 @@ mod win {
                 // Not running. Its children cannot be running supervised either,
                 // but a hard-killed agent may have left orphans: sweep the owned
                 // images (never our own image — that would kill this process).
-                for image in ["rhydra-server.exe", "mdrdp-idd-create.exe"] {
+                for image in OWNED_IMAGES {
                     let _ = Command::new("taskkill").args(["/f", "/im", image]).status();
                 }
             }
