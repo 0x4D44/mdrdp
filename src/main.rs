@@ -990,6 +990,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let pid = std::process::id();
         let started_unix = mdrdp::presence::unix_now();
         let (mut width, mut height) = (desktop.width, desktop.height);
+        let mut codec = mdrdp::presence::CodecTracker::default();
         mdrdp::presence::spawn_writer(dir, Arc::clone(&presence_stop), move || {
             let s = stats.snapshot();
             if let Some(surface) = store
@@ -1005,14 +1006,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 host: host.clone(),
                 port,
                 user: user.clone(),
+                version: mdrdp::cli::VERSION.to_owned(),
                 width,
                 height,
                 started_unix,
                 updated_unix: mdrdp::presence::unix_now(),
                 frames: s.frames,
                 bytes_in: s.bytes_in,
-                cache_hits: s.cache.hits,
-                cache_misses: s.cache.misses,
+                codec: codec.observe(&s.codec_painted),
                 latency_p50_us: s.latency.recent().map(|p| p.p50),
                 frame_gap_p50_us: s.frame_gap.recent().map(|p| p.p50),
                 decode_errors: s.decode_errors,

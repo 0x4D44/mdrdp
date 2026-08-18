@@ -44,6 +44,11 @@ pub struct SessionPresence {
     pub host: String,
     pub port: u16,
     pub user: String,
+    /// The mdrdp build running this session. Sessions are separate processes with
+    /// their own lifetimes, so two of them can be on different builds after an
+    /// upgrade — the listing says which. Empty when an older session wrote the file.
+    #[serde(default)]
+    pub version: String,
     /// Current session resolution (tracks dynamic resize).
     pub width: u16,
     pub height: u16,
@@ -51,8 +56,11 @@ pub struct SessionPresence {
     pub updated_unix: u64,
     pub frames: u64,
     pub bytes_in: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
+    /// The codec carrying the picture right now, as the title bar names it
+    /// (`Avc444v2`, `ClearCodec+Progressive`). Empty before the first paint, or when
+    /// an older session wrote the file. See [`CodecTracker`].
+    #[serde(default)]
+    pub codec: String,
     /// Recent input round-trip p50, microseconds.
     pub latency_p50_us: Option<u32>,
     /// Recent wall-clock gap between paints p50, microseconds — the received frame
@@ -61,6 +69,33 @@ pub struct SessionPresence {
     pub decode_errors: u64,
     /// Frames seen per codec, e.g. `{"ClearCodec": 1234}`.
     pub codecs: BTreeMap<String, u64>,
+}
+
+/// Names the codec currently carrying the picture, sample to sample.
+///
+/// The lister is a different process reading one snapshot, so it cannot diff anything
+/// itself — the session has to answer "which codec, now?" before it writes. That is the
+/// same question the window title answers, so this reuses [`crate::window::codec_note`]:
+/// whichever codecs painted bytes since the previous sample, noise dropped.
+///
+/// An idle sample paints nothing at all, which is not evidence the codec changed, so the
+/// previous answer sticks rather than blinking to unknown between keystrokes.
+#[derive(Debug, Default)]
+pub struct CodecTracker {
+    painted: BTreeMap<String, u64>,
+    current: String,
+}
+
+impl CodecTracker {
+    /// Fold in `painted` — [`crate::stats::SessionStats::codec_painted`], cumulative
+    /// bytes per codec — and return the codec to record.
+    pub fn observe(&mut self, painted: &BTreeMap<String, u64>) -> String {
+        if let Some(note) = crate::window::codec_note(painted, &self.painted) {
+            self.current = note;
+        }
+        self.painted.clone_from(painted);
+        self.current.clone()
+    }
 }
 
 /// Seconds since the Unix epoch, saturating at 0 on a clock set before 1970.
@@ -265,7 +300,7 @@ fn grade_low(value: f64, good: f64, warn: f64) -> &'static str {
 
 /// The columns one session renders to, in table order.
 ///
-/// The four health columns — FPS, CACHE, P50, ERRS — carry a grade; the rest carry a
+/// The three health columns — FPS, P50, ERRS — carry a grade; the rest carry a
 /// fixed identity colour. The thresholds are set from what this codebase has actually
 /// measured: a remote session's encoder tops out near 30 fps, and a healthy input round
 /// trip is tens of milliseconds (~30 ms to quench, ~48 ms to temper under AVC444) while
@@ -282,14 +317,6 @@ fn row_cells(p: &SessionPresence, now_unix: u64) -> Vec<Cell> {
         }
         None => ("-".to_owned(), UNMEASURED),
     };
-    let lookups = p.cache_hits + p.cache_misses;
-    let (cache, cache_sgr) = if lookups > 0 {
-        let hit_rate = (p.cache_hits as f64 / lookups as f64) * 100.0;
-        (format!("{hit_rate:.0}%"), grade_high(hit_rate, 75.0, 40.0))
-    } else {
-        // An AVC444 session sends no cache PDUs at all, so a bare "-" is normal here.
-        ("-".to_owned(), UNMEASURED)
-    };
     let (p50, p50_sgr) = match p.latency_p50_us {
         Some(us) => {
             let ms = f64::from(us) / 1000.0;
@@ -299,23 +326,37 @@ fn row_cells(p: &SessionPresence, now_unix: u64) -> Vec<Cell> {
     };
     // Zero decode errors is the expected state, not an achievement: stay quiet.
     let errs_sgr = if p.decode_errors > 0 { BAD } else { SECONDARY };
+    // Neither the build nor the codec is a verdict, so an unknown one is a quiet dash
+    // rather than a blank cell that reads as "nothing to report".
+    let (version, version_sgr) = unknown_if_empty(&p.version, SECONDARY);
+    let (codec, codec_sgr) = unknown_if_empty(&p.codec, "");
     vec![
         Cell::new(p.name.clone(), IDENTITY),
         Cell::new(format!("{}@{}:{}", p.user, p.host, p.port), ADDRESS),
         Cell::new(p.pid.to_string(), SECONDARY),
+        Cell::new(version, version_sgr),
         Cell::new(up, ""),
         Cell::new(format!("{}x{}", p.width, p.height), ""),
+        Cell::new(codec, codec_sgr),
         Cell::new(fps, fps_sgr),
         Cell::new(p.frames.to_string(), SECONDARY),
         Cell::new(fmt_bytes(p.bytes_in), SECONDARY),
-        Cell::new(cache, cache_sgr),
         Cell::new(p50, p50_sgr),
         Cell::new(p.decode_errors.to_string(), errs_sgr),
     ]
 }
 
+/// A text cell that shows a dash, dimmed, when there is nothing to say.
+fn unknown_if_empty(text: &str, sgr: &'static str) -> (String, &'static str) {
+    if text.is_empty() {
+        ("-".to_owned(), UNMEASURED)
+    } else {
+        (text.to_owned(), sgr)
+    }
+}
+
 const HEADER: &[&str] = &[
-    "NAME", "TARGET", "PID", "UP", "RES", "FPS", "FRAMES", "RX", "CACHE", "P50", "ERRS",
+    "NAME", "TARGET", "PID", "VER", "UP", "RES", "CODEC", "FPS", "FRAMES", "RX", "P50", "ERRS",
 ];
 
 /// Render the sessions table, one line per session, columns sized to the content.
@@ -389,14 +430,14 @@ mod tests {
             host: "quench.lan.example".to_owned(),
             port: 3390,
             user: "ano".to_owned(),
+            version: "9.8.7".to_owned(),
             width: 2560,
             height: 1440,
             started_unix: now - 133,
             updated_unix: now,
             frames: 4321,
             bytes_in: 1_300_000,
-            cache_hits: 90,
-            cache_misses: 10,
+            codec: "Avc444v2".to_owned(),
             latency_p50_us: Some(3_140),
             frame_gap_p50_us: Some(33_333),
             decode_errors: 7,
@@ -500,10 +541,15 @@ mod tests {
         assert!(lines.next().is_none(), "one session, one row");
 
         for label in [
-            "NAME", "TARGET", "PID", "UP", "RES", "FPS", "FRAMES", "RX", "CACHE", "P50", "ERRS",
+            "NAME", "TARGET", "PID", "VER", "UP", "RES", "CODEC", "FPS", "FRAMES", "RX", "P50",
+            "ERRS",
         ] {
             assert!(header.contains(label), "header is missing {label}");
         }
+        assert!(
+            !header.contains("CACHE"),
+            "an AVC444 session caches nothing, so the column only ever showed a dash"
+        );
         let cells: Vec<&str> = row.split_whitespace().collect();
         assert_eq!(
             cells,
@@ -511,12 +557,13 @@ mod tests {
                 "quench",
                 "ano@quench.lan.example:3390",
                 "4242",
+                "9.8.7",
                 "2m13s",
                 "2560x1440",
+                "Avc444v2",
                 "30", // 33,333 us between frames
                 "4321",
                 "1.2 MB",
-                "90%", // 90 hits of 100 lookups
                 "3.1ms",
                 "7",
             ]
@@ -532,15 +579,75 @@ mod tests {
         let mut idle = presence(1, now);
         idle.latency_p50_us = None;
         idle.frame_gap_p50_us = None;
-        idle.cache_hits = 0;
-        idle.cache_misses = 0;
+        idle.codec = String::new();
         let text = render_table(&[idle], now, false);
         let row = lines_of(&text).nth(1).expect("session row").to_owned();
         assert_eq!(
             row.split_whitespace().filter(|c| *c == "-").count(),
             3,
-            "fps, cache and p50 must all show as unmeasured: {row}"
+            "fps, codec and p50 must all show as unmeasured: {row}"
         );
+    }
+
+    #[test]
+    fn a_file_from_an_older_build_still_lists_with_its_build_unnamed() {
+        let dir = tmpdir();
+        let now = unix_now();
+        // What 0.1.57 and earlier wrote: no `version`, no `codec`, and cache counters
+        // this build no longer reads.
+        let old = serde_json::json!({
+            "pid": 5150,
+            "name": "quench",
+            "host": "quench.lan.example",
+            "port": 3389,
+            "user": "ano",
+            "width": 1920,
+            "height": 1080,
+            "started_unix": now - 60,
+            "updated_unix": now,
+            "frames": 100,
+            "bytes_in": 2048,
+            "cache_hits": 3,
+            "cache_misses": 4,
+            "latency_p50_us": 30_000,
+            "frame_gap_p50_us": 16_000,
+            "decode_errors": 0,
+            "codecs": {"Avc444v2": 100},
+        });
+        std::fs::write(dir.join("5150.json"), old.to_string()).expect("write");
+
+        let listed = list_from(&dir, now);
+        assert_eq!(listed.len(), 1, "an older session must still be listed");
+        assert!(listed[0].version.is_empty());
+        let row = render_table(&listed, now, false);
+        let cells: Vec<&str> = row
+            .lines()
+            .nth(1)
+            .expect("row")
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            cells[3], "-",
+            "unknown build, not a blank column: {cells:?}"
+        );
+        assert_eq!(cells[6], "-", "unknown codec: {cells:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_codec_tracker_names_what_is_painting_now_and_holds_it_while_idle() {
+        let mut tracker = CodecTracker::default();
+        assert_eq!(tracker.observe(&BTreeMap::new()), "", "nothing painted yet");
+
+        // A session that opens on ClearCodec and then switches to AVC must report AVC,
+        // even though ClearCodec still holds the larger cumulative byte count.
+        let mut painted = BTreeMap::from([("ClearCodec".to_owned(), 900_000)]);
+        assert_eq!(tracker.observe(&painted), "ClearCodec");
+        painted.insert("Avc444v2".to_owned(), 100_000);
+        assert_eq!(tracker.observe(&painted), "Avc444v2");
+
+        // An idle sample paints nothing; that is not evidence the codec changed.
+        assert_eq!(tracker.observe(&painted), "Avc444v2");
     }
 
     #[test]
@@ -626,6 +733,10 @@ mod tests {
             row.contains(&("2".to_owned(), "4242".to_owned())),
             "{row:?}"
         );
+        assert!(
+            row.contains(&("2".to_owned(), "9.8.7".to_owned())),
+            "the build is bookkeeping, not a headline: {row:?}"
+        );
     }
 
     #[test]
@@ -633,15 +744,11 @@ mod tests {
         let now = unix_now();
         let mut healthy = presence(1, now);
         healthy.frame_gap_p50_us = Some(33_333); // 30 fps — the remote-session cap
-        healthy.cache_hits = 95;
-        healthy.cache_misses = 5;
         healthy.latency_p50_us = Some(30_000); // measured-normal typing round trip
         healthy.decode_errors = 0;
 
         let mut sick = presence(2, now);
         sick.frame_gap_p50_us = Some(500_000); // 2 fps
-        sick.cache_hits = 1;
-        sick.cache_misses = 9;
         sick.latency_p50_us = Some(416_000); // the non-AVC path's p50
         sick.decode_errors = 12;
 
@@ -650,7 +757,7 @@ mod tests {
         let good = coloured_runs(lines.next().expect("healthy row"));
         let bad = coloured_runs(lines.next().expect("sick row"));
 
-        for cell in ["30", "95%", "30.0ms"] {
+        for cell in ["30", "30.0ms"] {
             assert!(
                 good.contains(&("32".to_owned(), cell.to_owned())),
                 "{cell} should read as healthy: {good:?}"
@@ -660,7 +767,7 @@ mod tests {
             good.contains(&("2".to_owned(), "0".to_owned())),
             "no decode errors is the normal state, not an achievement: {good:?}"
         );
-        for cell in ["2", "10%", "416.0ms", "12"] {
+        for cell in ["2", "416.0ms", "12"] {
             assert!(
                 bad.contains(&("1;31".to_owned(), cell.to_owned())),
                 "{cell} should read as unhealthy: {bad:?}"
@@ -673,12 +780,10 @@ mod tests {
         let now = unix_now();
         let mut middling = presence(1, now);
         middling.frame_gap_p50_us = Some(66_667); // 15 fps
-        middling.cache_hits = 50;
-        middling.cache_misses = 50;
         middling.latency_p50_us = Some(150_000); // 150 ms
         let text = render_table(&[middling], now, true);
         let row = coloured_runs(lines_of(&text).nth(1).expect("session row"));
-        for cell in ["15", "50%", "150.0ms"] {
+        for cell in ["15", "150.0ms"] {
             assert!(
                 row.contains(&("33".to_owned(), cell.to_owned())),
                 "{cell} sits between good and bad: {row:?}"
@@ -692,14 +797,13 @@ mod tests {
         let mut idle = presence(1, now);
         idle.latency_p50_us = None;
         idle.frame_gap_p50_us = None;
-        idle.cache_hits = 0;
-        idle.cache_misses = 0;
+        idle.codec = String::new();
         let text = render_table(&[idle], now, true);
         let row = coloured_runs(lines_of(&text).nth(1).expect("session row"));
         assert_eq!(
             row.iter().filter(|(sgr, t)| sgr == "2" && t == "-").count(),
             3,
-            "fps, cache and p50 are unknown, and unknown is not a pass: {row:?}"
+            "fps, codec and p50 are unknown, and unknown is not a pass: {row:?}"
         );
         assert!(
             !row.iter().any(|(sgr, t)| sgr == "32" && t == "-"),
