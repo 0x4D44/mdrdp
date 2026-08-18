@@ -49,6 +49,12 @@ pub struct Header {
     pub bitrate_kbps: u32,
     pub gop: u32,
     pub fps: u32,
+    /// Which capture source produced this run: `dxgi` (Desktop Duplication) or
+    /// `idd` (the driver's shared texture pool). The two have a ~7.5 ms difference
+    /// in their present→acquire stage, so a figure that does not name its source
+    /// cannot be compared with one that does.
+    pub source: &'static str,
+    /// Meaningful only when `source` is `dxgi`: the IDD pool is found by name.
     pub output_index: usize,
     pub adapter: String,
     pub output: String,
@@ -74,9 +80,10 @@ pub struct Header {
     pub sequence_header_available: bool,
 }
 
-/// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
-/// gained `dropped_rects`, and `record: "rects"` rows exist at all.
-pub const SCHEMA: u32 = 3;
+/// Schema 4: the header gained `source`, naming which capture path the run used.
+/// (Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
+/// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
+pub const SCHEMA: u32 = 4;
 pub const WIRE_VERSION: u32 = 2;
 
 impl Header {
@@ -91,6 +98,7 @@ impl Header {
             bitrate_kbps: 0,
             gop: 0,
             fps: 0,
+            source: "unknown",
             output_index: 0,
             adapter: String::new(),
             output: String::new(),
@@ -366,13 +374,16 @@ mod tests {
     }
 
     #[test]
-    fn the_header_publishes_the_frequency_and_the_encoder_choice() {
+    fn the_header_publishes_the_frequency_the_encoder_choice_and_the_source() {
         let mut h = Header::new();
         h.qpc_frequency = 10_000_000;
         h.encoder = "NVIDIA H.264 Encoder MFT".into();
         h.encoder_kind = "async-hardware";
         h.codec_api_applied = vec!["AVLowLatencyMode".into()];
         h.codec_api_refused = vec!["AVEncMPVGOPSize".into()];
+        // Which capture path produced the run. Without it an archived file cannot
+        // be told from the control arm it will be compared against.
+        h.source = "idd";
         let v: Value = serde_json::from_str(&to_line(&h)).unwrap();
         assert_eq!(v["record"], "header");
         assert_eq!(v["schema"], SCHEMA);
@@ -382,5 +393,9 @@ mod tests {
         assert_eq!(v["encoder_kind"], "async-hardware");
         assert_eq!(v["codec_api_applied"][0], "AVLowLatencyMode");
         assert_eq!(v["codec_api_refused"][0], "AVEncMPVGOPSize");
+        assert_eq!(v["source"], "idd");
+
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys.len(), 23, "unexpected field count: {keys:?}");
     }
 }

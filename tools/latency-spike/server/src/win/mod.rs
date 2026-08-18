@@ -1,7 +1,8 @@
 //! Everything that talks to Windows.
 //!
 //! Split by pipeline stage so the per-stage budget in the stats file maps one-to-one
-//! onto a module: [`dxgi`] captures, [`convert`] does BGRA→NV12 on the GPU,
+//! onto a module: [`source`] defines where frames come from and [`dxgi`] and
+//! [`idd_source`] are the two answers, [`convert`] does BGRA→NV12 on the GPU,
 //! [`encode`] drives the Media Foundation H.264 MFT, [`send`] owns the video socket
 //! and the stats file, and [`input`] owns the keystroke channel. [`pipeline`] wires
 //! them together.
@@ -9,10 +10,12 @@
 pub mod convert;
 pub mod dxgi;
 pub mod encode;
+pub mod idd_source;
 pub mod input;
 pub mod pipeline;
 pub mod qpc;
 pub mod send;
+pub mod source;
 
 pub use pipeline::{list_outputs, run};
 

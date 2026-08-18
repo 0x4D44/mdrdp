@@ -23,6 +23,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    # OpenFileMappingW / MapViewOfFile — the IddCx shared section.
+    "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Performance",
     "Win32_System_Threading",

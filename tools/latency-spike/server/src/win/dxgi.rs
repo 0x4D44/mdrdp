@@ -19,7 +19,13 @@
 //! 5. `ReleaseFrame` before the next `AcquireNextFrame`. Holding two is an error and
 //!    holding one blocks the compositor, so the frame is released at the top of the
 //!    next acquire rather than at some later convenient point.
+//!
+//! This is one of the two [`FrameSource`] implementations — the always-available
+//! one, and the pipeline's default. The other reads the IddCx driver's shared
+//! texture pool ([`super::idd_source`]); the shapes they both produce
+//! ([`Acquired`], [`ChangeInfo`]) live in [`super::source`].
 
+use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource, RectReadback};
 use super::{qpc, wide_to_string, Result};
 use std::time::Duration;
 use windows::core::Interface;
@@ -27,11 +33,8 @@ use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
-    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_UNSUPPORTED,
@@ -126,71 +129,14 @@ pub fn enumerate() -> Result<Vec<OutputInfo>> {
     Ok(list)
 }
 
-/// One changed region of a frame, in desktop coordinates, clamped to the desktop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DirtyRect {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
-
-/// Per-frame change metadata from the duplication.
-///
-/// `None` at the `acquire` call site means **unavailable** — the frame carried
-/// no metadata, or a metadata call failed — which the fast-path predicate must
-/// treat as "assume everything changed", never as "zero rects".
-///
-/// Accumulated frames (`AccumulatedFrames > 1`) are fine, deliberately: this
-/// scheme never replays moves — it reads the **final pixels** of the current
-/// frame at every covered rectangle — so what it needs from the metadata is
-/// coverage, not a replayable sequence. Any pixel that changed across the
-/// accumulated presents is inside some accumulated dirty rect or some move's
-/// destination, and the union of those is exactly what this returns (move rects
-/// contribute their *destination* rectangles). Order never matters to coverage.
-/// The first cut gated on `AccumulatedFrames == 1`; the §5a telemetry showed a
-/// keystroke on the 240 Hz IDD is a ~100 ms burst of presents the ~8 ms capture
-/// loop cannot drain one-by-one, so that gate starved the fast path to a 4-in-49
-/// hit rate while the accumulated union stayed small and correct.
-#[derive(Debug, Clone, Default)]
-pub struct ChangeInfo {
-    pub rects: Vec<DirtyRect>,
-    /// How many of `rects` came from move regions (diagnostic).
-    pub move_rects: u32,
-}
-
-impl ChangeInfo {
-    /// Total bytes a raw BGRA readback of every rect would carry.
-    pub fn dirty_bytes(&self) -> u64 {
-        self.rects
-            .iter()
-            .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
-            .sum()
-    }
-}
-
-/// What one `acquire` call produced.
-pub enum Acquired {
-    Frame {
-        texture: ID3D11Texture2D,
-        /// `DXGI_OUTDUPL_FRAME_INFO::LastPresentTime` — when the compositor
-        /// presented it, i.e. before we heard about it.
-        present_qpc: i64,
-        /// When `AcquireNextFrame` returned to us.
-        acquire_qpc: i64,
-        /// Change metadata, when this frame carried a trustworthy set.
-        change: Option<ChangeInfo>,
-    },
-    /// Nothing was presented within the timeout.
-    Timeout,
-    /// Only the mouse pointer moved; the desktop image is unchanged.
-    PointerOnly,
-    /// The duplication was lost and has been rebuilt. The next frame is a fresh
-    /// start, so the caller should ask the encoder for a keyframe.
-    Recreated,
-}
-
 /// The capture stage: a D3D11 device plus the duplication interface for one output.
+///
+/// Accumulated frames (`AccumulatedFrames > 1`) are accepted deliberately — see
+/// [`ChangeInfo`] for why coverage is order-free. The §5a telemetry showed a
+/// keystroke on the 240 Hz IDD is a ~100 ms burst of presents the ~8 ms capture
+/// loop cannot drain one-by-one, so the first cut's `AccumulatedFrames == 1` gate
+/// starved the fast path to a 4-in-49 hit rate while the accumulated union stayed
+/// small and correct.
 pub struct Capture {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
@@ -205,11 +151,8 @@ pub struct Capture {
     dupl: Option<IDXGIOutputDuplication>,
     /// True while a frame is checked out and owes a `ReleaseFrame`.
     holding: bool,
-    /// Full-desktop CPU-readable copy target for [`Capture::read_rects`], created on
-    /// first use. Lazy because a run that never takes the rect fast path (a large
-    /// desktop, `--no-rects`, a driver that reports full-frame dirty) should not pay
-    /// for an 8 MB staging surface it will never map.
-    staging: Option<ID3D11Texture2D>,
+    /// The raw fast path's GPU→CPU readback, shared with the IDD source.
+    readback: RectReadback,
 }
 
 impl Capture {
@@ -283,7 +226,7 @@ impl Capture {
             output,
             dupl: Some(dupl),
             holding: false,
-            staging: None,
+            readback: RectReadback::new(width, height),
         })
     }
 
@@ -335,8 +278,7 @@ impl Capture {
         }
     }
 
-    /// Acquire the next desktop frame, or say why there isn't one.
-    pub fn acquire(&mut self, timeout_ms: u32) -> Result<Acquired> {
+    fn acquire_frame(&mut self, timeout_ms: u32) -> Result<Acquired> {
         self.release_held()?;
         let dupl = self
             .dupl
@@ -462,144 +404,6 @@ impl Capture {
         })
     }
 
-    /// Create the readback surface if this is the first rect frame.
-    ///
-    /// Full desktop size rather than per-rect: a staging texture sized to the rect
-    /// would have to be recreated whenever a rect grew, and creating a texture is
-    /// far more expensive than copying into a corner of an existing one. Copying at
-    /// the rect's own desktop coordinates then keeps source and destination
-    /// coordinates identical, so there is no offset arithmetic to get wrong.
-    fn ensure_staging(&mut self) -> Result<()> {
-        if self.staging.is_some() {
-            return Ok(());
-        }
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: self.width,
-            Height: self.height,
-            MipLevels: 1,
-            ArraySize: 1,
-            // The duplication hands over BGRA8; a staging copy must match its
-            // source's format exactly or `CopySubresourceRegion` refuses it.
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_STAGING,
-            // A staging resource is bindable to no pipeline stage at all.
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-        };
-        let mut texture: Option<ID3D11Texture2D> = None;
-        // SAFETY: `desc` is fully initialised; the initial-data pointer is None
-        // because the surface is filled by a copy, not by us.
-        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }?;
-        self.staging = Some(texture.ok_or("CreateTexture2D returned no staging texture")?);
-        Ok(())
-    }
-
-    /// Read the pixels behind `change`'s rects back to the CPU, tightly packed.
-    ///
-    /// **Validity window: the frame must still be held.** `texture` is only alive
-    /// between the `AcquireNextFrame` that produced it and the `ReleaseFrame` the
-    /// *next* [`Capture::acquire`] performs, and the same is true of the metadata
-    /// `change` was built from. The pipeline calls this inside that window, before
-    /// the frame enters the converter — which is also where the latency win is.
-    ///
-    /// Each returned [`crate::rects::Rect`] carries exactly `w * h * 4` bytes of
-    /// BGRA, `w * 4` per row, top-down: `rects::encode`'s pixel contract.
-    ///
-    /// Wire coordinates are `u16`, so the caller must have established that the
-    /// desktop fits (it checks once at startup); the `debug_assert` below states
-    /// that contract rather than re-deriving it per frame.
-    pub fn read_rects(
-        &mut self,
-        texture: &ID3D11Texture2D,
-        change: &ChangeInfo,
-    ) -> Result<Vec<crate::rects::Rect>> {
-        if change.rects.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.ensure_staging()?;
-        let staging = self.staging.as_ref().ok_or("staging texture missing")?;
-
-        for r in &change.rects {
-            // Checked before the Map below, where an unwinding assert would leak
-            // the mapping.
-            debug_assert!(
-                r.x + r.w <= u16::MAX as u32 && r.y + r.h <= u16::MAX as u32,
-                "rect {r:?} does not fit the u16 wire fields; the caller gates on desktop size"
-            );
-            let region = D3D11_BOX {
-                left: r.x,
-                top: r.y,
-                front: 0,
-                right: r.x + r.w,
-                bottom: r.y + r.h,
-                back: 1,
-            };
-            // SAFETY: both textures are live, share the BGRA8 format and the desktop
-            // size, and `region` is inside both — `clamp` built the rect against
-            // exactly these dimensions. The copy is same-coordinate, so the
-            // destination cannot overrun either.
-            unsafe {
-                self.context.CopySubresourceRegion(
-                    staging,
-                    0,
-                    r.x,
-                    r.y,
-                    0,
-                    texture,
-                    0,
-                    Some(&region as *const D3D11_BOX),
-                );
-            }
-        }
-
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        // SAFETY: `staging` is live, subresource 0 is its only one (MipLevels and
-        // ArraySize are both 1), and `mapped` is a live local for the call.
-        unsafe {
-            self.context
-                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-        }?;
-
-        // Nothing between here and the `Unmap` can fail or return early: the copy
-        // loop only allocates and memcpys. That is what keeps the mapping from
-        // leaking without a guard type — a leaked map wedges the device.
-        let pitch = mapped.RowPitch as usize;
-        let mut out = Vec::with_capacity(change.rects.len());
-        for r in &change.rects {
-            let row_bytes = r.w as usize * 4;
-            let mut pixels = vec![0u8; row_bytes * r.h as usize];
-            for row in 0..r.h as usize {
-                let src_offset = (r.y as usize + row) * pitch + r.x as usize * 4;
-                // SAFETY: the mapping covers `height` rows of `RowPitch` bytes and
-                // the rect is inside the desktop, so `src_offset .. + row_bytes` is
-                // inside it too. The slice is read and dropped before `Unmap`.
-                let src = unsafe {
-                    std::slice::from_raw_parts(
-                        (mapped.pData as *const u8).add(src_offset),
-                        row_bytes,
-                    )
-                };
-                pixels[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(src);
-            }
-            out.push(crate::rects::Rect {
-                x: r.x as u16,
-                y: r.y as u16,
-                w: r.w as u16,
-                h: r.h as u16,
-                pixels,
-            });
-        }
-
-        // SAFETY: exactly one `Unmap` for the `Map` above, on the same subresource.
-        unsafe { self.context.Unmap(staging, 0) };
-        Ok(out)
-    }
-
     /// Release the dead duplication, then build a new one. The order is the whole
     /// point: DXGI will not hand out a second duplication while the first is alive.
     fn rebuild(&mut self) -> Result<()> {
@@ -607,6 +411,58 @@ impl Capture {
         self.dupl = None;
         self.dupl = Some(Self::duplicate(&self.output, &self.device)?);
         Ok(())
+    }
+}
+
+impl FrameSource for Capture {
+    fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn adapter(&self) -> &str {
+        &self.adapter
+    }
+
+    fn output_name(&self) -> &str {
+        &self.device_name
+    }
+
+    fn kind(&self) -> &'static str {
+        "dxgi"
+    }
+
+    fn acquire(&mut self, timeout_ms: u32) -> Result<Acquired> {
+        self.acquire_frame(timeout_ms)
+    }
+
+    /// The held frame is the validity window: `texture` and the metadata `change`
+    /// was built from both die at the `ReleaseFrame` the next `acquire` performs.
+    fn read_rects(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        change: &ChangeInfo,
+    ) -> Result<Vec<crate::rects::Rect>> {
+        // Split borrow: the readback needs the device and the context by reference
+        // at the same time as itself, which one `&mut self` method cannot express.
+        let Self {
+            readback,
+            device,
+            context,
+            ..
+        } = self;
+        readback.read(device, context, texture, change)
     }
 }
 

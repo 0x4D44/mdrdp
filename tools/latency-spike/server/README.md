@@ -71,12 +71,30 @@ spike-server.exe --output 1 --out C:\Users\ano\spike.jsonl
 ```
 spike-server --output N [--video-port 9500] [--input-port 9501]
              [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]
+             [--no-rects] [--source dxgi|idd]
 spike-server --list-outputs
 ```
 
 `--list-outputs` prints every DXGI adapter/output with its resolution, whether it is
 attached, and its rotation. The left-hand index is what `--output` takes. This is how
 you find the virtual display's output index once the IDD driver is installed.
+
+### `--source` — where frames come from
+
+`dxgi` (the default) is DXGI Desktop Duplication: it works against any output on any
+host, and it costs a measured ~7.5 ms between DWM's present and `AcquireNextFrame`
+returning.
+
+`idd` reads the `mdrdp-idd` driver's shared texture pool directly — the driver copies
+each committed swapchain buffer into one of three named shared textures and publishes
+what changed through the `Global\mdrdp-idd` section — which removes that gap. It needs
+the driver installed and started, it takes **no `--output`** (the pool is found by
+name, not by an output index), and it waits up to 30 s at startup for the driver to
+publish a pool, so a server started before the driver still comes up.
+
+The active source is recorded in the stats header as `source`. Quote it with any
+figure: the two paths differ by that ~7.5 ms, so a number that does not name its
+source cannot be compared with one that does.
 
 One video client at a time. On disconnect the server goes back to accepting, and the
 first frame of the next connection is forced to a keyframe. **While no client is
@@ -173,7 +191,8 @@ full. The queue is bounded at two frames and **lossy on purpose**: a queued fram
 a stale frame, and dropping the newest keeps the latency number honest. Every drop is
 counted, so the loss is never silent.
 
-The header line carries the config, the adapter and output description, the selected
+The header line carries the config, the adapter and output description, `source`
+(`dxgi` or `idd` — which capture path produced the run), the selected
 MFT's friendly name, its kind (`async-hardware` / `sync-software`), the QPC
 frequency, and — the field to check first when something looks odd —
 `codec_api_applied` / `codec_api_refused`. An encoder that silently refuses

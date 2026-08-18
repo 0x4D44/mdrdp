@@ -14,9 +14,10 @@
 //! number. Every drop is counted and published as `dropped_frames`, so the loss is
 //! never silent.
 
-use super::{convert, dxgi, encode, input, qpc, send, Result};
+use super::source::{Acquired, ChangeInfo, FrameSource};
+use super::{convert, dxgi, encode, idd_source, input, qpc, send, Result};
 use crate::annexb::{self, ParameterSets};
-use crate::cli::{Config, DECLARED_FPS};
+use crate::cli::{Config, Source, DECLARED_FPS};
 use crate::rects;
 use crate::stats::{self, FrameRecord, Header, QpcClock};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,8 +35,9 @@ const KEYFRAME_RETRY_FRAMES: u32 = DECLARED_FPS;
 /// rather than as growing latency.
 const QUEUE_DEPTH: usize = 2;
 
-/// `AcquireNextFrame` timeout. Short enough that a `Recreated` duplication or a
-/// newly connected client is noticed promptly, long enough not to spin.
+/// How long one [`FrameSource::acquire`] waits for a frame. Short enough that a
+/// rebuilt source or a newly connected client is noticed promptly, long enough not
+/// to spin.
 const ACQUIRE_TIMEOUT_MS: u32 = 8;
 
 /// 100-nanosecond units per second — Media Foundation's time base.
@@ -100,35 +102,47 @@ pub fn run(cfg: &Config) -> Result<()> {
     let clock = QpcClock::new(qpc::frequency())
         .ok_or("QueryPerformanceFrequency reported a non-positive frequency")?;
 
-    let outputs = dxgi::enumerate()?;
-    let info = outputs.get(cfg.output).ok_or_else(|| {
-        format!(
-            "--output {} is out of range: {} output(s) present. Run --list-outputs.",
-            cfg.output,
-            outputs.len()
-        )
-    })?;
-    let mut capture = dxgi::Capture::open(info)?;
+    // Both sources own their own D3D11 device — the IDD consumer's is built on the
+    // adapter LUID its driver publishes, not on one we choose — so everything
+    // downstream is built from whichever device the frames actually live on.
+    let mut source: Box<dyn FrameSource> = match cfg.source {
+        Source::Dxgi => {
+            let outputs = dxgi::enumerate()?;
+            let info = outputs.get(cfg.output).ok_or_else(|| {
+                format!(
+                    "--output {} is out of range: {} output(s) present. Run --list-outputs.",
+                    cfg.output,
+                    outputs.len()
+                )
+            })?;
+            Box::new(dxgi::Capture::open(info)?)
+        }
+        Source::Idd => Box::new(idd_source::IddSource::open()?),
+    };
     eprintln!(
-        "capture: output {} {}x{} on {}",
-        cfg.output, capture.width, capture.height, capture.adapter
+        "capture: source {} — {} {}x{} on {}",
+        source.kind(),
+        source.output_name(),
+        source.width(),
+        source.height(),
+        source.adapter()
     );
 
     let mut converter = convert::Nv12Converter::new(
-        &capture.device,
-        &capture.context,
-        capture.width,
-        capture.height,
+        source.device(),
+        source.context(),
+        source.width(),
+        source.height(),
         DECLARED_FPS,
     )?;
 
     // MF must be started on the thread that drives the transform, and torn down
     // after it — `_mf` outlives `encoder` because it is declared first.
     let _mf = encode::Session::start()?;
-    let manager = encode::device_manager(&capture.device)?;
+    let manager = encode::device_manager(source.device())?;
     let mut encoder = encode::create(
-        capture.width,
-        capture.height,
+        source.width(),
+        source.height(),
         DECLARED_FPS,
         cfg.bitrate_kbps,
         cfg.gop,
@@ -147,16 +161,17 @@ pub fn run(cfg: &Config) -> Result<()> {
     // re-tested per frame, and announced when it silently costs the operator the
     // path they asked for.
     let rects_enabled =
-        cfg.rects && capture.width <= u16::MAX as u32 && capture.height <= u16::MAX as u32;
+        cfg.rects && source.width() <= u16::MAX as u32 && source.height() <= u16::MAX as u32;
     if cfg.rects && !rects_enabled {
         eprintln!(
             "capture: {}x{} exceeds the u16 rect coordinates on the wire; \
              the raw dirty-rect fast path is disabled for this output",
-            capture.width, capture.height
+            source.width(),
+            source.height()
         );
     }
 
-    let header = build_header(cfg, clock, &capture, encoder.as_ref(), rects_enabled);
+    let header = build_header(cfg, clock, source.as_ref(), encoder.as_ref(), rects_enabled);
     let header_line = stats::to_line(&header);
 
     let connected = Arc::new(AtomicBool::new(false));
@@ -197,7 +212,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         })?;
 
     let outcome = capture_loop(capture_state(
-        &mut capture,
+        source.as_mut(),
         &mut converter,
         encoder.as_mut(),
         clock,
@@ -214,7 +229,7 @@ pub fn run(cfg: &Config) -> Result<()> {
 
 /// Everything the capture loop needs, bundled so the signature stays readable.
 struct CaptureState<'a> {
-    capture: &'a mut dxgi::Capture,
+    capture: &'a mut dyn FrameSource,
     converter: &'a mut convert::Nv12Converter,
     encoder: &'a mut dyn encode::Encoder,
     clock: QpcClock,
@@ -226,7 +241,7 @@ struct CaptureState<'a> {
 }
 
 fn capture_state<'a>(
-    capture: &'a mut dxgi::Capture,
+    capture: &'a mut dyn FrameSource,
     converter: &'a mut convert::Nv12Converter,
     encoder: &'a mut dyn encode::Encoder,
     clock: QpcClock,
@@ -248,7 +263,7 @@ fn capture_state<'a>(
 fn build_header(
     cfg: &Config,
     clock: QpcClock,
-    capture: &dxgi::Capture,
+    capture: &dyn FrameSource,
     encoder: &dyn encode::Encoder,
     rects_enabled: bool,
 ) -> Header {
@@ -259,11 +274,14 @@ fn build_header(
     h.bitrate_kbps = cfg.bitrate_kbps;
     h.gop = cfg.gop;
     h.fps = DECLARED_FPS;
+    // The source's own answer, not the flag's: the two cannot disagree, and the
+    // one that produced the frames is the one an archived run needs.
+    h.source = capture.kind();
     h.output_index = cfg.output;
-    h.adapter = capture.adapter.clone();
-    h.output = capture.device_name.clone();
-    h.width = capture.width;
-    h.height = capture.height;
+    h.adapter = capture.adapter().to_owned();
+    h.output = capture.output_name().to_owned();
+    h.width = capture.width();
+    h.height = capture.height();
     h.encoder = encoder.name().to_owned();
     h.encoder_kind = encoder.kind();
     h.codec_api_applied = encoder.codec_api_applied().to_vec();
@@ -379,9 +397,10 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
 /// Called only with `Some(change)`: metadata that is **absent** must never satisfy
 /// this predicate as `rect_count = 0`, because "we do not know what changed" is not
 /// "nothing changed" — treating the two alike would ship a stale canvas as a fresh
-/// one. `dxgi::acquire` already keeps the two states distinct; this function only
-/// has to not undo that.
-fn takes_fast_path(change: &dxgi::ChangeInfo) -> bool {
+/// one. Both sources already keep the two states distinct (duplication by having no
+/// metadata buffer, the IDD consumer by the coverage invariant in
+/// [`crate::idd_section::coverage_for`]); this function only has to not undo that.
+fn takes_fast_path(change: &ChangeInfo) -> bool {
     !change.rects.is_empty()
         && change.rects.len() <= RECT_MAX_COUNT
         && change.dirty_bytes() <= RECT_MAX_BYTES
@@ -390,12 +409,12 @@ fn takes_fast_path(change: &dxgi::ChangeInfo) -> bool {
 /// Read one frame's dirty rects back raw and hand them to the sender, ahead of the
 /// access unit for the same frame.
 ///
-/// This runs while the duplication frame is still held and *before* the converter
+/// This runs inside the source's frame-validity window and *before* the converter
 /// touches it: not waiting for convert+encode is the entire latency win.
 fn emit_rects(
-    capture: &mut dxgi::Capture,
+    capture: &mut dyn FrameSource,
     texture: &ID3D11Texture2D,
-    change: &dxgi::ChangeInfo,
+    change: &ChangeInfo,
     frame_seq: u64,
     ctx: &mut EmitCtx,
 ) -> Result<()> {
@@ -405,8 +424,8 @@ fn emit_rects(
     let rect_bytes: u64 = rect_pixels.iter().map(|r| r.pixels.len() as u64).sum();
     let update = rects::RectUpdate {
         frame_seq,
-        frame_width: capture.width,
-        frame_height: capture.height,
+        frame_width: capture.width(),
+        frame_height: capture.height(),
         rects: rect_pixels,
     };
     let mut payload = Vec::with_capacity(rects::encoded_len(&update));
@@ -447,6 +466,8 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
     // frame and that baseline is described by nothing — a small rect here would
     // lie by omission. The AU has no such gap: the encoder references the last
     // frame it actually encoded, so the difference it ships is complete.
+    // (`Recreated` is a rebuilt duplication under `--source dxgi`, and a rebuilt
+    // shared pool under `--source idd`; the reasoning is identical.)
     let mut suppress_rects_once = false;
     let mut last_epoch = state.encoder.config_epoch();
     let frame_duration_hns = HNS_PER_SECOND / DECLARED_FPS.max(1) as i64;
@@ -485,13 +506,13 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
 
         let acquired = state.capture.acquire(ACQUIRE_TIMEOUT_MS)?;
         let (texture, present_qpc, acquire_qpc, change) = match acquired {
-            dxgi::Acquired::Frame {
+            Acquired::Frame {
                 texture,
                 present_qpc,
                 acquire_qpc,
                 change,
             } => (texture, present_qpc, acquire_qpc, change),
-            dxgi::Acquired::Timeout => {
+            Acquired::Timeout => {
                 // No new frame, but the async MFT may be holding a finished AU it
                 // only delivers when pumped — on a static desktop that AU would
                 // otherwise never leave the transform.
@@ -499,9 +520,9 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
                 housekeep(&state, &mut ctx, &mut want_keyframe, &mut last_epoch);
                 continue;
             }
-            dxgi::Acquired::PointerOnly => continue,
-            dxgi::Acquired::Recreated => {
-                eprintln!("capture: duplication lost and rebuilt (desktop switch)");
+            Acquired::PointerOnly => continue,
+            Acquired::Recreated => {
+                eprintln!("capture: frame source lost and rebuilt");
                 want_keyframe = true;
                 suppress_rects_once = true;
                 continue;

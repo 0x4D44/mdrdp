@@ -3,9 +3,31 @@
 //! No clap: this crate is meant to cross-compile with nothing in the tree that
 //! cannot be read in an afternoon, and the flag surface is nine options wide.
 
+/// Where frames come from. `dxgi` is the default until the IDD source is proven
+/// against the gate (HLD decision 7) — it works against any output on any host,
+/// where `idd` needs our own driver installed and running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// DXGI Desktop Duplication.
+    Dxgi,
+    /// The IddCx driver's shared texture pool.
+    Idd,
+}
+
+impl Source {
+    /// The name the flag takes and the stats header reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dxgi => "dxgi",
+            Self::Idd => "idd",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// Index into the flat list printed by `--list-outputs`.
+    /// Index into the flat list printed by `--list-outputs`. Meaningful only for
+    /// `--source dxgi`: the IDD pool is found by name, not by output index.
     pub output: usize,
     pub video_port: u16,
     pub input_port: u16,
@@ -16,6 +38,8 @@ pub struct Config {
     /// Send small dirty regions as raw BGRA rects beside the H.264 stream. On by
     /// default; `--no-rects` turns it off to give a measurement its control arm.
     pub rects: bool,
+    /// Which capture source to run.
+    pub source: Source,
 }
 
 pub const DEFAULT_VIDEO_PORT: u16 = 9500;
@@ -41,6 +65,7 @@ impl Default for Config {
             out: None,
             list_outputs: false,
             rects: true,
+            source: Source::Dxgi,
         }
     }
 }
@@ -49,11 +74,16 @@ pub fn usage() -> &'static str {
     "usage:\n  \
      spike-server --output N [--video-port 9500] [--input-port 9501]\n               \
                   [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]\n               \
-                  [--no-rects]\n  \
+                  [--no-rects] [--source dxgi|idd]\n  \
+     spike-server --source idd [--video-port 9500] ...\n  \
      spike-server --list-outputs\n\n\
      --no-rects withholds the raw dirty-rect fast path, forcing every update down\n  \
      the H.264-only path. That is the control arm for a measurement, not a tuning\n  \
      knob: quote it whenever a figure is compared against the hybrid wire.\n\n\
+     --source idd reads the mdrdp-idd driver's shared texture pool instead of\n  \
+     Desktop Duplication, removing duplication's present-to-acquire gap. It needs\n  \
+     the driver installed and started, and it takes no --output: the pool is found\n  \
+     by name. --source dxgi is the default and the fallback.\n\n\
      Both listeners bind 127.0.0.1 only. Reach them over an SSH tunnel:\n  \
      ssh -L 9500:127.0.0.1:9500 -L 9501:127.0.0.1:9501 user@host"
 }
@@ -106,6 +136,13 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             }
             "--gop" => cfg.gop = value.parse().map_err(|e| format!("--gop {value:?}: {e}"))?,
             "--out" => cfg.out = Some(value.clone()),
+            "--source" => {
+                cfg.source = match value.as_str() {
+                    "dxgi" => Source::Dxgi,
+                    "idd" => Source::Idd,
+                    other => return Err(format!("--source {other:?}: expected dxgi or idd")),
+                }
+            }
             other => return Err(format!("unknown flag {other}\n{}", usage())),
         }
         i += 2;
@@ -114,9 +151,13 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     if cfg.list_outputs {
         return Ok(cfg);
     }
-    if !saw_output {
+    // The IDD source finds its pool through a named shared section, so there is no
+    // output index for it to take. Requiring one would be a flag the operator has
+    // to invent a value for, and a value the header would then report as if it
+    // meant something.
+    if !saw_output && cfg.source == Source::Dxgi {
         return Err(format!(
-            "--output is required (run --list-outputs to find the index)\n{}",
+            "--output is required for --source dxgi (run --list-outputs to find the index)\n{}",
             usage()
         ));
     }
@@ -160,6 +201,9 @@ mod tests {
         // The fast path is the default: a run has to opt *out* of it, so a forgotten
         // flag never silently produces the control arm's numbers.
         assert!(cfg.rects);
+        // Duplication is the default until the IDD source passes the gate, so a
+        // forgotten `--source` measures the proven path, not the new one.
+        assert_eq!(cfg.source, Source::Dxgi);
     }
 
     #[test]
@@ -180,6 +224,8 @@ mod tests {
             "8000",
             "--gop",
             "30",
+            "--source",
+            "idd",
             "--out",
             "/tmp/x.jsonl",
         ]))
@@ -191,6 +237,39 @@ mod tests {
         assert_eq!(cfg.gop, 30);
         assert_eq!(cfg.out.as_deref(), Some("/tmp/x.jsonl"));
         assert!(!cfg.rects);
+        assert_eq!(cfg.source, Source::Idd);
+    }
+
+    #[test]
+    fn the_source_flag_takes_both_names_and_refuses_anything_else() {
+        assert_eq!(
+            parse(&args(&["--output", "0", "--source", "dxgi"]))
+                .unwrap()
+                .source,
+            Source::Dxgi
+        );
+        assert_eq!(
+            parse(&args(&["--output", "0", "--source", "idd"]))
+                .unwrap()
+                .source,
+            Source::Idd
+        );
+        // Not silently defaulted: a typo that fell back to dxgi would produce a
+        // control-arm measurement labelled as the IDD arm.
+        let err = parse(&args(&["--output", "0", "--source", "iddcx"])).unwrap_err();
+        assert!(err.contains("expected dxgi or idd"), "{err}");
+        assert_eq!(Source::Dxgi.as_str(), "dxgi");
+        assert_eq!(Source::Idd.as_str(), "idd");
+    }
+
+    #[test]
+    fn the_idd_source_needs_no_output_index_but_dxgi_still_does() {
+        // The pool is found by name, so there is no index to give — and no index to
+        // report in the header as if it meant something.
+        let cfg = parse(&args(&["--source", "idd"])).unwrap();
+        assert_eq!(cfg.source, Source::Idd);
+        let err = parse(&args(&["--source", "dxgi"])).unwrap_err();
+        assert!(err.contains("--output is required"), "{err}");
     }
 
     #[test]

@@ -446,9 +446,15 @@ void SharedFramePool::ProcessFrame(
     // composites into a surface the GPU is still reading.
     WaitForCopy();
 
-    Target.Mutex->ReleaseSync(0);
-
+    // The record is written INSIDE the mutex, before the release: the pixels and the
+    // record that describes them must be one atomic unit to any holder. Published after
+    // the release, a consumer that acquired the instant we let go could pair this
+    // frame's pixels with the PREVIOUS record - and its coverage list would then
+    // under-claim, which the client's exactness invariant turns into permanently stale
+    // canvas regions. The consumer re-reads the record under the same mutex.
     PublishSlot(Index, m_FrameSeq, PresentQpc);
+
+    Target.Mutex->ReleaseSync(0);
     SetEvent(Target.hEvent.Get());
 
     m_Stats.Published++;
