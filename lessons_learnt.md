@@ -6,6 +6,13 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Windows monitor power-off silently poisons DXGI duplication: frames stay "successful", dirty metadata stays valid, pixels go black (`win/dxgi.rs:read_rects`).
+  No error is ever raised, so AccessLost recreation never fires; GDI CopyFromScreen still sees the real
+  desktop, which is the diagnostic. Restart the duplication session (i.e. the spike server) after any
+  display power transition. quench now runs `powercfg /change monitor-timeout-ac 0`, and waking a
+  blanked display needs SetThreadExecutionState from INSIDE the interactive session (task `mdrdp-wake`)
+  — injected keyboard/mouse input does not relight it. Cost: a 76%-timeout glass run and ~an hour, all
+  of which looked exactly like a latency regression.
 - A CGEvent built with a NULL source is silently dropped by CGEventPostToPid; create it from a HIDSystemState source (`glass::inject::Injector`).
   Cost two burned quench sessions: python ctypes CGEventCreateKeyboardEvent(None, …) posted "successfully"
   (permission preflight true, no error) yet the target app never saw a keystroke. Same call with
