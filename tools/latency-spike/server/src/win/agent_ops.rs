@@ -156,8 +156,10 @@ impl AgentOps for WinOps {
         Ok(())
     }
 
-    fn device_present(&mut self) -> bool {
-        Self::find_display().is_some()
+    fn device_id(&mut self) -> Option<String> {
+        // The GDI name (`\\.\DISPLAYn`) changes when the device is re-created,
+        // which is exactly the identity signal the reconciler keys on.
+        Self::find_display().map(|name| wide_to_string(&name))
     }
 
     fn display_mode(&mut self) -> Option<Mode> {

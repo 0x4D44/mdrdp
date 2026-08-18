@@ -12,9 +12,10 @@
 //!
 //! Bring-up order within one tick: creator → device → display mode → server. The
 //! server only *spawns* once the device is present (an IDD-source server without
-//! the device would just crash-loop through its 30 s section wait), but a server
-//! already running is left to supervision if the device blinks — it notices on its
-//! own and exits, which is the same signal.
+//! the device would just crash-loop through its 30 s section wait), and it is
+//! *restarted* whenever the device changes identity or blinks away and back — a
+//! server attached to a dead instance's section captures nothing, silently,
+//! forever (see [`AgentOps::device_id`]).
 
 use crate::control::{ChildReport, ModeReport, StatusReport, SCHEMA};
 
@@ -73,8 +74,14 @@ pub enum ChildState {
 pub trait AgentOps {
     fn poll_creator(&mut self) -> ChildState;
     fn spawn_creator(&mut self) -> Result<(), String>;
-    /// Is the virtual display present in the session's display set?
-    fn device_present(&mut self) -> bool;
+    /// The virtual display's identity, if it is in the session's display set —
+    /// the GDI device name (`\\.\DISPLAYn`) on Windows. Identity, not just
+    /// presence: device removal is asynchronous, so a freshly killed creator's
+    /// display can linger "present" for seconds while its shared section is
+    /// already dying, and only the name change betrays the swap (found live
+    /// 2026-08-18: the agent's first server attached to the dying section and
+    /// captured nothing, with no error, forever).
+    fn device_id(&mut self) -> Option<String>;
     /// The display's current mode, if it can be read.
     fn display_mode(&mut self) -> Option<Mode>;
     fn set_display_mode(&mut self, mode: Mode) -> Result<(), String>;
@@ -163,6 +170,9 @@ pub struct Reconciler {
     server: Supervised,
     desired: Mode,
     device_present: bool,
+    /// The identity last observed, for spotting swaps and blinks (see
+    /// [`AgentOps::device_id`]).
+    last_device_id: Option<String>,
     actual_mode: Option<Mode>,
     mode_ok: bool,
     restart_server_requested: bool,
@@ -176,6 +186,7 @@ impl Reconciler {
             server: Supervised::new(),
             desired: DESIRED_MODE,
             device_present: false,
+            last_device_id: None,
             actual_mode: None,
             mode_ok: false,
             restart_server_requested: false,
@@ -196,7 +207,20 @@ impl Reconciler {
         self.creator
             .tick(creator_state, &mut || ops.spawn_creator());
 
-        self.device_present = ops.device_present();
+        let device_id = ops.device_id();
+        self.device_present = device_id.is_some();
+        // A server that attached to one device instance's section captures nothing
+        // once that instance dies — silently, forever. Restart it whenever the
+        // device swaps identity or blinks away and back after the server started.
+        let device_replaced = match (&self.last_device_id, &device_id) {
+            (Some(old), Some(new)) => old != new,
+            (None, Some(_)) => self.server.ever_spawned,
+            _ => false,
+        };
+        if device_replaced {
+            self.restart_server_requested = true;
+        }
+        self.last_device_id = device_id;
         if self.device_present {
             self.actual_mode = ops.display_mode();
             self.mode_ok = self.actual_mode == Some(self.desired);
@@ -271,7 +295,7 @@ mod tests {
         calls: Vec<String>,
         creator_running: bool,
         creator_pending_exit: Option<i32>,
-        device_present: bool,
+        device_id: Option<String>,
         mode: Option<Mode>,
         mode_set_fails: bool,
         server_running: bool,
@@ -297,8 +321,8 @@ mod tests {
             self.creator_running = true;
             Ok(())
         }
-        fn device_present(&mut self) -> bool {
-            self.device_present
+        fn device_id(&mut self) -> Option<String> {
+            self.device_id.clone()
         }
         fn display_mode(&mut self) -> Option<Mode> {
             self.mode
@@ -358,7 +382,7 @@ mod tests {
 
         // Device arrives at its default 60 Hz: same tick sets the mode AND starts
         // the server — a degraded mode is not a reason to withhold capture.
-        ops.device_present = true;
+        ops.device_id = Some("dpy-1".to_owned());
         ops.mode = Some(Mode {
             width: 1920,
             height: 1080,
@@ -375,7 +399,7 @@ mod tests {
     #[test]
     fn mode_is_re_asserted_when_the_device_drifts_back() {
         let mut ops = FakeOps {
-            device_present: true,
+            device_id: Some("dpy-1".to_owned()),
             mode: Some(DESIRED_MODE),
             ..FakeOps::default()
         };
@@ -394,9 +418,54 @@ mod tests {
     }
 
     #[test]
+    fn a_device_swap_restarts_the_server() {
+        let mut ops = FakeOps {
+            device_id: Some("dpy-1".to_owned()),
+            mode: Some(DESIRED_MODE),
+            ..FakeOps::default()
+        };
+        let mut rec = Reconciler::new();
+        rec.tick(&mut ops); // brings everything up against dpy-1
+        assert!(ops.server_running);
+
+        // The live 2026-08-18 failure: the creator is replaced, its old display
+        // lingers, then the new instance appears under a new name. The running
+        // server holds the dead instance's section and must be restarted.
+        ops.device_id = Some("dpy-2".to_owned());
+        rec.tick(&mut ops);
+        assert!(ops.calls.contains(&"kill_server".to_owned()));
+        rec.tick(&mut ops); // cooldown
+        rec.tick(&mut ops); // respawn against dpy-2
+        assert!(ops.server_running);
+        assert_eq!(ops.calls.iter().filter(|c| *c == "spawn_server").count(), 2);
+    }
+
+    #[test]
+    fn a_device_blink_restarts_the_server_but_bring_up_does_not() {
+        let mut ops = FakeOps::default();
+        let mut rec = Reconciler::new();
+        rec.tick(&mut ops); // creator only; no device yet
+
+        // First arrival is bring-up, not a blink: no kill, just a spawn.
+        ops.device_id = Some("dpy-1".to_owned());
+        ops.mode = Some(DESIRED_MODE);
+        rec.tick(&mut ops);
+        assert!(!ops.calls.contains(&"kill_server".to_owned()));
+        assert!(ops.server_running);
+
+        // Away and back under the SAME name: the section behind it still died
+        // with the instance, so the server is restarted anyway.
+        ops.device_id = None;
+        rec.tick(&mut ops);
+        ops.device_id = Some("dpy-1".to_owned());
+        rec.tick(&mut ops);
+        assert!(ops.calls.contains(&"kill_server".to_owned()));
+    }
+
+    #[test]
     fn crash_loop_backs_off_doubling_to_the_cap() {
         let mut ops = FakeOps {
-            device_present: true,
+            device_id: Some("dpy-1".to_owned()),
             mode: Some(DESIRED_MODE),
             server_dies_instantly: true,
             ..FakeOps::default()
@@ -429,7 +498,7 @@ mod tests {
     #[test]
     fn an_hour_of_health_resets_the_backoff() {
         let mut ops = FakeOps {
-            device_present: true,
+            device_id: Some("dpy-1".to_owned()),
             mode: Some(DESIRED_MODE),
             ..FakeOps::default()
         };
@@ -461,7 +530,7 @@ mod tests {
     #[test]
     fn restart_request_kills_and_supervision_respawns() {
         let mut ops = FakeOps {
-            device_present: true,
+            device_id: Some("dpy-1".to_owned()),
             mode: Some(DESIRED_MODE),
             ..FakeOps::default()
         };
@@ -499,7 +568,7 @@ mod tests {
     #[test]
     fn status_reports_the_two_children_distinctly() {
         let mut ops = FakeOps {
-            device_present: true,
+            device_id: Some("dpy-1".to_owned()),
             mode: Some(DESIRED_MODE),
             ..FakeOps::default()
         };
