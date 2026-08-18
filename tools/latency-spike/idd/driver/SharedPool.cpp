@@ -46,6 +46,20 @@ static inline void SeqlockBegin(volatile UINT32* pSequence)
     MemoryBarrier();
 }
 
+// Adopted memory may carry an ODD sequence word: the previous driver instance can have
+// died between its SeqlockBegin and SeqlockEnd. Writing through an odd word inverts the
+// lock's parity permanently - stable-and-odd reads as mid-write forever, and the reader
+// gives up on the header (or retires a slot) for the life of the pool. Every writer that
+// touches memory it did not itself initialise normalises first (review, D3).
+static inline void SeqlockNormalize(volatile UINT32* pSequence)
+{
+    if ((*pSequence % 2) != 0)
+    {
+        *pSequence = *pSequence + 1;
+        MemoryBarrier();
+    }
+}
+
 static inline void SeqlockEnd(volatile UINT32* pSequence)
 {
     MemoryBarrier();
@@ -202,6 +216,7 @@ void SharedSection::Create()
     // generation to 0: whatever pool the header used to advertise, its textures and
     // events died with the driver instance that owned them, and 0 is the header state a
     // consumer already treats as "no pool yet - wait".
+    SeqlockNormalize(&pHeader->HeaderSequence);
     SeqlockBegin(&pHeader->HeaderSequence);
     pHeader->LayoutVersion = MDRDP_IDD_LAYOUT_VERSION;
     pHeader->SlotCount = MDRDP_IDD_SLOT_COUNT;
@@ -284,6 +299,14 @@ HRESULT SharedFramePool::Start(
     }
 
     QueryPerformanceFrequency(&m_PerfFrequency);
+    if (m_PerfFrequency.QuadPart == 0)
+    {
+        // Cannot happen on any supported Windows, but a zero frequency would turn the
+        // copy-wait limit into "give up instantly", which now means "publish nothing,
+        // ever" - fail the pool loudly instead of running it as a no-op (review, D7).
+        LogHresult(L"QueryPerformanceFrequency", E_FAIL);
+        return E_FAIL;
+    }
 
     m_pSection = pSection;
     m_Device = pDevice;
@@ -404,7 +427,9 @@ HRESULT SharedFramePool::Start(
             continue;
         }
         volatile UINT32* pSlotSequence = reinterpret_cast<volatile UINT32*>(&pSlot->Sequence);
+        SeqlockNormalize(pSlotSequence);
         SeqlockBegin(pSlotSequence);
+        pSlot->Generation = Generation;
         pSlot->FrameSeq = 0;
         pSlot->DirtySinceFrameSeq = 0;
         pSlot->PresentQpc = 0;
@@ -431,6 +456,7 @@ HRESULT SharedFramePool::Start(
     SeqlockEnd(&pHeader->HeaderSequence);
 
 
+    m_Generation = Generation;
     m_FrameSeq = 0;
     m_Started = true;
 
@@ -471,9 +497,6 @@ void SharedFramePool::Stop()
     m_Context.Reset();
     m_Device.Reset();
 
-    // The header's generation is deliberately left alone. The pool's objects are gone, so a
-    // server holding them sees abandoned handles; the next assignment bumps the generation,
-    // which is the invalidation signal the consumer is built around.
     m_pSection = nullptr;
     m_FrameSeq = 0;
     m_Started = false;
@@ -537,6 +560,24 @@ void SharedFramePool::ProcessFrame(
         // permanently stale canvas regions. The consumer re-reads the record under the
         // same mutex.
         PublishSlot(Index, m_FrameSeq, PresentQpc);
+    }
+    else
+    {
+        // The copy already clobbered the surface; leaving the PREVIOUS record standing
+        // would advertise the torn pixels under an older frame's truthful-looking
+        // coverage (review, D4). Invalidate the record - but leave the accumulator and
+        // LastPublishedFrameSeq alone, so the next real publish still describes a
+        // truthful union that includes this lost frame.
+        MdrdpSharedSlot* pSlot = m_pSection->Slot(Index);
+        if (pSlot != nullptr)
+        {
+            volatile UINT32* pSequence = reinterpret_cast<volatile UINT32*>(&pSlot->Sequence);
+            SeqlockBegin(pSequence);
+            pSlot->Generation = m_Generation;
+            pSlot->FrameSeq = 0;
+            pSlot->CoverageRectCount = MDRDP_IDD_COVERAGE_ABSENT;
+            SeqlockEnd(pSequence);
+        }
     }
 
     Target.Mutex->ReleaseSync(0);
@@ -745,7 +786,7 @@ void SharedFramePool::PublishSlot(UINT32 Index, UINT64 FrameSeq, INT64 PresentQp
     volatile UINT32* pSequence = reinterpret_cast<volatile UINT32*>(&pSlot->Sequence);
 
     SeqlockBegin(pSequence);
-    pSlot->Reserved0 = 0;
+    pSlot->Generation = m_Generation;
     pSlot->FrameSeq = FrameSeq;
     // The range this record's rects cover is (DirtySinceFrameSeq, FrameSeq]. A consumer
     // whose last consumed frame is at or after DirtySinceFrameSeq may treat the list as a

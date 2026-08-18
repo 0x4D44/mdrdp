@@ -102,7 +102,7 @@ namespace Microsoft
         struct MdrdpSharedSlot
         {
             UINT32 Sequence;            //  0 - seqlock
-            UINT32 Reserved0;           //  4 - 0
+            UINT32 Generation;          //  4 - the pool build this record belongs to
             UINT64 FrameSeq;            //  8 - contiguous presented-frame counter, from 1
             UINT64 DirtySinceFrameSeq;  // 16 - see the coverage invariant below
             INT64  PresentQpc;          // 24 - QPC ticks
@@ -123,6 +123,7 @@ namespace Microsoft
         static_assert(offsetof(MdrdpSharedHeader, HeaderSequence) == 40, "header layout drifted");
         static_assert(offsetof(MdrdpSharedHeader, Reserved) == 44, "header layout drifted");
 
+        static_assert(offsetof(MdrdpSharedSlot, Generation) == 4, "slot layout drifted");
         static_assert(sizeof(RECT) == 16, "RECT is not 4 x i32");
         static_assert(sizeof(MdrdpSharedSlot) == 1064, "slot layout drifted");
         static_assert(offsetof(MdrdpSharedSlot, FrameSeq) == 8, "slot layout drifted");
@@ -280,6 +281,7 @@ namespace Microsoft
 
             LARGE_INTEGER m_PerfFrequency;
             UINT64 m_FrameSeq;
+            UINT32 m_Generation;
             bool m_Started;
 
             WindowStats m_Stats;

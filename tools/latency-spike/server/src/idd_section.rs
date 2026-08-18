@@ -109,6 +109,7 @@ pub const HEADER_SEQUENCE_OFFSET: usize = OFF_HEADER_SEQUENCE;
 
 // Slot field offsets, page-relative.
 const OFF_SLOT_SEQUENCE: usize = 0;
+const OFF_SLOT_GENERATION: usize = 4;
 const OFF_FRAME_SEQ: usize = 8;
 const OFF_DIRTY_SINCE: usize = 16;
 const OFF_PRESENT_QPC: usize = 24;
@@ -173,6 +174,11 @@ pub enum Coverage {
 pub struct SlotRecord {
     /// The seqlock word this record was read at. Even, by construction.
     pub sequence: u32,
+    /// The pool build this record belongs to. A record from another generation
+    /// describes another pool's textures and must never be paired with this
+    /// one's pixels — the last line of defence if a generation number is ever
+    /// reused (review, D1).
+    pub generation: u32,
     /// The driver's contiguous presented-frame counter, 1-based per generation.
     /// `0` means the slot has never been published into.
     pub frame_seq: u64,
@@ -337,6 +343,7 @@ pub fn parse_slot(page: &[u8]) -> Result<SlotRecord, LayoutError> {
     };
     Ok(SlotRecord {
         sequence,
+        generation: u32_at(page, OFF_SLOT_GENERATION),
         frame_seq: u64_at(page, OFF_FRAME_SEQ),
         dirty_since_frame_seq: u64_at(page, OFF_DIRTY_SINCE),
         present_qpc: i64_at(page, OFF_PRESENT_QPC),
@@ -355,11 +362,18 @@ pub fn parse_slot(page: &[u8]) -> Result<SlotRecord, LayoutError> {
 /// The list is a list, not a winner, because the newest slot can turn out to be
 /// poisoned (`WAIT_ABANDONED`) at acquire time; the consumer then walks to the next
 /// one instead of losing the wakeup entirely.
-pub fn ready_slots(records: &[Option<SlotRecord>], last_consumed: u64) -> Vec<usize> {
+pub fn ready_slots(
+    records: &[Option<SlotRecord>],
+    generation: u32,
+    last_consumed: u64,
+) -> Vec<usize> {
     let mut ready: Vec<usize> = records
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.as_ref().is_some_and(|r| r.frame_seq > last_consumed))
+        .filter(|(_, r)| {
+            r.as_ref()
+                .is_some_and(|r| r.generation == generation && r.frame_seq > last_consumed)
+        })
         .map(|(i, _)| i)
         .collect();
     ready.sort_by(|&a, &b| {
@@ -470,6 +484,7 @@ mod tests {
 
         // Slot 0 at 4096, with two rects.
         b[4096..4100].copy_from_slice(&4u32.to_le_bytes()); // sequence
+        b[4100..4104].copy_from_slice(&13u32.to_le_bytes()); // generation stamp
         b[4104..4112].copy_from_slice(&99u64.to_le_bytes()); // frame_seq
         b[4112..4120].copy_from_slice(&95u64.to_le_bytes()); // dirty_since
         b[4120..4128].copy_from_slice(&1_234_567_890_123i64.to_le_bytes()); // present_qpc
@@ -544,6 +559,9 @@ mod tests {
         let b = fixture();
         let s = parse_slot(slot_page(&b, 0)).unwrap();
         assert_eq!(s.sequence, 4);
+        // 13, not the header's 7: a parse that read the generation from the wrong
+        // page (or defaulted it) cannot agree with this.
+        assert_eq!(s.generation, 13);
         assert_eq!(s.frame_seq, 99);
         assert_eq!(s.dirty_since_frame_seq, 95);
         assert_eq!(s.present_qpc, 1_234_567_890_123);
@@ -664,9 +682,12 @@ mod tests {
         assert!(matches!(s.coverage, Coverage::Rects(ref r) if r.len() == 64));
     }
 
+    /// Generation 7 throughout — distinct from 0 and from anything a test would
+    /// pass as "another generation".
     fn record(frame_seq: u64, dirty_since: u64, coverage: Coverage) -> SlotRecord {
         SlotRecord {
             sequence: 2,
+            generation: 7,
             frame_seq,
             dirty_since_frame_seq: dirty_since,
             present_qpc: 1,
@@ -693,10 +714,10 @@ mod tests {
             Some(record(97, 0, one_rect())),
             Some(record(63, 0, one_rect())),
         ];
-        assert_eq!(ready_slots(&slots, 0), vec![1, 2, 0]);
+        assert_eq!(ready_slots(&slots, 7, 0), vec![1, 2, 0]);
         // Already-consumed frames drop out, newest-first order survives.
-        assert_eq!(ready_slots(&slots, 50), vec![1, 2]);
-        assert_eq!(ready_slots(&slots, 97), Vec::<usize>::new());
+        assert_eq!(ready_slots(&slots, 7, 50), vec![1, 2]);
+        assert_eq!(ready_slots(&slots, 7, 97), Vec::<usize>::new());
     }
 
     #[test]
@@ -708,7 +729,21 @@ mod tests {
             Some(record(0, 0, one_rect())),
             Some(record(5, 0, one_rect())),
         ];
-        assert_eq!(ready_slots(&slots, 0), vec![2]);
+        assert_eq!(ready_slots(&slots, 7, 0), vec![2]);
+    }
+
+    #[test]
+    fn a_record_stamped_by_another_generation_is_never_selected() {
+        // Generation numbers can repeat across driver instances (teardown
+        // advertises 0 and a new instance seeds its counter from the adopted
+        // header), so the stamp — not the number's freshness — is what keeps a
+        // dead pool's records out of a live pool's selection.
+        let mut foreign = record(9, 0, one_rect());
+        foreign.generation = 6;
+        let slots = [Some(foreign), Some(record(5, 0, one_rect())), None];
+        // The foreign record has the HIGHEST frame_seq; selection must skip it
+        // anyway, or the fixture would pass on ordering alone.
+        assert_eq!(ready_slots(&slots, 7, 0), vec![1]);
     }
 
     #[test]

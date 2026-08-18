@@ -242,6 +242,13 @@ struct Slot {
 /// The three slots of one generation.
 struct Pool {
     generation: u32,
+    /// The random per-build suffix from the header. Pool identity is the PAIR
+    /// (generation, suffix): generation numbers can repeat across driver
+    /// instances (teardown advertises 0, and a new instance adopting the
+    /// section seeds its counter from that), so equality on the number alone
+    /// would let a consumer keep a dead pool's textures while believing it is
+    /// current (re-review, D1). 64 random bits make the pair unique.
+    suffix: u64,
     slots: Vec<Slot>,
     /// The slot events, in slot order, ready for `WaitForMultipleObjects`.
     events: Vec<HANDLE>,
@@ -290,6 +297,7 @@ impl Pool {
         }
         Ok(Self {
             generation: header.generation,
+            suffix: header.name_suffix,
             slots,
             events,
         })
@@ -483,23 +491,23 @@ impl IddSource {
     }
 
     /// The section itself went away — a `pnputil` redeploy, or the driver
-    /// unloading. Remap it and adopt whatever pool comes back.
-    fn reopen(&mut self) -> Result<()> {
+    /// unloading. Remap it and adopt whatever pool comes back. `Ok(false)` =
+    /// remapped but the pool would not open this tick; the header mismatch
+    /// persists, so the next tick retries the adopt.
+    fn reopen(&mut self) -> Result<bool> {
         // The old mapping goes first: `OpenFileMappingW` on a name this process
         // still holds open returns the same kernel object, and a "reopen" that
         // remaps the dead section would wait 30 s staring at its own stale header.
         self.section = None;
         let (section, header) = wait_for_pool()?;
         self.section = Some(section);
-        // A transient adopt failure here is retried on the next tick like any
-        // other: the generation mismatch persists until a pool opens.
-        self.adopt(&header).map(|_| ())
+        self.adopt(&header)
     }
 
     fn section(&self) -> &Section {
         self.section
             .as_ref()
-            .expect("the section is only None inside reopen, which never yields")
+            .expect("the section is None only inside reopen; reopen's own error path propagates and drops this source before anything else can call in")
     }
 
     fn read_slot_records(&mut self) -> Vec<Option<SlotRecord>> {
@@ -556,8 +564,11 @@ impl IddSource {
             // mutex means the writer died mid-write — the slot is as untrustworthy
             // as an abandoned one.
             record = match self.section().read_slot(slot) {
-                Some(Ok(r)) => Some(r),
-                Some(Err(_)) | None => None,
+                // A record stamped by another pool build describes another pool's
+                // texture; pairing it with this one's pixels is exactly the
+                // cross-generation confusion the stamp exists to stop.
+                Some(Ok(r)) if r.generation == self.pool.generation => Some(r),
+                Some(Ok(_)) | Some(Err(_)) | None => None,
             };
             if record.is_some() {
                 // SAFETY: both textures are live, share the BGRA8 format and the pool's
@@ -581,10 +592,18 @@ impl IddSource {
 
     fn acquire_frame(&mut self, timeout_ms: u32) -> Result<Acquired> {
         match self.section().read_header() {
-            Some(Ok(header)) if header.generation == self.pool.generation => {}
+            Some(Ok(header))
+                if header.generation == self.pool.generation
+                    && header.name_suffix == self.pool.suffix => {}
             // A torn-down pool with none published yet. Nothing to consume; the
-            // generation bump that follows is what triggers the rebuild.
-            Some(Ok(header)) if header.generation == 0 => return Ok(Acquired::Timeout),
+            // generation bump that follows is what triggers the rebuild. Sleep the
+            // timeout out first: this arm blocks on nothing, and an unpaced return
+            // spins the capture loop flat out for the whole teardown gap
+            // (re-review, D2).
+            Some(Ok(header)) if header.generation == 0 => {
+                std::thread::sleep(Duration::from_millis(u64::from(timeout_ms)));
+                return Ok(Acquired::Timeout);
+            }
             Some(Ok(header)) => {
                 eprintln!(
                     "capture: IDD pool rebuilt (generation {} → {})",
@@ -595,7 +614,9 @@ impl IddSource {
                 } else {
                     // The new generation's objects were not openable this tick —
                     // a rebuild race. The mismatch persists, so we land here
-                    // again next tick.
+                    // again next tick — paced, or the retry loop hammers
+                    // OpenSharedResourceByName flat out (re-review, D2).
+                    std::thread::sleep(Duration::from_millis(u64::from(timeout_ms)));
                     Acquired::Timeout
                 });
             }
@@ -617,8 +638,11 @@ impl IddSource {
             // is in flight. Same recovery as a generation bump.
             let e = windows::core::Error::from_thread();
             eprintln!("capture: IDD slot events went away ({e}); reopening the pool");
-            self.reopen()?;
-            return Ok(Acquired::Recreated);
+            return Ok(if self.reopen()? {
+                Acquired::Recreated
+            } else {
+                Acquired::Timeout
+            });
         }
         // WAIT_TIMEOUT is not a shortcut out: an earlier wakeup may have consumed
         // the event of a slot we did not take, so the records are scanned either
@@ -627,7 +651,7 @@ impl IddSource {
 
         let records = self.read_slot_records();
         let last_consumed = self.last_consumed;
-        for slot in idd_section::ready_slots(&records, last_consumed) {
+        for slot in idd_section::ready_slots(&records, self.pool.generation, last_consumed) {
             // The scan's record chooses the slot; the record that describes the
             // copied pixels is the one `take_slot` re-reads under the keyed mutex,
             // because the driver may republish a slot between scan and acquire.
