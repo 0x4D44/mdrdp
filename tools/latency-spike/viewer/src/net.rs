@@ -77,9 +77,18 @@ impl std::fmt::Display for PumpEnd {
 /// Every message completed by one `read` shares that read's stamp. They arrived in the
 /// same packet, so distinguishing them would be inventing precision the transport does
 /// not have.
+///
+/// Within one read's batch, `MSG_RECTS` is dispatched before the video messages. A
+/// rect blit costs ~0.1 ms and an AU decode ~6 ms, so wire order made a rect that
+/// shared a read with an AU wait a decode's length to paint (measured: recv→paint
+/// p50 9.5 ms on the Increment 1 typing runs). Correctness never depended on wire
+/// order — the sink's exactness gate skips, holds, or paints an update on its `seq`
+/// alone, whatever order it arrives in — so delivery order is purely latency policy.
+/// Relative order *within* each class is preserved.
 pub fn pump<R: Read>(reader: &mut R, clock: &Clock, sink: &mut dyn MessageSink) -> PumpEnd {
     let mut re = Reassembler::default();
     let mut buf = vec![0u8; READ_CHUNK];
+    let mut batch: Vec<framing::Message> = Vec::new();
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) => return PumpEnd::Eof,
@@ -89,9 +98,22 @@ pub fn pump<R: Read>(reader: &mut R, clock: &Clock, sink: &mut dyn MessageSink) 
         };
         let recv_done_us = clock.now_us();
         re.push(&buf[..n]);
+        batch.clear();
         loop {
             match re.next_message() {
-                Ok(Some(msg)) => match msg.msg_type {
+                Ok(Some(msg)) => batch.push(msg),
+                Ok(None) => break,
+                Err(e) => return PumpEnd::Framing(e),
+            }
+        }
+        let is_video = |t: u8| t == framing::MSG_VIDEO || t == framing::MSG_VIDEO_SEQ;
+        for pass in 0..2 {
+            let video_pass = pass == 1;
+            for msg in &batch {
+                if is_video(msg.msg_type) != video_pass {
+                    continue;
+                }
+                match msg.msg_type {
                     framing::MSG_VIDEO => sink.on_video(&msg.payload, None, recv_done_us),
                     framing::MSG_VIDEO_SEQ => {
                         let Some(seq_bytes) = msg.payload.get(..8) else {
@@ -110,9 +132,7 @@ pub fn pump<R: Read>(reader: &mut R, clock: &Clock, sink: &mut dyn MessageSink) 
                     }
                     framing::MSG_STATS => sink.on_stats(&msg.payload),
                     other => sink.on_unknown(other, msg.payload.len()),
-                },
-                Ok(None) => break,
-                Err(e) => return PumpEnd::Framing(e),
+                }
             }
         }
     }
@@ -128,6 +148,9 @@ mod tests {
         rects: Vec<Vec<u8>>,
         stats: Vec<Vec<u8>>,
         unknown: Vec<(u8, usize)>,
+        /// Dispatch order across the callback kinds, which the per-kind vecs above
+        /// cannot show — the batch reordering contract is asserted against this.
+        order: Vec<&'static str>,
         /// Makes `on_rects` refuse every payload, so the pump's handling of a sink
         /// error is testable without a real compositor.
         refuse_rects: bool,
@@ -135,12 +158,15 @@ mod tests {
 
     impl MessageSink for Recorder {
         fn on_video(&mut self, au: &[u8], seq: Option<u64>, recv_done_us: u64) {
+            self.order.push("video");
             self.video.push((au.to_vec(), seq, recv_done_us));
         }
         fn on_stats(&mut self, payload: &[u8]) {
+            self.order.push("stats");
             self.stats.push(payload.to_vec());
         }
         fn on_rects(&mut self, payload: &[u8], _recv_done_us: u64) -> Result<(), String> {
+            self.order.push("rects");
             self.rects.push(payload.to_vec());
             if self.refuse_rects {
                 return Err("rects: refused by the test sink".to_owned());
@@ -231,6 +257,35 @@ mod tests {
         assert!(
             sink.video.is_empty(),
             "nothing after the refusal is delivered"
+        );
+    }
+
+    #[test]
+    fn rects_sharing_a_read_with_earlier_video_are_dispatched_first() {
+        // Wire order is AU(1), rects(2), AU(2) in one read. A rect blit is ~60x
+        // cheaper than a decode, so the pump front-runs the rects; the sink's
+        // exactness gate makes any order correct, which is what licenses this.
+        let mut au1 = 1u64.to_le_bytes().to_vec();
+        au1.push(0xA1);
+        let mut au2 = 2u64.to_le_bytes().to_vec();
+        au2.push(0xA2);
+        let bytes = wire(&[
+            (framing::MSG_VIDEO_SEQ, au1),
+            (framing::MSG_RECTS, vec![9, 8, 7]),
+            (framing::MSG_VIDEO_SEQ, au2),
+        ]);
+        let mut sink = Recorder::default();
+        let end = pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
+        assert!(matches!(end, PumpEnd::Eof), "{end}");
+        assert_eq!(
+            sink.order,
+            vec!["rects", "video", "video"],
+            "the rect update paints before the batch's decodes"
+        );
+        assert_eq!(
+            (sink.video[0].1, sink.video[1].1),
+            (Some(1), Some(2)),
+            "video order within the batch is preserved"
         );
     }
 

@@ -133,27 +133,33 @@ fn the_receive_path_handles_a_stats_line_and_a_garbage_access_unit() {
         "two server lines and two decode errors: {lines:?}"
     );
 
-    assert_eq!(lines[0]["type"], "server");
-    assert_eq!(lines[0]["line"]["record"], "header");
-    assert_eq!(lines[0]["line"]["width"], 1920);
+    // Grouped by kind, not by line position: the pump dispatches non-video
+    // messages ahead of a read batch's decodes, so cross-kind log order depends
+    // on how the wire happened to split into reads. Survival of the refusals is
+    // already proven above by the clean EOF and frames() == 2; the log's job
+    // here is completeness and content.
+    let servers: Vec<_> = lines.iter().filter(|l| l["type"] == "server").collect();
+    let errors: Vec<_> = lines
+        .iter()
+        .filter(|l| l["type"] == "decode_error")
+        .collect();
+    assert_eq!(servers.len(), 2, "both server lines were relayed");
+    assert_eq!(servers[0]["line"]["record"], "header");
+    assert_eq!(servers[0]["line"]["width"], 1920);
+    assert_eq!(
+        servers[1]["line"]["record"], "frame",
+        "the line after the refusals still arrived"
+    );
 
-    assert_eq!(lines[1]["type"], "decode_error");
-    assert_eq!(lines[1]["au_bytes"], 4);
-    assert_eq!(lines[1]["keyframe"], false);
+    assert_eq!(errors.len(), 2, "each refused access unit got its record");
+    assert_eq!(errors[0]["au_bytes"], 4);
+    assert_eq!(errors[0]["keyframe"], false);
     assert!(
-        lines[1]["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        errors[0]["detail"].as_str().is_some_and(|d| !d.is_empty()),
         "the reason is recorded, not just the fact"
     );
-
-    assert_eq!(lines[2]["type"], "decode_error");
-    assert_eq!(lines[2]["au_bytes"], 8);
-    assert_eq!(lines[2]["keyframe"], true, "an IDR NAL is a keyframe");
-
-    assert_eq!(
-        lines[3]["type"], "server",
-        "the connection survived both refusals"
-    );
-    assert_eq!(lines[3]["line"]["record"], "frame");
+    assert_eq!(errors[1]["au_bytes"], 8);
+    assert_eq!(errors[1]["keyframe"], true, "an IDR NAL is a keyframe");
 }
 
 #[test]

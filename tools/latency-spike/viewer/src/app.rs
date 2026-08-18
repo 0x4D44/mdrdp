@@ -124,6 +124,14 @@ impl ViewerApp {
     }
 
     fn redraw(&mut self) {
+        self.paint(false);
+    }
+
+    /// Present the current picture. `fresh_only` skips the whole pass when the slot
+    /// holds nothing new — the wake path uses it so a redundant wake does not re-blit
+    /// 8 MB to show the pixels already on screen. OS-driven paths (expose, resize)
+    /// pass `false` and re-present unconditionally.
+    fn paint(&mut self, fresh_only: bool) {
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -132,6 +140,9 @@ impl ViewerApp {
         // below, after the present; a frame that was displaced before we got here was
         // already recorded as dropped by the decode thread.
         let fresh = self.slot.take();
+        if fresh_only && fresh.is_none() {
+            return;
+        }
         if let Some(frame) = fresh {
             let size = (frame.width, frame.height);
             self.current = Some(frame);
@@ -257,11 +268,14 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Frame => {
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
+            // Present now, on the wake, rather than `request_redraw`. On macOS a
+            // requested redraw rides the view's display cycle, which taxed every
+            // wake with up to a compositor interval of waiting — measured as
+            // paint→present p50 11.3 ms on the Increment 1 typing runs, against
+            // 5.4 ms for the decode path whose ~6 ms of work absorbed the phase.
+            // Presenting directly from the wake removes the wait; fresh-only, so
+            // a wake that lost its frame to a newer one costs nothing.
+            UserEvent::Frame => self.paint(true),
         }
     }
 
