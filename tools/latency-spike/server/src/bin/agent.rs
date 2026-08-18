@@ -15,14 +15,35 @@ use std::process::ExitCode;
 
 #[cfg(windows)]
 fn main() -> ExitCode {
-    match std::env::args().nth(1).as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
         Some("run") => win::run(),
         Some("install") => win::install(),
         Some("uninstall") => win::uninstall(),
+        Some("status") => match parse_wait(&args[1..]) {
+            Ok(wait) => win::status(wait),
+            Err(e) => {
+                eprintln!("agent: {e}");
+                ExitCode::from(2)
+            }
+        },
         _ => {
-            eprintln!("usage: rhydra-agent run|install|uninstall");
+            eprintln!("usage: rhydra-agent run|install|uninstall|status [--wait <secs>]");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Parse `status`'s optional `--wait <secs>`.
+#[cfg(windows)]
+fn parse_wait(args: &[String]) -> Result<Option<u64>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, secs] if flag == "--wait" => secs
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("--wait needs whole seconds, got {secs:?}")),
+        _ => Err(format!("unrecognised status arguments: {args:?}")),
     }
 }
 
@@ -250,16 +271,54 @@ mod win {
                 let mut reply = String::new();
                 let _ = BufReader::new(&stream).read_line(&mut reply);
                 println!("agent shutdown acknowledged: {}", reply.trim());
-                std::thread::sleep(Duration::from_secs(2));
+                // The agent notices shutdown at the top of its loop (up to a full
+                // tick plus a reconcile away), then still has to reap children.
+                // Poll until the port actually refuses — a fixed sleep raced the
+                // exit and handed deploy a still-locked exe (review finding).
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if TcpStream::connect(("127.0.0.1", CONTROL_PORT)).is_err() {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        eprintln!("agent: still answering {CONTROL_PORT} 15 s after shutdown ack");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                // Port closed; give image unmap a beat.
+                std::thread::sleep(Duration::from_millis(500));
             }
             Err(_) => {
-                // Not running. Its children cannot be running supervised either,
-                // but a hard-killed agent may have left orphans: sweep the owned
-                // images (never our own image — that would kill this process).
+                // No listener. Either no agent, or one that is wedged/starting with
+                // its port down — kill other instances of our own image by PID
+                // filter (plain /im would kill this process too), then sweep the
+                // orphans a hard-killed agent leaves behind.
+                let self_pid = std::process::id().to_string();
+                let _ = Command::new("taskkill")
+                    .args([
+                        "/f",
+                        "/fi",
+                        "IMAGENAME eq rhydra-agent.exe",
+                        "/fi",
+                        &format!("PID ne {self_pid}"),
+                    ])
+                    .status();
                 for image in OWNED_IMAGES {
                     let _ = Command::new("taskkill").args(["/f", "/im", image]).status();
                 }
             }
+        }
+        // A clean host has no task registered; "not found" is success, not failure
+        // (review finding: uninstall used to fail every fresh deploy's quiesce).
+        let registered = Command::new("schtasks")
+            .args(["/query", "/tn", TASK_NAME])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !registered {
+            println!("task {TASK_NAME} not registered; nothing to delete");
+            return ExitCode::SUCCESS;
         }
         match Command::new("schtasks")
             .args(["/delete", "/tn", TASK_NAME, "/f"])
@@ -272,6 +331,51 @@ mod win {
             other => {
                 eprintln!("agent: schtasks /delete failed: {other:?}");
                 ExitCode::FAILURE
+            }
+        }
+    }
+
+    /// One status sample (or a stable-green wait) against the local control port.
+    /// Exit 0: green (stable-green under `--wait`). Exit 1: agent answered but is
+    /// not green yet — bring-up walking `stuck` steps lands here by design.
+    /// Exit 2: nothing answered.
+    pub fn status(wait: Option<u64>) -> ExitCode {
+        use rhydra::control::{green, query_status, wait_stable_green, QueryError, WaitOutcome};
+        const ADDR: (&str, u16) = ("127.0.0.1", CONTROL_PORT);
+        match wait {
+            None => match query_status(ADDR) {
+                Ok(report) => {
+                    println!("{}", control::status_line(&report));
+                    if green(&report) {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    }
+                }
+                Err(QueryError::NoAnswer(e)) | Err(QueryError::Bad(e)) => {
+                    eprintln!("agent: {e}");
+                    ExitCode::from(2)
+                }
+            },
+            Some(secs) => {
+                match wait_stable_green(ADDR, Duration::from_secs(secs), Duration::from_secs(3)) {
+                    WaitOutcome::StableGreen(report) => {
+                        println!("{}", control::status_line(&report));
+                        ExitCode::SUCCESS
+                    }
+                    WaitOutcome::NotGreen(report) => {
+                        println!("{}", control::status_line(&report));
+                        eprintln!(
+                            "agent: not stably green after {secs} s (stuck: {})",
+                            report.stuck.as_deref().unwrap_or("server counters moving")
+                        );
+                        ExitCode::from(1)
+                    }
+                    WaitOutcome::NoAnswer(e) => {
+                        eprintln!("agent: {e}");
+                        ExitCode::from(2)
+                    }
+                }
             }
         }
     }

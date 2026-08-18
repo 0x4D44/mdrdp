@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 pub const CONTROL_PORT: u16 = 9502;
 
 /// Bumped on any incompatible change to the request or response shapes.
-pub const SCHEMA: u32 = 1;
+/// 2: `StatusReport.version` (defaulted on read, so a 2-client reads a 1-agent).
+pub const SCHEMA: u32 = 2;
 
 /// A parsed control request: `{"cmd":"status"}` and friends.
 ///
@@ -68,6 +69,11 @@ pub struct ModeReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusReport {
     pub schema: u32,
+    /// The agent's crate version. Defaulted (empty) when reading a pre-schema-2
+    /// agent, which is itself the signal a deploy verify needs: "" never equals
+    /// the version just deployed.
+    #[serde(default)]
+    pub version: String,
     pub uptime_s: u64,
     pub creator: ChildReport,
     pub device_present: bool,
@@ -78,6 +84,24 @@ pub struct StatusReport {
     pub server: ChildReport,
     /// The first unsatisfied step in bring-up order, or absent when green.
     pub stuck: Option<String>,
+}
+
+/// Whether one sample reads fully green: everything present, right mode, server
+/// up, no stuck step. One green sample is necessary but NOT sufficient — a
+/// crash-looping server shows one green tick per cycle (spawn sets `running`
+/// optimistically). Health claims go through [`stable_green`].
+pub fn green(r: &StatusReport) -> bool {
+    r.device_present && r.mode_ok && r.server.running && r.stuck.is_none()
+}
+
+/// The two-sample health rule: both samples green, taken far enough apart that a
+/// crash cycle would show, with the server's death counters unchanged between
+/// them. The *caller* owes the ≥3 s spacing; this predicate owes the counters.
+pub fn stable_green(first: &StatusReport, second: &StatusReport) -> bool {
+    green(first)
+        && green(second)
+        && first.server.restarts == second.server.restarts
+        && first.server.last_exit_code == second.server.last_exit_code
 }
 
 #[derive(Serialize)]
@@ -126,6 +150,95 @@ pub fn error_line(message: &str) -> String {
     .expect("an error always serialises")
 }
 
+/// Why a status query failed: the port not answering is a different fact (no
+/// agent) from an answer that could not be understood (wrong peer, wire skew).
+#[derive(Debug, PartialEq, Eq)]
+pub enum QueryError {
+    /// Connect/read failed — nothing is listening, or it hung up.
+    NoAnswer(String),
+    /// Something answered, but not with a status envelope we understand.
+    Bad(String),
+}
+
+/// One blocking status query against an agent control port.
+pub fn query_status(addr: (&str, u16)) -> Result<StatusReport, QueryError> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::time::Duration;
+
+    let stream = std::net::TcpStream::connect(addr)
+        .map_err(|e| QueryError::NoAnswer(format!("connect {}:{}: {e}", addr.0, addr.1)))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| QueryError::NoAnswer(e.to_string()))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| QueryError::NoAnswer(e.to_string()))?;
+    writeln!(writer, r#"{{"cmd":"status"}}"#).map_err(|e| QueryError::NoAnswer(e.to_string()))?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|e| QueryError::NoAnswer(format!("read: {e}")))?;
+    if line.trim().is_empty() {
+        return Err(QueryError::NoAnswer("empty reply".to_owned()));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&line).map_err(|e| QueryError::Bad(format!("not JSON: {e}")))?;
+    if value["ok"] != true {
+        return Err(QueryError::Bad(format!("refused: {}", line.trim())));
+    }
+    serde_json::from_value(value["status"].clone())
+        .map_err(|e| QueryError::Bad(format!("bad status shape: {e}")))
+}
+
+/// The outcome of waiting for stable green.
+#[derive(Debug)]
+pub enum WaitOutcome {
+    /// The two-sample rule passed; here is the second sample.
+    StableGreen(Box<StatusReport>),
+    /// Deadline hit while the agent answered but never went (stably) green.
+    NotGreen(Box<StatusReport>),
+    /// Deadline hit with the port never usefully answering.
+    NoAnswer(String),
+}
+
+/// Poll until [`stable_green`] passes or `deadline` runs out. `spacing` is the
+/// gap between the two samples of the health rule (production passes ~3 s; tests
+/// shrink it — the rule's power comes from the server's counters, the spacing
+/// only has to exceed a crash-cycle's green window).
+pub fn wait_stable_green(
+    addr: (&str, u16),
+    deadline: std::time::Duration,
+    spacing: std::time::Duration,
+) -> WaitOutcome {
+    let start = std::time::Instant::now();
+    loop {
+        let latest = match query_status(addr) {
+            Ok(first) if green(&first) => {
+                std::thread::sleep(spacing);
+                match query_status(addr) {
+                    Ok(second) => {
+                        if stable_green(&first, &second) {
+                            return WaitOutcome::StableGreen(Box::new(second));
+                        }
+                        Ok(second)
+                    }
+                    // The port vanished between samples; report the green we had —
+                    // the deadline arm below will surface it as not-stable.
+                    Err(_) => Ok(first),
+                }
+            }
+            other => other,
+        };
+        if start.elapsed() >= deadline {
+            return match latest {
+                Ok(report) => WaitOutcome::NotGreen(Box::new(report)),
+                Err(QueryError::NoAnswer(e)) | Err(QueryError::Bad(e)) => WaitOutcome::NoAnswer(e),
+            };
+        }
+        std::thread::sleep(spacing.min(std::time::Duration::from_secs(1)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +276,7 @@ mod tests {
     fn distinct_report() -> StatusReport {
         StatusReport {
             schema: SCHEMA,
+            version: "9.9.9".to_owned(),
             uptime_s: 101,
             creator: ChildReport {
                 running: true,
@@ -200,6 +314,156 @@ mod tests {
         assert_eq!(value["status"]["creator"]["restarts"], 3);
         assert_eq!(value["status"]["server"]["restarts"], 5);
         assert_eq!(value["status"]["server"]["cooldown_s"], 4);
+    }
+
+    #[test]
+    fn a_schema_1_line_without_version_still_parses() {
+        // A 2-client reading a 1-agent: version defaults to empty, which is the
+        // "old agent" signal, never a parse failure.
+        let mut old = serde_json::to_value(distinct_report()).unwrap();
+        old.as_object_mut().unwrap().remove("version");
+        let back: StatusReport = serde_json::from_value(old).unwrap();
+        assert_eq!(back.version, "");
+    }
+
+    fn green_report() -> StatusReport {
+        StatusReport {
+            schema: SCHEMA,
+            version: "9.9.9".to_owned(),
+            uptime_s: 60,
+            creator: ChildReport {
+                running: true,
+                restarts: 0,
+                last_exit_code: None,
+                cooldown_s: 0,
+            },
+            device_present: true,
+            display_mode: Some(ModeReport {
+                width: 1920,
+                height: 1080,
+                hz: 240,
+            }),
+            mode_ok: true,
+            server: ChildReport {
+                running: true,
+                restarts: 0,
+                last_exit_code: None,
+                cooldown_s: 0,
+            },
+            stuck: None,
+        }
+    }
+
+    #[test]
+    fn stable_green_accepts_two_quiet_samples() {
+        let a = green_report();
+        let mut b = green_report();
+        b.uptime_s = 70; // time passing alone must not break stability
+        assert!(stable_green(&a, &b));
+    }
+
+    #[test]
+    fn stable_green_rejects_a_crash_loop() {
+        // The ops-review scenario: each crash cycle shows one green tick, but the
+        // restart counter moves between samples.
+        let a = green_report();
+        let mut b = green_report();
+        b.server.restarts = a.server.restarts + 1;
+        assert!(!stable_green(&a, &b));
+
+        // A death and clean respawn inside the window also shows in the exit code.
+        let mut c = green_report();
+        c.server.last_exit_code = Some(1);
+        assert!(!stable_green(&a, &c));
+    }
+
+    #[test]
+    fn stable_green_requires_green_on_both_ends() {
+        let a = green_report();
+        let mut not_yet = green_report();
+        not_yet.server.running = false;
+        not_yet.stuck = Some("server".to_owned());
+        assert!(!stable_green(&not_yet, &a));
+        assert!(!stable_green(&a, &not_yet));
+        assert!(!green(&not_yet));
+    }
+
+    /// Serve one scripted status line per incoming connection, in order, then
+    /// keep serving the last one. Returns the bound port.
+    fn scripted_agent(lines: Vec<String>) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut served = 0usize;
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut writer = stream.try_clone().unwrap();
+                let mut request = String::new();
+                let _ = BufReader::new(stream).read_line(&mut request);
+                let line = &lines[served.min(lines.len() - 1)];
+                let _ = writeln!(writer, "{line}");
+                served += 1;
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn query_status_reads_a_real_socket() {
+        let port = scripted_agent(vec![status_line(&distinct_report())]);
+        let report = query_status(("127.0.0.1", port)).unwrap();
+        assert_eq!(report, distinct_report());
+    }
+
+    #[test]
+    fn query_status_distinguishes_no_answer_from_bad_answer() {
+        // Nothing listening: NoAnswer.
+        let unused = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = unused.local_addr().unwrap().port();
+        drop(unused);
+        assert!(matches!(
+            query_status(("127.0.0.1", port)),
+            Err(QueryError::NoAnswer(_))
+        ));
+        // Something answering garbage: Bad.
+        let port = scripted_agent(vec!["not json".to_owned()]);
+        assert!(matches!(
+            query_status(("127.0.0.1", port)),
+            Err(QueryError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn wait_stable_green_passes_a_stable_agent_and_fails_a_crash_loop() {
+        use std::time::Duration;
+        // Stable: same green twice.
+        let port = scripted_agent(vec![status_line(&green_report())]);
+        assert!(matches!(
+            wait_stable_green(
+                ("127.0.0.1", port),
+                Duration::from_secs(2),
+                Duration::from_millis(30)
+            ),
+            WaitOutcome::StableGreen(_)
+        ));
+        // Crash loop: every sample green but restarts always climbing.
+        let looping: Vec<String> = (0..200)
+            .map(|i| {
+                let mut r = green_report();
+                r.server.restarts = i;
+                status_line(&r)
+            })
+            .collect();
+        let port = scripted_agent(looping);
+        assert!(matches!(
+            wait_stable_green(
+                ("127.0.0.1", port),
+                Duration::from_millis(300),
+                Duration::from_millis(20)
+            ),
+            WaitOutcome::NotGreen(_)
+        ));
     }
 
     #[test]

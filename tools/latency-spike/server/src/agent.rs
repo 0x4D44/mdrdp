@@ -267,6 +267,7 @@ impl Reconciler {
     pub fn status(&self, uptime_s: u64) -> StatusReport {
         StatusReport {
             schema: SCHEMA,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             uptime_s,
             creator: self.creator.report(),
             device_present: self.device_present,

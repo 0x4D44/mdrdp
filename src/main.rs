@@ -202,6 +202,15 @@ fn ask_password_over_pipe(
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // `deploy` claims the first positional before ANYTHING else — before the
+    // global --help scan (deploy has its own), and long before the detach logic
+    // (a detached deploy would hand ssh a null stdin and log its prompts into a
+    // file). A favourite genuinely named "deploy" stays reachable as
+    // `mdrdp -- deploy`.
+    if args.first().is_some_and(|a| a == "deploy") {
+        std::process::exit(mdrdp::deploy::run(&args[1..]));
+    }
+
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
             "{}",

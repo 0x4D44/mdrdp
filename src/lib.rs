@@ -9,6 +9,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod connect;
 pub mod creds;
+pub mod deploy;
 pub mod detach;
 pub mod diag;
 pub mod disconnect;
