@@ -6,6 +6,13 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Suppress Output "allow" does NOT repaint: EGFX resumes only FUTURE deltas — reveal must send Refresh Rect (`session::visibility_pdus`).
+  A session that connects occluded stays black forever: the logon-black connect burst is all it
+  ever painted, the desktop appears server-side while suppressed (never sent), and a static desktop
+  produces no future deltas. Kiln showed this as a healthy connection with a permanent black
+  window, frames frozen at 80. Temper/crucible masked it because their desktops change constantly.
+  MS-RDPBCGR 2.2.11.2 Refresh Rect after the allow is what mstsc does. MDR-BUG-FLUX-00006.
+
 - softbuffer's CG backend colour-converts the WHOLE frame on CPU per present; IOSurface contents skip it (`present.rs`).
   An idle 1440p session burned 20–90% of a core: CoreAnimation re-renders every data-provider
   CGImage through a vImage ColorSync pass (~20 ms/frame at 2560x1440), plus softbuffer zero-allocs
