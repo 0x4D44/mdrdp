@@ -9,6 +9,7 @@
 pub mod annexb;
 pub mod cli;
 pub mod colorspace;
+pub mod diff;
 pub mod framing;
 pub mod idd_section;
 pub mod input_proto;

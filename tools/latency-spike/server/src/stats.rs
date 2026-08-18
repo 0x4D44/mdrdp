@@ -73,6 +73,11 @@ pub struct Header {
     /// Tuning knobs, reported so every archived run names its own thresholds.
     pub rect_max_count: u32,
     pub rect_max_bytes: u64,
+    /// Idle gap that arms the Increment 3 pixel diff, in milliseconds; 0 means the
+    /// diff was disabled for this run. Another telemetry-tuned knob on the same
+    /// terms as `rect_max_count`: a measurement compared against another must be
+    /// able to say which threshold each ran under.
+    pub diff_idle_gap_ms: u32,
     /// How SPS/PPS reach the wire: see `annexb`.
     pub parameter_set_route: &'static str,
     /// Whether the out-of-band `MF_MT_MPEG_SEQUENCE_HEADER` was available as a
@@ -80,10 +85,14 @@ pub struct Header {
     pub sequence_header_available: bool,
 }
 
-/// Schema 4: the header gained `source`, naming which capture path the run used.
-/// (Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
+/// Schema 5: the Increment 3 pixel diff becomes visible — the header gains
+/// `diff_idle_gap_ms`, frame rows gain the cumulative `diff_runs`/`diff_hits`/
+/// `diff_us_total`, and rects rows gain `from_diff`, which says whether a rect
+/// message was metadata-driven or measured against the previous frame.
+/// (Schema 4: the header gained `source`, naming which capture path the run used.
+/// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 pub const WIRE_VERSION: u32 = 2;
 
 impl Header {
@@ -110,6 +119,7 @@ impl Header {
             codec_api_refused: Vec::new(),
             rect_max_count: 0,
             rect_max_bytes: 0,
+            diff_idle_gap_ms: 0,
             parameter_set_route: "in-band, out-of-band fallback",
             sequence_header_available: false,
         }
@@ -162,6 +172,16 @@ pub struct FrameRecord {
     /// Cumulative count of encoder outputs whose sample timestamp matched no
     /// pending submission — each one is a stamp pairing taken on faith (FIFO).
     pub stamp_mismatches: u64,
+    /// Cumulative count of idle-regime pixel diffs attempted (HLD §6b).
+    pub diff_runs: u64,
+    /// Of those, how many produced a usable measured delta. `diff_runs - diff_hits`
+    /// is the scene-cut cost: a diff that ran, found too much change, and left the
+    /// frame on the codec path it was already taking.
+    pub diff_hits: u64,
+    /// Cumulative microseconds spent inside those diffs. Carried on every frame row
+    /// (like `dropped_rects`) so the cost is attributable even when the frame that
+    /// paid it produced no rect message.
+    pub diff_us_total: u64,
     /// Dirty-rect metadata from the duplication, when the frame carried any
     /// (`None` = metadata unavailable, which is NOT the same as zero rects).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,6 +223,12 @@ pub struct RectRecord {
     pub send_done_us: i64,
     /// Cumulative rect messages dropped because the send queue was full.
     pub dropped_rects: u64,
+    /// Where these rects came from: `false` = the source's own change metadata
+    /// satisfied the predicate, `true` = the metadata missed and the Increment 3
+    /// pixel diff measured the delta instead. The two arms have different costs and
+    /// different trust arguments, so a row that cannot say which one it is cannot be
+    /// analysed.
+    pub from_diff: bool,
 }
 
 impl RectRecord {
@@ -307,6 +333,12 @@ mod tests {
         r.dropped_frames = 3;
         r.dropped_rects = 5;
         r.stamp_mismatches = 2;
+        // All three diff counters distinct: a fixture where `diff_runs` equalled
+        // `diff_hits` could not tell the two apart if they were swapped, and the
+        // difference between them is the whole scene-cut story.
+        r.diff_runs = 11;
+        r.diff_hits = 6;
+        r.diff_us_total = 90_000;
         r.dirty_rect_count = Some(4);
         r.dirty_bytes = Some(8192);
         r.move_rect_count = Some(1);
@@ -328,13 +360,63 @@ mod tests {
         assert_eq!(v["dropped_frames"], 3);
         assert_eq!(v["dropped_rects"], 5);
         assert_eq!(v["stamp_mismatches"], 2);
+        assert_eq!(v["diff_runs"], 11);
+        assert_eq!(v["diff_hits"], 6);
+        assert_eq!(v["diff_us_total"], 90_000);
         assert_eq!(v["dirty_rect_count"], 4);
         assert_eq!(v["dirty_bytes"], 8192);
         assert_eq!(v["move_rect_count"], 1);
         assert_eq!(v["keyframe_wait_frames"], 17);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 19, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 22, "unexpected field count: {keys:?}");
+    }
+
+    #[test]
+    fn a_diff_counter_is_serialised_even_when_zero() {
+        // The three diff counters are cumulative, not optional: a run whose diff
+        // never fired must still say so, or "the diff was off" and "the diff never
+        // triggered" become the same line. (Contrast the `Option` dirty fields
+        // below, where absence genuinely means "unknown".)
+        let r = FrameRecord::new();
+        let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["diff_runs"], 0);
+        assert_eq!(obj["diff_hits"], 0);
+        assert_eq!(obj["diff_us_total"], 0);
+    }
+
+    #[test]
+    fn a_rects_line_names_its_stamps_and_which_arm_produced_it() {
+        let mut r = RectRecord::new();
+        // Distinct values throughout: `rect_count` and `rect_bytes` sharing a number
+        // would hide a swap, and so would equal pack stamps.
+        r.frame = 12;
+        r.rect_count = 3;
+        r.rect_bytes = 6144;
+        r.pack_start_us = 2000;
+        r.pack_end_us = 2100;
+        r.send_done_us = 2200;
+        r.dropped_rects = 4;
+        // The pixel-diff arm. `false` is the metadata arm, and the default, so the
+        // fixture sets the value that a forgotten assignment would not produce.
+        r.from_diff = true;
+
+        let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
+        assert_eq!(v["record"], "rects");
+        assert_eq!(v["frame"], 12);
+        assert_eq!(v["rect_count"], 3);
+        assert_eq!(v["rect_bytes"], 6144);
+        assert_eq!(v["pack_start_us"], 2000);
+        assert_eq!(v["pack_end_us"], 2100);
+        assert_eq!(v["send_done_us"], 2200);
+        assert_eq!(v["dropped_rects"], 4);
+        assert_eq!(v["from_diff"], true);
+        // A fresh record is the metadata arm until something says otherwise.
+        assert!(to_line(&RectRecord::new()).contains(r#""from_diff":false"#));
+
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys.len(), 9, "unexpected field count: {keys:?}");
     }
 
     #[test]
@@ -384,6 +466,11 @@ mod tests {
         // Which capture path produced the run. Without it an archived file cannot
         // be told from the control arm it will be compared against.
         h.source = "idd";
+        // The tuning knobs, all three distinct: a fixture reusing one number could
+        // not catch the diff gap being written from the rect predicate's value.
+        h.rect_max_count = 32;
+        h.rect_max_bytes = 98_304;
+        h.diff_idle_gap_ms = 100;
         let v: Value = serde_json::from_str(&to_line(&h)).unwrap();
         assert_eq!(v["record"], "header");
         assert_eq!(v["schema"], SCHEMA);
@@ -394,8 +481,11 @@ mod tests {
         assert_eq!(v["codec_api_applied"][0], "AVLowLatencyMode");
         assert_eq!(v["codec_api_refused"][0], "AVEncMPVGOPSize");
         assert_eq!(v["source"], "idd");
+        assert_eq!(v["rect_max_count"], 32);
+        assert_eq!(v["rect_max_bytes"], 98_304);
+        assert_eq!(v["diff_idle_gap_ms"], 100);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 23, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 24, "unexpected field count: {keys:?}");
     }
 }

@@ -14,10 +14,11 @@
 //! number. Every drop is counted and published as `dropped_frames`, so the loss is
 //! never silent.
 
-use super::source::{Acquired, ChangeInfo, FrameSource};
-use super::{convert, dxgi, encode, idd_source, input, qpc, send, Result};
+use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource};
+use super::{convert, dxgi, encode, idd_source, input, pixel_diff, qpc, send, Result};
 use crate::annexb::{self, ParameterSets};
 use crate::cli::{Config, Source, DECLARED_FPS};
+use crate::diff;
 use crate::rects;
 use crate::stats::{self, FrameRecord, Header, QpcClock};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +58,15 @@ const RECT_MAX_COUNT: usize = 32;
 /// **Provisional until the §5a telemetry run**, on the same terms as
 /// [`RECT_MAX_COUNT`].
 const RECT_MAX_BYTES: u64 = 96 * 1024;
+
+/// How long a gap since the previous consumed frame arms the Increment 3 pixel
+/// diff (HLD §6b). An isolated keystroke always clears it; video and burst typing
+/// never do, so continuous content pays the diff's cost exactly zero times.
+///
+/// **Provisional until the §6b telemetry run**, on the same terms as
+/// [`RECT_MAX_COUNT`]: a tuning knob, reported in the stats header so every
+/// archived measurement names the threshold it ran under.
+const DIFF_IDLE_GAP_US: i64 = 100_000;
 
 /// `--list-outputs`.
 pub fn list_outputs() -> Result<()> {
@@ -171,7 +181,19 @@ pub fn run(cfg: &Config) -> Result<()> {
         );
     }
 
-    let header = build_header(cfg, clock, source.as_ref(), encoder.as_ref(), rects_enabled);
+    // The diff rides the rect wire path and produces nothing else, so a run without
+    // rects has nothing for it to emit through. Deciding it here keeps the loop from
+    // re-testing a pair of flags per frame, and keeps the header honest.
+    let diff_enabled = cfg.diff && rects_enabled;
+
+    let header = build_header(
+        cfg,
+        clock,
+        source.as_ref(),
+        encoder.as_ref(),
+        rects_enabled,
+        diff_enabled,
+    );
     let header_line = stats::to_line(&header);
 
     let connected = Arc::new(AtomicBool::new(false));
@@ -219,6 +241,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         tx,
         connected,
         rects_enabled,
+        diff_enabled,
     ));
     // Only reached when the loop fails; the happy path never returns. Draining the
     // MFT before `MFShutdown` runs (via `_mf`'s Drop) keeps the driver's own logs
@@ -238,8 +261,12 @@ struct CaptureState<'a> {
     /// Whether the raw dirty-rect fast path may run at all: `--no-rects` and a
     /// desktop too large for the wire's u16 coordinates both switch it off.
     rects_enabled: bool,
+    /// Whether the Increment 3 pixel diff may run at all. Implies `rects_enabled`:
+    /// the diff emits through the rect path or not at all.
+    diff_enabled: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_state<'a>(
     capture: &'a mut dyn FrameSource,
     converter: &'a mut convert::Nv12Converter,
@@ -248,6 +275,7 @@ fn capture_state<'a>(
     tx: SyncSender<send::Outbound>,
     connected: Arc<AtomicBool>,
     rects_enabled: bool,
+    diff_enabled: bool,
 ) -> CaptureState<'a> {
     CaptureState {
         capture,
@@ -257,6 +285,7 @@ fn capture_state<'a>(
         tx,
         connected,
         rects_enabled,
+        diff_enabled,
     }
 }
 
@@ -266,6 +295,7 @@ fn build_header(
     capture: &dyn FrameSource,
     encoder: &dyn encode::Encoder,
     rects_enabled: bool,
+    diff_enabled: bool,
 ) -> Header {
     let mut h = Header::new();
     h.qpc_frequency = clock.freq();
@@ -295,6 +325,13 @@ fn build_header(
     };
     h.rect_max_count = max_count;
     h.rect_max_bytes = max_bytes;
+    // 0 on the same terms: a reader must be able to tell the diff's control arm
+    // from a run whose idle gate simply never opened.
+    h.diff_idle_gap_ms = if diff_enabled {
+        (DIFF_IDLE_GAP_US / 1000) as u32
+    } else {
+        0
+    };
     h.sequence_header_available = encoder.parameter_sets().is_some();
     h
 }
@@ -310,6 +347,13 @@ struct EmitCtx {
     /// Cumulative rect messages dropped for the same reason. Counted separately so
     /// fast-path pressure is visible on its own.
     dropped_rects: u64,
+    /// Cumulative idle-regime pixel diffs attempted.
+    diff_runs: u64,
+    /// Of those, how many produced a usable measured delta.
+    diff_hits: u64,
+    /// Cumulative microseconds spent inside those diffs — the cost side of the
+    /// trade the hit count is the benefit side of.
+    diff_us_total: u64,
     /// SPS/PPS scanned out of the stream's own access units — the fallback when
     /// the encoder publishes no out-of-band sequence header (Quick Sync). Updated
     /// on every in-band sighting; cleared when the encoder's config epoch moves.
@@ -353,6 +397,9 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     record.param_sets_prepended = prepended;
     record.dropped_frames = ctx.dropped;
     record.dropped_rects = ctx.dropped_rects;
+    record.diff_runs = ctx.diff_runs;
+    record.diff_hits = ctx.diff_hits;
+    record.diff_us_total = ctx.diff_us_total;
     record.stamp_mismatches = au.stamp_mismatches;
     if au.meta.change_valid {
         record.dirty_rect_count = Some(au.meta.dirty_rect_count);
@@ -406,6 +453,40 @@ fn takes_fast_path(change: &ChangeInfo) -> bool {
         && change.dirty_bytes() <= RECT_MAX_BYTES
 }
 
+/// The bounding box of a change claim, clipped to the desktop — where the
+/// Increment 3 diff scans when there is a claim to verify.
+///
+/// The claim may be wildly inflated (that is the whole reason the diff exists), but
+/// it is never *short*: both sources publish coverage, so every changed pixel lies
+/// inside some listed rect. Scanning the box that contains them all therefore cannot
+/// miss real change, and on the isolated-keystroke frames it is far smaller than the
+/// full frame the absent-metadata case has to scan.
+///
+/// An empty claim yields a zero-sized region; the caller never passes one (a `Some`
+/// with no rects is a claim of no change, which has nothing to verify).
+fn claimed_bounds(rects: &[DirtyRect], width: u32, height: u32) -> diff::Region {
+    let mut left = u32::MAX;
+    let mut top = u32::MAX;
+    let mut right = 0u32;
+    let mut bottom = 0u32;
+    for r in rects {
+        left = left.min(r.x);
+        top = top.min(r.y);
+        right = right.max(r.x.saturating_add(r.w));
+        bottom = bottom.max(r.y.saturating_add(r.h));
+    }
+    let left = left.min(width);
+    let top = top.min(height);
+    let right = right.min(width);
+    let bottom = bottom.min(height);
+    diff::Region {
+        x: left,
+        y: top,
+        w: right.saturating_sub(left),
+        h: bottom.saturating_sub(top),
+    }
+}
+
 /// Read one frame's dirty rects back raw and hand them to the sender, ahead of the
 /// access unit for the same frame.
 ///
@@ -420,12 +501,43 @@ fn emit_rects(
 ) -> Result<()> {
     let pack_start = qpc::now();
     let rect_pixels = capture.read_rects(texture, change)?;
+    send_rects(
+        rect_pixels,
+        frame_seq,
+        capture.width(),
+        capture.height(),
+        pack_start,
+        false,
+        ctx,
+    )
+}
+
+/// Encode one already-packed rect set and hand it to the sender.
+///
+/// The tail both fast-path arms share: the metadata one above, which has just read
+/// the claimed rects back, and the Increment 3 diff, which packed the *measured*
+/// delta straight out of its own mapping. Only `from_diff` tells them apart on the
+/// wire — the trust argument differs (HLD §6b) but the payload and the send policy
+/// do not, and two copies of that policy would be two places for the drop
+/// accounting to diverge.
+///
+/// `pack_start` is the stamp taken before whichever work produced `rect_pixels`, so
+/// the row's `pack_start_us .. pack_end_us` span covers the diff when there was one.
+fn send_rects(
+    rect_pixels: Vec<rects::Rect>,
+    frame_seq: u64,
+    frame_width: u32,
+    frame_height: u32,
+    pack_start: i64,
+    from_diff: bool,
+    ctx: &mut EmitCtx,
+) -> Result<()> {
     let rect_count = rect_pixels.len() as u32;
     let rect_bytes: u64 = rect_pixels.iter().map(|r| r.pixels.len() as u64).sum();
     let update = rects::RectUpdate {
         frame_seq,
-        frame_width: capture.width(),
-        frame_height: capture.height(),
+        frame_width,
+        frame_height,
         rects: rect_pixels,
     };
     let mut payload = Vec::with_capacity(rects::encoded_len(&update));
@@ -439,6 +551,7 @@ fn emit_rects(
     record.pack_start_us = ctx.clock.micros(pack_start);
     record.pack_end_us = ctx.clock.micros(pack_end);
     record.dropped_rects = ctx.dropped_rects;
+    record.from_diff = from_diff;
 
     match ctx
         .tx
@@ -470,6 +583,11 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
     // shared pool under `--source idd`; the reasoning is identical.)
     let mut suppress_rects_once = false;
     let mut last_epoch = state.encoder.config_epoch();
+    // HLD §6b: the previous consumed frame, retained on the GPU, plus the stamp that
+    // says how long ago it was. Both are the diff's whole state, and both reset on a
+    // rebuilt source.
+    let mut pixel_diff = pixel_diff::PixelDiff::new(state.capture.width(), state.capture.height());
+    let mut last_acquire_qpc: Option<i64> = None;
     let frame_duration_hns = HNS_PER_SECOND / DECLARED_FPS.max(1) as i64;
     let start_qpc = qpc::now();
     let mut ctx = EmitCtx {
@@ -477,6 +595,9 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
         tx: state.tx.clone(),
         dropped: 0,
         dropped_rects: 0,
+        diff_runs: 0,
+        diff_hits: 0,
+        diff_us_total: 0,
         stream_sets: None,
         encoder_sets: None,
         awaiting_keyframe: None,
@@ -525,6 +646,12 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
                 eprintln!("capture: frame source lost and rebuilt");
                 want_keyframe = true;
                 suppress_rects_once = true;
+                // The retained frame predates the rebuild, so it is no longer the
+                // baseline the viewer is painting on top of; a diff against it would
+                // measure against something never on screen. Dropping the stamp too
+                // keeps the idle gate from reading the rebuild's own outage as idle.
+                pixel_diff.invalidate();
+                last_acquire_qpc = None;
                 continue;
             }
         };
@@ -533,12 +660,105 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
 
         // The fast path is an overlay, not a branch: whatever happens here, the
         // frame still goes on to convert, encode and send as H.264 below.
+        let mut metadata_took_fast_path = false;
         if state.rects_enabled && !suppress_rects_once {
             if let Some(change) = change.as_ref().filter(|c| takes_fast_path(c)) {
                 emit_rects(state.capture, &texture, change, frame_seq, &mut ctx)?;
+                metadata_took_fast_path = true;
+            }
+        }
+
+        // Increment 3 (HLD §6b): the metadata missed, so measure instead of
+        // trusting. Five conditions, each earning its place:
+        //
+        // * `!suppress_rects_once` — a rebuilt source suppresses *both* arms for one
+        //   frame, for the same decision-15 reason.
+        // * `!metadata_took_fast_path` — the frame is already on the fast path;
+        //   diffing it would cost 5–8 ms to re-derive an answer we have.
+        // * `pixel_diff.valid()` — there is a baseline the viewer actually saw.
+        // * an idle gap of at least [`DIFF_IDLE_GAP_US`] — the regime where the
+        //   metadata is known to be wrong, and the one regime where the diff's cost
+        //   is affordable. Continuous content never reaches it.
+        // * the metadata did not honestly say "nothing changed" — a `Some` with no
+        //   rects is a claim of no change, and there is nothing to verify. (Absent
+        //   metadata is the opposite: it claims nothing, so the diff is the only
+        //   thing that can tell us anything.)
+        let idle_gap_passed = match last_acquire_qpc {
+            Some(last) => ctx.clock.micros(acquire_qpc.saturating_sub(last)) >= DIFF_IDLE_GAP_US,
+            None => false,
+        };
+        let metadata_claims_no_change = change.as_ref().is_some_and(|c| c.rects.is_empty());
+        if state.diff_enabled
+            && !suppress_rects_once
+            && !metadata_took_fast_path
+            && pixel_diff.valid()
+            && idle_gap_passed
+            && !metadata_claims_no_change
+        {
+            // Where to look. A claim, however inflated, still *contains* the true
+            // delta: duplication's dirty rects are complete coverage, and the IDD
+            // driver's buffer-relative damage is a superset of the desktop-relative
+            // change. Absent metadata claims nothing, so the whole frame is in play.
+            let region = match change.as_ref() {
+                Some(c) => claimed_bounds(&c.rects, state.capture.width(), state.capture.height()),
+                None => diff::Region {
+                    x: 0,
+                    y: 0,
+                    w: state.capture.width(),
+                    h: state.capture.height(),
+                },
+            };
+            // The stamp the rect row reports as `pack_start_us`: the diff is part of
+            // what this frame's fast path cost, not a prelude to it.
+            let diff_start = qpc::now();
+            let measured = {
+                let device = state.capture.device();
+                let context = state.capture.context();
+                pixel_diff.diff(
+                    device,
+                    context,
+                    &texture,
+                    region,
+                    RECT_MAX_COUNT,
+                    RECT_MAX_BYTES,
+                )?
+            };
+            let diff_us = ctx
+                .clock
+                .micros(qpc::now().saturating_sub(diff_start))
+                .max(0) as u64;
+            ctx.diff_runs += 1;
+            ctx.diff_us_total += diff_us;
+            // `None` is a miss — too many rects, or too many bytes — and needs no
+            // action: the frame is on the codec path already, which is where a
+            // large change belongs anyway.
+            if let Some(rect_pixels) = measured {
+                ctx.diff_hits += 1;
+                if !rect_pixels.is_empty() {
+                    send_rects(
+                        rect_pixels,
+                        frame_seq,
+                        state.capture.width(),
+                        state.capture.height(),
+                        diff_start,
+                        true,
+                        &mut ctx,
+                    )?;
+                }
             }
         }
         suppress_rects_once = false;
+
+        // Still inside the frame's validity window, and before the converter touches
+        // it: this frame becomes the next one's baseline. Unconditional while the
+        // diff is on — see [`pixel_diff`] for why a conditional copy would buy less
+        // than it costs in ways to be wrong.
+        if state.diff_enabled {
+            let device = state.capture.device();
+            let context = state.capture.context();
+            pixel_diff.retain(device, context, &texture)?;
+        }
+        last_acquire_qpc = Some(acquire_qpc);
 
         let convert_start = qpc::now();
         let nv12 = state.converter.convert(&texture)?;

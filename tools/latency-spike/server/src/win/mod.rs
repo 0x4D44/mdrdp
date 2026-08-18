@@ -5,7 +5,8 @@
 //! [`idd_source`] are the two answers, [`convert`] does BGRA→NV12 on the GPU,
 //! [`encode`] drives the Media Foundation H.264 MFT, [`send`] owns the video socket
 //! and the stats file, and [`input`] owns the keystroke channel. [`pipeline`] wires
-//! them together.
+//! them together. [`pixel_diff`] sits beside the sources: it is the D3D11 half of
+//! the Increment 3 pixel diff, whose portable comparison lives in [`crate::diff`].
 
 pub mod convert;
 pub mod dxgi;
@@ -13,6 +14,7 @@ pub mod encode;
 pub mod idd_source;
 pub mod input;
 pub mod pipeline;
+pub mod pixel_diff;
 pub mod qpc;
 pub mod send;
 pub mod source;

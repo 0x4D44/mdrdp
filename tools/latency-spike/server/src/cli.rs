@@ -38,6 +38,11 @@ pub struct Config {
     /// Send small dirty regions as raw BGRA rects beside the H.264 stream. On by
     /// default; `--no-rects` turns it off to give a measurement its control arm.
     pub rects: bool,
+    /// Verify a missed fast-path predicate by diffing the frame against the
+    /// previous one, when the frame follows an idle gap (HLD §6b). On by default;
+    /// `--no-diff` turns it off to give that measurement its own control arm. It
+    /// rides the rect wire path, so `--no-rects` disables it too.
+    pub diff: bool,
     /// Which capture source to run.
     pub source: Source,
 }
@@ -65,6 +70,7 @@ impl Default for Config {
             out: None,
             list_outputs: false,
             rects: true,
+            diff: true,
             source: Source::Dxgi,
         }
     }
@@ -74,12 +80,15 @@ pub fn usage() -> &'static str {
     "usage:\n  \
      spike-server --output N [--video-port 9500] [--input-port 9501]\n               \
                   [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]\n               \
-                  [--no-rects] [--source dxgi|idd]\n  \
+                  [--no-rects] [--no-diff] [--source dxgi|idd]\n  \
      spike-server --source idd [--video-port 9500] ...\n  \
      spike-server --list-outputs\n\n\
      --no-rects withholds the raw dirty-rect fast path, forcing every update down\n  \
      the H.264-only path. That is the control arm for a measurement, not a tuning\n  \
      knob: quote it whenever a figure is compared against the hybrid wire.\n\n\
+     --no-diff withholds the Increment 3 pixel-diff fast path; metadata-driven\n  \
+     rects still run. That is the control arm for the diff's own A/B, so quote it\n  \
+     whenever an idle-regime figure is compared against a diffing server.\n\n\
      --source idd reads the mdrdp-idd driver's shared texture pool instead of\n  \
      Desktop Duplication, removing duplication's present-to-acquire gap. It needs\n  \
      the driver installed and started, and it takes no --output: the pool is found\n  \
@@ -103,6 +112,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
         if flag == "--no-rects" {
             cfg.rects = false;
+            i += 1;
+            continue;
+        }
+        if flag == "--no-diff" {
+            cfg.diff = false;
             i += 1;
             continue;
         }
@@ -199,8 +213,10 @@ mod tests {
         assert_eq!(cfg.out, None);
         assert!(!cfg.list_outputs);
         // The fast path is the default: a run has to opt *out* of it, so a forgotten
-        // flag never silently produces the control arm's numbers.
+        // flag never silently produces the control arm's numbers. Same for the
+        // pixel diff riding on top of it.
         assert!(cfg.rects);
+        assert!(cfg.diff);
         // Duplication is the default until the IDD source passes the gate, so a
         // forgotten `--source` measures the proven path, not the new one.
         assert_eq!(cfg.source, Source::Dxgi);
@@ -209,9 +225,9 @@ mod tests {
     #[test]
     fn every_flag_lands_in_its_own_field() {
         // All five numeric values distinct: a fixture reusing one number could not
-        // catch two flags writing the same field. `--no-rects` sits in the middle of
-        // the list, where a bare flag that wrongly consumed a value would derail
-        // every flag after it.
+        // catch two flags writing the same field. `--no-rects` and `--no-diff` sit
+        // in the middle of the list, where a bare flag that wrongly consumed a value
+        // would derail every flag after it.
         let cfg = parse(&args(&[
             "--output",
             "2",
@@ -222,6 +238,7 @@ mod tests {
             "--no-rects",
             "--bitrate-kbps",
             "8000",
+            "--no-diff",
             "--gop",
             "30",
             "--source",
@@ -237,6 +254,7 @@ mod tests {
         assert_eq!(cfg.gop, 30);
         assert_eq!(cfg.out.as_deref(), Some("/tmp/x.jsonl"));
         assert!(!cfg.rects);
+        assert!(!cfg.diff);
         assert_eq!(cfg.source, Source::Idd);
     }
 
@@ -286,6 +304,29 @@ mod tests {
         .unwrap();
         assert!(!cfg.rects);
         assert_eq!(cfg.out.as_deref(), Some("/tmp/y.jsonl"));
+        // `--no-rects` disables the wire path the diff rides on, but it is not the
+        // diff's own flag: the two arms must stay separable in the config, or an
+        // A/B of one silently varies the other.
+        assert!(cfg.diff);
+    }
+
+    #[test]
+    fn no_diff_turns_the_pixel_diff_off_and_leaves_the_metadata_rects_alone() {
+        // The trailing `--out` proves the cursor advanced by one, as for
+        // `--no-rects` above.
+        let cfg = parse(&args(&[
+            "--output",
+            "0",
+            "--no-diff",
+            "--out",
+            "/tmp/z.jsonl",
+        ]))
+        .unwrap();
+        assert!(!cfg.diff);
+        // Metadata-driven rects still run: that is what makes `--no-diff` the
+        // diff's control arm rather than a second `--no-rects`.
+        assert!(cfg.rects);
+        assert_eq!(cfg.out.as_deref(), Some("/tmp/z.jsonl"));
     }
 
     #[test]
