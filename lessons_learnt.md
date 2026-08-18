@@ -6,6 +6,15 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- spike-server records ZERO frames until a viewer connects (`win/pipeline.rs:609` — by design); a viewer-less smoke proves nothing.
+  A whole afternoon's "dead capture" diagnosis on quench was this: the capture loop parks in 50 ms
+  sleeps until the video port accepts a client. Arm it headlessly with an SSH tunnel plus
+  `nc -d 127.0.0.1 9500 > /dev/null` (without `-d`, nc closes on stdin EOF and the server disarms).
+  Two more rig traps stacked on top: schtasks context cannot `SetForegroundWindow` (SendKeys stimulus
+  silently misses — post `WM_CHAR` to the hwnd instead), and `schtasks /end` kills only the cmd
+  wrapper, orphaning `spike-server-inc3.exe` on ports 9500/9501 (`taskkill /im` it). Also: the IDD
+  device lives only while `mdrdp-idd-create.exe --wait` runs — a reboot removes the device entirely;
+  quench task `mdrdp-idd-create` recreates it.
 - Windows monitor power-off silently poisons DXGI duplication: frames stay "successful", dirty metadata stays valid, pixels go black (`win/dxgi.rs:read_rects`).
   No error is ever raised, so AccessLost recreation never fires; GDI CopyFromScreen still sees the real
   desktop, which is the diagnostic. Restart the duplication session (i.e. the spike server) after any
