@@ -8,14 +8,17 @@ Abstract:
 
     An indirect display driver that exposes ONE EDID-less virtual monitor capable of
     1920x1080 at 240/120/60 Hz. It is a measurement instrument for the mdrdp latency
-    spike, not a shipping display driver: the swap-chain loop acquires and releases
-    each frame immediately and only records cadence.
+    spike, not a shipping display driver.
 
     Differences from the Microsoft sample this is derived from:
       * WPP tracing removed entirely (no Trace.h, no Driver.tmh).
       * One monitor, always EDID-less - the sample's static EDID table is gone.
       * Monitor/target mode lists retuned for high-refresh 1080p.
       * Frame-cadence instrumentation added to SwapChainProcessor::RunCore.
+      * Each acquired frame is published to a user-mode server through a named shared
+        texture pool - see SharedPool.h. That is the point of the driver now; the
+        null-consumer loop it replaced survives only as the fallback for when the shared
+        section cannot be created.
 
     MSDN documentation on indirect displays can be found at https://msdn.microsoft.com/en-us/library/windows/hardware/mt761968(v=vs.85).aspx.
 
@@ -294,8 +297,8 @@ HRESULT Direct3DDevice::Init()
 
 #pragma region SwapChainProcessor
 
-SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent)
-    : m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent)
+SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, SharedSection* pSection)
+    : m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent), m_pSection(pSection)
 {
     m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
 
@@ -366,6 +369,14 @@ void SwapChainProcessor::RunCore()
     QueryPerformanceCounter(&WindowStart);
     DWORD FramesThisWindow = 0;
 
+    // The shared pool is built lazily, on the first frame: its textures must match the
+    // acquired surface, whose width/height/format are not known until then. An unusable
+    // section (creation failed, or the well-known name was squatted) leaves the pool
+    // permanently unstarted, and the loop below degrades to the null consumer it used to
+    // be rather than failing the display.
+    const bool PoolWanted = (m_pSection != nullptr) && m_pSection->Usable();
+    bool PoolStartTried = false;
+
     // Acquire and release buffers in a loop
     for (;;)
     {
@@ -407,9 +418,30 @@ void SwapChainProcessor::RunCore()
             // We have new frame to process, the surface has a reference on it that the driver has to release
             AcquiredBuffer.Attach(Buffer.MetaData.pSurface);
 
-            // The spike deliberately does no frame processing: it measures how fast the OS
-            // will hand us frames for this monitor's mode, so acquire-then-release-immediately
-            // is the measurement, not a placeholder.
+            if (PoolWanted)
+            {
+                ComPtr<ID3D11Texture2D> AcquiredTexture;
+                if (SUCCEEDED(AcquiredBuffer.As(&AcquiredTexture)))
+                {
+                    if (!PoolStartTried)
+                    {
+                        // Once only. A failure is reported by the pool and then left alone:
+                        // retrying every frame would spam the log and burn a generation
+                        // each time. The next swap-chain assignment is the natural retry.
+                        PoolStartTried = true;
+
+                        D3D11_TEXTURE2D_DESC SourceDesc = {};
+                        AcquiredTexture->GetDesc(&SourceDesc);
+
+                        m_Pool.Start(m_pSection, m_Device->Device.Get(), m_Device->DeviceContext.Get(), m_Device->AdapterLuid, SourceDesc);
+                    }
+
+                    // Copies into the next slot if the server is not holding it, folds this
+                    // frame's dirty/move coverage into all three either way, and signals the
+                    // slot's event. Never blocks: see SharedPool.h.
+                    m_Pool.ProcessFrame(m_hSwapChain, Buffer.MetaData, AcquiredTexture.Get());
+                }
+            }
 
             // We have finished processing this frame hence we release the reference on it.
             // If the driver forgets to release the reference to the surface, it will be leaked which results in the
@@ -435,11 +467,24 @@ void SwapChainProcessor::RunCore()
                     Seconds = static_cast<double>(Now.QuadPart - WindowStart.QuadPart) / static_cast<double>(PerfFrequency.QuadPart);
                 }
 
-                wchar_t Message[128];
-                swprintf_s(Message, L"mdrdp-idd: %lu frames in %.2f s (%.1f fps)\n",
+                // Publish counters ride the same report: how many of those frames actually
+                // reached a slot, how many lost their slot to the server, and what the copy
+                // ordering cost on the present path. The HLD budgets that cost against the
+                // 7.5 ms this pool removes, so it is measured, not asserted free.
+                SharedFramePool::WindowStats Stats = {};
+                m_Pool.TakeWindowStats(Stats);
+
+                wchar_t Message[256];
+                swprintf_s(Message,
+                    L"mdrdp-idd: %lu frames in %.2f s (%.1f fps), published %lu, slot-busy %lu, copy-wait avg %.3f ms max %.3f ms, wait-timeouts %lu\n",
                     static_cast<unsigned long>(FramesThisWindow),
                     Seconds,
-                    (Seconds > 0.0) ? (static_cast<double>(FramesThisWindow) / Seconds) : 0.0);
+                    (Seconds > 0.0) ? (static_cast<double>(FramesThisWindow) / Seconds) : 0.0,
+                    static_cast<unsigned long>(Stats.Published),
+                    static_cast<unsigned long>(Stats.SkippedBusy),
+                    (Stats.Published > 0) ? (Stats.CopyWaitSumMs / static_cast<double>(Stats.Published)) : 0.0,
+                    Stats.CopyWaitMaxMs,
+                    static_cast<unsigned long>(Stats.CopyWaitTimeouts));
                 OutputDebugStringW(Message);
 
                 FramesThisWindow = 0;
@@ -470,6 +515,13 @@ IndirectDeviceContext::~IndirectDeviceContext()
 
 void IndirectDeviceContext::InitAdapter()
 {
+    // Claim the one well-known name before any monitor exists, and hold it for the life of
+    // the device: the swap-chain pool is rebuilt on every assignment, but a server must be
+    // able to find the section across those rebuilds. Idempotent, because D0Entry can fire
+    // more than once. If it cannot be claimed, the swap-chain loop publishes nothing and
+    // the display still works.
+    m_SharedSection.Create();
+
     // The strings and version numbers below are used for telemetry and may be displayed to
     // the user in some situations. This is also where static per-adapter capabilities are
     // determined.
@@ -553,7 +605,7 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
     {
         // Create a new monitor context object and attach it to the Idd monitor object
         auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject);
-        pMonitorContextWrapper->pContext = new IndirectMonitorContext(MonitorCreateOut.MonitorObject);
+        pMonitorContextWrapper->pContext = new IndirectMonitorContext(MonitorCreateOut.MonitorObject, &m_SharedSection);
 
         // Tell the OS that the monitor has been plugged in
         IDARG_OUT_MONITORARRIVAL ArrivalOut;
@@ -561,8 +613,9 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
     }
 }
 
-IndirectMonitorContext::IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor) :
-    m_Monitor(Monitor)
+IndirectMonitorContext::IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor, SharedSection* pSection) :
+    m_Monitor(Monitor),
+    m_pSection(pSection)
 {
 }
 
@@ -585,7 +638,7 @@ void IndirectMonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID Ren
     else
     {
         // Create a new swap-chain processing thread
-        m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent));
+        m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent, m_pSection));
     }
 }
 

@@ -28,6 +28,11 @@ Derived from microsoft/Windows-driver-samples@717778a2 (MIT) for the mdrdp laten
 #include <memory>
 #include <vector>
 
+// The mdrdp shared frame pool: the section layout, its coverage invariant, and the pool
+// the swap-chain thread publishes into. Self-contained, so it repeats the platform
+// includes above rather than depending on this file's ordering.
+#include "SharedPool.h"
+
 // WPP tracing is stripped in this derivation: no "Trace.h", no "Driver.tmh".
 
 namespace Microsoft
@@ -85,7 +90,7 @@ namespace Microsoft
         class SwapChainProcessor
         {
         public:
-            SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent);
+            SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, SharedSection* pSection);
             ~SwapChainProcessor();
 
         private:
@@ -99,6 +104,11 @@ namespace Microsoft
             HANDLE m_hAvailableBufferEvent;
             Microsoft::WRL::Wrappers::Thread m_hThread;
             Microsoft::WRL::Wrappers::Event m_hTerminateEvent;
+
+            // Null, or unusable, when the section could not be created or was squatted; the
+            // loop then behaves exactly as it did before the pool existed.
+            SharedSection* m_pSection;
+            SharedFramePool m_Pool;
         };
 
         /// <summary>
@@ -116,12 +126,18 @@ namespace Microsoft
         protected:
             WDFDEVICE m_WdfDevice;
             IDDCX_ADAPTER m_Adapter;
+
+            // Created once at adapter start and held open for the life of the device, so
+            // the one well-known name survives every swap-chain assignment. Monitors get a
+            // raw pointer to it; they are children of this device object and so never
+            // outlive it.
+            SharedSection m_SharedSection;
         };
 
         class IndirectMonitorContext
         {
         public:
-            IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor);
+            IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor, SharedSection* pSection);
             virtual ~IndirectMonitorContext();
 
             void AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent);
@@ -129,6 +145,7 @@ namespace Microsoft
 
         private:
             IDDCX_MONITOR m_Monitor;
+            SharedSection* m_pSection;
             std::unique_ptr<SwapChainProcessor> m_ProcessingThread;
         } ;
     }

@@ -92,9 +92,11 @@ DRIVER_DEFS=(
     /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /DNTDDI_VERSION=0x0A000010
 )
 
-echo "==> compiling driver/Driver.cpp"
-"${CL_COMMON[@]}" "${DRIVER_DEFS[@]}" "${DRIVER_INCLUDES[@]}" \
-    /Fo"$OBJ/Driver.obj" -- "$HERE/driver/Driver.cpp"
+for src in Driver SharedPool; do
+    echo "==> compiling driver/$src.cpp"
+    "${CL_COMMON[@]}" "${DRIVER_DEFS[@]}" "${DRIVER_INCLUDES[@]}" \
+        /Fo"$OBJ/$src.obj" -- "$HERE/driver/$src.cpp"
+done
 
 echo "==> compiling creator/main.cpp"
 "${CL_COMMON[@]}" /D_CONSOLE /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 \
@@ -125,9 +127,10 @@ echo "==> linking build/mdrdp_idd.dll"
     /nologo /DLL /MACHINE:X64 \
     "/OUT:$BUILD/mdrdp_idd.dll" \
     "${DRIVER_LIBPATHS[@]}" \
-    "$OBJ/Driver.obj" \
+    "$OBJ/Driver.obj" "$OBJ/SharedPool.obj" \
     WdfDriverStubUm.lib iddcxstub.lib \
     dxgi.lib d3d11.lib avrt.lib ole32.lib \
+    AdvAPI32.Lib bcrypt.lib \
     ntdll.lib kernel32.lib
 # Library set pruned empirically to exactly what resolves:
 #   WdfDriverStubUm.lib - UMDF2 stub; supplies FxDriverEntryUm and the export directive.
@@ -135,8 +138,12 @@ echo "==> linking build/mdrdp_idd.dll"
 #   ntdll.lib           - the stub calls DbgPrintEx, which lives in ntdll, not in
 #                         kernel32/OneCoreUAP. This is the one non-obvious library.
 #   dxgi/d3d11/avrt/ole32 - what Driver.cpp itself calls.
+#   AdvAPI32.Lib        - ConvertStringSecurityDescriptorToSecurityDescriptorW, for the
+#                         shared pool's named-object DACL. Named with the SDK's on-disk
+#                         casing so the cross build works on a case-sensitive volume.
+#   bcrypt.lib          - BCryptGenRandom, for the per-generation name suffix.
 # The sample's OneCoreUAP.lib is NOT needed here (nothing resolves only through it), and
-# neither are user32/advapi32; adding them changes no import in the output.
+# neither is user32; adding it changes no import in the output.
 
 echo "==> linking build/mdrdp-idd-create.exe"
 "$RUST_LLD" -flavor link \
