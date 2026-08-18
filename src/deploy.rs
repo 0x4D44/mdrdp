@@ -351,20 +351,12 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
             }
         }
     }
-    if let Some(agent) = &evidence.agent
-        && agent.server_running
-        && !cfg.force
-    {
-        return Err(
-            "a capture server is live: deploying now drops the virtual display and \
-             any native session. Re-run with --force to proceed"
-                .to_owned(),
-        );
-    }
-
     // Fast path: the exact version is already deployed, byte-sizes match, and
     // the running agent reports that version healthy. (Same-version different
-    // bytes falls through to a full deploy: sizes are the tell.)
+    // bytes falls through to a full deploy: sizes are the tell.) Checked BEFORE
+    // the live-server guard: a fast path mutates nothing, so the normal state
+    // after a successful deploy — server up — must not force-gate the no-op
+    // re-run the idempotence criterion demands.
     let vdir = format!("v{}", artifacts.version);
     let sizes_match = artifacts.files().iter().all(|(local, remote)| {
         let name = remote.rsplit('\\').next().unwrap_or(remote);
@@ -384,6 +376,17 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
             .is_some_and(|a| a.green && a.version == artifacts.version)
     {
         return Ok(Branch::FastPath);
+    }
+
+    if let Some(agent) = &evidence.agent
+        && agent.server_running
+        && !cfg.force
+    {
+        return Err(
+            "a capture server is live: deploying now drops the virtual display and \
+             any native session. Re-run with --force to proceed"
+                .to_owned(),
+        );
     }
 
     // Driver work needed? Device present or the artifact's DriverVer staged
@@ -1061,9 +1064,28 @@ mod tests {
             Branch::FastPath
         ));
 
-        // One byte off: full deploy, not fast path.
+        // The state every successful deploy leaves behind — server running — must
+        // still take the fast path without --force (it mutates nothing).
+        ev.agent = Some(AgentProbe {
+            version: "0.2.0".to_owned(),
+            green: true,
+            server_running: true,
+        });
+        assert!(matches!(
+            decide(&cfg(), &art, &ev).unwrap(),
+            Branch::FastPath
+        ));
+
+        // One byte off: not the fast path any more — and with the server live,
+        // the mutation now force-gates.
         ev.target_dir_sizes
             .insert("rhydra-server.exe".to_owned(), 11);
+        assert!(decide(&cfg(), &art, &ev).unwrap_err().contains("--force"));
+        ev.agent = Some(AgentProbe {
+            version: "0.2.0".to_owned(),
+            green: true,
+            server_running: false,
+        });
         assert!(matches!(
             decide(&cfg(), &art, &ev).unwrap(),
             Branch::Full(_)
