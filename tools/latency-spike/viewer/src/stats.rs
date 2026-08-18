@@ -21,7 +21,10 @@ use serde::Serialize;
 /// `MSG_VIDEO_SEQ`, the exact cross-file join key (`null` on a v1 stream).
 /// Schema 3: adds `rects` records (the raw dirty-rect fast path) and `suppressed`
 /// on frame records — so `dropped` no longer means "not presented" on its own.
-pub const SCHEMA: u32 = 3;
+/// Schema 4: adds `partial` on both painted shapes — which convert path put this
+/// snapshot on screen, so an A/B can tell whether the damage-only path carried a run
+/// rather than assuming the build implies it.
+pub const SCHEMA: u32 = 4;
 
 /// First line of the file: what this run was, and on which clock.
 #[derive(Debug, Clone, Serialize)]
@@ -115,10 +118,15 @@ pub struct FrameRecord {
     /// for this same frame had already painted it. The decoder still ran, so the
     /// decode stamps on this line are real.
     pub suppressed: bool,
+    /// This snapshot reached the screen through the damage-only convert (the window
+    /// thread's persistent canvas took just the damaged rects) rather than a
+    /// full-surface `present_into`. Always `false` on a record with no present stamp:
+    /// nothing converted anything for a snapshot that was never shown.
+    pub partial: bool,
 }
 
 impl FrameRecord {
-    pub fn new(stamps: &FrameStamps, present_done_us: Option<u64>) -> Self {
+    pub fn new(stamps: &FrameStamps, present_done_us: Option<u64>, partial: bool) -> Self {
         Self {
             kind: "frame",
             frame: stamps.frame,
@@ -133,6 +141,7 @@ impl FrameRecord {
             height: stamps.height,
             dropped: present_done_us.is_none(),
             suppressed: false,
+            partial,
         }
     }
 
@@ -153,6 +162,8 @@ impl FrameRecord {
             height: stamps.height,
             dropped: false,
             suppressed: true,
+            // It never reached a canvas at all, so no convert path claims it.
+            partial: false,
         }
     }
 }
@@ -176,12 +187,16 @@ pub struct RectRecord {
     /// Why this update painted nothing, or `null` when it painted.
     pub skipped: Option<&'static str>,
     pub dropped: bool,
+    /// This snapshot reached the screen through the damage-only convert rather than a
+    /// full-surface `present_into` — the fast path the rect path exists to feed.
+    /// Always `false` when nothing was presented.
+    pub partial: bool,
 }
 
 impl RectRecord {
     /// An update that was blitted into the canvas. `present_done_us` is `None` when a
     /// newer snapshot displaced this one before the window thread ever showed it.
-    pub fn painted(stamps: &RectStamps, present_done_us: Option<u64>) -> Self {
+    pub fn painted(stamps: &RectStamps, present_done_us: Option<u64>, partial: bool) -> Self {
         Self {
             kind: "rects",
             seq: stamps.seq,
@@ -192,6 +207,7 @@ impl RectRecord {
             rect_bytes: stamps.rect_bytes,
             skipped: None,
             dropped: present_done_us.is_none(),
+            partial,
         }
     }
 
@@ -219,6 +235,8 @@ impl RectRecord {
             rect_bytes,
             skipped: Some(reason),
             dropped: false,
+            // Nothing was painted, so no convert path ran for it.
+            partial: false,
         }
     }
 }
@@ -400,7 +418,9 @@ mod tests {
             width: 1920,
             height: 1080,
         };
-        let v = parse(&to_line(&FrameRecord::new(&stamps, Some(5_000))));
+        // `keyframe: true` against `partial: false` is deliberate: with every bool the
+        // same value, a line that serialised one under another's name would pass.
+        let v = parse(&to_line(&FrameRecord::new(&stamps, Some(5_000), false)));
         assert_eq!(v["type"], "frame");
         assert_eq!(v["frame"], 7);
         assert_eq!(
@@ -415,6 +435,30 @@ mod tests {
         assert_eq!(v["keyframe"], true);
         assert_eq!(v["width"], 1920);
         assert_eq!(v["height"], 1080);
+        assert_eq!(v["dropped"], false);
+        assert_eq!(v["suppressed"], false);
+        assert_eq!(v["partial"], false, "a full convert put this one on screen");
+    }
+
+    #[test]
+    fn a_frame_presented_by_the_damage_only_path_says_which_path_it_was() {
+        // The A/B's whole question: did the partial path actually carry the run? Here
+        // `partial` is the only true bool on the line, so a field written under the
+        // wrong name shows up as one of the other three flipping.
+        let stamps = FrameStamps {
+            frame: 11,
+            seq: Some(52),
+            recv_done_us: 1_000,
+            decode_in_us: 1_100,
+            decode_out_us: 1_200,
+            au_bytes: 900,
+            keyframe: false,
+            width: 1920,
+            height: 1080,
+        };
+        let v = parse(&to_line(&FrameRecord::new(&stamps, Some(9_000), true)));
+        assert_eq!(v["partial"], true);
+        assert_eq!(v["keyframe"], false);
         assert_eq!(v["dropped"], false);
         assert_eq!(v["suppressed"], false);
     }
@@ -432,10 +476,14 @@ mod tests {
             width: 640,
             height: 360,
         };
-        let v = parse(&to_line(&FrameRecord::new(&stamps, None)));
+        let v = parse(&to_line(&FrameRecord::new(&stamps, None, false)));
         assert_eq!(v["present_done_us"], Value::Null);
         assert_eq!(v["dropped"], true);
         assert_eq!(v["suppressed"], false);
+        assert_eq!(
+            v["partial"], false,
+            "nothing converted a snapshot that was never shown"
+        );
         assert_eq!(v["seq"], Value::Null, "a v1 stream has no seq to invent");
     }
 
@@ -463,6 +511,7 @@ mod tests {
         assert_eq!(v["present_done_us"], Value::Null);
         assert_eq!(v["suppressed"], true);
         assert_eq!(v["dropped"], false, "suppressed is not dropped");
+        assert_eq!(v["partial"], false, "and it reached no canvas at all");
     }
 
     #[test]
@@ -475,7 +524,7 @@ mod tests {
             rect_count: 3,
             rect_bytes: 9_600,
         };
-        let v = parse(&to_line(&RectRecord::painted(&stamps, Some(2_900))));
+        let v = parse(&to_line(&RectRecord::painted(&stamps, Some(2_900), false)));
         assert_eq!(v["type"], "rects");
         assert_eq!(v["seq"], 77);
         assert_eq!(v["recv_done_us"], 2_000);
@@ -485,6 +534,27 @@ mod tests {
         assert_eq!(v["rect_bytes"], 9_600);
         assert_eq!(v["skipped"], Value::Null);
         assert_eq!(v["dropped"], false);
+        assert_eq!(
+            v["partial"], false,
+            "this one was carried by a full convert"
+        );
+    }
+
+    #[test]
+    fn a_rect_update_presented_by_the_damage_only_path_says_which_path_it_was() {
+        // `partial` true against `dropped` false, and the reverse in the test below:
+        // the pair pins the two flags to their own names.
+        let stamps = RectStamps {
+            seq: 79,
+            recv_done_us: 4_000,
+            paint_done_us: 4_100,
+            rect_count: 2,
+            rect_bytes: 1_280,
+        };
+        let v = parse(&to_line(&RectRecord::painted(&stamps, Some(4_400), true)));
+        assert_eq!(v["partial"], true);
+        assert_eq!(v["dropped"], false);
+        assert_eq!(v["skipped"], Value::Null);
     }
 
     #[test]
@@ -496,10 +566,11 @@ mod tests {
             rect_count: 1,
             rect_bytes: 64,
         };
-        let v = parse(&to_line(&RectRecord::painted(&stamps, None)));
+        let v = parse(&to_line(&RectRecord::painted(&stamps, None, false)));
         assert_eq!(v["paint_done_us"], 3_050, "it was painted, just not shown");
         assert_eq!(v["present_done_us"], Value::Null);
         assert_eq!(v["dropped"], true);
+        assert_eq!(v["partial"], false, "no convert ran for it");
     }
 
     #[test]
@@ -523,6 +594,7 @@ mod tests {
             v["dropped"], false,
             "nothing was painted, so nothing was lost after painting"
         );
+        assert_eq!(v["partial"], false, "and no convert path claims it");
     }
 
     #[test]

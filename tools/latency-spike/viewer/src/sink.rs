@@ -36,6 +36,65 @@ pub enum PaintStamps {
     Rects(RectStamps),
 }
 
+/// A rectangle of the canvas, in canvas (= frame) pixel coordinates.
+///
+/// Deliberately not `rects::Rect`: that one carries the wire's pixel payload and
+/// `u16` fields, and the window thread wants neither. This is geometry only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// What a published snapshot changed since the window thread last saw the canvas.
+///
+/// It rides the slot because only the publisher knows it, and only the presenter can
+/// use it: the window thread keeps a persistent converted canvas and re-converts just
+/// the damage (`crate::present::present_region_into`) instead of the whole surface.
+///
+/// `Full` is the honest answer for a decoded access unit — H.264 says nothing about
+/// which pixels changed — and also the safe answer for anything this type cannot
+/// describe cheaply, because a full convert is always correct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Damage {
+    Full,
+    Rects(Vec<DamageRect>),
+}
+
+/// Past this many rects the union collapses to `Full`: a bounded list keeps the
+/// per-publish memory fixed, and converting that many small regions costs more than
+/// the one sequential pass over the whole canvas it is trying to avoid.
+const MAX_DAMAGE_RECTS: usize = 64;
+
+impl Damage {
+    /// Fold another snapshot's coverage into this one.
+    ///
+    /// **The displacement invariant.** A publish that displaces a snapshot the window
+    /// thread never took must carry that snapshot's damage as well as its own:
+    /// otherwise the displaced frame's pixels are painted into the persistent canvas
+    /// by nobody, and every later partial present ships a stale region — silently,
+    /// and forever, since nothing re-damages an area that stopped changing.
+    ///
+    /// Coverage is a set, so this is order-free: `Full` absorbs anything, and two
+    /// rect lists concatenate (overlaps are converted twice, which is correct and
+    /// costs only time).
+    pub fn absorb(&mut self, other: &Damage) {
+        match (&mut *self, other) {
+            (Damage::Full, _) => {}
+            (_, Damage::Full) => *self = Damage::Full,
+            (Damage::Rects(mine), Damage::Rects(theirs)) => {
+                if mine.len() + theirs.len() > MAX_DAMAGE_RECTS {
+                    *self = Damage::Full;
+                } else {
+                    mine.extend_from_slice(theirs);
+                }
+            }
+        }
+    }
+}
+
 /// One canvas snapshot, ready to present.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -49,6 +108,9 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub stamps: PaintStamps,
+    /// What changed since the window thread last took a snapshot — including the
+    /// damage of any snapshot displaced before it was taken. See [`Damage::absorb`].
+    pub damage: Damage,
     /// This frame still owes the stats file a line. Cleared once presented, so a
     /// repaint that shows the same frame again (a resize, an expose) does not emit a
     /// second line for it.
@@ -181,11 +243,20 @@ impl FrameSlot {
     }
 
     /// Install the newest frame, returning the one it displaced, if any.
-    pub fn put(&self, frame: Frame) -> Option<Frame> {
+    ///
+    /// The displaced frame's damage is folded into the new one *here*, under the same
+    /// lock that hands the slot to the window thread — the only place where "is there
+    /// still an untaken frame?" can be answered without racing the taker. The
+    /// displaced frame is returned only so its stats line can be closed; its own
+    /// damage now belongs to the frame that replaced it.
+    pub fn put(&self, mut frame: Frame) -> Option<Frame> {
         let mut guard = self
             .latest
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(displaced) = guard.as_ref() {
+            frame.damage.absorb(&displaced.damage);
+        }
         guard.replace(frame)
     }
 
@@ -264,8 +335,9 @@ impl DecodeSink {
     /// Copy the canvas into the slot and wake the window thread.
     ///
     /// A snapshot it displaced was never shown, so its own record is closed here with
-    /// no present stamp — whichever message painted it.
-    fn publish(&self, stamps: PaintStamps) {
+    /// no present stamp — whichever message painted it. Its *damage* is not discarded
+    /// with it: [`FrameSlot::put`] merges it into this snapshot.
+    fn publish(&self, stamps: PaintStamps, damage: Damage) {
         let canvas = self
             .canvas
             .as_ref()
@@ -277,6 +349,7 @@ impl DecodeSink {
             width: canvas.width,
             height: canvas.height,
             stamps,
+            damage,
             stamps_pending: true,
         });
         if let Some(old) = displaced {
@@ -287,9 +360,11 @@ impl DecodeSink {
 
     /// Close the record of a snapshot that never reached the window.
     fn record_unpresented(&self, stamps: &PaintStamps) {
+        // `partial: false`: no convert ran for a snapshot that never reached the
+        // window thread, so neither present path can claim it.
         match stamps {
-            PaintStamps::Au(s) => self.stats.record(&FrameRecord::new(s, None)),
-            PaintStamps::Rects(s) => self.stats.record(&RectRecord::painted(s, None)),
+            PaintStamps::Au(s) => self.stats.record(&FrameRecord::new(s, None, false)),
+            PaintStamps::Rects(s) => self.stats.record(&RectRecord::painted(s, None, false)),
         }
     }
 
@@ -304,13 +379,30 @@ impl DecodeSink {
             .expect("painting is gated on a live canvas")
             .apply_rects(update)?;
         let paint_done_us = self.clock.now_us();
-        self.publish(PaintStamps::Rects(RectStamps {
-            seq: update.frame_seq,
-            recv_done_us,
-            paint_done_us,
-            rect_count: update.rects.len() as u32,
-            rect_bytes: update.rects.iter().map(|r| r.pixels.len()).sum(),
-        }));
+        // Exactly the rectangles just blitted, in the coordinates
+        // `blit_bgra_to_rgba` used — the window thread converts these and nothing else.
+        let damage = Damage::Rects(
+            update
+                .rects
+                .iter()
+                .map(|r| DamageRect {
+                    x: u32::from(r.x),
+                    y: u32::from(r.y),
+                    w: u32::from(r.w),
+                    h: u32::from(r.h),
+                })
+                .collect(),
+        );
+        self.publish(
+            PaintStamps::Rects(RectStamps {
+                seq: update.frame_seq,
+                recv_done_us,
+                paint_done_us,
+                rect_count: update.rects.len() as u32,
+                rect_bytes: update.rects.iter().map(|r| r.pixels.len()).sum(),
+            }),
+            damage,
+        );
         Ok(())
     }
 
@@ -476,7 +568,9 @@ impl MessageSink for DecodeSink {
             }
             canvas.set_frame(Arc::new(decoded.into_data()), seq);
         }
-        self.publish(PaintStamps::Au(stamps));
+        // A decoded access unit repaints the whole desktop and the bitstream says
+        // nothing about which pixels moved, so the only true damage is everything.
+        self.publish(PaintStamps::Au(stamps), Damage::Full);
         // The AU may have closed the gap a held rect update was waiting on.
         self.try_apply_pending();
     }
@@ -599,7 +693,26 @@ mod tests {
             width: 4,
             height: 2,
             stamps: PaintStamps::Au(stamps(n)),
+            damage: Damage::Full,
             stamps_pending: true,
+        }
+    }
+
+    /// A frame carrying rect damage, with `n` distinguishing both the stamps and the
+    /// rectangle — so a union that returned the wrong operand cannot pass.
+    fn rect_damaged_frame(n: u64, damage: Vec<DamageRect>) -> Frame {
+        Frame {
+            damage: Damage::Rects(damage),
+            ..frame(n)
+        }
+    }
+
+    fn damage_rect(seed: u32) -> DamageRect {
+        DamageRect {
+            x: seed,
+            y: seed * 2,
+            w: seed + 1,
+            h: seed + 3,
         }
     }
 
@@ -632,6 +745,110 @@ mod tests {
         let displaced = slot.put(frame(2)).expect("the first frame was displaced");
         assert_eq!(au_frame_number(&displaced), 1);
         assert_eq!(au_frame_number(&slot.take().unwrap()), 2, "the newest wins");
+    }
+
+    // ---- Damage, and the union that survives displacement ----
+
+    #[test]
+    fn damage_passes_through_the_slot_unchanged_when_nothing_is_displaced() {
+        let slot = FrameSlot::new();
+        let mine = vec![damage_rect(1), damage_rect(2)];
+        assert!(
+            slot.put(rect_damaged_frame(1, mine.clone())).is_none(),
+            "nothing displaced"
+        );
+        assert_eq!(
+            slot.take().expect("a frame").damage,
+            Damage::Rects(mine),
+            "an untouched publish must not gain or lose damage"
+        );
+    }
+
+    #[test]
+    fn a_displaced_frames_damage_rides_along_with_the_frame_that_displaced_it() {
+        // The invariant the persistent canvas depends on: nobody else will ever paint
+        // the displaced frame's pixels, so its damage has to reach the window thread
+        // on the back of the frame that replaced it — or that region stays stale on
+        // screen forever.
+        let slot = FrameSlot::new();
+        slot.put(rect_damaged_frame(1, vec![damage_rect(1)]));
+        slot.put(rect_damaged_frame(2, vec![damage_rect(2)]));
+
+        let taken = slot.take().expect("a frame");
+        assert_eq!(
+            au_frame_number(&taken),
+            2,
+            "the newest frame is the one kept"
+        );
+        let Damage::Rects(rects) = taken.damage else {
+            panic!("two rect publishes union to rects, not Full");
+        };
+        assert!(
+            rects.contains(&damage_rect(1)),
+            "the displaced frame's rect must survive: {rects:?}"
+        );
+        assert!(
+            rects.contains(&damage_rect(2)),
+            "and so must the surviving frame's own: {rects:?}"
+        );
+        assert_eq!(rects.len(), 2, "coverage is a set union, not a replacement");
+    }
+
+    #[test]
+    fn full_damage_absorbs_rect_damage_in_either_order() {
+        // A full repaint's coverage is everything, so a union with it is everything —
+        // whichever side of the displacement it landed on.
+        let displaced_full = FrameSlot::new();
+        displaced_full.put(frame(1)); // Damage::Full
+        displaced_full.put(rect_damaged_frame(2, vec![damage_rect(3)]));
+        assert_eq!(
+            displaced_full.take().expect("a frame").damage,
+            Damage::Full,
+            "a displaced full repaint is not narrowed to the newer frame's rects"
+        );
+
+        let displacing_full = FrameSlot::new();
+        displacing_full.put(rect_damaged_frame(1, vec![damage_rect(3)]));
+        displacing_full.put(frame(2)); // Damage::Full
+        assert_eq!(
+            displacing_full.take().expect("a frame").damage,
+            Damage::Full,
+            "a full repaint already covers the displaced rects"
+        );
+    }
+
+    #[test]
+    fn a_union_past_the_rect_cap_collapses_to_a_full_repaint() {
+        // Bounded memory, and past the cap converting the rects one at a time costs
+        // more than the single sequential pass a full convert makes.
+        let at_cap = FrameSlot::new();
+        at_cap.put(rect_damaged_frame(
+            1,
+            (0..40).map(damage_rect).collect::<Vec<_>>(),
+        ));
+        at_cap.put(rect_damaged_frame(
+            2,
+            (40..64).map(damage_rect).collect::<Vec<_>>(),
+        ));
+        match at_cap.take().expect("a frame").damage {
+            Damage::Rects(rects) => assert_eq!(rects.len(), MAX_DAMAGE_RECTS, "exactly at the cap"),
+            Damage::Full => panic!("{MAX_DAMAGE_RECTS} rects is not past the cap"),
+        }
+
+        let over_cap = FrameSlot::new();
+        over_cap.put(rect_damaged_frame(
+            1,
+            (0..40).map(damage_rect).collect::<Vec<_>>(),
+        ));
+        over_cap.put(rect_damaged_frame(
+            2,
+            (40..65).map(damage_rect).collect::<Vec<_>>(),
+        ));
+        assert_eq!(
+            over_cap.take().expect("a frame").damage,
+            Damage::Full,
+            "one rect past the cap collapses, and Full is always correct"
+        );
     }
 
     // ---- Canvas: the ordering rule and the blit, with no decoder in sight ----
@@ -867,6 +1084,17 @@ mod tests {
         assert_eq!(s.rect_bytes, r.pixels.len());
         assert!(s.paint_done_us > 0, "a paint stamp was taken");
         assert!(published.stamps_pending, "the line is still owed");
+        assert_eq!(
+            published.damage,
+            Damage::Rects(vec![DamageRect {
+                x: 2,
+                y: 1,
+                w: 3,
+                h: 2
+            }]),
+            "the damage is the geometry that was blitted, so the window thread can \
+             convert exactly it"
+        );
 
         // The snapshot carries the painted pixels, swizzled. Row 1, column 2.
         let d = 8 * 4 + 2 * 4;

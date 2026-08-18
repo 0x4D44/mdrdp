@@ -6,9 +6,12 @@
 //! `buffer.present()`. Same crates, same versions, same call order — which is what
 //! makes a spike measurement and an mdrdp measurement comparable on the client side.
 //!
-//! Two deliberate differences, both because this is an instrument rather than a
-//! client. The viewport is 1:1 (see [`crate::present`]), and there is no overlay: a
-//! stats panel would repaint pixels inside the interval being measured.
+//! Three deliberate differences, all because this is an instrument rather than a
+//! client. The viewport is 1:1 (see [`crate::present`]); there is no overlay, since a
+//! stats panel would repaint pixels inside the interval being measured; and the
+//! converted picture is kept here in a persistent canvas so a present costs a
+//! damage-only convert plus a copy instead of a full-surface convert (see
+//! [`ViewerApp::canvas`] for why softbuffer cannot do that for us).
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -28,8 +31,8 @@ use crate::clock::Clock;
 use crate::input_link::InputLink;
 use crate::interrupt;
 use crate::keymap;
-use crate::present::one_to_one;
-use crate::sink::{Frame, FrameSlot, PaintStamps};
+use crate::present::{one_to_one, present_region_into};
+use crate::sink::{Damage, DamageRect, Frame, FrameSlot, PaintStamps};
 use crate::stats::{FrameRecord, InputRecord, RectRecord, StatsLog};
 
 /// The window before the first frame tells us the stream's coded size.
@@ -40,6 +43,38 @@ const PLACEHOLDER: PhysicalSize<u32> = PhysicalSize::new(640, 360);
 /// no-op iteration every 200 ms and buys a Ctrl-C that closes the sockets and flushes
 /// the stats file instead of killing the process mid-line.
 const INTERRUPT_POLL: Duration = Duration::from_millis(200);
+
+/// One damaged frame rectangle, in window coordinates, clipped to what the window can
+/// actually show — the shape `present_with_damage` documents.
+///
+/// `None` when nothing of it is visible, which is exactly when there is no damage to
+/// declare. The clip repeats [`present_region_into`]'s, because the two must agree:
+/// declaring damage the convert did not write would let a backend that honours damage
+/// show a region the canvas never updated.
+fn window_damage(
+    viewport: &mdrdp::window::Viewport,
+    window: (u32, u32),
+    r: DamageRect,
+) -> Option<softbuffer::Rect> {
+    let (window_width, window_height) = window;
+    if viewport.dest_x >= window_width || viewport.dest_y >= window_height {
+        return None;
+    }
+    let x1 =
+        r.x.saturating_add(r.w)
+            .min(u32::from(viewport.session_width))
+            .min(window_width - viewport.dest_x);
+    let y1 =
+        r.y.saturating_add(r.h)
+            .min(u32::from(viewport.session_height))
+            .min(window_height - viewport.dest_y);
+    Some(softbuffer::Rect {
+        x: viewport.dest_x + r.x,
+        y: viewport.dest_y + r.y,
+        width: NonZeroU32::new(x1.checked_sub(r.x)?)?,
+        height: NonZeroU32::new(y1.checked_sub(r.y)?)?,
+    })
+}
 
 /// Wakes the window thread when a frame lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +105,24 @@ pub struct ViewerApp {
     sized_to: Option<(u32, u32)>,
     /// One warning per unpresentable frame geometry, not one per frame.
     warned_geometry: bool,
+
+    /// The converted picture, in the window's pixels and softbuffer's `0x00RRGGBB`
+    /// packing, retained across presents.
+    ///
+    /// It exists because softbuffer cannot: its macOS backend allocates a fresh zeroed
+    /// buffer on every `buffer_mut()` and its `present_with_damage` ignores the damage
+    /// it is given, so *nothing* survives a present down there and every present would
+    /// otherwise re-convert the whole surface. Keeping the converted pixels here turns
+    /// a rect update's present into a damage-only convert plus one sequential
+    /// `copy_from_slice`, and an expose into the copy alone.
+    canvas: Vec<u32>,
+    /// The window size `canvas` was built for. A mismatch means every pixel in it is
+    /// at the wrong offset, so it must be rebuilt rather than patched.
+    canvas_size: (u32, u32),
+    /// Whether `canvas` currently holds the picture that is on screen. False before
+    /// the first convert and after anything that invalidates the whole surface (a
+    /// resize, a scale change) — the one bit that decides "patch" against "rebuild".
+    canvas_valid: bool,
 }
 
 impl ViewerApp {
@@ -91,6 +144,9 @@ impl ViewerApp {
             current: None,
             sized_to: None,
             warned_geometry: false,
+            canvas: Vec::new(),
+            canvas_size: (0, 0),
+            canvas_valid: false,
         }
     }
 
@@ -143,6 +199,7 @@ impl ViewerApp {
         if fresh_only && fresh.is_none() {
             return;
         }
+        let had_fresh = fresh.is_some();
         if let Some(frame) = fresh {
             let size = (frame.width, frame.height);
             self.current = Some(frame);
@@ -181,14 +238,85 @@ impl ViewerApp {
             }
         };
 
-        let mut presentable = false;
-        match self.current.as_ref() {
-            Some(frame) => match one_to_one(size.width, size.height, frame.width, frame.height) {
-                Some(viewport) => {
-                    present_into(&mut buffer, size.width, size.height, &viewport, &frame.rgba);
-                    presentable = true;
+        // softbuffer's buffer decides the geometry we must fill, and it is not
+        // required to agree with the size read above: a `Resized` can land between
+        // the two, and a `copy_from_slice` across a length mismatch is a panic. Trust
+        // the buffer, re-reading the window once to name its shape; if even that does
+        // not describe it, show black and come back on the redraw rather than
+        // shipping a mis-strided picture.
+        let mut win = (size.width, size.height);
+        if buffer.len() != win.0 as usize * win.1 as usize {
+            let now = window.inner_size();
+            if buffer.len() == now.width as usize * now.height as usize {
+                win = (now.width, now.height);
+            } else {
+                buffer.fill(0);
+                self.canvas_valid = false;
+                window.pre_present_notify();
+                if let Err(e) = buffer.present() {
+                    eprintln!("present: present failed: {e}");
                 }
-                None => {
+                window.request_redraw();
+                return;
+            }
+            // Whatever the canvas holds is at the previous window's offsets.
+            self.canvas_valid = false;
+        }
+
+        // The canvas is the window's size or it is nothing: every pixel in it is
+        // addressed by the window stride.
+        let canvas_pixels = win.0 as usize * win.1 as usize;
+        if self.canvas_size != win || self.canvas.len() != canvas_pixels {
+            self.canvas.resize(canvas_pixels, 0);
+            self.canvas_size = win;
+            self.canvas_valid = false;
+        }
+
+        let viewport = self
+            .current
+            .as_ref()
+            .and_then(|f| one_to_one(win.0, win.1, f.width, f.height));
+        let presentable = viewport.is_some();
+        let mut partial = false;
+        let mut damage: Vec<softbuffer::Rect> = Vec::new();
+
+        // What this paint owes the canvas. Nothing, when no frame arrived and the
+        // canvas is still valid: the picture is already converted and the present
+        // below is a pure copy — which is what makes an expose or a redundant redraw
+        // free rather than an 8 MB convert.
+        if had_fresh || !self.canvas_valid {
+            match (self.current.as_ref(), viewport) {
+                (Some(frame), Some(viewport)) => {
+                    // The partial path needs both a fresh frame that says what it
+                    // changed and a canvas that is already the picture it changed
+                    // *from*. Without the second, "since last time" has no referent
+                    // and only a full convert is honest.
+                    let rects = match &frame.damage {
+                        Damage::Rects(rects) if self.canvas_valid && had_fresh => Some(rects),
+                        _ => None,
+                    };
+                    match rects {
+                        Some(rects) => {
+                            for r in rects {
+                                present_region_into(
+                                    &mut self.canvas,
+                                    win.0,
+                                    win.1,
+                                    &viewport,
+                                    &frame.rgba,
+                                    *r,
+                                );
+                                damage.extend(window_damage(&viewport, win, *r));
+                            }
+                            partial = true;
+                        }
+                        None => {
+                            present_into(&mut self.canvas, win.0, win.1, &viewport, &frame.rgba);
+                            self.canvas_valid = true;
+                        }
+                    }
+                }
+                (Some(frame), None) => {
                     if !self.warned_geometry {
                         self.warned_geometry = true;
                         eprintln!(
@@ -196,15 +324,34 @@ impl ViewerApp {
                             frame.width, frame.height
                         );
                     }
-                    buffer.fill(0);
+                    // Black is a picture too: the canvas holds it, so a later expose
+                    // does not have to work it out again.
+                    self.canvas.fill(0);
+                    self.canvas_valid = true;
                 }
-            },
-            // Nothing decoded yet: black, not whatever the buffer last held.
-            None => buffer.fill(0),
+                // Nothing decoded yet: black, not whatever the buffer last held.
+                (None, _) => {
+                    self.canvas.fill(0);
+                    self.canvas_valid = true;
+                }
+            }
         }
 
+        // The present itself: one sequential copy, never a convert. Lengths were
+        // reconciled above, so this cannot panic.
+        buffer.copy_from_slice(&self.canvas);
+
         window.pre_present_notify();
-        if let Err(e) = buffer.present() {
+        // softbuffer 0.4.8's macOS backend throws the damage away and presents the
+        // whole surface, so this is a no-op there today — but it is the truthful call
+        // for what changed, and it becomes the fast path unchanged the day a backend
+        // honours it (or phase 2 replaces the presenter).
+        let presented = if partial {
+            buffer.present_with_damage(&damage)
+        } else {
+            buffer.present()
+        };
+        if let Err(e) = presented {
             eprintln!("present: present failed: {e}");
             return;
         }
@@ -216,12 +363,14 @@ impl ViewerApp {
             if presentable && frame.stamps_pending {
                 frame.stamps_pending = false;
                 match frame.stamps {
-                    PaintStamps::Au(s) => self
-                        .stats
-                        .record(&FrameRecord::new(&s, Some(present_done_us))),
-                    PaintStamps::Rects(s) => self
-                        .stats
-                        .record(&RectRecord::painted(&s, Some(present_done_us))),
+                    PaintStamps::Au(s) => {
+                        self.stats
+                            .record(&FrameRecord::new(&s, Some(present_done_us), partial))
+                    }
+                    PaintStamps::Rects(s) => {
+                        self.stats
+                            .record(&RectRecord::painted(&s, Some(present_done_us), partial))
+                    }
                 }
             }
         }
@@ -284,6 +433,11 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                // The canvas is indexed by the window stride and offset by the
+                // viewport, so a new geometry makes every pixel in it wrong. Drop it
+                // here rather than trying to detect the change at paint time: this is
+                // where the change is actually announced.
+                self.canvas_valid = false;
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }

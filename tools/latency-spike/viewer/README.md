@@ -160,7 +160,9 @@ access unit will be a `decode_error` and the window will stay black.
 | `present_done_us` | immediately after `buffer.present()` returned |
 
 Plus `frame` (a counter over all access units, decoded or not), `au_bytes`, `keyframe`,
-the decoded `width`/`height`, and `dropped`.
+the decoded `width`/`height`, `dropped`, and `partial` — whether the present that
+closed this row went through the damage-only path (Increment 4) rather than a full
+convert. The same `partial` field appears on painted `rects` rows.
 
 Read the gaps: `decode_in - recv_done` is the handoff to the decoder,
 `decode_out - decode_in` is the decode itself, `present_done - decode_out` is the wait
