@@ -6,15 +6,15 @@
 - **Area:** render
 - **Raised:** 2026-08-18T18:02:47Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260818T180323Z-p53431-n173223000-c1
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00005-run-fix-20260818T180323Z-p53431-n173223000-c1
+- **Owner base:** d3443c1a40952b54c86207c8e5b8576ae8a4b843
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-18T18:03:23Z
+- **Owner until:** 2026-08-18T20:03:23Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
