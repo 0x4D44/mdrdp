@@ -88,6 +88,14 @@ pub enum SessionCommand {
         /// advertises nothing.
         scale_percent: Option<u32>,
     },
+    /// Tell the server whether anyone can currently see the session window.
+    ///
+    /// Maps to the Suppress Output PDU (MS-RDPBCGR 2.2.11.3): a fully occluded window
+    /// asks the server to stop sending graphics; becoming visible again asks for them
+    /// back, with the full desktop rect, which prompts a full repaint of it. Sent
+    /// best-effort — a server that ignores it just keeps streaming, and the window
+    /// keeps discarding.
+    SetVisibility { visible: bool },
 }
 
 /// How long a requested resize waits for the Display Control channel to open before the
@@ -249,6 +257,8 @@ fn pump(
     let mut last_clipboard_poll = Instant::now();
     // A resize waiting for the Display Control channel to open, with when it was asked.
     let mut pending_resize: Option<(SessionCommand, Instant)> = None;
+    // The latest visibility change not yet told to the server.
+    let mut pending_visibility: Option<bool> = None;
     // When input went out with no resulting paint seen yet. The gap between the two is
     // the round trip the latency requirement is about.
     let mut input_sent_at: Option<Instant> = None;
@@ -284,12 +294,23 @@ fn pump(
         }
 
         // --- outbound: session commands ---------------------------------------
-        // Only the newest resize matters: a user who toggled fullscreen twice while the
-        // channel was still opening wants where they ended up, not the journey.
+        // Only the newest of each kind matters: a user who toggled fullscreen twice
+        // while the channel was still opening wants where they ended up, not the
+        // journey, and likewise a window hidden and revealed in one slice is visible.
         while let Ok(command) = commands.try_recv() {
-            pending_resize = Some((command, Instant::now()));
+            match command {
+                SessionCommand::Resize { .. } => {
+                    pending_resize = Some((command, Instant::now()));
+                }
+                SessionCommand::SetVisibility { visible } => {
+                    pending_visibility = Some(visible);
+                }
+            }
         }
         if let Err(e) = service_resize(established, &mut pending_resize) {
+            return SessionEnd::Failed(e);
+        }
+        if let Err(e) = service_visibility(established, &mut pending_visibility) {
             return SessionEnd::Failed(e);
         }
 
@@ -723,6 +744,71 @@ fn service_resize(
     }
 }
 
+/// Tell the server whether to keep sending graphics, per the latest visibility change.
+///
+/// Unlike a resize this needs no channel to open — the Suppress Output PDU rides the
+/// static global channel, which exists from the moment the session is established — so
+/// there is no pending/retry state: it either goes out now or the send error ends the
+/// session (a failed `write_all` means the socket is gone, not that suppression failed).
+fn service_visibility(
+    established: &mut Established,
+    pending: &mut Option<bool>,
+) -> Result<(), ConnectError> {
+    let Some(visible) = *pending else {
+        return Ok(());
+    };
+
+    let pdu = suppress_output_pdu(visible, established.desktop_size);
+    let mut buf = ironrdp::core::WriteBuf::new();
+    match established.stage.encode_static(&mut buf, pdu) {
+        Ok(_) => {
+            *pending = None;
+            if visible {
+                eprintln!("display: window visible again; asked the server to resume updates");
+            } else {
+                eprintln!("display: window hidden; asked the server to suppress updates");
+            }
+            established
+                .framed
+                .write_all(buf.filled())
+                .map_err(ConnectError::Io)
+        }
+        Err(e) => {
+            // Losing one suppression is not worth losing the desktop: the only cost of
+            // a server that keeps streaming is the idle CPU this was meant to save.
+            *pending = None;
+            eprintln!(
+                "display: could not encode the visibility change ({}); updates keep flowing",
+                describe(&e)
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Build the Suppress Output PDU for a visibility state.
+///
+/// Pure so it is testable without an [`Established`]. Hidden sends no rectangle (that
+/// IS the suppression, per MS-RDPBCGR 2.2.11.3); visible sends the full desktop as an
+/// *inclusive* rectangle, which also prompts the server to repaint all of it — the
+/// frames discarded while hidden must not leave a stale picture behind.
+fn suppress_output_pdu(
+    visible: bool,
+    desktop: DesktopSize,
+) -> ironrdp::pdu::rdp::headers::ShareDataPdu {
+    use ironrdp::pdu::geometry::InclusiveRectangle;
+    use ironrdp::pdu::rdp::headers::ShareDataPdu;
+    use ironrdp::pdu::rdp::suppress_output::SuppressOutputPdu;
+
+    let desktop_rect = visible.then(|| InclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: desktop.width.saturating_sub(1),
+        bottom: desktop.height.saturating_sub(1),
+    });
+    ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect })
+}
+
 /// Whether a resize request names the state the session is already in.
 ///
 /// Pure so it is testable without an [`Established`]. `scale` compares exactly:
@@ -914,6 +1000,44 @@ mod tests {
     use super::*;
     use crate::surface::SurfaceStore;
     use std::sync::mpsc;
+
+    // --- visibility / suppress output --------------------------------------------
+
+    #[test]
+    fn a_hidden_window_suppresses_updates_with_no_rectangle() {
+        // The polarity is the whole PDU: an absent rectangle means SUPPRESS, a present
+        // one means allow (MS-RDPBCGR 2.2.11.3). Swapping it would make hiding the
+        // window ask for MORE traffic — a bug invisible to every local test but this.
+        use ironrdp::pdu::rdp::headers::ShareDataPdu;
+        let desktop = DesktopSize {
+            width: 2560,
+            height: 1440,
+        };
+        match suppress_output_pdu(false, desktop) {
+            ShareDataPdu::SuppressOutput(pdu) => assert!(pdu.desktop_rect.is_none()),
+            other => panic!("wrong PDU kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_visible_window_resumes_updates_with_the_full_inclusive_desktop() {
+        // The rectangle is INCLUSIVE: right/bottom are width-1/height-1. Sending the
+        // exclusive form asks for a column and row that do not exist, which Windows
+        // answers by ignoring the PDU — updates would never resume.
+        use ironrdp::pdu::rdp::headers::ShareDataPdu;
+        let desktop = DesktopSize {
+            width: 2560,
+            height: 1440,
+        };
+        match suppress_output_pdu(true, desktop) {
+            ShareDataPdu::SuppressOutput(pdu) => {
+                let rect = pdu.desktop_rect.expect("visible must carry the rect");
+                assert_eq!((rect.left, rect.top), (0, 0));
+                assert_eq!((rect.right, rect.bottom), (2559, 1439));
+            }
+            other => panic!("wrong PDU kind: {other:?}"),
+        }
+    }
 
     /// A framed sink that records what was written, so the input path can be tested
     /// without a server.

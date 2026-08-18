@@ -933,6 +933,10 @@ struct SessionApp {
     /// Whether the window is currently fullscreen — ours to track, because winit reports
     /// transitions only as ordinary `Resized` events.
     fullscreen: bool,
+    /// Whether the OS reports the window fully occluded (covered, minimised, or on a
+    /// hidden Space). While true, damage does not request redraws — nobody can see
+    /// them — and the session is asked to suppress server updates entirely.
+    occluded: bool,
     /// Mirror of `fullscreen` readable after the loop dies. See
     /// [`SessionWindow::fullscreen_state`].
     fullscreen_state: Arc<AtomicBool>,
@@ -1020,6 +1024,7 @@ impl SessionApp {
             on_exit: None,
             commands: None,
             fullscreen,
+            occluded: false,
             fullscreen_state: Arc::new(AtomicBool::new(fullscreen)),
             windowed_session,
             resize_settle: None,
@@ -1628,8 +1633,11 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         match event {
             SessionEvent::Damaged => {
                 // The whole point of the generation counter: a nudge that turns out to
-                // change nothing costs one atomic-ish read and no frame.
-                if self.presented != Some(self.generation())
+                // change nothing costs one atomic-ish read and no frame. An occluded
+                // window presents to nobody, so damage accumulates silently until the
+                // reveal's own request_redraw shows the latest frame (Occluded arm).
+                if !self.occluded
+                    && self.presented != Some(self.generation())
                     && let Some(window) = &self.window
                 {
                     window.request_redraw();
@@ -1795,6 +1803,14 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 self.resize_settle = None;
                 let now = self.now_ms();
                 self.policy.note_occluded(occluded, now);
+                if occluded != self.occluded {
+                    self.occluded = occluded;
+                    // Nobody can see a fully occluded window, so the server should stop
+                    // encoding frames for it (MDR-BUG-FLUX-00005: an idle hidden session
+                    // burned most of a core presenting invisible frames). Resuming asks
+                    // for a full repaint, so nothing stale survives the reveal.
+                    self.send_command(SessionCommand::SetVisibility { visible: !occluded });
+                }
                 // Becoming visible is the first moment anything can actually be fixed:
                 // the size may have been changed while the screen was off, and no further
                 // `Resized` is guaranteed to arrive to prompt us.
