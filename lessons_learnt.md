@@ -6,6 +6,14 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- softbuffer's CG backend colour-converts the WHOLE frame on CPU per present; IOSurface contents skip it (`present.rs`).
+  An idle 1440p session burned 20–90% of a core: CoreAnimation re-renders every data-provider
+  CGImage through a vImage ColorSync pass (~20 ms/frame at 2560x1440), plus softbuffer zero-allocs
+  the buffer each frame. `present::LayerPresenter` hands CA an IOSurface instead — conversion moves
+  to the GPU. Never rewrite the surface currently on glass: CA can short-circuit a `setContents`
+  naming the object it already shows, so in-place writes silently stop updating the screen (hence
+  the pool of three). `MDRDP_PRESENT=soft` forces the old path for A/B. MDR-BUG-FLUX-00005.
+
 - spike-server records ZERO frames until a viewer connects (`win/pipeline.rs:609` — by design); a viewer-less smoke proves nothing.
   A whole afternoon's "dead capture" diagnosis on quench was this: the capture loop parks in 50 ms
   sleeps until the video port accepts a client. Arm it headlessly with an SSH tunnel plus
