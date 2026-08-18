@@ -1,9 +1,17 @@
 [package]
-name = "spike-server"
+name = "rhydra"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Instrumented Windows capture/encode/send spike server for the mdrdp latency exploration"
+description = "rhydra — mdrdp's native Windows capture/encode/send server and session agent"
+
+[[bin]]
+name = "rhydra-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "rhydra-agent"
+path = "src/bin/agent.rs"
 
 [dependencies]
 # Same versions as the repository root Cargo.toml.

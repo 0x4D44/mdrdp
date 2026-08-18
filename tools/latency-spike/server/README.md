@@ -1,4 +1,4 @@
-# `spike-server` — instrumented capture/encode/send, Windows
+# `rhydra-server` — mdrdp's native capture/encode/send server, Windows
 
 The server half of the mdrdp latency spike. It captures one display with DXGI
 Desktop Duplication, converts BGRA→NV12 on the GPU, encodes H.264 with a Media
@@ -30,7 +30,7 @@ cargo fmt -- --check
 Cross-compile the Windows executable from macOS:
 
 ```
-./build.sh                      # → target/x86_64-pc-windows-msvc/release/spike-server.exe
+./build.sh                      # → target/x86_64-pc-windows-msvc/release/rhydra-server.exe
 XWIN_DIR=/some/other/splat ./build.sh
 ```
 
@@ -47,7 +47,7 @@ present in the xwin splat, and the produced binary is
 and `WS2_32.dll`. (`mfuuid.lib` contributes GUID constants only, so it correctly
 leaves no DLL import behind.)
 
-On a non-Windows host the binary prints `spike-server: windows only` and exits 2.
+On a non-Windows host the binary prints `rhydra-server: windows only` and exits 2.
 
 ---
 
@@ -64,15 +64,15 @@ ssh -L 9500:127.0.0.1:9500 -L 9501:127.0.0.1:9501 user@quench
 Then, **in the interactive console session** (see the caveat below):
 
 ```
-spike-server.exe --list-outputs
-spike-server.exe --output 1 --out C:\Users\ano\spike.jsonl
+rhydra-server.exe --list-outputs
+rhydra-server.exe --output 1 --out C:\Users\ano\spike.jsonl
 ```
 
 ```
-spike-server --output N [--video-port 9500] [--input-port 9501]
+rhydra-server --output N [--video-port 9500] [--input-port 9501]
              [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]
              [--no-rects] [--source dxgi|idd]
-spike-server --list-outputs
+rhydra-server --list-outputs
 ```
 
 `--list-outputs` prints every DXGI adapter/output with its resolution, whether it is
@@ -281,3 +281,17 @@ contract. **None of it has executed.** The first live run happens on the host.
 * **No Ctrl-C handler.** Stats are flushed per line so nothing is lost, but the MF
   drain and `MFShutdown` do not run on a kill. Harmless for a spike; worth knowing
   before anyone reads a driver log.
+
+---
+
+## `rhydra-agent` — the session agent
+
+The second binary in this crate: the logon-task supervisor that keeps the whole
+capture stack up (IDD creator → device → 1920x1080@240 → `rhydra-server`), with a
+loopback JSON control port on 9502 (`{"cmd":"status"}`, `{"cmd":"restart-server"}`,
+`{"cmd":"shutdown"}` — one object per line, same shape back). `rhydra-agent install`
+registers the onlogon scheduled task and starts it; `rhydra-agent uninstall` shuts
+the running agent down over the control port (killing its children) and deletes the
+task. Stopping it any other way orphans the children; the sweep at the next agent
+start repairs that. Design and rationale:
+`wrk_docs/2026.08.18 - HLD - rhydra tranche 1 - session agent and rename.md`.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cross-build spike-server.exe for x86_64-pc-windows-msvc from macOS.
+# Cross-build rhydra-server.exe (and rhydra-agent.exe) for x86_64-pc-windows-msvc from macOS.
 #
 # Unlike ../../../scripts/check-windows.sh this LINKS, so it needs the SDK import
 # libraries as well as the headers. Both come from the same one-time xwin splat that

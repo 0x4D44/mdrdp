@@ -14,8 +14,8 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use rhydra::framing;
 use serde_json::Value;
-use spike_server::framing;
 use spike_viewer::clock::Clock;
 use spike_viewer::net::{self, PumpEnd};
 use spike_viewer::sink::{DecodeSink, FrameSlot};

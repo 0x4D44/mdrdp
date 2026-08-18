@@ -8,6 +8,7 @@
 //! them together. [`pixel_diff`] sits beside the sources: it is the D3D11 half of
 //! the Increment 3 pixel diff, whose portable comparison lives in [`crate::diff`].
 
+pub mod agent_ops;
 pub mod convert;
 pub mod dxgi;
 pub mod encode;

@@ -78,11 +78,11 @@ impl Default for Config {
 
 pub fn usage() -> &'static str {
     "usage:\n  \
-     spike-server --output N [--video-port 9500] [--input-port 9501]\n               \
+     rhydra-server --output N [--video-port 9500] [--input-port 9501]\n               \
                   [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]\n               \
                   [--no-rects] [--no-diff] [--source dxgi|idd]\n  \
-     spike-server --source idd [--video-port 9500] ...\n  \
-     spike-server --list-outputs\n\n\
+     rhydra-server --source idd [--video-port 9500] ...\n  \
+     rhydra-server --list-outputs\n\n\
      --no-rects withholds the raw dirty-rect fast path, forcing every update down\n  \
      the H.264-only path. That is the control arm for a measurement, not a tuning\n  \
      knob: quote it whenever a figure is compared against the hybrid wire.\n\n\

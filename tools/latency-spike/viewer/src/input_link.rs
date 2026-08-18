@@ -1,6 +1,6 @@
 //! The keystroke channel, viewer → server.
 //!
-//! Records are [`spike_server::input_proto`] — the server's own encoder, so a field
+//! Records are [`rhydra::input_proto`] — the server's own encoder, so a field
 //! order or endianness change cannot desynchronise the two halves.
 //!
 //! Writes happen **on the window thread, inside the key event**. That is the point of
@@ -12,7 +12,7 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use spike_server::input_proto::{self, InputRecord, KeyKind};
+use rhydra::input_proto::{self, InputRecord, KeyKind};
 
 pub struct InputLink {
     stream: TcpStream,

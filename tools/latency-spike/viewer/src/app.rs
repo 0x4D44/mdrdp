@@ -22,7 +22,7 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use mdrdp::window::present_into;
-use spike_server::input_proto::KeyKind;
+use rhydra::input_proto::KeyKind;
 
 use crate::clock::Clock;
 use crate::input_link::InputLink;

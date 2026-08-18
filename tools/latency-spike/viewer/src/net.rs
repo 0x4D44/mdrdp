@@ -1,6 +1,6 @@
 //! The video socket reader: bytes in, framed messages out.
 //!
-//! Framing is [`spike_server::framing`] — the server's own module, reassembling what
+//! Framing is [`rhydra::framing`] — the server's own module, reassembling what
 //! the server's own `encode` produced. A second implementation of a length-prefixed
 //! format is a second place for it to be wrong.
 //!
@@ -10,7 +10,7 @@
 
 use std::io::Read;
 
-use spike_server::framing::{self, Reassembler};
+use rhydra::framing::{self, Reassembler};
 
 use crate::clock::Clock;
 

@@ -17,7 +17,7 @@ mdrdp = { path = "../../.." }
 
 # The server's portable half — framing, the input record. One implementation of the
 # wire format, shared, rather than two that can drift.
-spike-server = { path = "../server" }
+rhydra = { path = "../server" }
 
 # Same versions as the repository root Cargo.toml: presenting through softbuffer
 # exactly as mdrdp's window thread does is the measurement, so a different version

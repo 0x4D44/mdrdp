@@ -1,6 +1,6 @@
 # `spike-viewer` — the macOS measuring client for the latency spike
 
-Connects to `spike-server` over an SSH tunnel, decodes the H.264 stream it sends,
+Connects to `rhydra-server` over an SSH tunnel, decodes the H.264 stream it sends,
 presents it in a window, and forwards its own keystrokes back on the server's input
 port. It writes one JSON line per frame so the client half of the pipeline is a
 per-stage budget rather than one number.
@@ -14,7 +14,7 @@ comparison is only valid if the client side is byte-for-byte the same code as th
 client being compared against. Nothing here re-implements a decoder, a colour
 conversion, or a scaler.
 
-The wire format is not re-implemented either — `spike-server`'s own `framing`,
+The wire format is not re-implemented either — `rhydra-server`'s own `framing`,
 `annexb` and `input_proto` modules are imported as a path dependency.
 
 **Not shipped code.** Like everything under `tools/`, this crate carries its own empty
@@ -46,7 +46,7 @@ one being measured. See `vendor/README.md` for what the six forks change.
 
 ## Running it
 
-Open the tunnel to the host running `spike-server` (both its listeners bind 127.0.0.1
+Open the tunnel to the host running `rhydra-server` (both its listeners bind 127.0.0.1
 only — an unauthenticated screen feed plus a keystroke injector on the LAN is a
 remote-control channel for anyone on it):
 

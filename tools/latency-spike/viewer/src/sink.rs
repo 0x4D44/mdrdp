@@ -19,7 +19,7 @@
 use std::sync::{Arc, Mutex};
 
 use ironrdp_egfx::decode::H264Decoder;
-use spike_server::{annexb, rects};
+use rhydra::{annexb, rects};
 
 use crate::clock::Clock;
 use crate::net::MessageSink;
@@ -576,8 +576,8 @@ impl MessageSink for DecodeSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rhydra::rects::{encode, Rect, RectUpdate};
     use serde_json::Value;
-    use spike_server::rects::{encode, Rect, RectUpdate};
 
     fn stamps(frame: u64) -> FrameStamps {
         FrameStamps {

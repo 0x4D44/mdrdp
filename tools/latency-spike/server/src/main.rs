@@ -1,4 +1,4 @@
-//! `spike-server` — the Windows half of the mdrdp latency spike.
+//! `rhydra-server` — the Windows half of mdrdp's native transport.
 //!
 //! See `README.md` beside this file for the wire protocol, the stage-timestamp
 //! semantics and how to run it on the host.
@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 #[cfg(windows)]
 fn main() -> ExitCode {
-    use spike_server::cli;
+    use rhydra::cli;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cfg = match cli::parse(&args) {
@@ -19,9 +19,9 @@ fn main() -> ExitCode {
     };
 
     let outcome = if cfg.list_outputs {
-        spike_server::win::list_outputs()
+        rhydra::win::list_outputs()
     } else {
-        spike_server::win::run(&cfg)
+        rhydra::win::run(&cfg)
     };
 
     match outcome {
@@ -39,6 +39,6 @@ fn main() -> ExitCode {
 /// on, which is the whole reason the pure-logic modules are portable.
 #[cfg(not(windows))]
 fn main() -> ExitCode {
-    eprintln!("spike-server: windows only");
+    eprintln!("rhydra-server: windows only");
     ExitCode::from(2)
 }

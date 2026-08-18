@@ -7,8 +7,8 @@
 //! `softbuffer` at the versions the client pins. What changes between a spike run and
 //! an mdrdp run is the *server* and the *transport*, which is the whole point.
 //!
-//! The wire format is not re-implemented either: [`spike_server::framing`] and
-//! [`spike_server::input_proto`] are the same modules the server encodes with.
+//! The wire format is not re-implemented either: [`rhydra::framing`] and
+//! [`rhydra::input_proto`] are the same modules the server encodes with.
 //!
 //! Layering, and why it is split this way: everything above [`app`] is free of any
 //! window. The socket reader ([`net`]), the decode-and-store step ([`sink`]) and the
