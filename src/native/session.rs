@@ -236,6 +236,16 @@ fn pump_input(
         Ok(w) => w,
         Err(e) => return Some(format!("input socket: {e}")),
     };
+    // How many records this session put on the wire — printed however the thread
+    // exits; the one number that splits "the client never sent it" from "the host
+    // never injected it".
+    struct WrittenReport(u64);
+    impl Drop for WrittenReport {
+        fn drop(&mut self) {
+            eprintln!("native: input records written: {}", self.0);
+        }
+    }
+    let mut written = WrittenReport(0);
     let mut seq: u32 = 1;
     let mut resize_noted = false;
     loop {
@@ -271,6 +281,7 @@ fn pump_input(
                                 Some(format!("input write: {e}"))
                             };
                         }
+                        written.0 += 1;
                     }
                 }
                 Err(TryRecvError::Empty) => break,
