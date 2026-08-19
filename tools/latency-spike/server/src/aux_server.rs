@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::auxchan::{self, Slot};
+use crate::auxchan::{self, Outbox};
 use crate::clipboard::{self, Bridge, Policy, TextClipboard};
 
 /// What one connection did, as counts. No content, by construction.
@@ -166,7 +166,7 @@ pub fn serve_one(
             .seed(seed.as_deref());
     }
 
-    let slot = Slot::new();
+    let slot = Outbox::new();
     let stop = Arc::new(AtomicBool::new(false));
     let mut joins = Vec::new();
 
@@ -200,7 +200,7 @@ pub fn serve_one(
                         if let Some(text) =
                             clipboard::poll_local(&mut **os, &poll_bridge, &mut report)
                         {
-                            poll_slot.put(text);
+                            poll_slot.put_clipboard(text);
                         }
                     }
                     std::thread::sleep(POLL_INTERVAL);

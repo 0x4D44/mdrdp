@@ -27,7 +27,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ironrdp_egfx::decode::H264Decoder;
-use rhydra::auxchan::{self, Slot};
+use rhydra::auxchan::{self, Outbox};
 use rhydra::framing::{self, Reassembler};
 use rhydra::input_proto::{MouseButton as WireButton, Record, WheelAxis, encode_record};
 use rhydra::rects::{self, RectUpdate};
@@ -63,7 +63,7 @@ const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// here is written so that losing the clipboard cannot end one.
 struct AuxChannel {
     socket: TcpStream,
-    slot: Arc<Slot>,
+    slot: Arc<Outbox>,
     joins: Vec<JoinHandle<()>>,
 }
 
@@ -270,7 +270,7 @@ fn spawn_aux(
         guard.seed(seed.as_deref());
     }
 
-    let slot = Slot::new();
+    let slot = Outbox::new();
     let mut joins = Vec::new();
 
     let rx_socket = socket.try_clone()?;
@@ -334,7 +334,7 @@ fn spawn_aux(
                         let mut os = lock(&poll_os);
                         if let Some(text) = clip::poll_local(&mut **os, &poll_bridge, &mut report) {
                             COUNTERS.note_sent();
-                            poll_slot.put(text);
+                            poll_slot.put_clipboard(text);
                         }
                     }
                     std::thread::sleep(CLIPBOARD_POLL_INTERVAL);

@@ -23,15 +23,20 @@
 //! rather than silent, because "the clipboard is slow" and "the clipboard is
 //! dropping things" need different answers.
 //!
-//! Tranche 6 adds audio *above* this tier with a strict-priority sender — any
-//! pending audio before any pending clipboard. That tier is deliberately not
-//! built here: there is nothing to rank against yet.
+//! Tranche 6 adds audio *above* this tier, under **bounded** priority rather
+//! than strict priority: audio goes first, but at most
+//! [`AUDIO_BURST_BEFORE_CLIPBOARD`] frames before a waiting clipboard payload is
+//! let through. Strict priority was the first design and is a livelock — audio
+//! is continuous, so under sustained back-pressure it is always pending and the
+//! clipboard is never selected. See that constant for why the distinction
+//! matters more than it looks.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::aux_proto::{self, AuxMessage};
+use crate::aux_proto::{self, AudioFrame, AuxMessage};
 use crate::framing::{self, Reassembler};
 
 /// How long a taker parks before looping, so a closed slot is noticed promptly
@@ -40,15 +45,18 @@ pub const SLOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// What a taker got.
 ///
-/// `Debug` is **hand-written**, like every other type on this path that can
-/// hold a payload. It derived it first, and a `debug!(?take)` in the writer loop
+/// `Debug` is **hand-written**, like every other type on this path that can hold
+/// a payload. It derived it first, and a `debug!(?take)` in the writer loop
 /// printed the whole clipboard — a password, a one-time code — which is the
 /// tranche-3 pattern exactly: a type whose derived `Debug` looks innocuous and
-/// carries content. AC9's leak check found it.
+/// carries content. AC9's leak check found it. Audio is the same class of
+/// content: a voice call is as sensitive as a clipboard.
 #[derive(PartialEq, Eq)]
 pub enum Take {
-    /// A payload to send.
-    Item(String),
+    /// A clipboard payload to send.
+    Clipboard(String),
+    /// One block of PCM to send.
+    Audio(AudioFrame),
     /// Nothing pending; the wait elapsed. Keep going.
     Idle,
     /// The session is ending. Stop.
@@ -59,16 +67,56 @@ impl std::fmt::Debug for Take {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // The variant and a length. Never the bytes.
-            Take::Item(text) => f.debug_struct("Item").field("bytes", &text.len()).finish(),
+            Take::Clipboard(text) => f
+                .debug_struct("Clipboard")
+                .field("bytes", &text.len())
+                .finish(),
+            // Delegates to AudioFrame's own hand-written Debug, which prints
+            // shape and timing and never samples.
+            Take::Audio(frame) => f.debug_tuple("Audio").field(frame).finish(),
             Take::Idle => f.write_str("Idle"),
             Take::Closed => f.write_str("Closed"),
         }
     }
 }
 
-/// A depth-1, keep-latest outbound slot.
-pub struct Slot {
-    state: Mutex<SlotState>,
+/// How many audio frames the outbound queue holds before dropping the oldest.
+///
+/// 20 frames is 200 ms at the 10 ms frame this tranche sends. Bounded so a
+/// stalled link cannot grow memory without limit, and drop-**oldest** because
+/// when we are behind, stale audio is worthless and the listener wants to catch
+/// up rather than hear the past.
+pub const AUDIO_FIFO_FRAMES: usize = 20;
+
+/// How many audio frames may be sent before a waiting clipboard payload is let
+/// through.
+///
+/// **This constant is the whole difference between bounded priority and
+/// starvation.** The first design drained *all* pending audio before any
+/// clipboard, which reads like a clean statement of the priority order and is a
+/// livelock: audio is continuous, so under the sustained back-pressure the FIFO
+/// exists to survive, audio is *always* pending and the clipboard is never
+/// selected — for as long as the congestion lasts, in exactly the window where
+/// the user is working. Product requirement 1 is that the clipboard never
+/// wedges, so a policy that makes a wedge reachable by construction is wrong
+/// however well it expresses the priority.
+///
+/// Eight frames is 80 ms — below the threshold where a clipboard paste feels
+/// delayed, and far above the point where audio would notice.
+pub const AUDIO_BURST_BEFORE_CLIPBOARD: usize = 8;
+
+/// The outbound side of the auxiliary channel: an audio FIFO and a keep-latest
+/// clipboard slot, drained under bounded priority.
+///
+/// **One mutex and one condvar, deliberately.** Composing two independently
+/// synchronised queues would give two condition variables, and `std` cannot wait
+/// on both: a taker parked on one would miss a `put` or a `close` on the other
+/// and wake only when the poll interval elapsed. That is not a deadlock, which
+/// is what makes it dangerous — it is a silent quarter-second added to every
+/// clipboard send and to teardown, on a product whose premise is latency, and it
+/// would regress two properties this module already makes failable.
+pub struct Outbox {
+    state: Mutex<OutboxState>,
     ready: Condvar,
     /// How long a taker parks before looping. Configurable **so the condvar
     /// wake-up is testable**: with the production quarter-second, a test cannot
@@ -78,51 +126,67 @@ pub struct Slot {
 }
 
 #[derive(Default)]
-struct SlotState {
-    pending: Option<String>,
+struct OutboxState {
+    clipboard: Option<String>,
+    audio: VecDeque<AudioFrame>,
     closed: bool,
     superseded: u64,
+    audio_dropped: u64,
+    /// Audio frames taken since the last clipboard payload went out.
+    audio_run: usize,
 }
 
-impl Slot {
+impl Outbox {
     pub fn new() -> Arc<Self> {
         Self::with_interval(SLOT_POLL_INTERVAL)
     }
 
     pub fn with_interval(interval: Duration) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(SlotState::default()),
+            state: Mutex::new(OutboxState::default()),
             ready: Condvar::new(),
             interval,
         })
     }
 
-    /// Queue `text`, replacing anything already pending.
+    /// Queue clipboard `text`, replacing anything already pending.
     ///
     /// Never blocks and never grows. A payload replaced here was never the
     /// clipboard's current content by the time it would have been sent, so
     /// dropping it is correct rather than merely tolerable.
-    pub fn put(&self, text: String) {
+    pub fn put_clipboard(&self, text: String) {
         let mut state = self.lock();
         if state.closed {
             return;
         }
-        if state.pending.is_some() {
+        if state.clipboard.is_some() {
             state.superseded += 1;
         }
-        state.pending = Some(text);
+        state.clipboard = Some(text);
         drop(state);
         self.ready.notify_one();
     }
 
-    /// Wait up to [`SLOT_POLL_INTERVAL`] for a payload.
+    /// Queue one audio frame, dropping the oldest if the queue is full.
+    pub fn put_audio(&self, frame: AudioFrame) {
+        let mut state = self.lock();
+        if state.closed {
+            return;
+        }
+        while state.audio.len() >= AUDIO_FIFO_FRAMES {
+            state.audio.pop_front();
+            state.audio_dropped += 1;
+        }
+        state.audio.push_back(frame);
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    /// Wait up to the poll interval for something to send.
     pub fn take(&self) -> Take {
         let mut state = self.lock();
-        if let Some(text) = state.pending.take() {
-            return Take::Item(text);
-        }
-        if state.closed {
-            return Take::Closed;
+        if let Some(take) = Self::next(&mut state) {
+            return take;
         }
         let (mut state, _) = self
             .ready
@@ -131,13 +195,39 @@ impl Slot {
                 let (guard, timeout) = e.into_inner();
                 (guard, timeout)
             });
-        if let Some(text) = state.pending.take() {
-            Take::Item(text)
-        } else if state.closed {
-            Take::Closed
-        } else {
-            Take::Idle
+        Self::next(&mut state).unwrap_or(Take::Idle)
+    }
+
+    /// The scheduling decision, in one place so it can be reasoned about.
+    fn next(state: &mut OutboxState) -> Option<Take> {
+        if state.closed {
+            // **On close, queued audio is discarded and a pending clipboard
+            // payload is still delivered.** `close()` is followed immediately by
+            // a socket shutdown, so a writer that drained 200 ms of audio first
+            // would find the socket gone and lose the last copy — breaking the
+            // property that a copy made a moment before teardown still reaches
+            // the peer. Stale audio at teardown is worth nothing; that copy is.
+            state.audio.clear();
+            return Some(match state.clipboard.take() {
+                Some(text) => Take::Clipboard(text),
+                None => Take::Closed,
+            });
         }
+        let clipboard_waiting = state.clipboard.is_some();
+        if clipboard_waiting && state.audio_run >= AUDIO_BURST_BEFORE_CLIPBOARD {
+            state.audio_run = 0;
+            return state.clipboard.take().map(Take::Clipboard);
+        }
+        if let Some(frame) = state.audio.pop_front() {
+            state.audio_run += 1;
+            return Some(Take::Audio(frame));
+        }
+        // Nothing to prioritise against: audio is empty, so the clipboard goes.
+        if let Some(text) = state.clipboard.take() {
+            state.audio_run = 0;
+            return Some(Take::Clipboard(text));
+        }
+        None
     }
 
     /// End the session. Wakes any parked taker.
@@ -146,12 +236,27 @@ impl Slot {
         self.ready.notify_all();
     }
 
-    /// How many queued payloads were replaced before they could be sent.
+    /// How many queued clipboard payloads were replaced before they could be sent.
     pub fn superseded(&self) -> u64 {
         self.lock().superseded
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, SlotState> {
+    /// How many audio frames were dropped because the queue was full.
+    pub fn audio_dropped(&self) -> u64 {
+        self.lock().audio_dropped
+    }
+
+    /// How many audio frames are queued.
+    ///
+    /// Exists so the discard-on-close rule is observable. Without it that
+    /// `clear()` is invisible from outside — the close path returns the
+    /// clipboard first either way — and a test claiming to cover it would be
+    /// asserting something it cannot see.
+    pub fn audio_pending(&self) -> usize {
+        self.lock().audio.len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, OutboxState> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -173,26 +278,44 @@ pub enum WriterEnd {
 /// the session-safety property: above the framing layer's own limit the peer
 /// would see a terminal `FramingError` and drop the session, so a large copy
 /// would kill the remote desktop — worse than having no clipboard.
-pub fn pump_writer(mut out: impl Write, slot: &Slot, report: &mut impl FnMut(&str)) -> WriterEnd {
+pub fn pump_writer(
+    mut out: impl Write,
+    outbox: &Outbox,
+    report: &mut impl FnMut(&str),
+) -> WriterEnd {
     let mut buf = Vec::new();
     loop {
-        match slot.take() {
+        let encoded = match outbox.take() {
             Take::Closed => return WriterEnd::Closed,
             Take::Idle => continue,
-            Take::Item(text) => {
+            Take::Clipboard(text) => {
                 buf.clear();
-                if let Err(e) = aux_proto::encode_clipboard_text(&text, &mut buf) {
+                match aux_proto::encode_clipboard_text(&text, &mut buf) {
+                    Ok(()) => Ok(()),
                     // Names sizes only; `AuxProtoError` carries no content.
-                    report(&format!("clipboard not sent: {e}"));
-                    continue;
-                }
-                if let Err(e) = out.write_all(&buf) {
-                    return WriterEnd::Io(e.to_string());
-                }
-                if let Err(e) = out.flush() {
-                    return WriterEnd::Io(e.to_string());
+                    Err(e) => Err(format!("clipboard not sent: {e}")),
                 }
             }
+            Take::Audio(frame) => {
+                buf.clear();
+                match aux_proto::encode_audio(&frame, &mut buf) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(format!("audio frame not sent: {e}")),
+                }
+            }
+        };
+        if let Err(why) = encoded {
+            // A malformed payload is dropped, never written: above the framing
+            // layer's limit the peer sees a terminal error and drops the
+            // session, so one bad message would kill the remote desktop.
+            report(&why);
+            continue;
+        }
+        if let Err(e) = out.write_all(&buf) {
+            return WriterEnd::Io(e.to_string());
+        }
+        if let Err(e) = out.flush() {
+            return WriterEnd::Io(e.to_string());
         }
     }
 }
@@ -300,14 +423,14 @@ mod tests {
         // type a `debug!(?x)` at the send site could reach must print no
         // payload byte.
         //
-        // This started RED. `Take` derived `Debug`, so `Take::Item(String)`
+        // This started RED. `Take` derived `Debug`, so `Take::Clipboard(String)`
         // printed the clipboard in full — the exact tranche-3 pattern (a type
         // whose derived Debug looks innocuous and carries content), in code
         // written two units after that lesson was recorded.
         let secret = "hunter2-the-actual-secret";
 
-        let slot = Slot::with_interval(Duration::from_millis(10));
-        slot.put(secret.to_owned());
+        let slot = Outbox::with_interval(Duration::from_millis(10));
+        slot.put_clipboard(secret.to_owned());
         let taken = slot.take();
         let rendered = format!("{taken:?}");
         assert!(
@@ -316,13 +439,49 @@ mod tests {
         );
         // …and still says which variant it is, or it is useless for debugging.
         assert!(
-            rendered.contains("Item"),
+            rendered.contains("Clipboard"),
             "Take must still name its variant: {rendered}"
         );
 
-        // The other two carry nothing, and must keep saying so plainly.
-        assert_eq!(format!("{:?}", Take::Idle), "Idle");
-        assert_eq!(format!("{:?}", Take::Closed), "Closed");
+        // Audio is the same class of content and must be checked here too. A
+        // review of the first tranche-6 design pointed out that this test
+        // enumerates variants **by hand**, so exhaustiveness does not cover it:
+        // a new payload-carrying variant with a derived-looking Debug would sail
+        // straight through a green suite. The match below exists to make that
+        // impossible — adding a variant fails to compile until it is considered.
+        let sample_bytes = vec![0xABu8, 0xCD, 0xAB, 0xCD];
+        let audio = Take::Audio(crate::aux_proto::AudioFrame {
+            sample_rate: 48_000,
+            channels: 2,
+            capture_pos: 7,
+            pcm: sample_bytes,
+        });
+        let audio_rendered = format!("{audio:?}");
+        assert!(
+            !audio_rendered.contains("171") && !audio_rendered.contains("205"),
+            "Take leaked audio samples: {audio_rendered}"
+        );
+        assert!(
+            audio_rendered.contains("Audio"),
+            "Take must still name its variant: {audio_rendered}"
+        );
+
+        // Exhaustive by construction: a future variant will not compile here
+        // until someone decides whether it can carry content.
+        for variant in [taken, audio, Take::Idle, Take::Closed] {
+            match &variant {
+                Take::Clipboard(_) | Take::Audio(_) => {
+                    let s = format!("{variant:?}");
+                    assert!(
+                        !s.contains("hunter2") && !s.contains("171"),
+                        "a payload-carrying variant leaked: {s}"
+                    );
+                }
+                // The other two carry nothing, and must keep saying so plainly.
+                Take::Idle => assert_eq!(format!("{variant:?}"), "Idle"),
+                Take::Closed => assert_eq!(format!("{variant:?}"), "Closed"),
+            }
+        }
 
         // The reader's counters are the one thing here that is safe to print
         // whole — no content can reach them by construction.
@@ -332,10 +491,10 @@ mod tests {
 
     #[test]
     fn the_slot_keeps_the_latest_payload_and_counts_what_it_replaced() {
-        let slot = Slot::new();
-        slot.put("first".to_owned());
-        slot.put("second".to_owned());
-        assert_eq!(slot.take(), Take::Item("second".to_owned()));
+        let slot = Outbox::new();
+        slot.put_clipboard("first".to_owned());
+        slot.put_clipboard("second".to_owned());
+        assert_eq!(slot.take(), Take::Clipboard("second".to_owned()));
         assert_eq!(
             slot.superseded(),
             1,
@@ -350,7 +509,7 @@ mod tests {
         // The distinction is what keeps the writer looping instead of ending
         // the channel the first quiet quarter-second. Short interval: this test
         // is about which answer comes back, not how long it waits.
-        let slot = Slot::with_interval(Duration::from_millis(10));
+        let slot = Outbox::with_interval(Duration::from_millis(10));
         assert_eq!(slot.take(), Take::Idle);
     }
 
@@ -372,7 +531,7 @@ mod tests {
         // would simply time out and re-check. That is a correct answer arrived
         // at a park interval late, which for a teardown path means threads that
         // outlive the session.
-        let slot = Slot::with_interval(LONG_PARK);
+        let slot = Outbox::with_interval(LONG_PARK);
         let waker = Arc::clone(&slot);
         let t = std::thread::spawn(move || {
             let started = std::time::Instant::now();
@@ -394,7 +553,7 @@ mod tests {
         // on `put`, every clipboard send would sit for a full park interval
         // before reaching the wire. Correct, and a quarter-second slower than
         // it needs to be, on a product whose premise is latency.
-        let slot = Slot::with_interval(LONG_PARK);
+        let slot = Outbox::with_interval(LONG_PARK);
         let taker = Arc::clone(&slot);
         let t = std::thread::spawn(move || {
             let started = std::time::Instant::now();
@@ -403,9 +562,9 @@ mod tests {
         // Let the taker park first, or `put` beats it to the lock and the test
         // proves nothing about waking.
         std::thread::sleep(Duration::from_millis(50));
-        slot.put("now".to_owned());
+        slot.put_clipboard("now".to_owned());
         let (outcome, elapsed) = t.join().unwrap();
-        assert_eq!(outcome, Take::Item("now".to_owned()));
+        assert_eq!(outcome, Take::Clipboard("now".to_owned()));
         assert!(
             elapsed < PROMPT,
             "the payload waited {elapsed:?} for the park to elapse instead of waking the writer"
@@ -416,25 +575,25 @@ mod tests {
     fn a_payload_already_pending_when_the_slot_closes_is_still_delivered() {
         // Closing is an orderly end, not a discard: a copy made a moment before
         // teardown should still reach the peer if the socket is still there.
-        let slot = Slot::new();
-        slot.put("last words".to_owned());
+        let slot = Outbox::new();
+        slot.put_clipboard("last words".to_owned());
         slot.close();
-        assert_eq!(slot.take(), Take::Item("last words".to_owned()));
+        assert_eq!(slot.take(), Take::Clipboard("last words".to_owned()));
         assert_eq!(slot.take(), Take::Closed);
     }
 
     #[test]
     fn putting_after_close_is_dropped_rather_than_queued_forever() {
-        let slot = Slot::new();
+        let slot = Outbox::new();
         slot.close();
-        slot.put("too late".to_owned());
+        slot.put_clipboard("too late".to_owned());
         assert_eq!(slot.take(), Take::Closed);
     }
 
     #[test]
     fn the_writer_frames_a_queued_payload_and_stops_when_the_slot_closes() {
-        let slot = Slot::new();
-        slot.put("hello\nworld".to_owned());
+        let slot = Outbox::new();
+        slot.put_clipboard("hello\nworld".to_owned());
         slot.close();
         let mut wire = Vec::new();
         let mut reports = Vec::new();
@@ -453,7 +612,7 @@ mod tests {
         // keep-latest: queueing both at once would replace the oversize one
         // before the writer ever saw it, and the test would pass without
         // exercising the refusal at all.
-        let slot = Slot::new();
+        let slot = Outbox::new();
         let reports: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let wire: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -476,9 +635,9 @@ mod tests {
             })
         });
 
-        slot.put("x".repeat(aux_proto::MAX_CLIPBOARD_BYTES + 1));
+        slot.put_clipboard("x".repeat(aux_proto::MAX_CLIPBOARD_BYTES + 1));
         wait_until(|| reports.lock().unwrap().len() == 1);
-        slot.put("small".to_owned());
+        slot.put_clipboard("small".to_owned());
         wait_until(|| !wire.lock().unwrap().is_empty());
         slot.close();
         assert_eq!(writer.join().unwrap(), WriterEnd::Closed);
@@ -507,8 +666,8 @@ mod tests {
                 Ok(())
             }
         }
-        let slot = Slot::new();
-        slot.put("anything".to_owned());
+        let slot = Outbox::new();
+        slot.put_clipboard("anything".to_owned());
         slot.close();
         let end = pump_writer(Broken, &slot, &mut |_| {});
         assert!(matches!(end, WriterEnd::Io(m) if m.contains("gone")));
@@ -628,5 +787,183 @@ mod tests {
             &mut stats,
         );
         assert_eq!(got, vec!["first".to_owned(), "second".to_owned()]);
+    }
+
+    // -- the outbox: bounded priority (tranche 6) --------------------------------
+
+    fn frame(pos: u64) -> AudioFrame {
+        AudioFrame {
+            sample_rate: 48_000,
+            channels: 2,
+            capture_pos: pos,
+            // Four bytes = one stereo frame. Content is irrelevant here; the
+            // capture position is what each assertion identifies a frame by.
+            pcm: vec![0, 0, 0, 0],
+        }
+    }
+
+    #[test]
+    fn audio_is_taken_before_a_waiting_clipboard_payload() {
+        let outbox = Outbox::with_interval(Duration::from_millis(10));
+        outbox.put_clipboard("later".to_owned());
+        outbox.put_audio(frame(1));
+        assert_eq!(outbox.take(), Take::Audio(frame(1)));
+    }
+
+    #[test]
+    fn a_clipboard_payload_cannot_be_starved_by_a_continuous_audio_stream() {
+        // **The criterion the first design omitted, and its absence was the
+        // tell**: that design drained ALL pending audio before any clipboard.
+        // Audio is continuous, so under sustained back-pressure it is always
+        // pending and the clipboard would never be selected. Requirement 1 is
+        // that the clipboard never wedges.
+        //
+        // The producer here never stops, which is the case strict priority
+        // could not survive.
+        let outbox = Outbox::with_interval(Duration::from_millis(10));
+        outbox.put_clipboard("must get through".to_owned());
+
+        let mut audio_taken = 0usize;
+        for i in 0..1000 {
+            // Refill every lap: the queue is never allowed to run dry, so
+            // "the clipboard goes when audio happens to be empty" cannot be
+            // what rescues this test.
+            outbox.put_audio(frame(i));
+            match outbox.take() {
+                Take::Audio(_) => audio_taken += 1,
+                Take::Clipboard(text) => {
+                    assert_eq!(text, "must get through");
+                    assert!(
+                        audio_taken <= AUDIO_BURST_BEFORE_CLIPBOARD,
+                        "clipboard waited behind {audio_taken} audio frames, over the bound"
+                    );
+                    return;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        panic!("the clipboard was starved: {audio_taken} audio frames and it never went");
+    }
+
+    #[test]
+    fn the_audio_queue_is_bounded_and_drops_the_oldest() {
+        let outbox = Outbox::with_interval(Duration::from_millis(10));
+        // Two full queues' worth, each identifiable by its capture position.
+        for i in 0..(AUDIO_FIFO_FRAMES as u64 * 2) {
+            outbox.put_audio(frame(i));
+        }
+        assert_eq!(
+            outbox.audio_dropped(),
+            AUDIO_FIFO_FRAMES as u64,
+            "one drop for every frame past the bound"
+        );
+        // What survives must be the NEWEST, not the oldest: stale audio is
+        // worthless when we are behind.
+        let first = outbox.take();
+        assert_eq!(
+            first,
+            Take::Audio(frame(AUDIO_FIFO_FRAMES as u64)),
+            "the oldest surviving frame should be the first of the second batch"
+        );
+    }
+
+    #[test]
+    fn closing_discards_queued_audio_but_still_delivers_a_pending_clipboard() {
+        // close() is followed immediately by a socket shutdown, so a writer that
+        // drained 200 ms of audio first would find the socket gone and lose the
+        // last copy. A copy made a moment before teardown must still reach the
+        // peer; stale audio at teardown is worth nothing.
+        let outbox = Outbox::with_interval(Duration::from_millis(10));
+        for i in 0..AUDIO_FIFO_FRAMES as u64 {
+            outbox.put_audio(frame(i));
+        }
+        outbox.put_clipboard("last words".to_owned());
+        outbox.close();
+
+        assert_eq!(outbox.take(), Take::Clipboard("last words".to_owned()));
+        assert_eq!(
+            outbox.audio_pending(),
+            0,
+            "queued audio must be discarded at close, not held"
+        );
+        assert_eq!(outbox.take(), Take::Closed, "and then it is done");
+    }
+
+    #[test]
+    fn a_queued_audio_frame_wakes_a_parked_taker_rather_than_waiting_for_the_next_lap() {
+        // The single-condvar requirement, made failable. With two condvars a
+        // taker parked on the clipboard's would miss this notify entirely and
+        // wake only when LONG_PARK elapsed -- not a deadlock, which is what makes
+        // it dangerous, just a silent delay on a product whose premise is latency.
+        let outbox = Outbox::with_interval(LONG_PARK);
+        let waiter = Arc::clone(&outbox);
+        let started = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started.0.send(()).unwrap();
+            waiter.take()
+        });
+        started.1.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let began = std::time::Instant::now();
+        outbox.put_audio(frame(42));
+        let outcome = handle.join().unwrap();
+        let elapsed = began.elapsed();
+
+        assert_eq!(outcome, Take::Audio(frame(42)));
+        assert!(
+            elapsed < LONG_PARK / 2,
+            "the taker waited {elapsed:?}, so it timed out rather than being woken"
+        );
+    }
+
+    #[test]
+    fn putting_audio_after_close_is_dropped_rather_than_queued_forever() {
+        let outbox = Outbox::with_interval(Duration::from_millis(10));
+        outbox.close();
+        outbox.put_audio(frame(1));
+        // Asserting on `take()` alone would prove nothing: the close path clears
+        // the queue, so this passes whether or not `put_audio` honours `closed`.
+        // A mutation pass caught exactly that. What the guard is actually for is
+        // memory -- a producer that keeps pushing after teardown, with nobody
+        // taking, must not accumulate -- so the queue depth is what to check.
+        assert_eq!(
+            outbox.audio_pending(),
+            0,
+            "a frame queued after close would grow without bound"
+        );
+        assert_eq!(outbox.take(), Take::Closed);
+    }
+
+    #[test]
+    fn the_writer_frames_an_audio_frame_onto_the_wire() {
+        let outbox = Outbox::with_interval(Duration::from_millis(10));
+        outbox.put_audio(frame(9));
+        let closer = Arc::clone(&outbox);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            closer.close();
+        });
+
+        let mut sink = Vec::new();
+        let mut said = Vec::new();
+        let end = pump_writer(&mut sink, &outbox, &mut |m| said.push(m.to_owned()));
+        assert_eq!(end, WriterEnd::Closed);
+
+        let mut reassembler = Reassembler::new(framing::DEFAULT_MAX_PAYLOAD);
+        reassembler.push(&sink);
+        let message = reassembler
+            .next_message()
+            .expect("well-formed")
+            .expect("one message");
+        assert_eq!(message.msg_type, aux_proto::MSG_AUDIO);
+        match aux_proto::decode_audio(&message.payload).expect("decodes") {
+            AuxMessage::Audio(got) => assert_eq!(got.capture_pos, 9),
+            other => panic!("expected audio, got {other:?}"),
+        }
+        assert!(
+            said.is_empty(),
+            "a good frame should report nothing: {said:?}"
+        );
     }
 }
