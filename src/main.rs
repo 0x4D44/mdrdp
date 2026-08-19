@@ -463,6 +463,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut native_flag = false;
     let mut rdp_flag = false;
     let mut doctor = false;
+    // Set by `--clipboard-check <text>`: ask the host whether its interactive
+    // session's clipboard holds exactly this. Read-only, and nothing about the
+    // host's clipboard comes back but a verdict and two lengths.
+    let mut clipboard_check: Option<String> = None;
     let mut ssh_user: Option<String> = None;
 
     // Human-typed flags carry a single-letter short code as well; harness-facing ones
@@ -484,6 +488,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 continue;
             }
+            "--clipboard-check" => clipboard_check = Some(value()?.clone()),
             "--doctor" => {
                 doctor = true;
                 i += 1;
@@ -596,6 +601,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // It implies the native path whatever the favourite says — a favourite set to
     // `native = never` is a statement about how to CONNECT, not a reason to
     // refuse to diagnose — and it never falls back to RDP.
+    // Before --doctor: both are read-only diagnostics, and a run that asked for
+    // this one wants its verdict, not a health ladder.
+    if let Some(expected) = &clipboard_check {
+        let host = positional
+            .as_deref()
+            .ok_or("--clipboard-check needs a host: mdrdp <host> --clipboard-check <text>")?;
+        let verdict =
+            mdrdp::native::doctor::clipboard_matches(host, ssh_user.as_deref(), expected)?;
+        println!("clipboard {host}: {verdict}");
+        if !verdict.matches {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     if doctor {
         let host = positional
             .as_deref()

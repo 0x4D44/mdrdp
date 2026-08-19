@@ -79,6 +79,26 @@ mod win {
         cycle_requested: bool,
     }
 
+    /// Read the console session's clipboard.
+    ///
+    /// Windows-only by nature: the whole point is the window station this
+    /// process sits in, and there is no such thing anywhere else. The
+    /// non-Windows arm exists so the binary still type-checks on the machine it
+    /// is cross-built from, and says so rather than pretending to succeed.
+    #[cfg(windows)]
+    fn read_console_clipboard() -> Result<Option<String>, String> {
+        use rhydra::clipboard::TextClipboard;
+        // A fresh owner per call: this is asked rarely and on demand, so there
+        // is no sequence-number cache worth keeping, and a fresh one cannot
+        // serve a stale answer to an assertion.
+        rhydra::win::clipboard::ClipboardOwner::new().read_text()
+    }
+
+    #[cfg(not(windows))]
+    fn read_console_clipboard() -> Result<Option<String>, String> {
+        Err("clipboard reads need Windows".to_owned())
+    }
+
     /// One timestamped line to the agent log and stderr. The log is the record;
     /// stderr shows up when run by hand.
     fn log(file: &mut std::fs::File, message: &str) {
@@ -255,6 +275,24 @@ mod win {
                         );
                         shared.lock().expect("not poisoned").cycle_requested = true;
                         control::ok_line()
+                    }
+                }
+                Ok(Request::ClipboardMatches { expected }) => {
+                    // Answered on this thread rather than routed through the
+                    // reconcile loop: the clipboard belongs to the *process's*
+                    // window station, and this process is the one in the
+                    // console session, so any of its threads can read it.
+                    match read_console_clipboard() {
+                        Ok(actual) => {
+                            let (matches, actual_bytes, expected_bytes) =
+                                control::clipboard_verdict(actual.as_deref(), &expected);
+                            control::clipboard_match_line(matches, actual_bytes, expected_bytes)
+                        }
+                        // Never the clipboard's content, and never the caller's
+                        // expectation either — this line goes to a log file.
+                        Err(e) => {
+                            control::error_line(&format!("could not read the clipboard: {e}"))
+                        }
                     }
                 }
             };

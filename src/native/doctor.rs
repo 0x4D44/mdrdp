@@ -18,7 +18,7 @@
 //! It is not free of side effects and does not claim to be: it performs an ssh
 //! key logon, and that is named in the output.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rhydra::control::{Rung, RungState, StatusReport};
 
@@ -398,5 +398,86 @@ mod tests {
             );
         }
         assert!(text.contains("FAIL"), "a failing rung must stand out");
+    }
+}
+
+/// Ask the host whether its **interactive session's** clipboard holds exactly
+/// `expected`.
+///
+/// The acceptance criteria and the soak both need this and neither can get it
+/// any other way: an ssh session on Windows is a different window station, so
+/// `Get-Clipboard` there reads a clipboard nobody is using.
+///
+/// **Nothing comes back but a boolean and two lengths.** The obvious verb —
+/// "print the host's clipboard" — would pull arbitrary content down a control
+/// port that anything on the host can reach. A caller asserting equality
+/// already knows the text, so it sends the expectation and gets a verdict.
+///
+/// `expected` goes over the wire, so callers must use synthetic text.
+pub fn clipboard_matches(
+    host: &str,
+    ssh_user: Option<&str>,
+    expected: &str,
+) -> Result<ClipboardVerdict, String> {
+    let ports = ssh::allocate_ports().map_err(|e| format!("port alloc: {e}"))?;
+    let spec = TunnelSpec {
+        host: host.to_owned(),
+        ssh_user: ssh_user.map(str::to_owned),
+        local: ports,
+    };
+    let mut tunnel = Tunnel::spawn(&spec).map_err(|e| format!("spawn ssh: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    ssh::await_forward_ready(ports.control_addr(), deadline, &mut || tunnel.poll_exit())
+        .map_err(|e| format!("control forward: {e:?}"))?;
+
+    let request = serde_json::json!({
+        "cmd": "clipboard-matches",
+        "expected": expected,
+    })
+    .to_string();
+    let reply = rhydra::control::send_request(
+        ("127.0.0.1", ports.control),
+        &request,
+        Duration::from_secs(5),
+    )
+    .map_err(|e| format!("control: {e:?}"))?;
+    tunnel.kill();
+
+    let report: rhydra::control::ClipboardMatchReport =
+        serde_json::from_str(&reply).map_err(|e| format!("unexpected reply: {e}"))?;
+    Ok(ClipboardVerdict {
+        matches: report.matches,
+        actual_bytes: report.actual_bytes,
+        expected_bytes: report.expected_bytes,
+    })
+}
+
+/// What [`clipboard_matches`] found. Carries no clipboard content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardVerdict {
+    pub matches: bool,
+    /// `None` when the host's clipboard holds something that is not text —
+    /// which is a different answer from holding text that differs.
+    pub actual_bytes: Option<usize>,
+    pub expected_bytes: usize,
+}
+
+impl std::fmt::Display for ClipboardVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.matches {
+            return write!(f, "match ({} bytes)", self.expected_bytes);
+        }
+        match self.actual_bytes {
+            Some(actual) => write!(
+                f,
+                "MISMATCH (host holds {actual} bytes, expected {})",
+                self.expected_bytes
+            ),
+            None => write!(
+                f,
+                "MISMATCH (the host clipboard holds no text; expected {} bytes)",
+                self.expected_bytes
+            ),
+        }
     }
 }

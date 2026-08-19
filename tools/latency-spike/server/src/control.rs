@@ -23,7 +23,10 @@ pub const CONTROL_PORT: u16 = 9502;
 ///    deliberately declines to version-check the control port, which is why a
 ///    schema-2 *client* reading a schema-3 agent is also safe (serde ignores the
 ///    fields it does not know).
-pub const SCHEMA: u32 = 3;
+/// 4: `ClipboardMatches`, the interactive-session clipboard comparison. Purely
+///    additive — a schema-3 client never sends it, and a schema-3 agent answers
+///    an unrecognised command with an error rather than misbehaving.
+pub const SCHEMA: u32 = 4;
 
 /// A parsed control request: `{"cmd":"status"}` and friends.
 ///
@@ -55,6 +58,29 @@ pub enum Request {
     CycleDevice {
         #[serde(default)]
         confirm: String,
+    },
+    /// Does the **interactive session's** clipboard hold exactly this text?
+    ///
+    /// Exists because the acceptance criteria cannot be checked any other way:
+    /// an ssh session on Windows runs in a different session and window
+    /// station, so `Get-Clipboard` over ssh reads a clipboard nobody is using.
+    /// The agent is in the console session, so it can see the real one.
+    ///
+    /// **It compares rather than reads, and that is the whole design.** The
+    /// obvious verb — "tell me what is on the clipboard" — would put arbitrary
+    /// clipboard content on a control port that any process on the host can
+    /// reach and that the probe forwards on every Auto connect. A caller
+    /// checking an assertion already knows the text it expects, so sending the
+    /// expectation *in* and getting a boolean *out* answers the same question
+    /// and discloses nothing. The reply carries a byte count so a mismatch is
+    /// still diagnosable.
+    ///
+    /// Callers must send synthetic text. Nothing here stops a caller sending a
+    /// real secret as `expected`, and nothing can — but the acceptance criteria
+    /// that use it generate nonces by construction.
+    ClipboardMatches {
+        #[serde(default)]
+        expected: String,
     },
 }
 
@@ -379,6 +405,61 @@ pub fn error_line(message: &str) -> String {
     .expect("an error always serialises")
 }
 
+/// The answer to [`Request::ClipboardMatches`].
+///
+/// Carries no clipboard content, by construction: a boolean and two lengths are
+/// enough to assert equality and to say how a mismatch differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardMatchReport {
+    pub ok: bool,
+    pub schema: u32,
+    /// Whether the interactive session's clipboard is byte-identical to the
+    /// text sent, after both are put in canonical LF form — the host stores
+    /// CRLF, so a raw comparison would fail on every multi-line payload.
+    pub matches: bool,
+    /// Length of what the clipboard holds, in canonical form. `None` when the
+    /// clipboard holds something that is not text, which is a different answer
+    /// from holding text that differs.
+    pub actual_bytes: Option<usize>,
+    /// Length of what the caller expected, for the same reason.
+    pub expected_bytes: usize,
+}
+
+/// Decide whether a clipboard reading matches an expectation.
+///
+/// Both sides are put in canonical LF form first, and that is the whole point:
+/// the host stores CRLF, so a raw byte comparison would report a mismatch on
+/// every multi-line payload for a reason that has nothing to do with whether
+/// the two clipboards agree.
+///
+/// Lives here rather than in the agent binary so it can be tested at all — the
+/// binary is Windows-only and never compiles on the machine this is written on.
+pub fn clipboard_verdict(actual: Option<&str>, expected: &str) -> (bool, Option<usize>, usize) {
+    let expected_wire = crate::aux_proto::to_wire_newlines(expected);
+    let actual_wire = actual.map(crate::aux_proto::to_wire_newlines);
+    (
+        actual_wire.as_deref() == Some(expected_wire.as_str()),
+        actual_wire.as_ref().map(|a| a.len()),
+        expected_wire.len(),
+    )
+}
+
+/// Serialise a clipboard comparison as one line.
+pub fn clipboard_match_line(
+    matches: bool,
+    actual_bytes: Option<usize>,
+    expected_bytes: usize,
+) -> String {
+    serde_json::to_string(&ClipboardMatchReport {
+        ok: true,
+        schema: SCHEMA,
+        matches,
+        actual_bytes,
+        expected_bytes,
+    })
+    .expect("a clipboard report always serialises")
+}
+
 /// Why a status query failed: the port not answering is a different fact (no
 /// agent) from an answer that could not be understood (wrong peer, wire skew).
 #[derive(Debug, PartialEq, Eq)]
@@ -450,7 +531,7 @@ pub fn send_request(
     addr: (&str, u16),
     line: &str,
     timeout: std::time::Duration,
-) -> Result<(), QueryError> {
+) -> Result<String, QueryError> {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpStream, ToSocketAddrs};
 
@@ -485,7 +566,10 @@ pub fn send_request(
         let why = value["error"].as_str().unwrap_or(reply.trim()).to_owned();
         return Err(QueryError::Bad(why));
     }
-    Ok(())
+    // The whole line, for callers whose reply carries more than the ack — the
+    // clipboard comparison, and whatever comes next. Callers that only wanted
+    // "did it work?" write `send_request(..)?;` and drop it.
+    Ok(reply)
 }
 
 /// The outcome of waiting for stable green.
@@ -801,6 +885,56 @@ mod tests {
         assert_eq!(sorted, Rung::ALL, "ALL must already be in ladder order");
         assert_eq!(Rung::ALL[0], Rung::Creator);
         assert_eq!(Rung::ALL[Rung::ALL.len() - 1], Rung::Liveness);
+    }
+
+    #[test]
+    fn clipboard_matches_parses_and_carries_its_expectation() {
+        assert_eq!(
+            parse_request(r#"{"cmd":"clipboard-matches","expected":"hello"}"#),
+            Ok(Request::ClipboardMatches {
+                expected: "hello".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_crlf_host_clipboard_matches_an_lf_expectation() {
+        // THE reason the comparison canonicalises. The host stores CRLF, so a
+        // raw comparison would report a mismatch on every multi-line payload
+        // and the acceptance criteria would fail for a reason unrelated to
+        // whether the two clipboards actually agree.
+        let (matches, actual, expected) = clipboard_verdict(Some("a\r\nb"), "a\nb");
+        assert!(matches);
+        assert_eq!((actual, expected), (Some(3), 3));
+    }
+
+    #[test]
+    fn text_that_genuinely_differs_does_not_match_and_says_how_long_it_was() {
+        let (matches, actual, expected) = clipboard_verdict(Some("something else"), "expected");
+        assert!(!matches);
+        assert_eq!((actual, expected), (Some(14), 8));
+    }
+
+    #[test]
+    fn a_clipboard_holding_no_text_is_distinguishable_from_one_holding_the_wrong_text() {
+        // Two different answers with two different remedies: "the copy did not
+        // happen" versus "an image is on the clipboard". A bare false would
+        // conflate them.
+        let (matches, actual, expected) = clipboard_verdict(None, "expected");
+        assert!(!matches);
+        assert_eq!(actual, None);
+        assert_eq!(expected, 8);
+    }
+
+    #[test]
+    fn the_reply_carries_lengths_and_never_the_content() {
+        let line = clipboard_match_line(false, Some(14), 8);
+        assert!(line.contains("\"matches\":false"));
+        assert!(line.contains("\"actual_bytes\":14"));
+        assert!(
+            !line.contains("something"),
+            "a reply must never carry content: {line}"
+        );
     }
 
     #[test]

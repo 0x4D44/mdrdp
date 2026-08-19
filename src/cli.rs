@@ -121,6 +121,10 @@ const OPTIONS: &[(&str, &str)] = &[
     ),
     ("--rdp", "skip the rhydra probe and connect over RDP"),
     (
+        "--clipboard-check <text>",
+        "ask the native host whether its interactive session's clipboard holds\nexactly this text — read-only, and only a verdict comes back",
+    ),
+    (
         "--doctor",
         "report the native host's health ladder and exit — read-only,\nopens no session and takes no viewer slot",
     ),
