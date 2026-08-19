@@ -948,24 +948,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         (Some(handler), gfx_stats, slot_stats)
     };
 
+    // The direction gate is shared by both transports: the same Settings choice
+    // decides what CLIPRDR may carry and what the native auxiliary channel may
+    // carry, so the two cannot disagree about what the user asked for.
+    let clipboard_to_remote = matches!(
+        settings.clipboard.direction,
+        mdrdp::settings::ClipboardDirection::Both | mdrdp::settings::ClipboardDirection::ToRemote
+    );
+    let clipboard_from_remote = matches!(
+        settings.clipboard.direction,
+        mdrdp::settings::ClipboardDirection::Both | mdrdp::settings::ClipboardDirection::FromRemote
+    );
+
     // The backend goes into the connection (CLIPRDR is static, so it must be registered
     // before the channel join); the bridge stays here and is driven by the session loop.
-    // Native has no clipboard yet (tranche 5), so it opens no OS clipboard at all.
+    // The native transport carries its clipboard on the auxiliary channel instead, and
+    // opens its own OS handle inside the session (tranche 5).
     let clipboard_enabled =
         !is_native && settings.clipboard.direction != mdrdp::settings::ClipboardDirection::Off;
     let clipboard = (!is_native).then(|| {
         let (backend, bridge) = clipboard_channel(Box::new(ArboardClipboard::new()));
         let bridge = bridge.with_policy(mdrdp::clipboard::ClipboardPolicy {
-            to_remote: matches!(
-                settings.clipboard.direction,
-                mdrdp::settings::ClipboardDirection::Both
-                    | mdrdp::settings::ClipboardDirection::ToRemote
-            ),
-            from_remote: matches!(
-                settings.clipboard.direction,
-                mdrdp::settings::ClipboardDirection::Both
-                    | mdrdp::settings::ClipboardDirection::FromRemote
-            ),
+            to_remote: clipboard_to_remote,
+            from_remote: clipboard_from_remote,
             max_image_bytes: settings.clipboard.max_image_bytes,
             paste_timeout_ms: settings.clipboard.timeout_secs.saturating_mul(1000),
         });
@@ -1600,6 +1605,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 waker,
                 session_stats.clone(),
                 session_wake_rx,
+                mdrdp::native::clipboard::Policy {
+                    to_remote: clipboard_to_remote,
+                    from_remote: clipboard_from_remote,
+                    // Text only this tranche, so the image ceiling does not
+                    // apply; the wire ceiling is the binding one and the Policy
+                    // default already carries it.
+                    ..Default::default()
+                },
             )
             .map_err(|e| format!("native session: {e}"))?,
         ),

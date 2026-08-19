@@ -31,6 +31,7 @@ use rhydra::framing::{self, Reassembler};
 use rhydra::input_proto::{MouseButton as WireButton, Record, WheelAxis, encode_record};
 use rhydra::rects::{self, RectUpdate};
 
+use crate::clipboard::{ArboardClipboard, ClipboardContent, OsClipboard};
 use crate::input::{InputEvent, MouseButton, ScrollAxis};
 use crate::session::{SessionCommand, SessionEnd};
 use crate::stats::StatsHandle;
@@ -38,6 +39,8 @@ use crate::surface::{Rect, SurfaceStore};
 use crate::wake::{self, DoorbellReceiver};
 use crate::window::Waker;
 
+use super::auxchan::{self, Slot};
+use super::clipboard::{self as clip, Bridge, Policy};
 use super::probe::ProbedTransport;
 use super::ssh::Tunnel;
 
@@ -46,6 +49,38 @@ pub const OUTPUT_SURFACE: u16 = 0;
 
 /// The codec label the title bar and HUD show for native frames.
 const CODEC_LABEL: &str = "AVC (rhydra)";
+
+/// How often the local clipboard is read. Matches the RDP bridge's cadence:
+/// macOS has no change notification worth using, so this is a poll.
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Everything one session's auxiliary channel owns, so [`NativeHandle`] carries
+/// one optional field rather than five.
+///
+/// Absent whenever the host does not advertise the channel or its connect
+/// failed — a session without a clipboard is a working session, and every path
+/// here is written so that losing the clipboard cannot end one.
+struct AuxChannel {
+    socket: TcpStream,
+    slot: Arc<Slot>,
+    joins: Vec<JoinHandle<()>>,
+}
+
+impl AuxChannel {
+    /// Close the slot, drop the socket, and join the threads.
+    ///
+    /// Order matters: closing the slot is what lets the writer return from its
+    /// park, and shutting the socket is what unblocks the reader out of
+    /// `read`. Joining before either would hang the session's teardown on a
+    /// thread that is still waiting to be told to stop.
+    fn shutdown(self) {
+        self.slot.close();
+        let _ = self.socket.shutdown(Shutdown::Both);
+        for join in self.joins {
+            let _ = join.join();
+        }
+    }
+}
 
 /// A running native session. `shutdown` is the only way out, mirroring
 /// `session::SessionHandle`; dropping the handle without it leaks nothing —
@@ -56,6 +91,7 @@ pub struct NativeHandle {
     input: TcpStream,
     video_join: JoinHandle<SessionEnd>,
     input_join: JoinHandle<Option<String>>,
+    aux: Option<AuxChannel>,
     tunnel: Tunnel,
 }
 
@@ -65,6 +101,12 @@ impl NativeHandle {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.video.shutdown(Shutdown::Both);
         let _ = self.input.shutdown(Shutdown::Both);
+        // The clipboard goes first and its result is discarded: it is the one
+        // part of a session whose failure must never change how the session is
+        // reported to have ended.
+        if let Some(aux) = self.aux.take() {
+            aux.shutdown();
+        }
         let input_end = self.input_join.join().unwrap_or(None);
         let end = self.video_join.join().unwrap_or(SessionEnd::WindowClosed);
         self.tunnel.kill();
@@ -91,6 +133,7 @@ pub fn spawn(
     waker: Waker,
     stats: StatsHandle,
     wake_rx: DoorbellReceiver,
+    clipboard_policy: Policy,
 ) -> std::io::Result<NativeHandle> {
     let ProbedTransport { conn, tunnel, .. } = transport;
     let stop = Arc::new(AtomicBool::new(false));
@@ -107,6 +150,24 @@ pub fn spawn(
             (true, false) => "advertised, but its channel did not connect",
         }
     );
+
+    // Only when the host advertised it AND the socket connected. Failure here is
+    // reported and dropped: it may not stop a session starting.
+    let aux = match conn.aux {
+        Some(socket) => match spawn_aux(
+            socket,
+            Box::new(ArboardClipboard::new()),
+            clipboard_policy,
+            Arc::clone(&stop),
+        ) {
+            Ok(channel) => Some(channel),
+            Err(e) => {
+                eprintln!("native: clipboard threads did not start ({e}); continuing without");
+                None
+            }
+        },
+        None => None,
+    };
 
     // The store's surface 0 is created at the wire size before any thread runs,
     // so the window can size itself and the first AU adopts cleanly.
@@ -166,8 +227,126 @@ pub fn spawn(
         input,
         video_join,
         input_join,
+        aux,
         tunnel,
     })
+}
+
+/// Start the auxiliary channel's three threads: read, write, and poll.
+///
+/// Three rather than two because the poll must keep running while the writer is
+/// blocked on a slow socket. Folding the poll into the writer's idle lap would
+/// stall it behind a write, and the suppression slot would then be stale by the
+/// time the next arrival is judged against it.
+/// The clipboard is injected rather than constructed here, so the teardown test
+/// can run without touching the developer's own pasteboard.
+fn spawn_aux(
+    socket: TcpStream,
+    clipboard: Box<dyn OsClipboard>,
+    policy: Policy,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<AuxChannel> {
+    // Nagle would add up to 40 ms to a small, bursty clipboard message.
+    socket.set_nodelay(true)?;
+
+    let os = Arc::new(Mutex::new(clipboard));
+    let bridge = Arc::new(Mutex::new(Bridge::new(policy)));
+
+    // Seed from whatever the pasteboard already holds. Without this the first
+    // poll reads as a change and one end clobbers the other's clipboard with no
+    // user action — and which end wins is a race.
+    {
+        let mut guard = lock(&bridge);
+        let seed = match lock(&os).get_content() {
+            Ok(ClipboardContent::Text(text)) => Some(text),
+            // An image or an unreadable pasteboard both mean "no text we could
+            // have sent", which is exactly what an empty seed says.
+            _ => None,
+        };
+        guard.seed(seed.as_deref());
+    }
+
+    let slot = Slot::new();
+    let mut joins = Vec::new();
+
+    let rx_socket = socket.try_clone()?;
+    let rx_bridge = Arc::clone(&bridge);
+    let rx_os = Arc::clone(&os);
+    joins.push(
+        std::thread::Builder::new()
+            .name("native-aux-rx".to_owned())
+            .spawn(move || {
+                let mut stats = auxchan::ReaderStats::default();
+                let end = auxchan::pump_reader(
+                    rx_socket,
+                    &mut || lock(&rx_bridge).accepts_incoming(),
+                    &mut |text| {
+                        // Both locks are taken here and nowhere else together,
+                        // and never while the reader holds either — so the
+                        // ordering cannot deadlock against the poll thread.
+                        let mut bridge = lock(&rx_bridge);
+                        let mut os = lock(&rx_os);
+                        clip::apply_remote(&mut **os, &mut bridge, text, &mut report);
+                    },
+                    &mut stats,
+                );
+                if let auxchan::ReaderEnd::Io(reason) = end {
+                    report(&format!("clipboard channel closed: {reason}"));
+                }
+            })?,
+    );
+
+    let tx_socket = socket.try_clone()?;
+    let tx_slot = Arc::clone(&slot);
+    joins.push(
+        std::thread::Builder::new()
+            .name("native-aux-tx".to_owned())
+            .spawn(move || {
+                if let auxchan::WriterEnd::Io(reason) =
+                    auxchan::pump_writer(tx_socket, &tx_slot, &mut report)
+                {
+                    report(&format!("clipboard channel write failed: {reason}"));
+                }
+            })?,
+    );
+
+    let poll_slot = Arc::clone(&slot);
+    let poll_bridge = Arc::clone(&bridge);
+    let poll_os = Arc::clone(&os);
+    joins.push(
+        std::thread::Builder::new()
+            .name("native-clipboard-poll".to_owned())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    {
+                        let mut bridge = lock(&poll_bridge);
+                        let mut os = lock(&poll_os);
+                        if let Some(text) = clip::poll_local(&mut **os, &mut bridge, &mut report) {
+                            poll_slot.put(text);
+                        }
+                    }
+                    std::thread::sleep(CLIPBOARD_POLL_INTERVAL);
+                }
+            })?,
+    );
+
+    Ok(AuxChannel {
+        socket,
+        slot,
+        joins,
+    })
+}
+
+/// A poisoned clipboard mutex is not worth ending a session over: the state it
+/// guards is a fingerprint and a handle, and the next lap rebuilds both.
+fn lock<T: ?Sized>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Where the clipboard threads say things. Never carries content — every caller
+/// is a message that names sizes and reasons only.
+fn report(message: &str) {
+    eprintln!("native: {message}");
 }
 
 /// Read and dispatch framed messages until the socket closes, the wire is
@@ -566,6 +745,66 @@ impl NativeSink {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, TcpListener};
+
+    /// A pasteboard that holds nothing and never changes, so the poll thread
+    /// runs its real loop without touching the developer's own clipboard.
+    struct InertClipboard;
+
+    impl OsClipboard for InertClipboard {
+        fn get_content(&mut self) -> Result<ClipboardContent, String> {
+            Ok(ClipboardContent::Text(String::new()))
+        }
+        fn set_content(&mut self, _: ClipboardContent) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tearing_down_the_auxiliary_channel_stops_all_three_threads() {
+        // The one way this unit can hurt a user: a clipboard thread that will
+        // not stop holds the whole session's teardown open. All three park
+        // somewhere different — the reader in `read`, the writer on a condvar,
+        // the poller in `sleep` — so each needs its own thing to happen, in
+        // order: close the slot, drop the socket, then join.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+        let socket = TcpStream::connect(addr).unwrap();
+        let held_open = peer.join().unwrap().unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let aux = spawn_aux(
+            socket,
+            Box::new(InertClipboard),
+            Policy::default(),
+            Arc::clone(&stop),
+        )
+        .expect("threads should start");
+
+        // Run the teardown on its own thread so a hang FAILS this test rather
+        // than stalling it forever. A bare `aux.shutdown()` here would give a
+        // wrong implementation nothing worse than an infinite wait, which no
+        // assertion can catch.
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+        stop.store(true, Ordering::Relaxed);
+        std::thread::spawn(move || {
+            aux.shutdown();
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !finished.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the auxiliary channel did not tear down: a clipboard thread is still parked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(held_open);
+    }
+
     use super::*;
     use ironrdp_egfx::decode::{DecodedFrame, DecoderResult, H264Decoder};
     use rhydra::input_proto::decode_record;
