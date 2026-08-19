@@ -6,6 +6,26 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A health gate must treat "I could not tell" as neither health nor failure (`control::stuck_from_rungs`).
+  Deriving a connect gate from "first rung that is not Ok" makes a transiently unreadable section
+  refuse a session that would have worked; deriving it from "first rung that is Fail" lets a partial
+  report manufacture health. rhydra needs both answers, so it has two functions:
+  `stuck_from_rungs` (Fail only — may a client connect?) and `first_unsatisfied_rung` (counts
+  Unknown and absent — what should a human look at?). Conflating them costs real sessions either
+  way round.
+
+- The IDD section's `frame_seq` is a driver-written present counter readable by ANY process, with no viewer (`idd_section.rs:184`).
+  This refuted a whole design: the wedge detector does not need to live in the client, because the
+  agent can open `Global\mdrdp-idd` read-only every tick and see whether pixels are moving. Agent-side
+  detection then survives client death, works between sessions, and lets `--doctor` answer instead of
+  reporting "untested". Generation 0 is the driver's explicit "no pool" (`SharedPool.cpp` AdvertiseNoPool).
+
+- Restarting rhydra's capture server against pool generation 0 turns a silent wedge into a 30 s crash loop.
+  A *running* server at generation 0 loops on timeout forever; a *fresh* one refuses it
+  (`idd_source.rs` wait_for_pool) and dies into doubling backoff. The remedy for "no pool" is
+  restarting the CREATOR, which owns the device's lifetime and makes the driver republish. Cause-specific
+  remediation matters here because the wrong remedy is worse than none.
+
 - `with_resizable(false)` blocks only the USER: `request_inner_size` still resizes, so a fixed dialog can follow its content (`egui_host::resize_to`).
   Verified live on macOS 2026-08-19 — the Session-lost dialog opens at its measured
   closed height and grows when the Technical details disclosure opens. Two things make
