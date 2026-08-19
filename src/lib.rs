@@ -14,6 +14,7 @@ pub mod detach;
 pub mod diag;
 pub mod disconnect;
 pub mod display;
+pub mod dock;
 pub mod egfx;
 pub mod favourites;
 pub mod gfx;

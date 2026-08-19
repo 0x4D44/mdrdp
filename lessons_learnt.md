@@ -6,6 +6,23 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A new mdrdp dependency also needs `tools/latency-spike/viewer/Cargo.lock` refreshed, or `deltic integrate` fails.
+  The viewer is its own workspace that depends on the root library by path, so a dep added to
+  mdrdp changes the viewer's graph too. Deltic's bump step runs `cargo metadata --locked` over
+  every sub-manifest and refuses to update a lock, so the integration dies after the rebase with
+  "cannot update the lock file … because --locked was passed". Refresh it in the same commit:
+  `cargo metadata --manifest-path tools/latency-spike/viewer/Cargo.toml --offline --format-version 1`.
+
+- eframe sets the macOS Dock icon for you; a raw-winit window gets the generic "exec" tile (`dock::set_label`).
+  macOS gives an unbundled executable a placeholder tile unless something calls
+  `-[NSApplication setApplicationIconImage:]`. eframe makes that call from
+  `ViewportBuilder::with_icon`, so the launcher always looked right — the session window is
+  raw winit and never did. The fix composes the tile in portable Rust (icon + a hostname pill
+  rasterised with ab_glyph) and hands AppKit one RGBA buffer, so the layout and the pixels are
+  unit-testable. Build the rep from raw RGBA, never from PNG: some macOS builds load an
+  arbitrary libpng for `NSImage`-from-PNG and SIGBUS (egui#7155). `NSBitmapImageRep` does not
+  copy the planes, and the Dock re-renders whenever it likes, so the buffer must outlive the call.
+
 - Resetting the H.264 decoder on ResetGraphics fails every P-frame until the next IDR (`client::handle_reset_graphics`).
   `H264Decoder::reset` drops the VideoToolbox session, and a session rebuilt mid-GOP holds no
   reference frames — while the server, which never asked for this, keeps sending P-frames. The

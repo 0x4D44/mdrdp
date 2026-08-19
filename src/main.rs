@@ -1241,6 +1241,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Window on the main thread, before the session thread that needs its waker.
     let mut window_config = WindowConfig::new(title_base, desktop.width, desktop.height)
+        .with_dock_label(display_name.clone())
         .with_fullscreen(fullscreen)
         .with_overlay_on_start(settings.diagnostics.overlay_on_connect)
         .with_dynamic_resolution(settings.graphics.dynamic_resolution)

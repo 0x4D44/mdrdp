@@ -76,6 +76,9 @@ pub struct WindowConfig {
     /// `--size` was given — a stated resolution is pinned, and dragging the window then
     /// only changes how much letterbox surrounds it. Requires `dynamic_resolution`.
     pub follow_window_resize: bool,
+    /// The name this session shows on its macOS Dock tile — the favourite's name, or
+    /// the host as typed. `None` leaves the platform default (see [`crate::dock`]).
+    pub dock_label: Option<String>,
 }
 
 impl WindowConfig {
@@ -90,7 +93,14 @@ impl WindowConfig {
             dynamic_resolution: true,
             integer_fullscreen_fit: true,
             follow_window_resize: true,
+            dock_label: None,
         }
+    }
+
+    /// Name this session on the Dock tile. Cosmetic, and macOS-only in effect.
+    pub fn with_dock_label(mut self, label: impl Into<String>) -> Self {
+        self.dock_label = Some(label.into());
+        self
     }
 
     /// Show the stats overlay from the first frame.
@@ -1816,6 +1826,12 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         // One line of provenance for every measurement taken against this session:
         // a CPU or latency figure without the present backend named is ambiguous.
         eprintln!("present: {} backend", presenter.backend());
+
+        // After the window, so AppKit is up and this is its main thread: an unbundled
+        // session process otherwise sits in the Dock as a generic "exec" block.
+        if let Some(label) = &self.config.dock_label {
+            crate::dock::set_label(label);
+        }
 
         window.request_redraw();
         self.window = Some(window.clone());

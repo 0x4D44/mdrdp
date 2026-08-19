@@ -254,7 +254,14 @@ fn window_shell(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) -> bool {
 
 /// Decode the embedded app icon. `None` on decode failure — cosmetic, never fatal.
 pub fn app_icon() -> Option<egui::IconData> {
-    let bytes: &[u8] = include_bytes!("../../assets/icon/macos/icon-256.png");
+    decode_icon(include_bytes!("../../assets/icon/macos/icon-256.png"))
+}
+
+/// Decode an RGBA8 PNG. `None` for any other colour type, depth, or a bad file.
+///
+/// Shared with `crate::dock`, which composes the Dock tile from a larger cut of the
+/// same art.
+pub fn decode_icon(bytes: &[u8]) -> Option<egui::IconData> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0; reader.output_buffer_size()?];
