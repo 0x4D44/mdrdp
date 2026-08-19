@@ -442,6 +442,13 @@ which visibly pumps the colour of chroma-detailed (dithered) content under Windo
 steady-state LC=1/LC=2 alternation (MDR-BUG-FLUX-00007, measured live against
 temper 2026-08-19; a `chroma_seen` per-block bitset keeps the virgin-surface
 first-paint replication intact, so the FreeRDP oracle still byte-matches there).
+The preservation divergence carries a refinement: when a block's delivered average
+jumps under a luma-only update, its preserved odd samples are one chroma catch-up
+behind, and reconstruction against them overshoots into hues that were never on
+screen (a one-frame blue flash on transitions; whole-window colour casts on large
+redraws). A `chroma_stale` bitset marks such blocks and paint uses their flat
+average until the catch-up clears the mark (MDR-BUG-FLUX-00010; replayed against
+32 captured temper payloads, 1,706 wrong-hue pixels before, 0 after).
 
 ## ironrdp-egfx: AVC444/AVC444v2 decode path (new, 2026-08-16)
 

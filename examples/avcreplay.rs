@@ -10,10 +10,19 @@
 //!
 //! Per frame it prints: the LC mode, region rect counts, the probe region's mean
 //! RGB, how many probe pixels moved by more than a visibility threshold since the
-//! previous frame, and the buffer-plane YUV at four fixed pixels covering the four
+//! previous frame, the buffer-plane YUV at four fixed pixels covering the four
 //! 2x2 phases (even/even is main-frame territory, odd columns come from the aux Y
 //! plane, odd-row/even-col from the aux U/V planes) — so instability attributes to
-//! a source.
+//! a source — and, on luma-carrying frames, `avgd`: the distribution of per-block
+//! chroma-average deltas between the incoming main frame and the buffer's stored
+//! even/even values over the update's rects (counts above 4/8/16/32, then max).
+//! That distribution separates codec noise on re-encoded static content from a
+//! genuine content change, and sized `STALE_AVG_DELTA` in the combiner.
+//!
+//! After the run it prints a transient-spike report: probe pixels whose blue
+//! channel exceeds BOTH temporal neighbours by more than 40 — the objective form
+//! of MDR-BUG-FLUX-00010's one-frame blue tint (reconstruction against
+//! one-catch-up-stale odd chroma overshoots U upward).
 
 use ironrdp::core::{Decode as _, ReadCursor};
 use ironrdp::pdu::geometry::ExclusiveRectangle;
@@ -50,6 +59,7 @@ fn main() {
     let mut main = Yuv420Frame::default();
     let mut aux = Yuv420Frame::default();
     let mut prev_rgba: Option<Vec<u8>> = None;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
 
     // Fixed probe pixels covering the four 2x2 phases, inside the probe rect.
     let px = usize::from(probe.left) / 2 * 2 + 20;
@@ -77,6 +87,7 @@ fn main() {
             _ => "  C",
         };
 
+        let mut avgd = String::new();
         match lc {
             e if e == Encoding::LUMA_AND_CHROMA => {
                 decoder
@@ -85,6 +96,7 @@ fn main() {
                 decoder
                     .decode_yuv420(stream.stream2.as_ref().unwrap().data, &mut aux)
                     .expect("chroma decode");
+                avgd = avg_delta_stats(&buffer, &main, &rects1);
                 buffer.apply_luma(&main, &rects1);
                 buffer.apply_chroma_v2(&aux, rects2.as_ref().unwrap());
             }
@@ -92,6 +104,7 @@ fn main() {
                 decoder
                     .decode_yuv420(stream.stream1.data, &mut main)
                     .expect("luma decode");
+                avgd = avg_delta_stats(&buffer, &main, &rects1);
                 buffer.apply_luma(&main, &rects1);
             }
             _ => {
@@ -132,7 +145,7 @@ fn main() {
         }
 
         println!(
-            "[{idx:03}] {mode} r1={:2} r2={:2} touched={} mean=({mr:5.1},{mg:5.1},{mb:5.1}) moved>{}: {moved:6} maxd={maxd:3} |{phase_s}",
+            "[{idx:03}] {mode} r1={:2} r2={:2} touched={} mean=({mr:5.1},{mg:5.1},{mb:5.1}) moved>{}: {moved:6} maxd={maxd:3} |{phase_s}{avgd}",
             rects1.len(),
             rects2.as_ref().map_or(0, |r| r.len()),
             if touched { "Y" } else { "n" },
@@ -148,8 +161,88 @@ fn main() {
                 usize::from(probe.bottom - probe.top),
             );
         }
-        prev_rgba = Some(rgba);
+        prev_rgba = Some(rgba.clone());
+        frames.push(rgba);
     }
+
+    // Transient-spike report. Two per-pixel signals, each requiring the anomaly to
+    // last exactly one frame (both temporal neighbours disagree):
+    // - `spike`: B exceeds both neighbours by more than 40. Catches the overshoot
+    //   but also counts the fix's deliberate one-frame flat-average softening, so
+    //   it measures "how much moved", not "how wrong".
+    // - `blueflip`: the pixel is blue-dominant (B > R + 20) while BOTH neighbours
+    //   are yellow/red-dominant (B < R). A hue that was never on screen — the
+    //   defining wrongness of MDR-BUG-FLUX-00010, and a hue no flat average of
+    //   the block's real colours can produce on yellow-on-black content.
+    println!(
+        "-- one-frame transients (spike: B > both neighbours + 40; blueflip: B>R+20 vs B<R) --"
+    );
+    let (mut total, mut total_flips) = (0usize, 0usize);
+    for t in 1..frames.len().saturating_sub(1) {
+        let (mut count, mut worst, mut flips) = (0usize, 0u8, 0usize);
+        for ((p, c), n) in frames[t - 1]
+            .chunks_exact(4)
+            .zip(frames[t].chunks_exact(4))
+            .zip(frames[t + 1].chunks_exact(4))
+        {
+            let over = c[2].saturating_sub(p[2].max(n[2]));
+            if over > 40 {
+                count += 1;
+                worst = worst.max(over);
+            }
+            if c[2] > c[0].saturating_add(20) && p[2] < p[0] && n[2] < n[0] {
+                flips += 1;
+            }
+        }
+        if count > 0 || flips > 0 {
+            println!("[{t:03}] spike pixels {count:6}  worst +{worst}  blueflips {flips:6}");
+        }
+        total += count;
+        total_flips += flips;
+    }
+    println!("totals across run: spikes {total}, blueflips {total_flips}");
+}
+
+/// Distribution of per-block chroma-average deltas (max of |dU|, |dV|) between the
+/// incoming main frame and the buffer's stored even/even values, over the given
+/// rects: " avgd n=N >4:a >8:b >16:c >32:d max=m".
+fn avg_delta_stats(
+    buffer: &Yuv444Buffer,
+    main: &Yuv420Frame,
+    rects: &[ExclusiveRectangle],
+) -> String {
+    let (_, u_pl, v_pl) = buffer.planes();
+    let w = buffer.width();
+    let uv_row = main.uv_row();
+    let (mut n, mut over, mut max) = (0usize, [0usize; 4], 0u8);
+    for r in rects {
+        let left = usize::from(r.left).min(w);
+        let top = usize::from(r.top).min(buffer.height());
+        let right = usize::from(r.right).min(w).min(main.width);
+        let bottom = usize::from(r.bottom).min(buffer.height()).min(main.height);
+        let mut dy = top.div_ceil(2) * 2;
+        while dy < bottom {
+            let mut dx = left.div_ceil(2) * 2;
+            while dx < right {
+                let s = (dy / 2) * uv_row + dx / 2;
+                let i = dy * w + dx;
+                let d = u_pl[i].abs_diff(main.u[s]).max(v_pl[i].abs_diff(main.v[s]));
+                n += 1;
+                for (bin, thresh) in over.iter_mut().zip([4u8, 8, 16, 32]) {
+                    if d > thresh {
+                        *bin += 1;
+                    }
+                }
+                max = max.max(d);
+                dx += 2;
+            }
+            dy += 2;
+        }
+    }
+    format!(
+        " avgd n={n} >4:{} >8:{} >16:{} >32:{} max={max}",
+        over[0], over[1], over[2], over[3]
+    )
 }
 
 fn parse_rect(s: &str) -> ExclusiveRectangle {
