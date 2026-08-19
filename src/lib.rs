@@ -30,6 +30,7 @@ pub mod screenshot;
 pub mod session;
 pub mod settings;
 pub mod shell;
+pub mod sshsetup;
 pub mod stagelog;
 pub mod state;
 pub mod stats;
