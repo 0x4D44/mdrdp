@@ -96,6 +96,15 @@ windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 # Embeds assets/icon/windows/mdrdp.ico into the Windows executable; a no-op elsewhere.
 winresource = "0.1"
 
+# NOT a cargo workspace, deliberately. See scripts/test-vendored.sh.
+#
+# Making the vendored crates workspace members does make `cargo test --workspace` run their
+# own suites — but it also resolves their dev-dependencies and optional features into
+# Cargo.lock, which adds 37 packages including `winscard`, `libz-sys`, `openh264`,
+# `zstd-sys` and `nasm-rs`. CLAUDE.md is explicit that the `winscard -> flate2/zlib ->
+# libz-sys` subtree is what breaks `scripts/check-windows.sh`, so that cure is worse than
+# the disease (measured 2026-08-19, MDR-BUG-FLUX-00016).
+
 [patch.crates-io]
 # See vendor/README.md — one flag, without which EGFX never opens.
 ironrdp-connector = { path = "vendor/ironrdp-connector" }

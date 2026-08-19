@@ -1733,6 +1733,23 @@ mod tests {
         };
         deliver_avc444(&mut client, Codec1Type::Avc444v2, &full);
 
+        // Read the delivered chroma BEFORE the luma-only pass, and assert against THAT
+        // rather than against a hand-computed constant.
+        //
+        // A constant is what made this test go stale and sit red on trunk
+        // (MDR-BUG-FLUX-00016). It asserted 31 — the luma frame's own replicated 4:2:0
+        // average — which was correct until MDR-BUG-FLUX-00007 established that a luma
+        // pass must PRESERVE chroma already delivered at an odd position. Overwriting it
+        // is exactly what made colours pump on the LC=1/LC=2 alternation Windows sends,
+        // so the behaviour was deliberately removed and the assertion was left behind.
+        // Capturing the value keeps this test pinned to the invariant (the luma pass does
+        // not touch it) instead of to whatever the aux packing happens to produce.
+        let chroma_before = {
+            let buffer = client.avc444_buffers.get(&1).expect("buffer");
+            let (_, u, _) = buffer.planes();
+            u[5 * 64 + 5]
+        };
+
         // LC=1 over the left half only.
         let luma_only = Avc444BitmapStream {
             encoding: Encoding::LUMA,
@@ -1753,10 +1770,17 @@ mod tests {
             10u8.wrapping_add((5 * 64 + 40) as u8),
             "luma preserved outside the rect"
         );
+        assert_ne!(
+            chroma_before, 31,
+            "the delivered chroma must differ from the luma frame's replicated average, \
+             or the assertion below cannot tell preservation from overwriting"
+        );
         assert_eq!(
             u[5 * 64 + 5],
-            31,
-            "inside the rect chroma degrades to the replicated average"
+            chroma_before,
+            "a luma-only pass must PRESERVE chroma already delivered at an odd position \
+             (MDR-BUG-FLUX-00007); overwriting it with the frame's own replicated average \
+             is what made colours pump"
         );
         assert_eq!(
             u[5 * 64 + 41],

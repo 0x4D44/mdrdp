@@ -55,13 +55,23 @@ redirection, server-side/listener mode. Say so and stop rather than quietly addi
 ```
 cargo build                 # debug
 cargo build --release       # what you benchmark; never benchmark a debug build
-cargo test                  # unit + integration
+cargo test                  # unit + integration — does NOT cover vendor/
+./scripts/test-vendored.sh  # the vendored crates' own suites
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 ```
 
 Focused first: `cargo test -p mdrdp <module>` before the whole suite. Run suites with
 stdin closed — `cargo test </dev/null` — or a test that reads stdin hangs forever.
+
+**`cargo test` does not test `vendor/`.** Those crates arrive through
+`[patch.crates-io]` as path dependencies, not workspace members, so cargo builds them as
+libraries and never compiles their `#[cfg(test)]` code. `origin/main` sat red with a
+failing `ironrdp-egfx` test while `cargo test` reported ~690 passing
+(MDR-BUG-FLUX-00016). Run `./scripts/test-vendored.sh` when you touch anything under
+`vendor/`. Two of those crates (`ironrdp-graphics`, `ironrdp-pdu`) have dev-dependencies
+and cannot be tested this way at all — the script says so rather than pretending they
+passed, and `Cargo.toml` records why making them workspace members is the wrong cure.
 
 **Keep the Windows target compiling.** This repo mandates macOS *and* Windows, and a
 Rust project drifts into macOS-only silently — nothing fails locally until someone tries

@@ -274,4 +274,27 @@ rather than a judgement to make inside a fix.
 **Do not close this bug on the ResetGraphics fix alone.** Three runs is a thin sample and
 the two paths were not otherwise matched; the correlation is suggestive, not settled.
 
+### DECIDED 2026-08-19: suppress-on-minimise-only is permanently parked
+
+Arthur's decision, recorded so it is not re-proposed. mdrdp keeps sending Suppress Output
+on **occlusion**, not only on minimise, despite that being the thing no other client does.
+
+The comparison that prompted the question: FreeRDP suppresses only on `UnmapNotify` and
+the minimized `PropertyNotify` — never on occlusion — so established clients avoid this
+whole failure class by rarely entering the suppressed state rather than by handling resume
+better. FreeRDP has the same bug on file anyway
+([#4371](https://github.com/FreeRDP/FreeRDP/issues/4371), "black screen with gfx and
+suppress output", reproduced by switching workspaces away and back). Notably FreeRDP sends
+no Refresh Rect on resume at all, so mdrdp's FLUX-00006 fix already does more than
+upstream — the repaint request was never the weak link.
+
+Rationale for keeping it: a hidden window otherwise makes the server encode and ship
+updates that cost bandwidth on the wire and GPU to decode, for a window nobody can see,
+and Space-switched-away is the common case rather than minimised. The saving is judged
+worth the exposure.
+
+**Consequence to carry:** the suppress/resume reference-continuity mechanism above stays
+live and unmitigated. Whatever eventually addresses it must work *with* occlusion-driven
+suppression, not by removing it.
+
 ## Notes

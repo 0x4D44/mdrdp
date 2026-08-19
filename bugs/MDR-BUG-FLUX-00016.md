@@ -59,6 +59,36 @@ Fix directions:
 
 ## Fix
 
-<unfixed — raised only>
+**The assertion was stale, not the behaviour.** Determined by mutation rather than by
+argument: removing the preservation branch in `avc444::apply_luma` (`if odd_position &&
+seen { continue; }`) makes the test fail with `left: 31, right: 86`. So **31 was the
+overwrite value** — the luma frame's own replicated 4:2:0 average — and 86 is the chroma
+the aux pass delivered. The old assertion was pinning exactly the behaviour
+MDR-BUG-FLUX-00007 deliberately removed when it established that a luma pass must preserve
+delivered odd chroma, because overwriting it is what made colours pump on the LC=1/LC=2
+alternation Windows sends.
+
+Rewritten to assert the invariant instead of a constant: capture the delivered chroma
+before the LC=1 pass, then assert the luma pass left it alone. That cannot go stale when
+the aux packing changes, and it fails if preservation is ever removed (verified by the
+mutation above). A companion `assert_ne!` pins the captured value away from 31, so the
+test cannot pass by the two happening to coincide.
+
+**Second half — the coverage gap — partially closed.** `scripts/test-vendored.sh` now runs
+the vendored crates' own suites, and `CLAUDE.md` documents that `cargo test` does not.
+
+Making them workspace members was tried and **rejected**: it works, but resolving their
+dev-dependencies adds 37 packages to `Cargo.lock` including `winscard`, `libz-sys`,
+`openh264`, `zstd-sys` and `nasm-rs`. `CLAUDE.md` is explicit that the
+`winscard -> flate2/zlib -> libz-sys` subtree is what breaks `scripts/check-windows.sh`.
+The reasoning is recorded in `Cargo.toml` next to `[patch.crates-io]` so the next person
+does not repeat the experiment.
+
+**Residual, deliberately left open in this record:** `ironrdp-graphics` and `ironrdp-pdu`
+have dev-dependencies, so cargo refuses to test them outside a workspace at all. Their
+tests — including the avc444 codec-math tests guarding MDR-BUG-FLUX-00007 and -00010 —
+therefore run nowhere. The script reports them as SKIPPED rather than implying they
+passed. Closing that properly needs either upstreaming the vendored patches or a
+dependency-isolation approach that does not drag `libz-sys` into the Windows check.
 
 ## Notes
