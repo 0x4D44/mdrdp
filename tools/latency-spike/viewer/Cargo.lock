@@ -3004,6 +3004,7 @@ dependencies = [
  "objc2-quartz-core 0.3.2",
  "objc2-screen-capture-kit",
  "png",
+ "rhydra",
  "rpassword",
  "rustls",
  "rustls-pki-types",
@@ -4409,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "rhydra"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
