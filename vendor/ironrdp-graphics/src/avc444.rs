@@ -9,11 +9,15 @@
 //!
 //! The packing layouts and the fixed-point RGB matrix are transcribed from FreeRDP's
 //! `prim_YUV.c` / `prim_internal.h` (master, 2026-08-16; 3.27.1 installed locally),
-//! the field-proven reference against Windows servers. One deliberate divergence:
+//! the field-proven reference against Windows servers. Two deliberate divergences:
 //! FreeRDP walks each region ROI-relative, which is only phase-correct for aligned
 //! rect origins; this module maps every destination position through **absolute frame
 //! coordinates**, which agrees with FreeRDP on the aligned rects Windows actually
-//! sends and stays correct for arbitrary ones. Every source read is bounds-checked:
+//! sends and stays correct for arbitrary ones. And FreeRDP's luma pass replicates
+//! the main frame's averaged chroma over previously delivered aux samples, which
+//! visibly pumps the colour of chroma-detailed content under Windows' steady-state
+//! LC=1/LC=2 alternation; this module's luma pass preserves delivered chroma (see
+//! [`Yuv444Buffer::apply_luma`]). Every source read is bounds-checked:
 //! a destination position whose source sample does not exist in the decoded frame is
 //! left unwritten (it keeps its previous or luma-replicated value) rather than
 //! shearing or panicking — wire data is untrusted.
@@ -76,18 +80,57 @@ pub struct Yuv444Buffer {
     v: Vec<u8>,
     width: usize,
     height: usize,
+    /// One bit per 2x2 block (row-major, `width.div_ceil(2)` per row): set once a
+    /// chroma pass has delivered true odd-position samples for the whole block.
+    ///
+    /// The luma pass consults this to decide what its main-frame chroma may touch.
+    /// Windows alternates luma-only (LC=1) and chroma-only (LC=2) updates in steady
+    /// state, and the encoder's contract is that a luma-only update leaves
+    /// previously delivered chroma detail intact — it re-sends chroma only when
+    /// chroma changed. Replicating the luma frame's 2x2 averages over the odd
+    /// positions (FreeRDP behaviour, and this module's until 2026-08-19) degrades
+    /// every chroma'd region back to 4:2:0 on each luma pass, which oscillates the
+    /// colour of chroma-detailed content (measured live against temper: dithered
+    /// tiles pumped between two tones, 33k of 48k probe pixels jumping by up to 98
+    /// RGB units at every LC transition — the deliberate FreeRDP divergence here).
+    chroma_seen: Vec<u64>,
 }
 
 impl Yuv444Buffer {
     /// A black frame (Y=0, U=V=128) of the given dimensions.
     pub fn new(width: u16, height: u16) -> Self {
         let (w, h) = (usize::from(width), usize::from(height));
+        let blocks = w.div_ceil(2) * h.div_ceil(2);
         Self {
             y: vec![0; w * h],
             u: vec![128; w * h],
             v: vec![128; w * h],
             width: w,
             height: h,
+            chroma_seen: vec![0; blocks.div_ceil(64)],
+        }
+    }
+
+    /// Whether the 2x2 block containing `(dx, dy)` has ever received true chroma.
+    fn chroma_seen_at(&self, dx: usize, dy: usize) -> bool {
+        let idx = (dy / 2) * self.width.div_ceil(2) + dx / 2;
+        self.chroma_seen[idx / 64] & (1 << (idx % 64)) != 0
+    }
+
+    /// Mark every 2x2 block *fully covered* by the clipped rect as chroma'd.
+    ///
+    /// Partially covered edge blocks stay unmarked (their uncovered positions were
+    /// not written), so the luma pass keeps replicating there — fail-safe. Windows
+    /// sends even-aligned rects, for which every block in range is fully covered.
+    fn mark_chroma_seen(&mut self, left: usize, top: usize, right: usize, bottom: usize) {
+        let blocks_per_row = self.width.div_ceil(2);
+        let (bx0, by0) = (left.div_ceil(2), top.div_ceil(2));
+        let (bx1, by1) = (right / 2, bottom / 2);
+        for by in by0..by1 {
+            for bx in bx0..bx1 {
+                let idx = by * blocks_per_row + bx;
+                self.chroma_seen[idx / 64] |= 1 << (idx % 64);
+            }
         }
     }
 
@@ -112,12 +155,14 @@ impl Yuv444Buffer {
         assert_eq!(y.len(), width * height);
         assert_eq!(u.len(), width * height);
         assert_eq!(v.len(), width * height);
+        let blocks = width.div_ceil(2) * height.div_ceil(2);
         Self {
             y,
             u,
             v,
             width,
             height,
+            chroma_seen: vec![0; blocks.div_ceil(64)],
         }
     }
 
@@ -130,14 +175,20 @@ impl Yuv444Buffer {
         (left, top, right, bottom)
     }
 
-    /// The luma pass: copy Y and replicate the main frame's 2x2-subsampled chroma
-    /// into every position of each rect.
+    /// The luma pass: copy Y, and land the main frame's 2x2-subsampled chroma (the
+    /// encoder's block averages) where it belongs.
     ///
-    /// The replicated values are the encoder's block averages; a following chroma
-    /// pass overwrites the odd positions with true samples, and the RGB conversion
-    /// reconstructs the even/even sample from the average (see [`Self::to_rgba_into`]).
-    /// A luma-only (LC=1) update therefore degrades its rects to 4:2:0 chroma until
-    /// the next chroma pass covers them — reference-client behavior.
+    /// Where a block has already received true odd-position chroma from an aux
+    /// frame, the average is written **only to the even/even position** (its
+    /// MS-RDPEGFX home, B2/B3) and the delivered samples persist — Windows sends
+    /// luma-only (LC=1) updates precisely when chroma did not change, so
+    /// overwriting the odd positions with averages (FreeRDP behaviour) makes every
+    /// LC=1/LC=2 alternation visibly pump the colour of chroma-detailed content
+    /// (see `chroma_seen`). On blocks no chroma pass has covered yet, the average
+    /// is replicated into all four positions as before, so a surface painted ahead
+    /// of its first chroma pass degrades to 4:2:0 rather than to neutral grey. The
+    /// RGB conversion reconstructs the even/even sample from the average either
+    /// way (see [`Self::to_rgba_into`]).
     pub fn apply_luma(&mut self, main: &Yuv420Frame, rects: &[ExclusiveRectangle]) {
         let uv_row = main.uv_row();
         for rect in rects {
@@ -152,6 +203,10 @@ impl Yuv444Buffer {
                 }
                 let sy = dy / 2;
                 for dx in left..src_right {
+                    let odd_position = dx % 2 != 0 || dy % 2 != 0;
+                    if odd_position && self.chroma_seen_at(dx, dy) {
+                        continue;
+                    }
                     let s = sy * uv_row + dx / 2;
                     self.u[dy * self.width + dx] = main.u[s];
                     self.v[dy * self.width + dx] = main.v[s];
@@ -173,6 +228,22 @@ impl Yuv444Buffer {
         let uv_height = aux.uv_height();
         for rect in rects {
             let (left, top, right, bottom) = self.clip(rect);
+            // Mark only rows whose aux sources exist: under SPS cropping the last
+            // 16-row block's V rows are absent (see the bounds check below), and a
+            // block marked chroma'd without its samples written would pin stale
+            // values against future luma passes. v_row is strictly increasing in k,
+            // so the first missing source bounds everything after it.
+            let mut mark_bottom = bottom;
+            let mut dy = if top % 2 == 0 { top + 1 } else { top };
+            while dy < mark_bottom {
+                let k = (dy - 1) / 2;
+                let v_row = (k / 8) * 16 + 8 + k % 8;
+                if v_row >= aux.height {
+                    mark_bottom = dy;
+                }
+                dy += 2;
+            }
+            self.mark_chroma_seen(left, top, right.min(aux.width), mark_bottom);
             for dy in top..bottom {
                 if dy % 2 == 1 {
                     let k = (dy - 1) / 2;
@@ -227,6 +298,9 @@ impl Yuv444Buffer {
         let uv_height = aux.uv_height();
         for rect in rects {
             let (left, top, right, bottom) = self.clip(rect);
+            // Rows at or past the aux height get no odd-column samples (bounds
+            // check below), so only blocks above it are truly chroma'd.
+            self.mark_chroma_seen(left, top, right.min(aux.width), bottom.min(aux.height));
             for dy in top..bottom {
                 // Odd columns, every row: from the aux Y plane's two halves.
                 if dy < aux.height {
@@ -406,6 +480,63 @@ mod tests {
             assert_eq!(buf.u[y * 4 + x], main.u[3]);
             assert_eq!(buf.v[y * 4 + x], main.v[3]);
         }
+    }
+
+    /// The regression for the LC=1/LC=2 colour pumping (measured live against
+    /// temper 2026-08-19): once an aux frame has delivered true odd-position
+    /// chroma, a later luma-only pass must update Y and the even/even average but
+    /// leave the delivered samples alone.
+    #[test]
+    fn a_luma_pass_preserves_previously_delivered_chroma_detail() {
+        let aux = tagged_420(8, 8, 0);
+        let mut buf = Yuv444Buffer::new(8, 8);
+        buf.apply_chroma_v2(&aux, &[rect(0, 0, 8, 8)]);
+        // Snapshot the delivered odd-position samples.
+        let u_before = buf.u.clone();
+        let v_before = buf.v.clone();
+
+        let main = tagged_420(8, 8, 7);
+        buf.apply_luma(&main, &[rect(0, 0, 8, 8)]);
+
+        // Y is fully refreshed.
+        assert_eq!(&buf.y, &main.y);
+        for y in 0..8 {
+            for x in 0..8 {
+                let i = y * 8 + x;
+                if x % 2 == 0 && y % 2 == 0 {
+                    // Even/even takes the NEW average (B2/B3's home).
+                    let s = (y / 2) * 4 + x / 2;
+                    assert_eq!(buf.u[i], main.u[s], "even/even U at ({x},{y})");
+                    assert_eq!(buf.v[i], main.v[s], "even/even V at ({x},{y})");
+                } else {
+                    // Every other position keeps the aux frame's sample.
+                    assert_eq!(buf.u[i], u_before[i], "delivered U clobbered at ({x},{y})");
+                    assert_eq!(buf.v[i], v_before[i], "delivered V clobbered at ({x},{y})");
+                }
+            }
+        }
+    }
+
+    /// Blocks the chroma pass never covered keep first-paint behaviour: the luma
+    /// pass replicates its averages there, so a surface painted ahead of its first
+    /// chroma pass degrades to 4:2:0, not to neutral grey.
+    #[test]
+    fn a_luma_pass_still_replicates_where_no_chroma_was_delivered() {
+        let aux = tagged_420(8, 8, 0);
+        let mut buf = Yuv444Buffer::new(8, 8);
+        // Chroma covers only the left half (blocks 0..2 of each row).
+        buf.apply_chroma_v2(&aux, &[rect(0, 0, 4, 8)]);
+        let u_before = buf.u.clone();
+
+        let main = tagged_420(8, 8, 7);
+        buf.apply_luma(&main, &[rect(0, 0, 8, 8)]);
+
+        // Left half: delivered samples preserved.
+        assert_eq!(buf.u[1 * 8 + 3], u_before[1 * 8 + 3]);
+        // Right half: never chroma'd, so the average is replicated as before.
+        let s = (1 / 2) * 4 + 5 / 2;
+        assert_eq!(buf.u[1 * 8 + 5], main.u[s]);
+        assert_eq!(buf.v[1 * 8 + 5], main.v[s]);
     }
 
     #[test]

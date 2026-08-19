@@ -434,9 +434,14 @@ RGBA conversion with the 2x2 chroma reconstruction (`4*avg - p01 - p10 - p11`,
 conditional on a >= 30 delta). Layouts and coefficients transcribed from FreeRDP's
 `prim_YUV.c` / `prim_internal.h` and verified byte-exact against the installed
 FreeRDP 3.27.1 primitives by `tools/codec-oracles/avc444diff` (720 differential runs,
-plus negative controls). One deliberate divergence: rects are combined via absolute
+plus negative controls). Two deliberate divergences: rects are combined via absolute
 frame coordinates rather than FreeRDP's ROI-relative pointer walks, which are only
-phase-correct for aligned rect origins.
+phase-correct for aligned rect origins; and the luma pass preserves previously
+delivered odd-position chroma instead of FreeRDP's replicate-the-average-everywhere,
+which visibly pumps the colour of chroma-detailed (dithered) content under Windows'
+steady-state LC=1/LC=2 alternation (MDR-BUG-FLUX-00007, measured live against
+temper 2026-08-19; a `chroma_seen` per-block bitset keeps the virgin-surface
+first-paint replication intact, so the FreeRDP oracle still byte-matches there).
 
 ## ironrdp-egfx: AVC444/AVC444v2 decode path (new, 2026-08-16)
 
