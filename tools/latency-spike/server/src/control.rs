@@ -270,6 +270,11 @@ pub struct StatusReport {
     /// and to refuse `--live` rather than time out against a held slot.
     #[serde(default)]
     pub viewer_connected: Option<bool>,
+    /// Whether a device cycle is in progress (schema 3). Everything else in the
+    /// report is deliberately torn down while this is true, so a doctor that did
+    /// not know would report a healthy host as broken.
+    #[serde(default)]
+    pub cycling: bool,
 }
 
 /// What the IDD shared section publishes, read by the agent every tick.
@@ -549,6 +554,7 @@ mod tests {
                 server_generation: Some(6),
             }),
             viewer_connected: Some(true),
+            cycling: false,
         }
     }
 
@@ -719,13 +725,14 @@ mod tests {
         // transport down against every host not yet redeployed.
         let mut value = serde_json::to_value(distinct_report()).unwrap();
         let object = value.as_object_mut().unwrap();
-        for field in ["rungs", "pool", "viewer_connected"] {
+        for field in ["rungs", "pool", "viewer_connected", "cycling"] {
             object.remove(field);
         }
         let back: StatusReport = serde_json::from_value(value).expect("schema-2 report must parse");
         assert!(back.rungs.is_empty(), "no ladder from a schema-2 agent");
         assert_eq!(back.pool, None);
         assert_eq!(back.viewer_connected, None);
+        assert!(!back.cycling, "a schema-2 agent is never mid-cycle");
         // And it must still be judgeable by the unchanged bring-up rule.
         assert_eq!(back.stuck.as_deref(), Some("display-mode"));
     }
@@ -844,6 +851,7 @@ mod tests {
                 server_generation: Some(7),
             }),
             viewer_connected: Some(false),
+            cycling: false,
         }
     }
 

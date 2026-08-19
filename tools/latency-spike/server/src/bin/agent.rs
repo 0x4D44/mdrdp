@@ -76,6 +76,7 @@ mod win {
         /// tick. Kept beside the serialised line rather than re-derived, so the
         /// guard and the status a caller read can never disagree.
         cycle_challenge: String,
+        cycle_requested: bool,
     }
 
     /// One timestamped line to the agent log and stderr. The log is the record;
@@ -129,6 +130,7 @@ mod win {
             restart_requested: false,
             shutdown_requested: false,
             cycle_challenge: first.cycle_challenge(),
+            cycle_requested: false,
         }));
 
         let listener = match TcpListener::bind(("127.0.0.1", CONTROL_PORT)) {
@@ -164,6 +166,10 @@ mod win {
                 if s.restart_requested {
                     s.restart_requested = false;
                     rec.request_server_restart();
+                }
+                if s.cycle_requested {
+                    s.cycle_requested = false;
+                    rec.request_device_cycle();
                 }
             }
 
@@ -243,11 +249,12 @@ mod win {
                              it recreates the display and drops every session on this host",
                         )
                     } else {
-                        // The cycle itself is the next unit; refuse loudly rather
-                        // than pretend, so a caller is never told a destructive
-                        // op succeeded when nothing happened.
-                        eprintln!("control: cycle-device confirmed but not implemented yet");
-                        control::error_line("cycle-device is not implemented in this build")
+                        eprintln!(
+                            "control: cycle-device confirmed — tearing the stack down and \
+                             rebuilding the device"
+                        );
+                        shared.lock().expect("not poisoned").cycle_requested = true;
+                        control::ok_line()
                     }
                 }
             };

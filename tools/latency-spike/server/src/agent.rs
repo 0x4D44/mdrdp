@@ -186,6 +186,25 @@ enum PoolRemedy {
 /// shorter than a human notices.
 const POOL_FAULT_TICKS: u32 = 3;
 
+/// A device cycle in progress (HLD tranche 4 §6 rung 7).
+///
+/// A *state*, not three loose operations. Killing the creator and then walking
+/// away would race the very supervision that is supposed to rebuild: `Supervised`
+/// respawns on its own backoff, and device removal is asynchronous — the display
+/// can linger "present" for seconds after its owner dies, which is exactly how a
+/// server ended up attached to a dying section on 2026-08-18. So bring-up is
+/// suppressed until the device has actually gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cycling {
+    /// Ticks spent waiting for the device to disappear.
+    waited: u32,
+}
+
+/// How long a cycle waits for the device to go before giving up and resuming
+/// bring-up anyway. One pass, never a loop: if the device will not leave, that is
+/// reported, not retried for ever.
+const CYCLE_DEADLINE_TICKS: u32 = 15;
+
 /// Supervision state for one child.
 #[derive(Debug, Default)]
 struct Supervised {
@@ -285,6 +304,9 @@ pub struct Reconciler {
     server_listening: Option<bool>,
     /// This tick's input-desktop reading.
     input_desktop: InputDesktopObservation,
+    /// `Some` while a device cycle is running; bring-up is suppressed until it
+    /// finishes so supervision cannot fight the rebuild.
+    cycling: Option<Cycling>,
 }
 
 impl Reconciler {
@@ -304,7 +326,24 @@ impl Reconciler {
             pool_fault_ticks: 0,
             server_listening: None,
             input_desktop: InputDesktopObservation::Unknown("not sampled yet".to_owned()),
+            cycling: None,
         }
+    }
+
+    /// Begin a device cycle: the explicit, destructive rung 7 remedy.
+    ///
+    /// Idempotent — a request while one is already running is ignored, so a
+    /// caller that retries after a read timeout cannot restart the cycle it may
+    /// already have started.
+    pub fn request_device_cycle(&mut self) {
+        if self.cycling.is_none() {
+            self.cycling = Some(Cycling { waited: 0 });
+        }
+    }
+
+    /// Whether a cycle is in progress, for the status report.
+    pub fn is_cycling(&self) -> bool {
+        self.cycling.is_some()
     }
 
     /// Ask the next tick to kill the server; supervision then respawns it.
@@ -315,6 +354,40 @@ impl Reconciler {
     /// One reconcile pass: creator → device → mode → server.
     pub fn tick(&mut self, ops: &mut dyn AgentOps) {
         self.ticks += 1;
+
+        if let Some(mut cycle) = self.cycling {
+            // Everything the stack owns goes first: the server so it is not
+            // holding the outgoing section, then the creator, which owns the
+            // device's lifetime. Both are idempotent.
+            ops.kill_server();
+            ops.kill_creator();
+            self.device_present = ops.device_id().is_some();
+            self.pool = ops.pool();
+            if !self.device_present {
+                // Gone. Ordinary bring-up resumes next tick and rebuilds
+                // creator -> device -> mode -> server on the NEW instance.
+                self.cycling = None;
+                self.last_device_id = None;
+                self.server_generation = None;
+                self.pool_fault_ticks = 0;
+                return;
+            }
+            cycle.waited += 1;
+            if cycle.waited >= CYCLE_DEADLINE_TICKS {
+                // One pass, never a loop. Give up and let bring-up carry on;
+                // the rungs will report whatever is actually wrong.
+                eprintln!(
+                    "cycle: the device is still present after {}s; resuming bring-up and \
+                     reporting rather than retrying",
+                    cycle.waited * TICK_SECS
+                );
+                self.cycling = None;
+                self.pool_fault_ticks = 0;
+            } else {
+                self.cycling = Some(cycle);
+            }
+            return;
+        }
 
         let creator_state = ops.poll_creator();
         self.creator
@@ -609,6 +682,7 @@ impl Reconciler {
             rungs,
             pool: self.pool_report(),
             viewer_connected: None,
+            cycling: self.is_cycling(),
         }
     }
 }
@@ -896,6 +970,101 @@ mod tests {
         assert_eq!(
             crate::control::first_unsatisfied_rung(&status.rungs).as_deref(),
             Some("pool")
+        );
+    }
+
+    #[test]
+    fn a_cycle_tears_the_stack_down_and_waits_for_the_device_to_actually_go() {
+        // The reason this is a state and not three loose calls: supervision
+        // respawns on its own backoff, and device removal is asynchronous. If
+        // bring-up ran during the wait it would race the rebuild it is watching.
+        let (mut rec, mut ops) = settled();
+        rec.request_device_cycle();
+
+        // Device still present: keep tearing down, spawn nothing.
+        for _ in 0..3 {
+            rec.tick(&mut ops);
+        }
+        assert!(rec.is_cycling(), "still waiting for the device to go");
+        assert!(
+            !ops.calls.iter().any(|c| c.starts_with("spawn")),
+            "bring-up must be suppressed during a cycle: {:?}",
+            ops.calls
+        );
+        assert!(ops.calls.iter().any(|c| c == "kill_creator"));
+
+        // The device goes: the cycle ends and ordinary bring-up resumes.
+        ops.device_id = None;
+        rec.tick(&mut ops);
+        assert!(!rec.is_cycling(), "the cycle ends when the device has gone");
+        assert_eq!(
+            rec.server_generation, None,
+            "the old attachment is forgotten"
+        );
+
+        ops.device_id = Some(r"\\.\DISPLAY2".into());
+        ops.calls.clear();
+        // Several ticks, not one: the first reaps the creator's death and pays
+        // its backoff, and the new device identity legitimately triggers a
+        // server restart. What matters is that bring-up resumes at all.
+        for _ in 0..4 {
+            rec.tick(&mut ops);
+        }
+        assert!(
+            ops.calls
+                .iter()
+                .any(|c| c == "spawn_creator" || c == "spawn_server"),
+            "bring-up must resume after the cycle: {:?}",
+            ops.calls
+        );
+    }
+
+    #[test]
+    fn a_cycle_gives_up_at_its_deadline_rather_than_looping() {
+        // "One pass, never a loop" (parent HLD §3.4). A device that will not
+        // leave is reported, not retried for ever — otherwise the stack stays
+        // torn down indefinitely and the host is worse off than when it started.
+        let (mut rec, mut ops) = settled();
+        rec.request_device_cycle();
+        for _ in 0..CYCLE_DEADLINE_TICKS + 1 {
+            rec.tick(&mut ops);
+        }
+        assert!(
+            !rec.is_cycling(),
+            "the cycle must give up at its deadline, not wait for ever"
+        );
+        ops.calls.clear();
+        for _ in 0..4 {
+            rec.tick(&mut ops);
+        }
+        assert!(
+            ops.calls.iter().any(|c| c.starts_with("spawn")),
+            "bring-up must resume after giving up: {:?}",
+            ops.calls
+        );
+    }
+
+    #[test]
+    fn a_second_cycle_request_while_one_runs_does_not_extend_it() {
+        // Idempotent by design: a caller retrying after a read timeout must not
+        // restart the cycle it may already have started, leaving the stack torn
+        // down for longer each time it asks.
+        //
+        // Tested through the DEADLINE, because that is where a re-request is
+        // observable. Ending the cycle via device-gone cannot tell the two apart
+        // — proven by mutation: resetting the counter left that version green.
+        let (mut rec, mut ops) = settled();
+        rec.request_device_cycle();
+        for _ in 0..CYCLE_DEADLINE_TICKS - 1 {
+            rec.tick(&mut ops);
+        }
+        assert!(rec.is_cycling(), "not at the deadline yet");
+
+        rec.request_device_cycle(); // must be ignored, not a fresh start
+        rec.tick(&mut ops);
+        assert!(
+            !rec.is_cycling(),
+            "a repeated request restarted the clock and extended the teardown"
         );
     }
 

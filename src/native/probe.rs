@@ -317,6 +317,7 @@ mod tests {
             rungs: Vec::new(),
             pool: None,
             viewer_connected: None,
+            cycling: false,
         }
     }
 
