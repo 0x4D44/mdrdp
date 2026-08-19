@@ -49,6 +49,12 @@ pub struct SessionPresence {
     /// upgrade — the listing says which. Empty when an older session wrote the file.
     #[serde(default)]
     pub version: String,
+    /// `"rdp"` or `"native"`. Defaults to RDP so files written by older builds —
+    /// which could only be RDP sessions — read back correctly. This field is what
+    /// the Auto fallback guard consults: an RDP logon would take the console out
+    /// from under a live native session on the same host.
+    #[serde(default = "default_transport")]
+    pub transport: String,
     /// Current session resolution (tracks dynamic resize).
     pub width: u16,
     pub height: u16,
@@ -96,6 +102,28 @@ impl CodecTracker {
         self.painted.clone_from(painted);
         self.current.clone()
     }
+}
+
+/// The transport older presence files were implicitly written under.
+fn default_transport() -> String {
+    TRANSPORT_RDP.to_owned()
+}
+
+/// The two values [`SessionPresence::transport`] takes.
+pub const TRANSPORT_RDP: &str = "rdp";
+pub const TRANSPORT_NATIVE: &str = "native";
+
+/// A live native session to `host`, if any — the Auto fallback guard's question
+/// (an RDP connect would take the console and zero-frame the native session).
+///
+/// Hosts compare case-insensitively but not alias-aware: `quench` and
+/// `quench.lan.example` are different strings, so a session opened under one name is
+/// invisible to a guard asking about the other. Accepted: the guard is best-effort
+/// protection against self-inflicted kicks, and favourites make names stable.
+pub fn live_native_for(dir: &Path, host: &str, now_unix: u64) -> Option<SessionPresence> {
+    list_from(dir, now_unix)
+        .into_iter()
+        .find(|p| p.transport == TRANSPORT_NATIVE && p.host.eq_ignore_ascii_case(host))
 }
 
 /// Seconds since the Unix epoch, saturating at 0 on a clock set before 1970.
@@ -330,9 +358,20 @@ fn row_cells(p: &SessionPresence, now_unix: u64) -> Vec<Cell> {
     // rather than a blank cell that reads as "nothing to report".
     let (version, version_sgr) = unknown_if_empty(&p.version, SECONDARY);
     let (codec, codec_sgr) = unknown_if_empty(&p.codec, "");
+    // A native session has no RDP port to report; its address is the host plus the
+    // transport, and the user (the ssh identity) may legitimately be unset.
+    let address = if p.transport == TRANSPORT_NATIVE {
+        if p.user.is_empty() {
+            format!("{} (native)", p.host)
+        } else {
+            format!("{}@{} (native)", p.user, p.host)
+        }
+    } else {
+        format!("{}@{}:{}", p.user, p.host, p.port)
+    };
     vec![
         Cell::new(p.name.clone(), IDENTITY),
-        Cell::new(format!("{}@{}:{}", p.user, p.host, p.port), ADDRESS),
+        Cell::new(address, ADDRESS),
         Cell::new(p.pid.to_string(), SECONDARY),
         Cell::new(version, version_sgr),
         Cell::new(up, ""),
@@ -431,6 +470,7 @@ mod tests {
             port: 3390,
             user: "ano".to_owned(),
             version: "9.8.7".to_owned(),
+            transport: TRANSPORT_RDP.to_owned(),
             width: 2560,
             height: 1440,
             started_unix: now - 133,
@@ -454,6 +494,47 @@ mod tests {
 
         let listed = list_from(&dir, now);
         assert_eq!(listed, vec![written]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_from_before_the_transport_field_reads_back_as_rdp() {
+        // Older builds could only write RDP sessions, so the missing field must
+        // default to "rdp" — not error, and not read as native.
+        let mut old = serde_json::to_value(presence(4141, unix_now())).expect("to json");
+        old.as_object_mut()
+            .expect("presence serialises as an object")
+            .remove("transport")
+            .expect("fixture carries the field");
+        let parsed: SessionPresence =
+            serde_json::from_value(old).expect("pre-transport file parses");
+        assert_eq!(parsed.transport, TRANSPORT_RDP);
+    }
+
+    #[test]
+    fn the_fallback_guard_finds_only_a_live_native_session_on_the_same_host() {
+        let dir = tmpdir();
+        let now = unix_now();
+        // An RDP session on the target host: never a guard hit.
+        write_to(&dir, &presence(5001, now)).expect("write rdp");
+        // A native session on a different host: not this guard's business.
+        let mut elsewhere = presence(5002, now);
+        elsewhere.transport = TRANSPORT_NATIVE.to_owned();
+        elsewhere.host = "temper.lan.example".to_owned();
+        write_to(&dir, &elsewhere).expect("write other-host native");
+        assert!(live_native_for(&dir, "quench.lan.example", now).is_none());
+
+        // A native session on the target host, found case-insensitively.
+        let mut native = presence(5003, now);
+        native.transport = TRANSPORT_NATIVE.to_owned();
+        write_to(&dir, &native).expect("write native");
+        let hit = live_native_for(&dir, "QUENCH.lan.example", now).expect("guard hit");
+        assert_eq!(hit.pid, 5003);
+
+        // Once stale it is a dead session, not a reason to refuse a connect.
+        native.updated_unix = now - STALE_AFTER.as_secs() - 1;
+        write_to(&dir, &native).expect("rewrite stale");
+        assert!(live_native_for(&dir, "quench.lan.example", now).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -570,6 +651,32 @@ mod tests {
             .into_iter()
             .flat_map(str::split_whitespace)
             .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_native_session_renders_its_transport_not_a_meaningless_port() {
+        let now = unix_now();
+        let mut native = presence(4243, now);
+        native.transport = TRANSPORT_NATIVE.to_owned();
+        let text = render_table(&[native], now, false);
+        assert!(
+            text.contains("ano@quench.lan.example (native)"),
+            "native TARGET names the transport: {text}"
+        );
+        assert!(
+            !text.contains(":3390"),
+            "no RDP port on a native row: {text}"
+        );
+
+        // Without an ssh user the row is just the host — never a dangling `@`.
+        let mut anonymous = presence(4244, now);
+        anonymous.transport = TRANSPORT_NATIVE.to_owned();
+        anonymous.user = String::new();
+        let text = render_table(&[anonymous], now, false);
+        assert!(
+            text.contains(" quench.lan.example (native)") && !text.contains('@'),
+            "unset ssh user renders without an @: {text}"
         );
     }
 

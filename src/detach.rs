@@ -44,8 +44,9 @@ const LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How long the parent will wait for a session child to report a connection before
 /// declaring it "still starting" and releasing the terminal anyway. Generous on
 /// purpose: waiting costs nothing once the marker check exists, and a WAN connect can
-/// legitimately take seconds.
-const CONNECT_GRACE: Duration = Duration::from_secs(10);
+/// legitimately take seconds. Sized above a worst-case native probe (8 s deadline)
+/// plus the RDP fallback connect that can follow it under `native = auto`.
+const CONNECT_GRACE: Duration = Duration::from_secs(15);
 
 /// How long the parent watches a launcher child (which has no "connected" moment) for
 /// an early exit before releasing the terminal.

@@ -1060,6 +1060,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 user: user.clone(),
                 version: mdrdp::cli::VERSION.to_owned(),
+                transport: mdrdp::presence::TRANSPORT_RDP.to_owned(),
                 width,
                 height,
                 started_unix,
