@@ -85,6 +85,52 @@ Arthur's direction (2026-08-19): fix Suppress Output rather than remove it — w
 the server encodes and ships updates that a hidden window consumes GPU to decode for no
 purpose.
 
+## Investigation 2026-08-19 (reproduction attempts)
+
+Still not root-caused, but the field has narrowed and one earlier hypothesis is dead.
+
+**Resolution is implicated, and the failure reaches the host.** Driving suppress/resume
+cycles against kiln with a fixed build:
+
+- **1280x720 windowed, 8 cycles, 30 s hidden each**: completely clean. 3149 frames, **0
+  decode errors**, 0 surface errors, surfaces +2 -1. Every reveal restored the stream.
+- **2560x1440 windowed, 4 min hidden**: after the fourth suppress the **server terminated
+  the session** — `[Protocol independent error] The display driver in the remote session
+  was unable to complete all the tasks required for startup`. 276 frames, 0 decode errors
+  up to that point.
+
+Arthur's failing sessions run at 2560x1440. A remote display driver that has failed but
+not taken the session down produces exactly the reported symptom: session alive, input
+round-tripping, every client-side measurement healthy, nothing rendering, so nothing sent,
+and a black window.
+
+**quench does not reproduce it.** 6 cycles at 1280x720 and a short run at 2560x1440, both
+0 decode errors, no driver fault. quench is wired; kiln is the WiFi host.
+
+**A false lead, recorded so it is not re-run.** An apparent wedge at cycle 8 of the
+1280x720 run — frames frozen across a full hide/reveal — was the window being restored
+but still *covered* by other windows. macOS reports that as occluded and the client
+correctly holds the suppression; raising the window recovered the stream immediately
+(3122 -> 3147 frames). Designed behaviour, manufactured by the harness, not the defect.
+
+**Ruled out by reading, not guessing:** the visibility command cannot sit unserviced — it
+travels on a `WakingSender` that rings the session doorbell, and `IDLE_WAIT` is 250 ms
+(`session.rs`).
+
+**Unexplained, do not theorise on it yet:** in one 2560x1440 cycle 2.2 MB arrived during a
+4-minute suppression, while the next cycle's suppression held to 1.4 KB.
+
+**Observed live, not by this investigation:** a kiln session on 0.1.70 at 2560x1440 that
+this agent did not start accumulated 72 decode errors in ~2 minutes. Worth noting that
+0.1.70 carries another agent's AVC444 paint change (MDR-BUG-FLUX-00010, commit 0345af8)
+and that every 0.1.69 run above showed 0 decode errors — a correlation only, confounded by
+differing conditions, and the original 148-error session predates it on 0.1.68.
+
+**Next, both needing host access:** read kiln's Windows event log for the display driver
+fault (source, timestamp, and whether it also fired during the overnight black screens),
+and drive the same cycling from FreeRDP or the Microsoft client to establish whether we
+are provoking a Windows fault or sending something wrong at that resolution.
+
 ## Fix
 
 <unfixed — raised only>
