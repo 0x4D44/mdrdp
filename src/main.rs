@@ -187,6 +187,149 @@ fn write_session_metrics(
 /// subscriber, so all of it is invisible. Setting e.g. `MDRDP_LOG=ironrdp_egfx=trace`
 /// makes that stream observable without touching a default run.
 ///
+/// Print the end-of-session diagnostics, and write the `--screenshot` frame.
+///
+/// Called from the window's exit hook, which runs at `LoopExiting` on EVERY close. This
+/// must NOT live after `SessionWindow::run()`: on macOS a Cmd+Q — or the Quit item in
+/// the application menu — makes AppKit call `exit(0)` from inside `run()`, so nothing
+/// written after it ever executes. That is how every user-initiated close, the common
+/// case, silently discarded the decode-failure reason tally, the surface counters and
+/// the `--screenshot` file, while still logging `session ended: …` from this same hook
+/// so the log looked complete (MDR-BUG-FLUX-00009). The reason tally is the only record
+/// that ever names WHY a frame failed to decode; losing it cost the root cause of
+/// MDR-BUG-FLUX-00008.
+fn report_session_epilogue(
+    store: &Mutex<SurfaceStore>,
+    gfx_stats: &GfxStatsHandle,
+    audio_stats: &AudioStatsHandle,
+    session_stats: &StatsHandle,
+    is_native: bool,
+    screenshot: Option<&str>,
+    capture_configured: bool,
+) {
+    // First: what was actually on screen? Every other signal this client emits can look
+    // healthy while the surface holds garbage, so a frame on disk is the only evidence
+    // that the decode path produced a picture rather than a plausible set of counters.
+    if let Some(path) = screenshot {
+        let captured = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .output_surface()
+            .map(|s| (s.width, s.height, s.pixels().to_vec()));
+        match captured {
+            Some((w, h, pixels)) => {
+                match mdrdp::screenshot::write_bmp(std::path::Path::new(path), w, h, &pixels) {
+                    Ok(()) => eprintln!("  screenshot: {w}x{h} written to {path}"),
+                    Err(e) => eprintln!("  screenshot: could not write {path}: {e}"),
+                }
+            }
+            None => eprintln!("  screenshot: no surface was ever mapped to output"),
+        }
+    }
+
+    let s = gfx_stats.snapshot();
+    let cache = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cache_stats();
+
+    // The RDP epilogue reads the EGFX pipeline; a native session never fed it, so
+    // all-zero counters would be noise pretending to be a report. Its own summary
+    // comes from the shared session stats the native sink does feed.
+    if is_native {
+        let stats = session_stats.snapshot();
+        eprintln!(
+            "  native: frames {}  bytes in {}  decode errors {}",
+            stats.frames, stats.bytes_in, stats.decode_errors
+        );
+    } else {
+        eprintln!(
+            "  frames {}  decode errors {}  undecoded regions {}  surface errors {}\n  \
+             surfaces +{} -{}  reset {:?}  unhandled pdus {}\n  codecs {:?}",
+            s.frames_completed,
+            s.decode_errors,
+            s.undecoded_regions,
+            s.surface_errors,
+            s.surfaces_created,
+            s.surfaces_deleted,
+            s.reset_graphics,
+            s.unhandled_pdus,
+            s.codec_ids_seen
+        );
+        match (cache.hit_rate(), cache.byte_savings()) {
+            (Some(hit), Some(saved)) => eprintln!(
+                "  bitmap cache: {:.0}% of {} lookups hit, saving {:.0}% of painted pixels \
+                 ({} evictions)",
+                hit * 100.0,
+                cache.hits + cache.misses,
+                saved * 100.0,
+                cache.evictions
+            ),
+            _ => eprintln!("  bitmap cache: never used by this server"),
+        }
+    }
+    let audio = audio_stats.snapshot();
+    // Printed unconditionally. Reporting only when packets arrived hides the single most
+    // important case — the channel was joined and the server sent nothing — which is
+    // exactly what a wrong NO_AUDIO_PLAYBACK flag looks like, and it looks identical to
+    // "nothing was playing" if the line is suppressed.
+    // Three outcomes, never merged: no channel was ever opened, one was opened and stayed
+    // silent, or audio actually played. Only `negotiated_formats` can tell the first two
+    // apart — `current_format` alone is `None` for both, and calling that "negotiated no
+    // format" blamed a stage that had not been measured.
+    if !is_native {
+        match (audio.current_format, audio.negotiated_formats) {
+            (Some(fmt), _) => eprintln!(
+                "  audio: {} packets at {} Hz/{}ch, {} dropped to overrun, {} underruns",
+                audio.packets_received,
+                fmt.sample_rate,
+                fmt.channels,
+                audio.overruns,
+                audio.underruns
+            ),
+            (None, None) => {
+                eprintln!("  audio: no audio channel was opened by the server this session")
+            }
+            (None, Some(0)) => eprintln!(
+                "  audio: formats exchanged, but the server shared none of the formats we offer"
+            ),
+            (None, Some(n)) => {
+                eprintln!(
+                    "  audio: {n} format(s) negotiated; the server sent no audio this session"
+                )
+            }
+        }
+    }
+    if !s.decode_error_reasons.is_empty() {
+        eprintln!("  decode failures by reason:");
+        let mut reasons: Vec<_> = s.decode_error_reasons.iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(a.1));
+        for (reason, count) in reasons.iter().take(5) {
+            eprintln!("    {count:>5}  {reason}");
+        }
+    }
+    if !s.surface_error_reasons.is_empty() {
+        eprintln!("  surface failures by reason:");
+        for (reason, count) in &s.surface_error_reasons {
+            eprintln!("    {count:>5}  {reason}");
+        }
+    }
+    if s.decode_errors > 0 && !capture_configured {
+        eprintln!(
+            "  {} tiles failed to decode. Re-run with --capture-failures <dir> to keep \
+             the bytes for offline debugging.",
+            s.decode_errors
+        );
+    }
+    if s.undecoded_regions > 0 {
+        eprintln!(
+            "  {} regions arrived in a surface codec without a decoder; \
+             those parts of the desktop will be stale (see the codec list above).",
+            s.undecoded_regions
+        );
+    }
+}
+
 /// `MDRDP_LOG` rather than `RUST_LOG` on purpose: an ambient `RUST_LOG` from the
 /// caller's shell must not silently turn a session into a diagnostic one. The connect
 /// sequence is unaffected either way — it runs under its own scoped subscriber, which
@@ -1278,6 +1421,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state_key_for_exit = state_key.clone();
     let state_path_for_exit = state_path.clone();
     let fullscreen_for_exit = Arc::clone(&fullscreen_at_exit);
+    // The epilogue runs from the exit hook so a Cmd+Q cannot skip it, and the post-`run`
+    // path only covers the case where the hook somehow did not fire. This flag is what
+    // keeps it to exactly one report either way.
+    let reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reported_for_exit = Arc::clone(&reported);
+    let store_for_exit = Arc::clone(&store);
+    let screenshot_for_exit = screenshot.clone();
+    let capture_configured = capture.is_some();
     // Keep a presence file alive for `mdrdp --sessions` in other processes. The exit
     // hook both stops the writer and removes the file itself: on macOS Cmd+Q the
     // process exits without unwinding, so the writer thread may never see the flag.
@@ -1376,6 +1527,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(end);
         }
+        // Outside the handle check on purpose: the diagnostics describe the session that
+        // ran, and are worth printing even when the handle was already taken elsewhere.
+        if !reported_for_exit.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            report_session_epilogue(
+                &store_for_exit,
+                &gfx_for_exit,
+                &audio_for_exit,
+                &stats_for_exit,
+                is_native,
+                screenshot_for_exit.as_deref(),
+                capture_configured,
+            );
+        }
     });
     let waker = window.waker();
 
@@ -1468,26 +1632,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Window gone: disconnect properly rather than dropping the socket, which would
     // leave a session alive on the host.
-    // Before tearing anything down: what was actually on screen? Every other signal this
-    // client emits can look healthy while the surface holds garbage, so a frame on disk is
-    // the only evidence that the decode path produced a picture rather than a plausible
-    // set of counters.
-    if let Some(path) = &screenshot {
-        let captured = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .output_surface()
-            .map(|s| (s.width, s.height, s.pixels().to_vec()));
-        match captured {
-            Some((w, h, pixels)) => {
-                match mdrdp::screenshot::write_bmp(std::path::Path::new(path), w, h, &pixels) {
-                    Ok(()) => eprintln!("  screenshot: {w}x{h} written to {path}"),
-                    Err(e) => eprintln!("  screenshot: could not write {path}: {e}"),
-                }
-            }
-            None => eprintln!("  screenshot: no surface was ever mapped to output"),
-        }
-    }
+    //
+    // The screenshot and the diagnostics summary used to live here. They now run from
+    // the exit hook (`report_session_epilogue`), because this point is never reached on
+    // a macOS Cmd+Q — see MDR-BUG-FLUX-00009.
 
     // Usually the exit hook has already disconnected (it runs at LoopExiting for
     // every close); this direct take only matters if the hook somehow did not run.
@@ -1506,107 +1654,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     });
-    let s = gfx_stats.snapshot();
+    // Normally the hook already reported; this covers the case where it did not run.
+    if !reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        report_session_epilogue(
+            &store,
+            &gfx_stats,
+            &audio_stats,
+            &session_stats,
+            is_native,
+            screenshot.as_deref(),
+            capture.is_some(),
+        );
+    }
+    // Still needed below: the end dialog quotes the cache saving, and the cache report
+    // writes the raw counters.
     let cache = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .cache_stats();
-
-    // The RDP epilogue reads the EGFX pipeline; a native session never fed it, so
-    // all-zero counters would be noise pretending to be a report. Its own summary
-    // comes from the shared session stats the native sink does feed.
-    if is_native {
-        let stats = session_stats.snapshot();
-        eprintln!(
-            "  native: frames {}  bytes in {}  decode errors {}",
-            stats.frames, stats.bytes_in, stats.decode_errors
-        );
-    } else {
-        eprintln!(
-            "  frames {}  decode errors {}  undecoded regions {}  surface errors {}\n  \
-             surfaces +{} -{}  reset {:?}  unhandled pdus {}\n  codecs {:?}",
-            s.frames_completed,
-            s.decode_errors,
-            s.undecoded_regions,
-            s.surface_errors,
-            s.surfaces_created,
-            s.surfaces_deleted,
-            s.reset_graphics,
-            s.unhandled_pdus,
-            s.codec_ids_seen
-        );
-        match (cache.hit_rate(), cache.byte_savings()) {
-            (Some(hit), Some(saved)) => eprintln!(
-                "  bitmap cache: {:.0}% of {} lookups hit, saving {:.0}% of painted pixels \
-                 ({} evictions)",
-                hit * 100.0,
-                cache.hits + cache.misses,
-                saved * 100.0,
-                cache.evictions
-            ),
-            _ => eprintln!("  bitmap cache: never used by this server"),
-        }
-    }
-    let audio = audio_stats.snapshot();
-    // Printed unconditionally. Reporting only when packets arrived hides the single most
-    // important case — the channel was joined and the server sent nothing — which is
-    // exactly what a wrong NO_AUDIO_PLAYBACK flag looks like, and it looks identical to
-    // "nothing was playing" if the line is suppressed.
-    // Three outcomes, never merged: no channel was ever opened, one was opened and stayed
-    // silent, or audio actually played. Only `negotiated_formats` can tell the first two
-    // apart — `current_format` alone is `None` for both, and calling that "negotiated no
-    // format" blamed a stage that had not been measured.
-    if !is_native {
-        match (audio.current_format, audio.negotiated_formats) {
-            (Some(fmt), _) => eprintln!(
-                "  audio: {} packets at {} Hz/{}ch, {} dropped to overrun, {} underruns",
-                audio.packets_received,
-                fmt.sample_rate,
-                fmt.channels,
-                audio.overruns,
-                audio.underruns
-            ),
-            (None, None) => {
-                eprintln!("  audio: no audio channel was opened by the server this session")
-            }
-            (None, Some(0)) => eprintln!(
-                "  audio: formats exchanged, but the server shared none of the formats we offer"
-            ),
-            (None, Some(n)) => {
-                eprintln!(
-                    "  audio: {n} format(s) negotiated; the server sent no audio this session"
-                )
-            }
-        }
-    }
-    if !s.decode_error_reasons.is_empty() {
-        eprintln!("  decode failures by reason:");
-        let mut reasons: Vec<_> = s.decode_error_reasons.iter().collect();
-        reasons.sort_by(|a, b| b.1.cmp(a.1));
-        for (reason, count) in reasons.iter().take(5) {
-            eprintln!("    {count:>5}  {reason}");
-        }
-    }
-    if !s.surface_error_reasons.is_empty() {
-        eprintln!("  surface failures by reason:");
-        for (reason, count) in &s.surface_error_reasons {
-            eprintln!("    {count:>5}  {reason}");
-        }
-    }
-    if s.decode_errors > 0 && capture.is_none() {
-        eprintln!(
-            "  {} tiles failed to decode. Re-run with --capture-failures <dir> to keep \
-             the bytes for offline debugging.",
-            s.decode_errors
-        );
-    }
-    if s.undecoded_regions > 0 {
-        eprintln!(
-            "  {} regions arrived in a surface codec without a decoder; \
-             those parts of the desktop will be stale (see the codec list above).",
-            s.undecoded_regions
-        );
-    }
 
     // The §7 epilogue dialogs, for interactive sessions only: a scripted run has
     // nobody to click Done, and its exit code already says what happened.
