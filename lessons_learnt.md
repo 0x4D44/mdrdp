@@ -6,6 +6,12 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A headless Windows box reports healthy audio hardware while having NO active render endpoint (`tools/audio-probe`).
+  `Win32_SoundDevice` says "Realtek — Status OK" and Audiosrv is Running, but with nothing in the jack every
+  endpoint is unplugged/not-present and `GetDefaultAudioEndpoint` returns 0x80070490. WASAPI loopback capture
+  has nothing to attach to, and apps cannot render audio at all — so there is no audio to capture, not merely a
+  capture problem. Ask WASAPI, never WMI. Parked tranche 6; see the PARK doc in wrk_docs.
+
 - A test fixture that silently fails to run makes the harness report the failure it exists to detect (`tools/clipboard-soak/src/main.rs`).
   Cost time twice on tranche 5. A clipboard holder reported success while holding nothing, and later
   `clipboard-cycle`'s launch died because the previous instance still held its log file, so a shell
