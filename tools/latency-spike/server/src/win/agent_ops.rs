@@ -25,6 +25,43 @@ use crate::agent::{AgentOps, ChildState, Mode};
 /// scripts key on.
 pub const DISPLAY_DEVICE_STRING: &str = "mdrdp latency-spike display";
 
+/// Where the IDD virtual display's top-left corner sits in the virtual desktop,
+/// in physical pixels — `DEVMODEW::dmPosition` for the display whose device
+/// string is [`DISPLAY_DEVICE_STRING`]. `None` when the display is not attached.
+///
+/// The IDD shared-pool header carries no desktop coordinates, so the source
+/// cannot learn its own placement from the pool the way Desktop Duplication
+/// learns it from `DXGI_OUTPUT_DESC::DesktopCoordinates`; GDI is the only path
+/// to it. Without this the mouse injector mapped every click as though the
+/// display sat at the desktop origin, which is correct only while it happens to
+/// be the sole display: attaching a console pushed it to (1920, 0) and every
+/// click landed 1920 px to its left, on the other display (HLD tranche 3 §5.2,
+/// AC2's corner clicks).
+pub fn idd_display_origin() -> Option<(i32, i32)> {
+    let device_name = WinOps::find_display()?;
+    let mut devmode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: `device_name` is a NUL-terminated wide buffer we own, and the
+    // out-parameter is a correctly-sized `DEVMODEW` whose `dmSize` we set.
+    let ok = unsafe {
+        EnumDisplaySettingsW(
+            PCWSTR::from_raw(device_name.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut devmode,
+        )
+    }
+    .as_bool();
+    if !ok {
+        return None;
+    }
+    // SAFETY: `dmPosition` is the active member for a display device queried with
+    // ENUM_CURRENT_SETTINGS — the same union arm the rig's prep script reads.
+    let position = unsafe { devmode.Anonymous1.Anonymous2.dmPosition };
+    Some((position.x, position.y))
+}
+
 /// The images the agent owns on the box. Swept at start, killed at shutdown.
 /// Deliberately does NOT include the agent's own image (an uninstall would kill
 /// itself) or the rig's `spike-server-inc3.exe`.

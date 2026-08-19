@@ -364,6 +364,11 @@ pub struct IddSource {
     last_consumed: u64,
     /// A malformed slot record is logged once per generation, not per frame.
     warned_bad_slot: bool,
+    /// This display's top-left corner in the virtual desktop, physical pixels —
+    /// read from GDI at open, since the pool header carries no placement. Read
+    /// once, like the duplication source's: a display that moves under a live
+    /// server needs a restart for the injector to follow it.
+    origin: (i32, i32),
     /// Start of the current streak of `Pool::open` failures inside [`adopt`];
     /// `None` while healthy. See `ADOPT_RETRY_LIMIT`.
     adopt_failing_since: Option<Instant>,
@@ -402,6 +407,18 @@ impl IddSource {
         })?;
         let pool = Pool::open(&device1, &header)?;
         let private = create_private_texture(&device, header.width, header.height)?;
+        // Where this display sits in the virtual desktop, for the mouse injector.
+        // A display that GDI cannot place falls back to the desktop origin, which
+        // is what the injector assumed unconditionally before — so an unreadable
+        // placement is no worse than the old behaviour, but it is worth saying.
+        let origin = super::agent_ops::idd_display_origin().unwrap_or_else(|| {
+            eprintln!(
+                "capture: the IDD display's desktop placement is unreadable; \
+                 mouse input will be mapped as though it sat at (0, 0)"
+            );
+            (0, 0)
+        });
+        eprintln!("capture: IDD display origin ({}, {})", origin.0, origin.1);
 
         Ok(Self {
             device,
@@ -419,6 +436,7 @@ impl IddSource {
             last_consumed: 0,
             warned_bad_slot: false,
             adopt_failing_since: None,
+            origin,
         })
     }
 
@@ -721,6 +739,13 @@ impl FrameSource for IddSource {
 
     fn kind(&self) -> &'static str {
         "idd"
+    }
+
+    /// Overrides the trait's `(0, 0)` default: the IDD display is routinely not
+    /// the desktop's top-left one, and the default silently mis-aimed every
+    /// click by the display's offset (§5.2).
+    fn origin(&self) -> (i32, i32) {
+        self.origin
     }
 
     fn acquire(&mut self, timeout_ms: u32) -> Result<Acquired> {
