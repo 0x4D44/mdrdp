@@ -633,6 +633,23 @@ impl Ssh {
         }
     }
 
+    /// Whether key (BatchMode) auth works. The native connect path requires it —
+    /// a GUI session owns no tty for ssh password prompts — so deploy's verify
+    /// reports the posture. A one-shot `exit` over a bounded connect: any prompt
+    /// makes BatchMode fail immediately instead of hanging.
+    fn batchmode_ok(&self) -> bool {
+        std::process::Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=4")
+            .arg(&self.dest)
+            .arg("exit")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn copy(&self, local: &Path, remote: &str) -> Result<(), String> {
         // scp needs forward-slash-tolerant quoting of the remote path; Windows
         // OpenSSH accepts backslashes verbatim inside the remote spec.
@@ -842,6 +859,49 @@ pub fn run(args: &[String]) -> i32 {
     match verify(&ssh, &artifacts) {
         Ok(summary) => {
             eprintln!("deploy: {summary}");
+            // The native connect needs key auth (a GUI session has no tty for ssh
+            // prompts). Report the posture, never fail the deploy over it: the host
+            // itself is healthy either way, and key install is a documented manual
+            // step (Windows admin-key ACL rules make silent automation a foot-gun).
+            if ssh.batchmode_ok() {
+                eprintln!(
+                    "deploy: key auth (BatchMode) verified — `mdrdp {} --native` can connect",
+                    cfg.host
+                );
+            } else {
+                eprintln!(
+                    "deploy: warning: native connect requires key auth, and ssh {} refused \
+                     BatchMode.\n  Install a key — for an admin account that is \
+                     C:\\ProgramData\\ssh\\administrators_authorized_keys on the host.\n  \
+                     (This deploy still succeeded; only `--native`/auto-detect needs the key.)",
+                    ssh.dest
+                );
+            }
+            // Record the host so `native = auto` may probe it (the deploy is the
+            // opt-in the record carries to the connect path). Best-effort: a failed
+            // write only costs auto-detection until the next deploy.
+            match crate::native::deployed::default_path() {
+                Some(path) => {
+                    let mut record = crate::native::deployed::NativeHosts::load_from(&path);
+                    record.record(&cfg.host, &artifacts.version, crate::presence::unix_now());
+                    match record.save_to(&path) {
+                        Ok(()) => eprintln!(
+                            "deploy: recorded {} in {} — auto-detect will prefer native",
+                            cfg.host,
+                            path.display()
+                        ),
+                        Err(e) => eprintln!(
+                            "deploy: warning: could not write {}: {e} — auto-detect will \
+                             not probe this host until a deploy records it",
+                            path.display()
+                        ),
+                    }
+                }
+                None => eprintln!(
+                    "deploy: warning: no config directory, so the deploy record was not \
+                     written — auto-detect will not probe this host (--native still works)"
+                ),
+            }
             0
         }
         Err(e) => {
