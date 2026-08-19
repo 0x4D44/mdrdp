@@ -47,6 +47,7 @@
 
 use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource, RectReadback};
 use super::{qpc, wide_to_string, Result};
+use crate::agent::PoolObservation;
 use crate::idd_section::{self, LayoutError, PoolHeader, SlotRecord};
 use std::sync::atomic::{compiler_fence, Ordering};
 use std::time::{Duration, Instant};
@@ -229,6 +230,66 @@ impl Drop for Section {
             let _ = UnmapViewOfFile(self.view);
             let _ = CloseHandle(self.mapping);
         }
+    }
+}
+
+/// Read the section for health purposes and let go again (HLD tranche 4 §5).
+///
+/// This is the agent's per-tick observation, and it is deliberately a *fresh*
+/// open every time. Holding the mapping open would keep the kernel object alive
+/// across a driver rebuild — the very hazard `IddSource::reopen` documents, where
+/// `OpenFileMappingW` on a name this process still holds hands back the old world
+/// — and an agent that pinned a dead generation would be reporting on a section
+/// nobody writes to while insisting it was fine.
+///
+/// Costs one open/map/copy/unmap per tick (every 2 s) and needs no viewer, no
+/// capture server, and no D3D device.
+pub(super) fn observe_pool() -> PoolObservation {
+    let section = match Section::open() {
+        Ok(s) => s,
+        // The name not existing is a real, actionable reading: no driver
+        // instance is publishing. Any other open failure is us failing to look.
+        Err(e) => {
+            let text = e.to_string();
+            return if text.contains("cannot find the file")
+                || text.contains("does not exist")
+                || text.contains("(os error 2)")
+            {
+                PoolObservation::Absent
+            } else {
+                PoolObservation::Unreadable(format!("opening the section failed: {text}"))
+            };
+        }
+    };
+
+    let header = match section.read_header() {
+        // The writer never let go: transient by construction.
+        None => return PoolObservation::Unreadable("the section stayed mid-write".to_owned()),
+        Some(Err(e)) => {
+            return PoolObservation::Unreadable(format!("the section header did not parse: {e}"))
+        }
+        Some(Ok(h)) => h,
+    };
+    if header.generation == 0 {
+        // The driver's own `AdvertiseNoPool`. Not ignorance — a statement.
+        return PoolObservation::NoPool;
+    }
+
+    // The driver advances `frame_seq` as the compositor presents, so the newest
+    // slot of this generation is the liveness counter. A slot that will not read
+    // is skipped rather than counted as zero: a torn slot must not look like a
+    // stalled display.
+    let frame_seq = (0..idd_section::SLOT_COUNT)
+        .filter_map(|slot| match section.read_slot(slot) {
+            Some(Ok(record)) if record.generation == header.generation => Some(record.frame_seq),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+
+    PoolObservation::Present {
+        generation: header.generation,
+        frame_seq,
     }
 }
 

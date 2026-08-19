@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use super::wide_to_string;
-use crate::agent::{AgentOps, ChildState, Mode};
+use crate::agent::{AgentOps, ChildState, Mode, PoolObservation};
 
 /// The device string the IDD driver's INF declares — the same one the rig's
 /// scripts key on.
@@ -251,6 +251,20 @@ impl AgentOps for WinOps {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+
+    fn kill_creator(&mut self) {
+        // Taking the creator down takes the virtual device with it, which is what
+        // makes the driver rebuild and republish the section. Supervision
+        // respawns the creator on the next tick.
+        if let Some(mut c) = self.creator.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    fn pool(&mut self) -> PoolObservation {
+        super::idd_source::observe_pool()
     }
 
     fn kill_all(&mut self) {

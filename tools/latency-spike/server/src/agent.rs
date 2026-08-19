@@ -17,7 +17,9 @@
 //! server attached to a dead instance's section captures nothing, silently,
 //! forever (see [`AgentOps::device_id`]).
 
-use crate::control::{ChildReport, ModeReport, Rung, RungReport, RungState, StatusReport, SCHEMA};
+use crate::control::{
+    ChildReport, ModeReport, PoolReport, Rung, RungReport, RungState, StatusReport, SCHEMA,
+};
 
 /// How often the runner calls [`Reconciler::tick`]. Cooldowns below are counted in
 /// ticks, so every duration here is a multiple of this.
@@ -89,9 +91,69 @@ pub trait AgentOps {
     fn spawn_server(&mut self) -> Result<(), String>;
     /// Kill the capture server (supervision respawns it): the restart-server path.
     fn kill_server(&mut self);
+    /// Kill the creator (supervision respawns it), which takes the virtual device
+    /// down with it and so makes the driver rebuild and republish the section.
+    /// This — not a server restart — is the remedy when the driver publishes no
+    /// pool: a fresh server against generation 0 refuses it and dies into
+    /// backoff, turning a silent wedge into a crash loop (HLD tranche 4 §6).
+    fn kill_creator(&mut self);
     /// Kill every supervised child: the shutdown path.
     fn kill_all(&mut self);
+    /// What the driver's shared section currently says.
+    ///
+    /// Read directly by the agent every tick, which is the tranche's central
+    /// observation: the section name is fixed, its generation is 0 exactly when
+    /// the driver publishes no pool, and its `frame_seq` is advanced by the
+    /// driver as the compositor presents — none of it needing a viewer, or even
+    /// a capture server, to be true.
+    fn pool(&mut self) -> PoolObservation;
 }
+
+/// One tick's reading of the shared section.
+///
+/// The distinction between [`Self::Absent`]/[`Self::NoPool`] and
+/// [`Self::Unreadable`] is the whole point: the first two are the driver
+/// *telling* us there is nothing, which is actionable; the last is us failing to
+/// find out, which is not. Acting on ignorance is how a health check earns its
+/// reputation for making things worse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolObservation {
+    /// The section does not exist. No driver instance is publishing at all.
+    Absent,
+    /// The section exists and the driver has explicitly advertised no pool
+    /// (`generation == 0`, written by the driver's `AdvertiseNoPool` on
+    /// teardown).
+    NoPool,
+    /// The section could not be read this tick — a torn mid-write copy, a
+    /// zero-filled section the driver has not written yet, or a layout this
+    /// build does not speak. Transient or a contract mismatch; either way not
+    /// something to remediate blind.
+    Unreadable(String),
+    Present {
+        generation: u32,
+        frame_seq: u64,
+    },
+}
+
+/// What a pool fault calls for. Two faults, two different remedies — applying
+/// the wrong one is worse than doing nothing (HLD tranche 4 §6 rung 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolRemedy {
+    /// No pool published: rebuild the device by restarting its owner.
+    RestartCreator,
+    /// A pool exists but the server is attached to a superseded generation.
+    RestartServer,
+}
+
+/// How many consecutive ticks a pool fault must persist before the reconciler
+/// acts on it.
+///
+/// A device cycle legitimately passes through "absent" and "no pool" on its way
+/// back up, and the driver's own rebuild issues unassign/assign pairs in quick
+/// succession. Remediating inside that window would fight the rebuild it is
+/// watching. Three ticks is 6 s — longer than any rebuild race observed, far
+/// shorter than a human notices.
+const POOL_FAULT_TICKS: u32 = 3;
 
 /// Supervision state for one child.
 #[derive(Debug, Default)]
@@ -177,6 +239,17 @@ pub struct Reconciler {
     mode_ok: bool,
     restart_server_requested: bool,
     ticks: u64,
+    /// This tick's reading of the shared section.
+    pool: PoolObservation,
+    /// The generation that was published when the capture server was last
+    /// spawned. A server attached to an older generation captures a section
+    /// nothing writes to any more — silently, forever — which is the failure
+    /// no structural check caught on 2026-08-19. Recorded here rather than
+    /// asked of the server, so it needs no cooperation from it.
+    server_generation: Option<u32>,
+    /// Consecutive ticks the current pool fault has persisted. Reset by any
+    /// healthy reading, so a rebuild race never accumulates toward an action.
+    pool_fault_ticks: u32,
 }
 
 impl Reconciler {
@@ -191,6 +264,9 @@ impl Reconciler {
             mode_ok: false,
             restart_server_requested: false,
             ticks: 0,
+            pool: PoolObservation::Unreadable("not sampled yet".to_owned()),
+            server_generation: None,
+            pool_fault_ticks: 0,
         }
     }
 
@@ -238,13 +314,80 @@ impl Reconciler {
             self.mode_ok = false;
         }
 
+        // Sample the section before deciding anything about the server: whether
+        // the server needs restarting depends on what the driver publishes now.
+        self.pool = ops.pool();
+        if self.pool_remedy().is_some() {
+            self.pool_fault_ticks = self.pool_fault_ticks.saturating_add(1);
+        } else {
+            self.pool_fault_ticks = 0;
+        }
+        // Act only once the same fault has outlived a rebuild race.
+        if self.pool_fault_ticks >= POOL_FAULT_TICKS {
+            match self.pool_remedy() {
+                Some(PoolRemedy::RestartCreator) => {
+                    // The device's lifetime belongs to the creator, so this is
+                    // what makes the driver rebuild and republish. Restarting the
+                    // server instead would meet the same generation 0 and die.
+                    ops.kill_creator();
+                    self.pool_fault_ticks = 0;
+                }
+                Some(PoolRemedy::RestartServer) => {
+                    self.restart_server_requested = true;
+                    self.pool_fault_ticks = 0;
+                }
+                None => {}
+            }
+        }
+
         if self.restart_server_requested {
             self.restart_server_requested = false;
             ops.kill_server();
         }
         let server_state = ops.poll_server();
         if self.device_present || server_state != ChildState::NotStarted {
-            self.server.tick(server_state, &mut || ops.spawn_server());
+            let pool = &self.pool;
+            let server_generation = &mut self.server_generation;
+            self.server.tick(server_state, &mut || {
+                let spawned = ops.spawn_server();
+                if spawned.is_ok() {
+                    // Remember what the server is about to attach to, so a later
+                    // generation bump is recognisable as staleness rather than
+                    // guessed at.
+                    *server_generation = match pool {
+                        PoolObservation::Present { generation, .. } => Some(*generation),
+                        _ => None,
+                    };
+                }
+                spawned
+            });
+        }
+    }
+
+    /// What, if anything, this tick's pool reading calls for — before debouncing.
+    ///
+    /// Cause-specific by construction: the two faults have different remedies and
+    /// applying the wrong one makes things worse rather than merely not better.
+    fn pool_remedy(&self) -> Option<PoolRemedy> {
+        match &self.pool {
+            // Us failing to read is not the driver failing to publish. Never act.
+            PoolObservation::Unreadable(_) => None,
+            // The driver says there is nothing. Only a rebuilt device fixes that,
+            // and the creator owns the device's lifetime.
+            PoolObservation::Absent | PoolObservation::NoPool => {
+                self.creator.running.then_some(PoolRemedy::RestartCreator)
+            }
+            PoolObservation::Present { generation, .. } => {
+                // A server attached to a superseded generation is capturing a
+                // section nothing writes to. Restarting it is correct AND cheap
+                // here: the session it drops is already receiving nothing.
+                match self.server_generation {
+                    Some(attached) if attached != *generation && self.server.running => {
+                        Some(PoolRemedy::RestartServer)
+                    }
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -260,6 +403,64 @@ impl Reconciler {
             Some("server")
         } else {
             None
+        }
+    }
+
+    /// The `pool` rung: is there a pool, and is the running server attached to
+    /// the generation the driver publishes *now*?
+    ///
+    /// An unreadable section is `Unknown`, never `Fail`. `Fail` drives a creator
+    /// restart, and restarting the stack because we could not read a page would
+    /// be a health check causing the outage it claims to detect.
+    fn pool_rung(&self) -> RungReport {
+        let (state, detail) = match &self.pool {
+            PoolObservation::Unreadable(why) => (RungState::Unknown, Some(why.clone())),
+            PoolObservation::Absent => (
+                RungState::Fail,
+                Some("the shared section does not exist: no driver instance is publishing".into()),
+            ),
+            PoolObservation::NoPool => (
+                RungState::Fail,
+                Some("the driver publishes no pool (generation 0)".into()),
+            ),
+            PoolObservation::Present { generation, .. } => match self.server_generation {
+                Some(attached) if attached != *generation && self.server.running => (
+                    RungState::Fail,
+                    Some(format!(
+                        "the capture server is attached to generation {attached}, but the driver \
+                         now publishes {generation}: it is reading a section nothing writes to"
+                    )),
+                ),
+                _ => (RungState::Ok, None),
+            },
+        };
+        RungReport {
+            rung: Rung::Pool,
+            state,
+            detail,
+        }
+    }
+
+    /// What the section says, for the wire.
+    fn pool_report(&self) -> Option<PoolReport> {
+        match &self.pool {
+            PoolObservation::Present {
+                generation,
+                frame_seq,
+            } => Some(PoolReport {
+                generation: *generation,
+                frame_seq: *frame_seq,
+                server_generation: self.server_generation,
+            }),
+            // `NoPool` is a real reading, and reporting generation 0 is exactly
+            // what a doctor needs to see. Absent and Unreadable have no numbers
+            // to give and must not invent any.
+            PoolObservation::NoPool => Some(PoolReport {
+                generation: 0,
+                frame_seq: 0,
+                server_generation: self.server_generation,
+            }),
+            PoolObservation::Absent | PoolObservation::Unreadable(_) => None,
         }
     }
 
@@ -293,7 +494,7 @@ impl Reconciler {
                 state: ok_or_fail(self.device_present),
                 detail: None,
             },
-            unimplemented(Rung::Pool),
+            self.pool_rung(),
             RungReport {
                 rung: Rung::DisplayMode,
                 state: ok_or_fail(self.mode_ok),
@@ -331,7 +532,7 @@ impl Reconciler {
             // rung has a real sampler, and the two agree by construction then.
             stuck: self.stuck().map(str::to_owned),
             rungs: self.rungs(),
-            pool: None,
+            pool: self.pool_report(),
             viewer_connected: None,
         }
     }
@@ -361,6 +562,9 @@ mod tests {
         server_pending_exit: Option<i32>,
         /// When true every server spawn dies before the next poll (crash loop).
         server_dies_instantly: bool,
+        /// What `pool()` reports. Defaults to a healthy generation so existing
+        /// tests are unaffected by the rung's arrival.
+        pool: Option<PoolObservation>,
     }
 
     impl AgentOps for FakeOps {
@@ -428,6 +632,183 @@ mod tests {
             self.creator_running = false;
             self.server_running = false;
         }
+        fn kill_creator(&mut self) {
+            self.calls.push("kill_creator".into());
+            if self.creator_running {
+                self.creator_running = false;
+                self.creator_pending_exit = Some(-1);
+            }
+        }
+        fn pool(&mut self) -> PoolObservation {
+            self.pool.clone().unwrap_or(PoolObservation::Present {
+                generation: 1,
+                frame_seq: 100,
+            })
+        }
+    }
+
+    /// Bring a fake to a fully green steady state, so a pool test starts from
+    /// "everything else is fine" and the rung under test is the only variable.
+    fn settled() -> (Reconciler, FakeOps) {
+        let mut rec = Reconciler::new();
+        let mut ops = FakeOps {
+            device_id: Some(r"\\.\DISPLAY1".into()),
+            mode: Some(DESIRED_MODE),
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            rec.tick(&mut ops);
+        }
+        ops.calls.clear();
+        (rec, ops)
+    }
+
+    fn rung_state(rec: &Reconciler, rung: Rung) -> RungState {
+        rec.rungs()
+            .into_iter()
+            .find(|r| r.rung == rung)
+            .expect("every rung is reported")
+            .state
+    }
+
+    #[test]
+    fn a_healthy_pool_leaves_the_rung_green_and_remediates_nothing() {
+        let (mut rec, mut ops) = settled();
+        for _ in 0..POOL_FAULT_TICKS + 3 {
+            rec.tick(&mut ops);
+        }
+        assert_eq!(rung_state(&rec, Rung::Pool), RungState::Ok);
+        assert!(
+            !ops.calls
+                .iter()
+                .any(|c| c == "kill_creator" || c == "kill_server"),
+            "a healthy pool must provoke nothing: {:?}",
+            ops.calls
+        );
+    }
+
+    #[test]
+    fn an_unreadable_section_is_unknown_and_never_remediated() {
+        // Us failing to read is not the driver failing to publish. This is the
+        // rule that stops the health check causing the outage it detects.
+        let (mut rec, mut ops) = settled();
+        ops.pool = Some(PoolObservation::Unreadable("mid-write".into()));
+        for _ in 0..POOL_FAULT_TICKS + 5 {
+            rec.tick(&mut ops);
+        }
+        assert_eq!(rung_state(&rec, Rung::Pool), RungState::Unknown);
+        assert!(
+            !ops.calls
+                .iter()
+                .any(|c| c == "kill_creator" || c == "kill_server"),
+            "an unreadable section must never be acted on: {:?}",
+            ops.calls
+        );
+    }
+
+    #[test]
+    fn no_pool_restarts_the_creator_not_the_server() {
+        // Generation 0 means the driver published nothing. A fresh SERVER would
+        // meet the same 0, refuse it, and die into backoff — turning a silent
+        // wedge into a crash loop. Only a rebuilt device fixes it, and the
+        // creator owns the device's lifetime.
+        let (mut rec, mut ops) = settled();
+        ops.pool = Some(PoolObservation::NoPool);
+        for _ in 0..POOL_FAULT_TICKS {
+            rec.tick(&mut ops);
+        }
+        assert_eq!(rung_state(&rec, Rung::Pool), RungState::Fail);
+        assert!(
+            ops.calls.iter().any(|c| c == "kill_creator"),
+            "expected a creator restart: {:?}",
+            ops.calls
+        );
+        assert!(
+            !ops.calls.iter().any(|c| c == "kill_server"),
+            "the server must NOT be restarted for a missing pool: {:?}",
+            ops.calls
+        );
+    }
+
+    #[test]
+    fn a_pool_fault_is_debounced_past_a_rebuild_race() {
+        // A device cycle passes through "no pool" on its way back up. Acting
+        // inside that window would fight the rebuild being watched.
+        //
+        // Tick counts here are LITERAL, not derived from POOL_FAULT_TICKS. A loop
+        // written `0..POOL_FAULT_TICKS - 1` runs zero times when the constant is
+        // 1, so it passes vacuously against an implementation with no debounce at
+        // all — proven by mutation. The literal 2 encodes the real requirement.
+        assert!(
+            POOL_FAULT_TICKS >= 2,
+            "the debounce must span more than one tick to outlive a rebuild race"
+        );
+
+        let (mut rec, mut ops) = settled();
+        ops.pool = Some(PoolObservation::NoPool);
+        rec.tick(&mut ops);
+        rec.tick(&mut ops);
+        assert!(
+            !ops.calls.iter().any(|c| c == "kill_creator"),
+            "acted after only two faulty ticks: {:?}",
+            ops.calls
+        );
+        // Recovery inside the window must clear the count, not bank it.
+        ops.pool = None;
+        rec.tick(&mut ops);
+        ops.pool = Some(PoolObservation::NoPool);
+        rec.tick(&mut ops);
+        rec.tick(&mut ops);
+        assert!(
+            !ops.calls.iter().any(|c| c == "kill_creator"),
+            "a healthy tick must reset the fault count, not bank it: {:?}",
+            ops.calls
+        );
+    }
+
+    #[test]
+    fn a_server_left_on_a_superseded_generation_is_restarted() {
+        // Incident A's signature: everything structurally healthy, the server
+        // reading a section nothing writes to any more.
+        let (mut rec, mut ops) = settled();
+        assert_eq!(rec.server_generation, Some(1), "attached at spawn");
+        ops.pool = Some(PoolObservation::Present {
+            generation: 2,
+            frame_seq: 5,
+        });
+        for _ in 0..POOL_FAULT_TICKS {
+            rec.tick(&mut ops);
+        }
+        assert!(
+            ops.calls.iter().any(|c| c == "kill_server"),
+            "expected a server restart: {:?}",
+            ops.calls
+        );
+        assert!(
+            !ops.calls.iter().any(|c| c == "kill_creator"),
+            "the creator is fine; only the server is stale: {:?}",
+            ops.calls
+        );
+    }
+
+    #[test]
+    fn a_restarted_server_records_the_generation_it_attached_to() {
+        // Without this the staleness check compares against a stale memory and
+        // restarts for ever.
+        let (mut rec, mut ops) = settled();
+        ops.pool = Some(PoolObservation::Present {
+            generation: 9,
+            frame_seq: 1,
+        });
+        for _ in 0..POOL_FAULT_TICKS + 3 {
+            rec.tick(&mut ops);
+        }
+        assert_eq!(
+            rec.server_generation,
+            Some(9),
+            "the respawned server must be recorded against the CURRENT generation"
+        );
+        assert_eq!(rung_state(&rec, Rung::Pool), RungState::Ok);
     }
 
     #[test]
