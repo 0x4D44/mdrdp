@@ -68,3 +68,16 @@ check-windows.sh green; live temper sessions re-verified.
 
 Repro capture and replay: `mdrdp <host> --capture-failures <dir>` then
 `cargo run --release --example avcreplay -- <dir> <l,t,r,b>`.
+
+**Live post-fix confirmation (2026-08-19, Arthur, temper, v0.1.69):** watching the
+original bar scene, both the solid and dithered regions now hold a steady tone —
+the pumping is gone. One expected residual: when the bar head retreats
+(solid `█` → dither `▒`), the newly-dithered region shows a blue tinge for
+roughly one frame. That is the documented information-forced transient: the
+luma-only frame carrying the content change paints against one-frame-stale odd
+chroma, and the even/even reconstruction `4*avg - neighbours` overshoots U
+upward (blue) until the next chroma-only frame lands. Pre-fix, the same frame
+showed a flat 4:2:0 average instead — but then pumped continuously. A possible
+refinement (fall back to the flat average in blocks whose luma changed
+substantially, until the next chroma pass) is noted for a separate task if the
+transient proves bothersome on real content.
