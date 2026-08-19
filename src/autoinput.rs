@@ -13,6 +13,7 @@
 //! keys win+r        # a chord: modifiers pressed in order, released in reverse
 //! type msedge https://example.com
 //! keys enter
+//! move 960 540      # pointer move only, no button — probes where a pixel lands
 //! click 960 540     # left-click at a session pixel
 //! rclick 960 540    # right-click
 //! dblclick 960 540  # double-click (left, inside the double-click threshold)
@@ -40,6 +41,13 @@ enum Step {
     Chord(Vec<Scancode>),
     /// Each entry is one key tap, with shift held where needed.
     Type(Vec<(Scancode, bool)>),
+    /// Pointer move with no button, for probing where a coordinate lands without
+    /// the side effects a click carries — a corner click would hit the close
+    /// button or the Start menu, which tells you nothing about the mapping.
+    Move {
+        x: u16,
+        y: u16,
+    },
     Click {
         x: u16,
         y: u16,
@@ -121,13 +129,14 @@ impl Script {
                     }
                     Step::Type(taps)
                 }
-                "click" | "rclick" | "dblclick" | "scroll" => {
+                "move" | "click" | "rclick" | "dblclick" | "scroll" => {
                     let mut parts = rest.split_whitespace();
                     let mut coord = || -> Option<u16> { parts.next()?.parse().ok() };
                     let (Some(x), Some(y)) = (coord(), coord()) else {
                         return Err(format!("line {}: {cmd} wants x y", idx + 1));
                     };
                     match cmd {
+                        "move" => Step::Move { x, y },
                         "click" => Step::Click {
                             x,
                             y,
@@ -209,6 +218,7 @@ impl Script {
                     std::thread::sleep(KEY_GAP);
                     sent
                 }),
+                Step::Move { x, y } => input.send(InputEvent::MouseMove { x: *x, y: *y }).is_ok(),
                 Step::Click { x, y, button } => send_click(input, *button, *x, *y),
                 Step::DoubleClick { x, y } => {
                     send_click(input, MouseButton::Left, *x, *y) && {
@@ -626,6 +636,17 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn move_sends_a_bare_pointer_move_and_nothing_else() {
+        // The point of `move` is the absence of a button: it is how a corner is
+        // probed without hitting whatever sits there.
+        let script = Script::parse("move 1919 1079").expect("parses");
+        let (tx, rx) = mpsc::channel();
+        script.run(&WakingSender::silent(tx));
+        let events: Vec<InputEvent> = rx.try_iter().collect();
+        assert_eq!(events, vec![InputEvent::MouseMove { x: 1919, y: 1079 }]);
     }
 
     #[test]
