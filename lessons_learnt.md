@@ -6,6 +6,14 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A test fixture that silently fails to run makes the harness report the failure it exists to detect (`tools/clipboard-soak/src/main.rs`).
+  Cost time twice on tranche 5. A clipboard holder reported success while holding nothing, and later
+  `clipboard-cycle`'s launch died because the previous instance still held its log file, so a shell
+  redirect could not open — the soak then ran with no generator and reported host->mac misses that had
+  nothing to do with the clipboard. Two in a row is a wedge, so the run's headline finding was an
+  artefact of its own fixture. Fix is a startup probe: the harness refuses to begin until it observes
+  the fixture actually working, rather than assuming it launched.
+
 - A new mdrdp dependency also needs `tools/latency-spike/viewer/Cargo.lock` refreshed, or `deltic integrate` fails.
   The viewer is its own workspace that depends on the root library by path, so a dep added to
   mdrdp changes the viewer's graph too. Deltic's bump step runs `cargo metadata --locked` over
