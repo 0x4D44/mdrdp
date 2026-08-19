@@ -137,6 +137,11 @@ pub fn run(cfg: &Config) -> Result<()> {
         source.height(),
         source.adapter()
     );
+    // The capture display's own offset into the virtual desktop, for the input
+    // thread's mouse-move mapping (§5.2). Read once here rather than by the input
+    // thread itself: it belongs to whichever `FrameSource` is live, and the input
+    // thread never touches the source.
+    let capture_origin = source.origin();
 
     let mut converter = convert::Nv12Converter::new(
         source.device(),
@@ -228,7 +233,7 @@ pub fn run(cfg: &Config) -> Result<()> {
                     }
                 })
                 .ok();
-            if let Err(e) = input::serve(input_port, clock, line_tx) {
+            if let Err(e) = input::serve(input_port, clock, line_tx, capture_origin) {
                 eprintln!("input: listener stopped: {e}");
             }
         })?;

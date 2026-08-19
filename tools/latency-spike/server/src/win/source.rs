@@ -122,6 +122,19 @@ pub trait FrameSource {
     fn height(&self) -> u32;
     /// Adapter description, for the stats header.
     fn adapter(&self) -> &str;
+    /// Where this source's captured display sits in the virtual desktop, in
+    /// physical pixels — `DXGI_OUTPUT_DESC::DesktopCoordinates`'s top-left corner
+    /// for duplication (HLD tranche 3 §5.2). The mouse-move injector adds this to
+    /// the wire's display-local `x, y` before mapping into
+    /// `SendInput`'s virtual-desktop absolute space
+    /// ([`crate::input_proto::map_to_virtual_desk`]).
+    ///
+    /// Defaults to `(0, 0)`: the IDD source's shared-pool header carries no desktop
+    /// coordinates, so a moved IDD virtual display needs revisiting when that
+    /// becomes reachable.
+    fn origin(&self) -> (i32, i32) {
+        (0, 0)
+    }
     /// What this source is capturing, for the stats header and the startup line:
     /// a `\\.\DISPLAY5` for duplication, the pool generation for the IDD source.
     fn output_name(&self) -> &str;

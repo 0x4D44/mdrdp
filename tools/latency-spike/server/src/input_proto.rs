@@ -282,6 +282,39 @@ fn encode_kind_field16_seq(
     8
 }
 
+/// Map one axis of a wire-local pixel coordinate into the Windows virtual-desktop
+/// absolute space that `SendInput`'s `MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_VIRTUALDESK`
+/// mode expects (HLD tranche 3 §5.2):
+///
+/// `(display_origin + local − virtual_origin) * 65536 / virtual_extent`
+///
+/// `local` is the wire's capture-display-local pixel; `display_origin` is that
+/// display's own offset into the virtual desktop (`DXGI_OUTPUT_DESC`'s
+/// `DesktopCoordinates`); `virtual_origin`/`virtual_extent` are
+/// `GetSystemMetrics(SM_X/YVIRTUALSCREEN)` and `SM_CX/CYVIRTUALSCREEN`. Scaled by
+/// 65536, not 65535, per the HLD — `SendInput`'s own documented convention.
+///
+/// Pure and portable (no Windows call inside) so it is unit-testable on any host;
+/// the `win` injection code supplies the four Windows-sourced integers.
+///
+/// A degenerate `virtual_extent` (zero, or negative — `GetSystemMetrics` failing)
+/// returns 0 rather than dividing by zero. A caller that hits this has a bigger
+/// problem than one misplaced click.
+pub fn map_to_virtual_desk(
+    local: u16,
+    display_origin: i32,
+    virtual_origin: i32,
+    virtual_extent: i32,
+) -> i32 {
+    if virtual_extent <= 0 {
+        return 0;
+    }
+    // i64: the operands are all well within range, but the product before the
+    // divide (up to ~2^31 * 2^16) would overflow i32.
+    let absolute = display_origin as i64 + local as i64 - virtual_origin as i64;
+    ((absolute * 65536) / virtual_extent as i64) as i32
+}
+
 /// Decode one v2 record from the front of `bytes`. `bytes` must hold at least as
 /// many bytes as [`kind_len`] of its own first byte demands — trailing bytes
 /// beyond that are ignored, so the caller may pass a longer read-ahead buffer.
@@ -666,5 +699,47 @@ mod tests {
             decode_record(&bytes),
             Err(InputProtoError::Short { need: 10, got: 5 })
         );
+    }
+
+    // --- map_to_virtual_desk -------------------------------------------------
+
+    #[test]
+    fn map_to_virtual_desk_zero_everything_is_zero() {
+        // Single-monitor case: the display and the virtual desktop coincide, and
+        // the top-left pixel maps to the origin of the absolute space.
+        assert_eq!(map_to_virtual_desk(0, 0, 0, 1920), 0);
+    }
+
+    #[test]
+    fn map_to_virtual_desk_the_far_edge_lands_near_the_top_of_the_range() {
+        // The last addressable pixel column of a 1920-wide display maps close to
+        // (but, by construction, short of) 65536 — hand-computed:
+        // (1919 * 65536) / 1920 = 65501 remainder 1664.
+        assert_eq!(map_to_virtual_desk(1919, 0, 0, 1920), 65501);
+    }
+
+    #[test]
+    fn map_to_virtual_desk_a_positive_display_origin_offsets_the_result() {
+        // A second 1920-wide monitor to the right of the primary, virtual desktop
+        // spanning both (0..3840). Its own local pixel 0 lands at the desktop's
+        // midpoint: (1920 * 65536) / 3840 = 32768 exactly.
+        assert_eq!(map_to_virtual_desk(0, 1920, 0, 3840), 32768);
+    }
+
+    #[test]
+    fn map_to_virtual_desk_a_negative_display_origin_offsets_the_result() {
+        // A second 1920-wide monitor to the LEFT of the primary: both the display
+        // and the virtual desktop's own origin sit at -1920. Local pixel 1919 (its
+        // rightmost column) — hand-computed: ((-1920 + 1919) - (-1920)) * 65536 /
+        // 3840 = (1919 * 65536) / 3840 = 32750 remainder 3584.
+        assert_eq!(map_to_virtual_desk(1919, -1920, -1920, 3840), 32750);
+    }
+
+    #[test]
+    fn map_to_virtual_desk_a_zero_virtual_extent_does_not_divide_by_zero() {
+        // GetSystemMetrics failing (or a degenerate 0-width virtual desktop) must
+        // not panic the injection thread.
+        assert_eq!(map_to_virtual_desk(100, 0, 0, 0), 0);
+        assert_eq!(map_to_virtual_desk(100, 0, 0, -1), 0);
     }
 }

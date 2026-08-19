@@ -9,6 +9,14 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     use rhydra::cli;
 
+    // Before any display or metrics call, including `--list-outputs`: a
+    // DPI-unaware process reads scaled virtual-screen metrics, and every mouse
+    // injection would land off by the scale factor (HLD tranche 3 §5.2). Logged,
+    // not fatal — the server still has useful degraded behaviour without it.
+    if let Err(e) = rhydra::win::init_dpi_awareness() {
+        eprintln!("warning: SetProcessDpiAwarenessContext failed: {e}");
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cfg = match cli::parse(&args) {
         Ok(cfg) => cfg,

@@ -268,6 +268,64 @@ impl InputEventRecord {
     }
 }
 
+/// One injected mouse-button transition or wheel notch — the same per-record
+/// scheme [`InputEventRecord`] uses for keys, kept as its own type because the
+/// payload differs (a button ordinal or a wheel delta, not a key code). `MouseMove`
+/// does NOT get one of these per record — see [`MouseMoveSummaryRecord`] — motion
+/// runs at up to hundreds of records a second, and a JSONL line per record on the
+/// injection thread is a latency bug in waiting (HLD tranche 3 §5.2, review S-m5).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MouseEventRecord {
+    pub record: &'static str,
+    pub seq: u32,
+    /// `btn_{left,right,middle,x1,x2}_{down,up}` or `wheel_{v,h}`.
+    pub kind: &'static str,
+    /// Meaning depends on `kind`: the button ordinal (1=L,2=R,3=M,4=X1,5=X2) for a
+    /// `btn_*` kind, the wheel notch delta (a multiple of ±120) for a `wheel_*` kind.
+    pub value: i32,
+    pub recv_qpc_us: i64,
+    pub injected_qpc_us: i64,
+}
+
+impl MouseEventRecord {
+    pub fn new(seq: u32, kind: &'static str, value: i32, recv: i64, injected: i64) -> Self {
+        Self {
+            record: "mouse",
+            seq,
+            kind,
+            value,
+            recv_qpc_us: recv,
+            injected_qpc_us: injected,
+        }
+    }
+}
+
+/// A periodic summary of injected mouse motion, in place of one JSONL line per
+/// `MouseMove` record (see [`MouseEventRecord`]'s doc for why). Emitted every
+/// [`crate::win::input`]'s summary interval, and once more for any remainder when
+/// the connection ends.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MouseMoveSummaryRecord {
+    pub record: &'static str,
+    /// Moves injected since the previous summary line (or connection start).
+    pub count: u64,
+    /// `recv_qpc` of the first move in this window.
+    pub window_start_qpc_us: i64,
+    /// `recv_qpc` of the last move in this window.
+    pub window_end_qpc_us: i64,
+}
+
+impl MouseMoveSummaryRecord {
+    pub fn new(count: u64, window_start_qpc_us: i64, window_end_qpc_us: i64) -> Self {
+        Self {
+            record: "mouse_move_summary",
+            count,
+            window_start_qpc_us,
+            window_end_qpc_us,
+        }
+    }
+}
+
 /// Serialise one record as a JSONL line (no trailing newline).
 ///
 /// Falls back to a minimal error object rather than panicking: losing one stats line
@@ -457,6 +515,28 @@ mod tests {
         assert_eq!(v["recv_qpc_us"], 500);
         assert_eq!(v["injected_qpc_us"], 620);
         assert_eq!(v.as_object().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn a_mouse_line_names_the_kind_and_value_and_both_stamps() {
+        let r = MouseEventRecord::new(3, "btn_left_down", 1, 700, 810);
+        let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
+        assert_eq!(v["record"], "mouse");
+        assert_eq!(v["seq"], 3);
+        assert_eq!(v["kind"], "btn_left_down");
+        assert_eq!(v["value"], 1);
+        assert_eq!(v["recv_qpc_us"], 700);
+        assert_eq!(v["injected_qpc_us"], 810);
+    }
+
+    #[test]
+    fn a_mouse_move_summary_line_names_the_window_and_count() {
+        let r = MouseMoveSummaryRecord::new(42, 1000, 2000);
+        let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
+        assert_eq!(v["record"], "mouse_move_summary");
+        assert_eq!(v["count"], 42);
+        assert_eq!(v["window_start_qpc_us"], 1000);
+        assert_eq!(v["window_end_qpc_us"], 2000);
     }
 
     #[test]

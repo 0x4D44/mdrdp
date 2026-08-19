@@ -71,12 +71,18 @@ fn rotation_name(r: i32) -> &'static str {
     }
 }
 
-fn describe(desc: &DXGI_OUTPUT_DESC) -> (String, u32, u32, bool, &'static str) {
+/// `origin_x, origin_y` are `DesktopCoordinates`'s top-left corner — this output's
+/// own offset into the virtual desktop, physical pixels. `enumerate` ignores them
+/// (`--list-outputs` has never printed placement); `Capture::open` keeps them, for
+/// the mouse-move injector (§5.2, review S-M5) — see [`super::source::FrameSource::origin`].
+fn describe(desc: &DXGI_OUTPUT_DESC) -> (String, u32, u32, i32, i32, bool, &'static str) {
     let rect = desc.DesktopCoordinates;
     (
         wide_to_string(&desc.DeviceName),
         (rect.right - rect.left).max(0) as u32,
         (rect.bottom - rect.top).max(0) as u32,
+        rect.left,
+        rect.top,
         desc.AttachedToDesktop.as_bool(),
         rotation_name(desc.Rotation.0),
     )
@@ -110,7 +116,8 @@ pub fn enumerate() -> Result<Vec<OutputInfo>> {
             };
             // SAFETY: `output` is a live COM interface.
             let desc = unsafe { output.GetDesc() }?;
-            let (device_name, width, height, attached, rotation) = describe(&desc);
+            let (device_name, width, height, _origin_x, _origin_y, attached, rotation) =
+                describe(&desc);
             list.push(OutputInfo {
                 index: list.len(),
                 adapter_index,
@@ -144,6 +151,10 @@ pub struct Capture {
     pub height: u32,
     pub adapter: String,
     pub device_name: String,
+    /// This output's own offset into the virtual desktop (§5.2) — see
+    /// [`super::source::FrameSource::origin`].
+    origin_x: i32,
+    origin_y: i32,
     output: IDXGIOutput1,
     /// `None` only while a lost duplication is being replaced. It must be dropped
     /// before `DuplicateOutput` is called again — DXGI refuses a second duplication
@@ -166,7 +177,7 @@ impl Capture {
         let output: IDXGIOutput1 = output.cast()?;
         // SAFETY: `output` is a live COM interface.
         let desc = unsafe { output.GetDesc() }?;
-        let (device_name, width, height, attached, _) = describe(&desc);
+        let (device_name, width, height, origin_x, origin_y, attached, _) = describe(&desc);
         if !attached {
             return Err(format!(
                 "output {} ({device_name}) is not attached to the desktop; \
@@ -223,6 +234,8 @@ impl Capture {
             height,
             adapter: info.adapter.clone(),
             device_name,
+            origin_x,
+            origin_y,
             output,
             dupl: Some(dupl),
             holding: false,
@@ -433,6 +446,10 @@ impl FrameSource for Capture {
 
     fn adapter(&self) -> &str {
         &self.adapter
+    }
+
+    fn origin(&self) -> (i32, i32) {
+        (self.origin_x, self.origin_y)
     }
 
     fn output_name(&self) -> &str {
