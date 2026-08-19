@@ -14,6 +14,9 @@
 //! type msedge https://example.com
 //! keys enter
 //! click 960 540     # left-click at a session pixel
+//! rclick 960 540    # right-click
+//! dblclick 960 540  # double-click (left, inside the double-click threshold)
+//! scroll 960 540 -3 # vertical wheel at a point; positive up, negative down
 //! drag 500 20 900 400 800   # press at 500,20, move to 900,400 over 800 ms, release
 //! ```
 //!
@@ -40,6 +43,18 @@ enum Step {
     Click {
         x: u16,
         y: u16,
+        button: MouseButton,
+    },
+    /// Two left clicks inside the double-click threshold.
+    DoubleClick {
+        x: u16,
+        y: u16,
+    },
+    /// A vertical wheel turn at a point; positive units scroll up (away).
+    Scroll {
+        x: u16,
+        y: u16,
+        units: i16,
     },
     /// Press at `from`, move to `to` in interpolated steps, release. A window drag.
     Drag {
@@ -104,17 +119,35 @@ impl Script {
                     }
                     Step::Type(taps)
                 }
-                "click" => {
+                "click" | "rclick" | "dblclick" | "scroll" => {
                     let mut parts = rest.split_whitespace();
-                    let x = parts
-                        .next()
-                        .and_then(|v| v.parse().ok())
-                        .ok_or_else(|| format!("line {}: click wants x y", idx + 1))?;
-                    let y = parts
-                        .next()
-                        .and_then(|v| v.parse().ok())
-                        .ok_or_else(|| format!("line {}: click wants x y", idx + 1))?;
-                    Step::Click { x, y }
+                    let mut coord = || -> Option<u16> { parts.next()?.parse().ok() };
+                    let (Some(x), Some(y)) = (coord(), coord()) else {
+                        return Err(format!("line {}: {cmd} wants x y", idx + 1));
+                    };
+                    match cmd {
+                        "click" => Step::Click {
+                            x,
+                            y,
+                            button: MouseButton::Left,
+                        },
+                        "rclick" => Step::Click {
+                            x,
+                            y,
+                            button: MouseButton::Right,
+                        },
+                        "dblclick" => Step::DoubleClick { x, y },
+                        _ => {
+                            let units: i16 =
+                                parts.next().and_then(|v| v.parse().ok()).ok_or_else(|| {
+                                    format!("line {}: scroll wants x y units", idx + 1)
+                                })?;
+                            if units == 0 {
+                                return Err(format!("line {}: scroll of zero units", idx + 1));
+                            }
+                            Step::Scroll { x, y, units }
+                        }
+                    }
                 }
                 "drag" => {
                     let mut parts = rest.split_whitespace();
@@ -174,25 +207,25 @@ impl Script {
                     std::thread::sleep(KEY_GAP);
                     sent
                 }),
-                Step::Click { x, y } => {
-                    let down = InputEvent::MouseButton {
-                        button: MouseButton::Left,
-                        down: true,
-                        x: *x,
-                        y: *y,
-                    };
-                    let up = InputEvent::MouseButton {
-                        button: MouseButton::Left,
-                        down: false,
-                        x: *x,
-                        y: *y,
-                    };
+                Step::Click { x, y, button } => send_click(input, *button, *x, *y),
+                Step::DoubleClick { x, y } => {
+                    send_click(input, MouseButton::Left, *x, *y) && {
+                        // Well inside Windows' default 500 ms double-click window.
+                        std::thread::sleep(Duration::from_millis(80));
+                        send_click(input, MouseButton::Left, *x, *y)
+                    }
+                }
+                Step::Scroll { x, y, units } => {
                     input.send(InputEvent::MouseMove { x: *x, y: *y }).is_ok() && {
                         std::thread::sleep(KEY_GAP);
-                        input.send(down).is_ok() && {
-                            std::thread::sleep(KEY_HOLD);
-                            input.send(up).is_ok()
-                        }
+                        input
+                            .send(InputEvent::Scroll {
+                                axis: crate::input::ScrollAxis::Vertical,
+                                units: *units,
+                                x: *x,
+                                y: *y,
+                            })
+                            .is_ok()
                     }
                 }
                 Step::Drag { from, to, duration } => send_drag(input, *from, *to, *duration),
@@ -201,6 +234,32 @@ impl Script {
                 return; // session gone; nothing left to type into
             }
         }
+    }
+}
+
+/// Move to the point, press, hold briefly, release. True while the channel lives.
+fn send_click(input: &WakingSender<InputEvent>, button: MouseButton, x: u16, y: u16) -> bool {
+    input.send(InputEvent::MouseMove { x, y }).is_ok() && {
+        std::thread::sleep(KEY_GAP);
+        input
+            .send(InputEvent::MouseButton {
+                button,
+                down: true,
+                x,
+                y,
+            })
+            .is_ok()
+            && {
+                std::thread::sleep(KEY_HOLD);
+                input
+                    .send(InputEvent::MouseButton {
+                        button,
+                        down: false,
+                        x,
+                        y,
+                    })
+                    .is_ok()
+            }
     }
 }
 
@@ -480,6 +539,69 @@ mod tests {
             shift_downs, 2,
             "one shift for ':', one for 'B', none for 'a' or '/'"
         );
+    }
+
+    #[test]
+    fn rclick_dblclick_and_scroll_produce_the_right_events() {
+        let script =
+            Script::parse("rclick 10 20\ndblclick 30 40\nscroll 50 60 -3").expect("parses");
+        let (tx, rx) = mpsc::channel();
+        script.run(&WakingSender::silent(tx));
+        let events: Vec<InputEvent> = rx.try_iter().collect();
+
+        // rclick: move, right down, right up.
+        assert_eq!(events[0], InputEvent::MouseMove { x: 10, y: 20 });
+        assert!(matches!(
+            events[1],
+            InputEvent::MouseButton {
+                button: MouseButton::Right,
+                down: true,
+                x: 10,
+                y: 20,
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            InputEvent::MouseButton {
+                button: MouseButton::Right,
+                down: false,
+                ..
+            }
+        ));
+
+        // dblclick: two full left clicks (move+down+up, twice) at the same point.
+        let left_downs = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    InputEvent::MouseButton {
+                        button: MouseButton::Left,
+                        down: true,
+                        x: 30,
+                        y: 40,
+                    }
+                )
+            })
+            .count();
+        assert_eq!(left_downs, 2, "a double-click is two presses");
+
+        // scroll: move then one vertical wheel event carrying the signed units.
+        assert_eq!(
+            events.last(),
+            Some(&InputEvent::Scroll {
+                axis: crate::input::ScrollAxis::Vertical,
+                units: -3,
+                x: 50,
+                y: 60,
+            })
+        );
+    }
+
+    #[test]
+    fn scroll_without_units_or_zero_units_is_a_parse_error() {
+        assert!(Script::parse("scroll 10 20").is_err());
+        assert!(Script::parse("scroll 10 20 0").is_err());
     }
 
     #[test]
