@@ -6,15 +6,15 @@
 - **Area:** diagnostics
 - **Raised:** 2026-08-19T07:16:05Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260819T151441Z-p23386-n706098000-c1
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00009-run-fix-20260819T151441Z-p23386-n706098000-c1
+- **Owner base:** daf875b9d1b5589bbb43538c4139237e05353522
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-19T15:14:41Z
+- **Owner until:** 2026-08-19T17:14:41Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
