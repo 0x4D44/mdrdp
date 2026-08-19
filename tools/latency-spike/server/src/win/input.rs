@@ -499,6 +499,53 @@ fn serve_one(
     }
 }
 
+/// Log this thread's window station and desktop names, and whether that desktop is
+/// the one currently receiving input. Read-only: it queries, it never switches.
+///
+/// The diagnostic for "SendInput succeeds and nothing happens": a process launched
+/// by a scheduled task can land on a non-interactive station (`Service-0x…-…$`) or a
+/// desktop other than the console's input desktop, where injection goes nowhere.
+fn log_input_desktop() {
+    use windows::Win32::System::StationsAndDesktops::{
+        GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, UOI_NAME,
+    };
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+
+    // SAFETY: each call takes a handle we own for the process lifetime (the station
+    // and desktop are not closed here) and a caller-sized buffer; `GetUserObjectInformationW`
+    // reports the needed size on failure, which we do not need to grow for names.
+    unsafe {
+        let name = |get: &dyn Fn() -> Option<windows::Win32::Foundation::HANDLE>| -> String {
+            let Some(handle) = get() else {
+                return "<none>".to_owned();
+            };
+            let hobj = windows::Win32::System::StationsAndDesktops::HDESK(handle.0);
+            let mut buf = [0u16; 256];
+            let mut needed = 0u32;
+            let ok = GetUserObjectInformationW(
+                windows::Win32::Foundation::HANDLE(hobj.0),
+                UOI_NAME,
+                Some(buf.as_mut_ptr().cast()),
+                (buf.len() * 2) as u32,
+                Some(&mut needed),
+            );
+            if ok.is_err() {
+                return "<unreadable>".to_owned();
+            }
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            String::from_utf16_lossy(&buf[..len])
+        };
+
+        let station = name(&|| GetProcessWindowStation().ok().map(|s| windows::Win32::Foundation::HANDLE(s.0)));
+        let desktop = name(&|| {
+            GetThreadDesktop(GetCurrentThreadId())
+                .ok()
+                .map(|d| windows::Win32::Foundation::HANDLE(d.0))
+        });
+        eprintln!("input: window station {station:?}, thread desktop {desktop:?}");
+    }
+}
+
 /// Run the input listener until the process exits. Intended for its own thread.
 ///
 /// Binds loopback only. That is a hard requirement, not a default: the transport to
@@ -514,6 +561,11 @@ pub fn serve(
     lines: SyncSender<String>,
     origin: (i32, i32),
 ) -> Result<()> {
+    // `SendInput` reaches a desktop only if this thread is on the input desktop of
+    // the console window station. On a headless IddCx host the injection can succeed
+    // (returns 1) yet reach nothing — this line names the station+desktop we are
+    // actually on, so "keys do nothing" stops being a mystery (see module docs).
+    log_input_desktop();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
     eprintln!("input: listening on 127.0.0.1:{port}");
     loop {
