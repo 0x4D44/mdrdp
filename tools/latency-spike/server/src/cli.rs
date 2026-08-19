@@ -14,6 +14,13 @@ pub enum AudioKind {
     Off,
     /// A synthetic two-tone generator, for proving the path end to end.
     Tone,
+    /// WASAPI loopback from the default render endpoint — the real source.
+    ///
+    /// **Never executed on any fleet host**: neither has a render endpoint, so
+    /// selecting this today yields "unavailable" and silence. It is a real
+    /// option rather than a hidden one because a host that grows an endpoint
+    /// should need no new build to use it.
+    Loopback,
 }
 
 impl AudioKind {
@@ -21,6 +28,7 @@ impl AudioKind {
         match self {
             AudioKind::Off => "off",
             AudioKind::Tone => "tone",
+            AudioKind::Loopback => "loopback",
         }
     }
 }
@@ -119,7 +127,7 @@ pub fn usage() -> &'static str {
      [--aux-port 9503 | --aux-port 0 to disable]\n               \
                   [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]\n               \
                   [--no-rects] [--no-diff] [--source dxgi|idd]\n  \
-     [--audio-source off|tone]\n  \
+     [--audio-source off|tone|loopback]\n  \
      rhydra-server --source idd [--video-port 9500] ...\n  \
      rhydra-server --list-outputs\n\n\
      --no-rects withholds the raw dirty-rect fast path, forcing every update down\n  \

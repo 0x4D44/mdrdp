@@ -252,7 +252,7 @@ pub fn run(cfg: &Config) -> Result<()> {
                 if let Err(e) = crate::aux_server::serve(
                     aux_port,
                     || Box::new(super::clipboard::ClipboardOwner::new()),
-                    move || -> Box<dyn crate::audio_source::AudioSource> {
+                    std::sync::Arc::new(move || -> Box<dyn crate::audio_source::AudioSource> {
                         match audio_kind {
                             crate::cli::AudioKind::Off => {
                                 Box::new(crate::audio_source::UnavailableSource)
@@ -260,8 +260,14 @@ pub fn run(cfg: &Config) -> Result<()> {
                             crate::cli::AudioKind::Tone => {
                                 Box::new(crate::audio_source::ToneSource::new(48_000, 2))
                             }
+                            // Constructed on the audio thread, not here: the
+                            // WASAPI client is COM-backed and must be built and
+                            // used on one thread.
+                            crate::cli::AudioKind::Loopback => {
+                                Box::new(super::audio::LoopbackCapture::new())
+                            }
                         }
-                    },
+                    }),
                     policy,
                 ) {
                     // Never fatal: a session without a clipboard is a working

@@ -55,7 +55,14 @@ pub enum Captured {
 }
 
 /// A source of host audio.
-pub trait AudioSource: Send {
+///
+/// Deliberately **not** `Send`. A WASAPI capture client holds COM interface
+/// pointers, and the right discipline for those is to build and use them on one
+/// thread rather than to move them between threads and reason about apartments.
+/// The channel's audio thread therefore constructs its own source from a factory
+/// instead of being handed one — which the borrow checker insisted on before the
+/// design did, and was right to.
+pub trait AudioSource {
     /// Produce the next block, blocking for at most one frame period.
     fn next_block(&mut self) -> Captured;
     /// A short name for logs and the health ladder.

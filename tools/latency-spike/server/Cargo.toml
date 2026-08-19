@@ -53,6 +53,12 @@ windows = { version = "0.62", optional = true, features = [
     # GetClipboardSequenceNumber — the host's half of the auxiliary channel's
     # clipboard (win::clipboard).
     "Win32_System_DataExchange",
+    # WASAPI loopback capture — win::audio. IMMDevice::Activate needs the
+    # StructuredStorage + Variant pair for its PROPVARIANT parameter, which is
+    # why they are here rather than only Win32_Media_Audio.
+    "Win32_Media_Audio",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     # OpenFileMappingW / MapViewOfFile — the IddCx shared section.
     "Win32_System_Memory",
     "Win32_System_Ole",

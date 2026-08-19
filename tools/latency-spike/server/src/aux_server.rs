@@ -29,6 +29,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::audio_source::{self, AudioSource, Captured};
+
+/// How the channel obtains an audio source.
+///
+/// Shared and called on the audio thread rather than invoked once by the caller,
+/// so a COM-backed source is constructed on the thread that uses it.
+pub type AudioFactory = Arc<dyn Fn() -> Box<dyn AudioSource> + Send + Sync>;
 use crate::auxchan::{self, Outbox};
 use crate::clipboard::{self, Bridge, Policy, TextClipboard};
 
@@ -95,7 +101,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub fn serve(
     port: u16,
     mut make_clipboard: impl FnMut() -> Box<dyn TextClipboard>,
-    mut make_audio: impl FnMut() -> Box<dyn AudioSource>,
+    make_audio: AudioFactory,
     policy: Policy,
 ) -> Result<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
@@ -104,7 +110,7 @@ pub fn serve(
         match listener.accept() {
             Ok((stream, peer)) => {
                 eprintln!("aux: connected {peer}");
-                match serve_one(stream, &mut make_clipboard, &mut make_audio, policy) {
+                match serve_one(stream, &mut make_clipboard, &make_audio, policy) {
                     // ASCII only: this goes to server.log, which is read
                     // through the Windows console codepage, where an em-dash
                     // comes out as mojibake.
@@ -146,7 +152,7 @@ pub fn serve(
 pub fn serve_one(
     socket: TcpStream,
     make_clipboard: &mut dyn FnMut() -> Box<dyn TextClipboard>,
-    make_audio: &mut dyn FnMut() -> Box<dyn AudioSource>,
+    make_audio: &AudioFactory,
     policy: Policy,
 ) -> Result<ConnectionReport> {
     // Clipboard messages are small and bursty; Nagle would add up to 40 ms.
@@ -231,13 +237,16 @@ pub fn serve_one(
     let audio_slot = Arc::clone(&slot);
     let audio_stop = Arc::clone(&stop);
     let audio_enabled = Arc::clone(&audio_on);
-    let mut source = make_audio();
+    let build_source = Arc::clone(make_audio);
     let audio_sent = Arc::new(AtomicU64::new(0));
     let sent_counter = Arc::clone(&audio_sent);
     joins.push(
         std::thread::Builder::new()
             .name("aux-audio".to_owned())
             .spawn(move || {
+                // Built HERE, on the thread that will use it: a WASAPI client is
+                // COM and must not be shuffled between threads.
+                let mut source = build_source();
                 let block = Duration::from_millis(audio_source::FRAME_MS as u64);
                 let mut said_unavailable = false;
                 // **Paced against a deadline, not by sleeping a fixed amount.**
@@ -492,7 +501,10 @@ mod tests {
             serve_one(
                 stream,
                 &mut make,
-                &mut || Box::new(crate::audio_source::ToneSource::new(48_000, 2)),
+                &(Arc::new(|| {
+                    Box::new(crate::audio_source::ToneSource::new(48_000, 2))
+                        as Box<dyn crate::audio_source::AudioSource>
+                }) as AudioFactory),
                 policy,
             )
         });
@@ -577,7 +589,10 @@ mod tests {
             serve_one(
                 stream,
                 &mut make,
-                &mut || Box::new(crate::audio_source::UnavailableSource),
+                &(Arc::new(|| {
+                    Box::new(crate::audio_source::UnavailableSource)
+                        as Box<dyn crate::audio_source::AudioSource>
+                }) as AudioFactory),
                 policy,
             )
         });
