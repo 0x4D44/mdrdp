@@ -746,7 +746,7 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// erroring the channel; without this seam those skips are invisible staleness —
     /// requirement 4 (visibility) reproduced inside the new codec. Counted with the
     /// same reason-tally shape the ClearCodec path uses.
-    fn on_decode_failure(&mut self, codec_id: Codec1Type, reason: &'static str) {
+    fn on_decode_failure(&mut self, codec_id: Codec1Type, reason: &str) {
         let reason = format!("{}: {reason}", codec_name(codec_id));
         self.stats.note(|s| {
             s.decode_errors = s.decode_errors.saturating_add(1);

@@ -294,9 +294,14 @@ pub trait GraphicsPipelineHandler: Send {
     ///
     /// mdrdp patch: the client's resilience policy is to skip a bad frame rather
     /// than error the channel, but a silent skip is invisible staleness — exactly
-    /// what the visibility requirement exists to surface. `reason` is a stable,
-    /// payload-free label suitable for tallying.
-    fn on_decode_failure(&mut self, _codec_id: Codec1Type, _reason: &'static str) {}
+    /// what the visibility requirement exists to surface.
+    ///
+    /// `reason` opens with a stable, payload-free label so a tally still groups, and
+    /// where the decoder gave one it carries the underlying error after a colon —
+    /// which for VideoToolbox includes the OSStatus. A bare label cost a day on
+    /// MDR-BUG-FLUX-00008: "avc444 luma decode failed" 67 times says the decodes
+    /// failed and nothing whatever about why. It never carries pixels.
+    fn on_decode_failure(&mut self, _codec_id: Codec1Type, _reason: &str) {}
 
     /// Called when a logical frame is complete
     ///
@@ -716,10 +721,29 @@ impl GraphicsPipelineClient {
         self.current_frame_id = None;
         self.frames_queued = 0;
 
-        // Reset decoder state for new stream
-        if let Some(ref mut decoder) = self.h264_decoder {
-            decoder.reset();
-        }
+        // mdrdp patch: the H.264 decoder is deliberately NOT reset here.
+        //
+        // `H264Decoder::reset` is not a flush — it drops the VideoToolbox decompression
+        // session outright. A session rebuilt mid-GOP holds no reference frames, so every
+        // P-frame after it fails until the server happens to send the next IDR, and the
+        // server has no way to know we threw our decoder away. `h264.rs` already records
+        // that measurement ("a rebuild mid-GOP fails every P-frame until the next IDR")
+        // and concludes rebuilds must never be routine — but a ResetGraphics IS routine
+        // on any host with a real display, where every mode change (idle power-off,
+        // backlight, lid, dock) produces one. That made the whole desktop undecodable
+        // until something forced a keyframe, which is why resizing the window a few times
+        // "fixed" it: MDR-BUG-FLUX-00008, measured on kiln as 105 failures across 163
+        // AVC444 updates (67 luma, 38 chroma) in one session.
+        //
+        // Resetting is also unnecessary. `decode_yuv420` rebuilds the session by itself
+        // whenever parameter sets first arrive or change, so a genuinely new stream heals
+        // at its first IDR; and a restarted stream reusing the same SPS/PPS decodes
+        // correctly on the live session, because an IDR resets reference state within the
+        // codec. Dropping the session buys nothing and costs every frame until the next
+        // keyframe.
+        //
+        // Every fleet test host is headless, so none of them could produce the trigger —
+        // the bug was only ever visible on the one machine with a screen attached.
 
         debug!(width, height, "Graphics reset");
         self.handler.on_reset_graphics(width, height);
@@ -983,7 +1007,7 @@ impl GraphicsPipelineClient {
                 && (usize::from(surf_h)..=aligned_h).contains(&frame.height)
         };
 
-        let mut chroma_skipped: Option<&'static str> = None;
+        let mut chroma_skipped: Option<String> = None;
         let mut emit_rects: Vec<ExclusiveRectangle>;
 
         match passes {
@@ -996,7 +1020,8 @@ impl GraphicsPipelineClient {
                 let decode_started = std::time::Instant::now();
                 if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.0) {
                     warn!(error = %e, "AVC444 luma stream decode failed; skipping this frame");
-                    self.handler.on_decode_failure(codec_id, "avc444 luma decode failed");
+                    self.handler
+                        .on_decode_failure(codec_id, &format!("avc444 luma decode failed: {e}"));
                     return;
                 }
                 decode_us += decode_started.elapsed().as_micros();
@@ -1011,9 +1036,9 @@ impl GraphicsPipelineClient {
                 let decode_started = std::time::Instant::now();
                 if let Err(e) = decoder.decode_yuv420(stream2.data, &mut self.yuv_scratch.1) {
                     warn!(error = %e, "AVC444 chroma stream decode failed; applying luma only");
-                    chroma_skipped = Some("avc444 chroma decode failed");
+                    chroma_skipped = Some(format!("avc444 chroma decode failed: {e}"));
                 } else if !self.yuv_scratch.1.is_well_formed() {
-                    chroma_skipped = Some("avc444 malformed decoded frame");
+                    chroma_skipped = Some("avc444 malformed decoded frame".to_owned());
                 }
                 decode_us += decode_started.elapsed().as_micros();
 
@@ -1040,7 +1065,7 @@ impl GraphicsPipelineClient {
                             aligned_h,
                             "AVC444 frame geometry does not match the packing geometry; luma only"
                         );
-                        chroma_skipped = Some("avc444 frame geometry mismatch");
+                        chroma_skipped = Some("avc444 frame geometry mismatch".to_owned());
                     }
                 }
                 emit_rects = stream1_rects;
@@ -1058,7 +1083,8 @@ impl GraphicsPipelineClient {
                 let decode_started = std::time::Instant::now();
                 if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.0) {
                     warn!(error = %e, "AVC444 luma stream decode failed; skipping this frame");
-                    self.handler.on_decode_failure(codec_id, "avc444 luma decode failed");
+                    self.handler
+                        .on_decode_failure(codec_id, &format!("avc444 luma decode failed: {e}"));
                     return;
                 }
                 decode_us += decode_started.elapsed().as_micros();
@@ -1078,7 +1104,8 @@ impl GraphicsPipelineClient {
                 let decode_started = std::time::Instant::now();
                 if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.1) {
                     warn!(error = %e, "AVC444 chroma stream decode failed; skipping this frame");
-                    self.handler.on_decode_failure(codec_id, "avc444 chroma decode failed");
+                    self.handler
+                        .on_decode_failure(codec_id, &format!("avc444 chroma decode failed: {e}"));
                     return;
                 }
                 decode_us += decode_started.elapsed().as_micros();
@@ -1111,7 +1138,7 @@ impl GraphicsPipelineClient {
             }
         }
 
-        if let Some(reason) = chroma_skipped {
+        if let Some(reason) = &chroma_skipped {
             self.handler.on_decode_failure(codec_id, reason);
         }
 
@@ -1459,6 +1486,50 @@ mod tests {
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
     }
 
+    #[test]
+    fn reset_graphics_does_not_destroy_the_h264_decoder() {
+        // MDR-BUG-FLUX-00008. `H264Decoder::reset` is not a flush — it drops the
+        // decompression session. One rebuilt mid-GOP holds no reference frames, so every
+        // P-frame after it fails until the server's next IDR, and the server has no way
+        // to know we threw the decoder away. On any host with a real screen attached,
+        // ResetGraphics is routine — idle display power-off, backlight, lid, dock all
+        // produce one — so resetting here left the whole desktop undecodable until
+        // something forced a keyframe. Measured on kiln: 105 failures across 163 AVC444
+        // updates in a single session, and resizing the window "fixed" it precisely
+        // because that forced a fresh keyframe.
+        //
+        // It is unnecessary too: `decode_yuv420` rebuilds the session itself whenever the
+        // parameter sets first arrive or change, so a genuinely new stream heals at its
+        // first IDR.
+        struct CountingDecoder(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl H264Decoder for CountingDecoder {
+            fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
+                Err(DecoderError::msg("not exercised by this test"))
+            }
+            fn reset(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(TestHandler),
+            Some(Box::new(CountingDecoder(std::sync::Arc::clone(&resets)))),
+        );
+
+        let _ = client.handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+            width: 2560,
+            height: 1440,
+            monitors: vec![],
+        }));
+
+        assert_eq!(
+            resets.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "ResetGraphics must not tear the decode session down"
+        );
+    }
+
     // ------------------------------------------------------------------------
     // AVC444 client-level tests: LC dispatch, rect ownership, buffer lifecycle.
     // ------------------------------------------------------------------------
@@ -1506,7 +1577,7 @@ mod tests {
     #[derive(Debug)]
     enum Event {
         Update { rect: (u16, u16, u16, u16), data_len: usize },
-        Failure(&'static str),
+        Failure(String),
     }
 
     struct Recorder(Sender<Event>);
@@ -1520,8 +1591,8 @@ mod tests {
             });
         }
 
-        fn on_decode_failure(&mut self, _codec_id: Codec1Type, reason: &'static str) {
-            let _ = self.0.send(Event::Failure(reason));
+        fn on_decode_failure(&mut self, _codec_id: Codec1Type, reason: &str) {
+            let _ = self.0.send(Event::Failure(reason.to_owned()));
         }
     }
 
@@ -1745,7 +1816,7 @@ mod tests {
         assert_eq!(u[1 * 64 + 1], 11, "chroma stayed at the luma-replicated value");
         assert!(
             rx.try_iter()
-                .any(|e| matches!(e, Event::Failure("avc444 frame geometry mismatch"))),
+                .any(|e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 frame geometry mismatch")),
             "the degradation must be counted"
         );
     }
@@ -1817,7 +1888,7 @@ mod tests {
         assert_eq!(u[3 * 60 + 5], 11, "chroma stayed at the luma-replicated value");
         assert!(
             rx.try_iter()
-                .any(|e| matches!(e, Event::Failure("avc444 frame geometry mismatch"))),
+                .any(|e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 frame geometry mismatch")),
             "the degradation must be counted"
         );
     }
@@ -1842,7 +1913,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, Event::Failure("avc444 malformed region rects"))),
+                .any(|e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 malformed region rects")),
             "{events:?}"
         );
         assert!(
