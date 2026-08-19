@@ -38,12 +38,34 @@ pub fn classify(reason: &GracefulDisconnectReason) -> Option<ServerFarewell> {
             "is shutting down",
             "The host is powering off. Reconnecting will only work once it is on again.".to_owned(),
         ),
+        // The commonest ending of all, and the spec's own sentence for it — "The
+        // disconnection was initiated by the user logging off his or her session on
+        // the server" — is three lines of dialog saying one thing.
+        ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::LogoffByUser) => (
+            "ended the session",
+            "User logged out of their session on the server".to_owned(),
+        ),
         // Everything else keeps the protocol's own description. It is written for a
         // reader ("Another user connected to the server, forcing the disconnection of
         // the current connection") and there is nothing we can add to it.
-        other => ("ended the session", other.description()),
+        other => ("ended the session", plain_description(*other)),
     };
     Some(ServerFarewell { headline, detail })
+}
+
+/// The protocol's own sentence, without the error-class label `ErrorInfo::description`
+/// prepends. "[Protocol independent error]" tells the reader which table of MS-RDPBCGR
+/// 2.2.5.1.1 the code came from, which is a fact about the specification rather than
+/// about their session.
+fn plain_description(info: ErrorInfo) -> String {
+    match info {
+        ErrorInfo::ProtocolIndependentCode(c) => c.description().to_owned(),
+        ErrorInfo::ProtocolIndependentLicensingCode(c) => c.description().to_owned(),
+        ErrorInfo::ProtocolIndependentConnectionBrokerCode(c) => c.description().to_owned(),
+        ErrorInfo::RdpSpecificCode(c) => c.description().to_owned(),
+        // No sentence exists for a code we cannot name, so the number is all there is.
+        ErrorInfo::Unknown(_) => info.description(),
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +132,36 @@ mod tests {
             farewell.detail.contains("Another user connected"),
             "{farewell:?}"
         );
+        // …but not the label naming the spec table the code came from. The reader is
+        // being told why their session ended, not which of MS-RDPBCGR's four code
+        // tables Microsoft filed the reason under.
+        assert!(
+            !farewell.detail.contains("[Protocol independent error]"),
+            "{farewell:?}"
+        );
+    }
+
+    /// The commonest ending of all. The spec's own sentence — "The disconnection was
+    /// initiated by the user logging off his or her session on the server" — is three
+    /// wrapped dialog lines saying one thing, so this is the one code we reword.
+    #[test]
+    fn a_user_logoff_is_said_in_one_short_line() {
+        let farewell = classify(&GracefulDisconnectReason::ErrorInfo(wire(0x0000_000C)))
+            .expect("a logoff is a server farewell");
+        assert_eq!(farewell.headline, "ended the session");
+        assert_eq!(
+            farewell.detail,
+            "User logged out of their session on the server"
+        );
+    }
+
+    /// A code with no sentence has only its number, and dropping the class label must
+    /// not drop that too — leaving the detail line blank.
+    #[test]
+    fn an_unnameable_code_still_shows_its_number() {
+        let farewell = classify(&GracefulDisconnectReason::ErrorInfo(wire(0x0000_00FE)))
+            .expect("an unknown code is still a farewell");
+        assert!(farewell.detail.contains("0x000000FE"), "{farewell:?}");
     }
 
     /// Closing the window is not a server farewell, so the ordinary clean-close path

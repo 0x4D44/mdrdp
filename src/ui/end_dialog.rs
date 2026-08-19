@@ -28,12 +28,14 @@ pub enum EndChoice {
 /// mock; height is measured from the content each time the dialog opens
 /// ([`window_size`]), because the failure text is the server's to choose and a real
 /// IronRDP error chain wraps to a dozen lines.
-const WARN_WIDTH: f32 = 480.0;
-const ENDED_WIDTH: f32 = 460.0;
-/// The mock's designed heights, kept as floors so a one-line ending still looks like a
-/// dialog rather than a strip.
-const WARN_MIN_HEIGHT: f32 = 300.0;
-const ENDED_MIN_HEIGHT: f32 = 280.0;
+const WARN_WIDTH: f32 = 440.0;
+const ENDED_WIDTH: f32 = 420.0;
+/// A floor only, so a one-line ending still looks like a dialog rather than a strip.
+/// It sits just under what the shortest real variant measures, which is the point: the
+/// content decides the height and the floor never pads it. The mock's 280/300 did pad
+/// it — the commonest dialog of all, a clean server logoff, opened with a third of its
+/// window empty below the buttons.
+const MIN_HEIGHT: f32 = 160.0;
 /// A taller dialog would start running off small displays, so growth stops here and the
 /// failure text scrolls inside [`REASON_MAX_HEIGHT`] instead.
 const MAX_HEIGHT: f32 = 640.0;
@@ -199,14 +201,14 @@ pub fn show(event_loop: &mut EventLoop<SessionEvent>, info: EndInfo) -> Option<E
 /// An aux window cannot be resized, so the size is chosen once, up front: lay the
 /// dialog out headlessly at its fixed width and take the height the content used.
 fn window_size(info: &EndInfo) -> [f32; 2] {
-    let (width, min_height) = if info.outcome.unexpected() {
-        (WARN_WIDTH, WARN_MIN_HEIGHT)
+    let width = if info.outcome.unexpected() {
+        WARN_WIDTH
     } else {
-        (ENDED_WIDTH, ENDED_MIN_HEIGHT)
+        ENDED_WIDTH
     };
     [
         width,
-        measured_height(info, width).clamp(min_height, MAX_HEIGHT),
+        measured_height(info, width).clamp(MIN_HEIGHT, MAX_HEIGHT),
     ]
 }
 
@@ -419,6 +421,8 @@ pub fn duration_str(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp::pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp::session::GracefulDisconnectReason;
 
     #[test]
     fn durations_read_compactly_at_every_scale() {
@@ -496,6 +500,52 @@ mod tests {
         }
     }
 
+    /// The floor is a floor, not a size: every ending a user actually meets is short,
+    /// so each one must open at the height its own content measured. The mock's 300 px
+    /// left the commonest dialog of all — a clean server logoff — with a third of its
+    /// window empty below the buttons.
+    #[test]
+    fn no_ordinary_ending_opens_with_dead_space_below_its_buttons() {
+        let cases = [
+            info(EndOutcome::Ended),
+            info(EndOutcome::Lost("connection reset by peer".to_owned())),
+            info(EndOutcome::ServerEnded(
+                crate::disconnect::classify(&GracefulDisconnectReason::ErrorInfo(
+                    ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::LogoffByUser),
+                ))
+                .expect("a logoff is a server farewell"),
+            )),
+        ];
+        for info in &cases {
+            let size = window_size(info);
+            assert_eq!(
+                size[1],
+                measured_height(info, size[0]),
+                "the floor padded a {size:?} window past its own content"
+            );
+            assert!(size[1] <= 220.0, "a short ending opened at {size:?}");
+        }
+    }
+
+    /// The spec's own sentence for the commonest ending runs to three dialog lines and
+    /// leads with a label about MS-RDPBCGR's tables. Ours says the same thing in one.
+    #[test]
+    fn a_user_logoff_reads_as_one_short_line() {
+        let farewell = crate::disconnect::classify(&GracefulDisconnectReason::ErrorInfo(
+            ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::LogoffByUser),
+        ))
+        .expect("a logoff is a server farewell");
+        let info = info(EndOutcome::ServerEnded(farewell));
+        let size = window_size(&info);
+        let texts = frame(size, &info);
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            drawn.contains(&"User logged out of their session on the server"),
+            "{drawn:?}"
+        );
+        assert_fits(&texts, size);
+    }
+
     /// The point of the whole change: a host that restarted says so by name, instead of
     /// showing the decode error its Set Error Info PDU used to provoke.
     #[test]
@@ -536,11 +586,7 @@ mod tests {
     fn a_lost_session_still_fits_its_window() {
         let info = info(EndOutcome::Lost("connection reset by peer".to_owned()));
         let size = window_size(&info);
-        assert_eq!(
-            size,
-            [WARN_WIDTH, WARN_MIN_HEIGHT],
-            "a one-line failure should still open at the designed size"
-        );
+        assert_eq!(size[0], WARN_WIDTH);
         let texts = frame(size, &info);
         let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
         assert!(drawn.contains(&"Session to Kiln lost"), "{drawn:?}");
@@ -551,7 +597,7 @@ mod tests {
     fn a_clean_end_still_fits_its_window() {
         let info = info(EndOutcome::Ended);
         let size = window_size(&info);
-        assert_eq!(size, [ENDED_WIDTH, ENDED_MIN_HEIGHT]);
+        assert_eq!(size[0], ENDED_WIDTH);
         let texts = frame(size, &info);
         let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
         assert!(drawn.contains(&"Session Kiln ended"), "{drawn:?}");
@@ -575,11 +621,12 @@ mod tests {
 
     #[test]
     fn a_ten_line_failure_grows_the_window_instead_of_losing_the_buttons() {
+        let one_line = window_size(&info(EndOutcome::Lost("reset by peer".to_owned())));
         let info = info(EndOutcome::Lost(REAL_DECODE_FAILURE.to_owned()));
         let size = window_size(&info);
         assert!(
-            size[1] > WARN_MIN_HEIGHT,
-            "the dialog did not grow for a ten-line failure: {size:?}"
+            size[1] > one_line[1],
+            "the dialog did not grow for a ten-line failure: {size:?} vs {one_line:?}"
         );
         let texts = frame(size, &info);
         let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
