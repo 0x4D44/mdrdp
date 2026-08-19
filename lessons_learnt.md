@@ -36,6 +36,12 @@ Indented lines below the first are detail: kept for lookup, never injected.
   changing, 5/5. Any "connects but blank" report needs the desktop's activity stated before it is
   a bug in anything else. MDR-BUG-FLUX-00011.
 
+- Intel's MF encoder MFTs ACCEPT 4:4:4 profiles and silently emit 4:2:0 — read the SPS back, never trust SetOutputType (`tools/mf-caps-probe`).
+  On quench (Core Ultra 7 270K Plus) Intel HEVC takes Main_444_8 + ARGB32 and emits profile 1 /
+  chroma_format_idc 1; Intel VP9 ignores the profile attribute outright (byte-identical output).
+  The silicon can do HEVC 4:4:4 — D3D12 Video Encode reports Main_444/Main10_444 with AYUV/Y410 —
+  but not via the MFT. Also: session 0 enumerates hardware MFTs but ActivateObject fails E_FAIL;
+  D3D12 CheckFeatureSupport works there. See the quench SPIKE doc of 2026-08-19.
 - M5 Max VideoToolbox decodes H.264 AND HEVC 4:4:4 in HARDWARE at 5K; VP9 has no VT decoder at all (`tools/vt-caps-probe`).
   `VTIsHardwareDecodeSupported` answers per codec only; the probe feeds real 4:2:0/4:2:2/4:4:4
   streams to a hardware-required session and counts frames. AV1 is hardware for 4:2:0 only. The

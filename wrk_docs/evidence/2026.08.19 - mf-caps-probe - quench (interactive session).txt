@@ -1,0 +1,993 @@
+2026-08-19T12:12:33Z (task launched, UTC)
+host: quench.lan.example (192.0.2.240), user ano
+invoked: schtasks /create /tn mfcapsprobe /tr "cmd /c C:\mdrdp\probe\mf-caps-probe.exe > C:\mdrdp\probe\out-interactive.txt 2>&1" /sc once /st 00:00 /it /rl highest /f  then  schtasks /run  --  console session; probe reports session_id             : 2
+----------------------------------------------------------------------
+mf-caps-probe 0.1.0 — Media Foundation encoder capability probe
+
+=== 1. HOST ===
+cpu_brand              : Intel(R) Core(TM) Ultra 7 270K Plus
+windows_product        : Windows 10 Pro
+windows_display_version: 25H2
+windows_build          : 26200.9168
+process_id             : 11076
+session_id             : 2
+  (session 0 is the non-interactive SSH/service session; the console user is normally session 1 or 2. Hardware MFT visibility can differ between them.)
+adapter[0]             : "Intel(R) Graphics" vendor=0x8086 device=0x7D67 subsys=0xD0001458 rev=6 vram_dedicated=128 MiB shared=48613 MiB flags=0x0
+adapter[1]             : "Intel(R) Graphics" vendor=0x8086 device=0x7D67 subsys=0xD0001458 rev=6 vram_dedicated=128 MiB shared=48613 MiB flags=0x0
+adapter[2]             : "Microsoft Basic Render Driver" vendor=0x1414 device=0x008C subsys=0x00000000 rev=0 vram_dedicated=0 MiB shared=48613 MiB flags=0x2
+d3d11_device           : created (available as an IMFDXGIDeviceManager for D3D-aware MFTs)
+mf_startup             : ok
+
+=== 2. ENCODER MFT INVENTORY ===
+(inputs marked **like this** can carry 4:4:4)
+
+-- output subtype H.264 {34363248-0000-0010-8000-00AA00389B71} --
+  [HARDWARE|ASYNCMFT|SYNCMFT|SORTANDFILTER] 4 MFT(s)
+    - Intel® Quick Sync Video H.264 Encoder MFT
+    -   clsid            : {4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**
+    -   4:4:4-capable in : ARGB32 (4:4:4 RGB)
+    - Intel® Quick Sync Video H.264 Encoder MFT
+    -   clsid            : {4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**
+    -   4:4:4-capable in : ARGB32 (4:4:4 RGB)
+    - Microsoft AVC DX12 Encoder
+    -   clsid            : {00000000-0000-0000-0000-000000000000}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "Microsoft AVC DX12 Encoder")
+    -   vendor_id        : VEN_1414
+    -   registered inputs: NV12, P010
+    -   4:4:4-capable in : NONE
+    - H264 Encoder MFT
+    -   clsid            : {6CA50344-051A-4DED-9779-A43305165E35}
+    -   hardware         : no (MFT_ENUM_HARDWARE_URL_Attribute absent)
+    -   vendor_id        : <absent>
+    -   registered inputs: IYUV, YV12, NV12, YUY2
+    -   4:4:4-capable in : NONE
+  [ALL|SORTANDFILTER] 4 MFT(s)
+    - Intel® Quick Sync Video H.264 Encoder MFT
+    -   clsid            : {4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**
+    -   4:4:4-capable in : ARGB32 (4:4:4 RGB)
+    - Intel® Quick Sync Video H.264 Encoder MFT
+    -   clsid            : {4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**
+    -   4:4:4-capable in : ARGB32 (4:4:4 RGB)
+    - Microsoft AVC DX12 Encoder
+    -   clsid            : {00000000-0000-0000-0000-000000000000}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "Microsoft AVC DX12 Encoder")
+    -   vendor_id        : VEN_1414
+    -   registered inputs: NV12, P010
+    -   4:4:4-capable in : NONE
+    - H264 Encoder MFT
+    -   clsid            : {6CA50344-051A-4DED-9779-A43305165E35}
+    -   hardware         : no (MFT_ENUM_HARDWARE_URL_Attribute absent)
+    -   vendor_id        : <absent>
+    -   registered inputs: IYUV, YV12, NV12, YUY2
+    -   4:4:4-capable in : NONE
+
+-- output subtype HEVC {43564548-0000-0010-8000-00AA00389B71} --
+  [HARDWARE|ASYNCMFT|SYNCMFT|SORTANDFILTER] 4 MFT(s)
+    - Intel® Hardware H265 Encoder MFT
+    -   clsid            : {BC10864D-2B34-408F-912A-102B1B867B6C}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+    -   4:4:4-capable in : ARGB32 (4:4:4 RGB)
+    - Intel® Hardware H265 Encoder MFT
+    -   clsid            : {BC10864D-2B34-408F-912A-102B1B867B6C}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+    -   4:4:4-capable in : ARGB32 (4:4:4 RGB)
+    - HEVCVideoExtensionEncoder
+    -   clsid            : {00000000-0000-0000-0000-000000000000}
+    -   hardware         : no (MFT_ENUM_HARDWARE_URL_Attribute absent)
+    -   vendor_id        : <absent>
+    -   registered inputs: NV12, IYUV, YV12, YUY2
+    -   4:4:4-capable in : NONE
+    - Microsoft HEVC DX12 Encoder
+    -   clsid            : {00000000-0000-0000-0000-000000000000}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "Microsoft HEVC DX12 Encoder")
+    -   vendor_id        : VEN_1414
+    -   registered inputs: NV12, P010
+    -   4:4:4-capable in : NONE
+  [ALL|SORTANDFILTER] 4 MFT(s)
+    - Intel® Hardware H265 Encoder MFT
+    -   clsid            : {BC10864D-2B34-408F-912A-102B1B867B6C}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+    -   4:4:4-capable in : ARGB32 (4:4:4 RGB)
+    - Intel® Hardware H265 Encoder MFT
+    -   clsid            : {BC10864D-2B34-408F-912A-102B1B867B6C}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+    -   4:4:4-capable in : ARGB32 (4:4:4 RGB)
+    - HEVCVideoExtensionEncoder
+    -   clsid            : {00000000-0000-0000-0000-000000000000}
+    -   hardware         : no (MFT_ENUM_HARDWARE_URL_Attribute absent)
+    -   vendor_id        : <absent>
+    -   registered inputs: NV12, IYUV, YV12, YUY2
+    -   4:4:4-capable in : NONE
+    - Microsoft HEVC DX12 Encoder
+    -   clsid            : {00000000-0000-0000-0000-000000000000}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "Microsoft HEVC DX12 Encoder")
+    -   vendor_id        : VEN_1414
+    -   registered inputs: NV12, P010
+    -   4:4:4-capable in : NONE
+
+-- output subtype AV1 {31305641-0000-0010-8000-00AA00389B71} --
+  [HARDWARE|ASYNCMFT|SYNCMFT|SORTANDFILTER] none
+  [ALL|SORTANDFILTER] none
+
+-- output subtype VP9 {30395056-0000-0010-8000-00AA00389B71} --
+  [HARDWARE|ASYNCMFT|SYNCMFT|SORTANDFILTER] 3 MFT(s)
+    - Intel® Hardware VP9 Encoder MFT
+    -   clsid            : {D186A626-77CA-4D80-942F-61E0A5111AFE}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+    -   4:4:4-capable in : NONE
+    - Intel® Hardware VP9 Encoder MFT
+    -   clsid            : {D186A626-77CA-4D80-942F-61E0A5111AFE}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+    -   4:4:4-capable in : NONE
+    - VP9VideoExtensionEncoder
+    -   clsid            : {00000000-0000-0000-0000-000000000000}
+    -   hardware         : no (MFT_ENUM_HARDWARE_URL_Attribute absent)
+    -   vendor_id        : <absent>
+    -   registered inputs: NV12, IYUV, YV12, YUY2
+    -   4:4:4-capable in : NONE
+  [ALL|SORTANDFILTER] 3 MFT(s)
+    - Intel® Hardware VP9 Encoder MFT
+    -   clsid            : {D186A626-77CA-4D80-942F-61E0A5111AFE}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+    -   4:4:4-capable in : NONE
+    - Intel® Hardware VP9 Encoder MFT
+    -   clsid            : {D186A626-77CA-4D80-942F-61E0A5111AFE}
+    -   hardware         : YES (MFT_ENUM_HARDWARE_URL_Attribute = "AA243E5D-2F73-48c7-97F7-F6FA17651651")
+    -   vendor_id        : VEN_8086
+    -   registered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+    -   4:4:4-capable in : NONE
+    - VP9VideoExtensionEncoder
+    -   clsid            : {00000000-0000-0000-0000-000000000000}
+    -   hardware         : no (MFT_ENUM_HARDWARE_URL_Attribute absent)
+    -   vendor_id        : <absent>
+    -   registered inputs: NV12, IYUV, YV12, YUY2
+    -   4:4:4-capable in : NONE
+
+driving 7 MFT(s) in sections 3 and 4:
+  [0] Intel® Quick Sync Video H.264 Encoder MFT (hardware, ordinal 0 in the H.264 ALL enumeration)
+  [1] Microsoft AVC DX12 Encoder (hardware, ordinal 2 in the H.264 ALL enumeration)
+  [2] H264 Encoder MFT (software, ordinal 3 in the H.264 ALL enumeration)
+  [3] Intel® Hardware H265 Encoder MFT (hardware, ordinal 0 in the HEVC ALL enumeration)
+  [4] HEVCVideoExtensionEncoder (software, ordinal 2 in the HEVC ALL enumeration)
+  [5] Microsoft HEVC DX12 Encoder (hardware, ordinal 3 in the HEVC ALL enumeration)
+  [6] Intel® Hardware VP9 Encoder MFT (hardware, ordinal 0 in the VP9 ALL enumeration)
+
+=== 3. PROFILE ACCEPTANCE (SetOutputType) ===
+
+-- Intel® Quick Sync Video H.264 Encoder MFT [hardware] H.264 --
+   1920x1080  eAVEncH264VProfile_Main                  value=77  4:2:0  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**
+   5120x2880  eAVEncH264VProfile_Main                  value=77  4:2:0  8-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH264VProfile_High                  value=100 4:2:0  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**
+   5120x2880  eAVEncH264VProfile_High                  value=100 4:2:0  8-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH264VProfile_High10                value=110 4:2:0 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**
+   5120x2880  eAVEncH264VProfile_High10                value=110 4:2:0 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH264VProfile_422                   value=122 4:2:2 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**
+   5120x2880  eAVEncH264VProfile_422                   value=122 4:2:2 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH264VProfile_444                   value=244 4:4:4  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**
+   5120x2880  eAVEncH264VProfile_444                   value=244 4:4:4  8-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+
+-- Microsoft AVC DX12 Encoder [hardware] H.264 --
+   1920x1080  eAVEncH264VProfile_Main                  value=77  4:2:0  8-bit  refused 0x80004005 (Unspecified error)
+   5120x2880  eAVEncH264VProfile_Main                  value=77  4:2:0  8-bit  refused 0x80070057 (The parameter is incorrect.)
+   1920x1080  eAVEncH264VProfile_High                  value=100 4:2:0  8-bit  refused 0x80004005 (Unspecified error)
+   5120x2880  eAVEncH264VProfile_High                  value=100 4:2:0  8-bit  refused 0x80070057 (The parameter is incorrect.)
+   1920x1080  eAVEncH264VProfile_High10                value=110 4:2:0 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   5120x2880  eAVEncH264VProfile_High10                value=110 4:2:0 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH264VProfile_422                   value=122 4:2:2 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   5120x2880  eAVEncH264VProfile_422                   value=122 4:2:2 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH264VProfile_444                   value=244 4:4:4  8-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   5120x2880  eAVEncH264VProfile_444                   value=244 4:4:4  8-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+
+-- H264 Encoder MFT [software] H.264 --
+   1920x1080  eAVEncH264VProfile_Main                  value=77  4:2:0  8-bit  ACCEPTED (S_OK)
+                 offered inputs: IYUV, YV12, NV12, YUY2
+   5120x2880  eAVEncH264VProfile_Main                  value=77  4:2:0  8-bit  ACCEPTED (S_OK)
+                 offered inputs: IYUV, YV12, NV12, YUY2
+   1920x1080  eAVEncH264VProfile_High                  value=100 4:2:0  8-bit  ACCEPTED (S_OK)
+                 offered inputs: IYUV, YV12, NV12, YUY2
+   5120x2880  eAVEncH264VProfile_High                  value=100 4:2:0  8-bit  ACCEPTED (S_OK)
+                 offered inputs: IYUV, YV12, NV12, YUY2
+   1920x1080  eAVEncH264VProfile_High10                value=110 4:2:0 10-bit  refused 0xC00D36BD (Invalid Profile)
+   5120x2880  eAVEncH264VProfile_High10                value=110 4:2:0 10-bit  refused 0xC00D36BD (Invalid Profile)
+   1920x1080  eAVEncH264VProfile_422                   value=122 4:2:2 10-bit  refused 0xC00D36BD (Invalid Profile)
+   5120x2880  eAVEncH264VProfile_422                   value=122 4:2:2 10-bit  refused 0xC00D36BD (Invalid Profile)
+   1920x1080  eAVEncH264VProfile_444                   value=244 4:4:4  8-bit  refused 0xC00D36BD (Invalid Profile)
+   5120x2880  eAVEncH264VProfile_444                   value=244 4:4:4  8-bit  refused 0xC00D36BD (Invalid Profile)
+
+-- Intel® Hardware H265 Encoder MFT [hardware] HEVC --
+   1920x1080  eAVEncH265VProfile_Main_420_8            value=1   4:2:0  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   5120x2880  eAVEncH265VProfile_Main_420_8            value=1   4:2:0  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   1920x1080  eAVEncH265VProfile_Main_420_10           value=2   4:2:0 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   5120x2880  eAVEncH265VProfile_Main_420_10           value=2   4:2:0 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   1920x1080  eAVEncH265VProfile_Main_420_12           value=3   4:2:0 12-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   5120x2880  eAVEncH265VProfile_Main_420_12           value=3   4:2:0 12-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   1920x1080  eAVEncH265VProfile_Main_422_10           value=4   4:2:2 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   5120x2880  eAVEncH265VProfile_Main_422_10           value=4   4:2:2 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   1920x1080  eAVEncH265VProfile_Main_422_12           value=5   4:2:2 12-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   5120x2880  eAVEncH265VProfile_Main_422_12           value=5   4:2:2 12-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   1920x1080  eAVEncH265VProfile_Main_444_8            value=6   4:4:4  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   5120x2880  eAVEncH265VProfile_Main_444_8            value=6   4:4:4  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   1920x1080  eAVEncH265VProfile_Main_444_10           value=7   4:4:4 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   5120x2880  eAVEncH265VProfile_Main_444_10           value=7   4:4:4 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   1920x1080  eAVEncH265VProfile_Main_444_12           value=8   4:4:4 12-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+   5120x2880  eAVEncH265VProfile_Main_444_12           value=8   4:4:4 12-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12, **ARGB32 (4:4:4 RGB)**, P010
+
+-- HEVCVideoExtensionEncoder [software] HEVC --
+   1920x1080  eAVEncH265VProfile_Main_420_8            value=1   4:2:0  8-bit  ACCEPTED (S_OK)
+                 offered inputs: IYUV, NV12, I422 (planar 4:2:2 8-bit), **I444 (planar 4:4:4 8-bit)**
+   5120x2880  eAVEncH265VProfile_Main_420_8            value=1   4:2:0  8-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_420_10           value=2   4:2:0 10-bit  refused 0xC00D36BD (Invalid Profile)
+   5120x2880  eAVEncH265VProfile_Main_420_10           value=2   4:2:0 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_420_12           value=3   4:2:0 12-bit  refused 0xC00D36BD (Invalid Profile)
+   5120x2880  eAVEncH265VProfile_Main_420_12           value=3   4:2:0 12-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_422_10           value=4   4:2:2 10-bit  refused 0xC00D36BD (Invalid Profile)
+   5120x2880  eAVEncH265VProfile_Main_422_10           value=4   4:2:2 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_422_12           value=5   4:2:2 12-bit  refused 0xC00D36BD (Invalid Profile)
+   5120x2880  eAVEncH265VProfile_Main_422_12           value=5   4:2:2 12-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_444_8            value=6   4:4:4  8-bit  ACCEPTED (S_OK)
+                 offered inputs: IYUV, NV12, I422 (planar 4:2:2 8-bit), **I444 (planar 4:4:4 8-bit)**
+   5120x2880  eAVEncH265VProfile_Main_444_8            value=6   4:4:4  8-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_444_10           value=7   4:4:4 10-bit  refused 0xC00D36BD (Invalid Profile)
+   5120x2880  eAVEncH265VProfile_Main_444_10           value=7   4:4:4 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_444_12           value=8   4:4:4 12-bit  refused 0xC00D36BD (Invalid Profile)
+   5120x2880  eAVEncH265VProfile_Main_444_12           value=8   4:4:4 12-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+
+-- Microsoft HEVC DX12 Encoder [hardware] HEVC --
+   1920x1080  eAVEncH265VProfile_Main_420_8            value=1   4:2:0  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: NV12
+   5120x2880  eAVEncH265VProfile_Main_420_8            value=1   4:2:0  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: NV12
+   1920x1080  eAVEncH265VProfile_Main_420_10           value=2   4:2:0 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: P010
+   5120x2880  eAVEncH265VProfile_Main_420_10           value=2   4:2:0 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: P010
+   1920x1080  eAVEncH265VProfile_Main_420_12           value=3   4:2:0 12-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   5120x2880  eAVEncH265VProfile_Main_420_12           value=3   4:2:0 12-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_422_10           value=4   4:2:2 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   5120x2880  eAVEncH265VProfile_Main_422_10           value=4   4:2:2 10-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_422_12           value=5   4:2:2 12-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   5120x2880  eAVEncH265VProfile_Main_422_12           value=5   4:2:2 12-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   1920x1080  eAVEncH265VProfile_Main_444_8            value=6   4:4:4  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: **AYUV (4:4:4 8-bit)**
+   5120x2880  eAVEncH265VProfile_Main_444_8            value=6   4:4:4  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: **AYUV (4:4:4 8-bit)**
+   1920x1080  eAVEncH265VProfile_Main_444_10           value=7   4:4:4 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: **Y410 (4:4:4 10-bit)**
+   5120x2880  eAVEncH265VProfile_Main_444_10           value=7   4:4:4 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: **Y410 (4:4:4 10-bit)**
+   1920x1080  eAVEncH265VProfile_Main_444_12           value=8   4:4:4 12-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+   5120x2880  eAVEncH265VProfile_Main_444_12           value=8   4:4:4 12-bit  refused 0xC00D36B4 (The data specified for the media type is invalid, inconsistent, or not supported by this object.)
+
+-- Intel® Hardware VP9 Encoder MFT [hardware] VP9 --
+   1920x1080  eAVEncVP9VProfile_unknown                value=0   ?      0-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   5120x2880  eAVEncVP9VProfile_unknown                value=0   ?      0-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   1920x1080  eAVEncVP9VProfile_420_8                  value=1   4:2:0  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   5120x2880  eAVEncVP9VProfile_420_8                  value=1   4:2:0  8-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   1920x1080  eAVEncVP9VProfile_420_10                 value=2   4:2:0 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   5120x2880  eAVEncVP9VProfile_420_10                 value=2   4:2:0 10-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   1920x1080  eAVEncVP9VProfile_420_12                 value=3   4:2:0 12-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   5120x2880  eAVEncVP9VProfile_420_12                 value=3   4:2:0 12-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   1920x1080  <UNSYMBOLISED raw 4>                     value=4   ?      0-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   5120x2880  <UNSYMBOLISED raw 4>                     value=4   ?      0-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   1920x1080  <UNSYMBOLISED raw 5>                     value=5   ?      0-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+   5120x2880  <UNSYMBOLISED raw 5>                     value=5   ?      0-bit  ACCEPTED (S_OK) [d3d manager set]
+                 offered inputs: {3231564E-3961-42AE-BA67-FF47CCC13EED}, NV12
+
+=== 4. REAL ENCODE (12 synthetic frames, cold, n=12) ===
+(latency is submit->output per frame from a cold start; CBR 20 Mbit, GOP 4, low-latency requested)
+
+-- Intel® Quick Sync Video H.264 Encoder MFT | H.264 eAVEncH264VProfile_Main (value=77) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=428628   mean_latency=7.65 ms  max=15.71 ms
+   bitstream says   : profile_idc=77 4:2:0 8-bit   [note: chroma_format_idc not coded for this profile_idc; inferred 1]
+   parsed fields    : profile_idc=Some(77) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 09 10 00 00 00 01 27 4D 00 2A 95 B0
+      0010  1E 00 89 F9 70 11 00 00 03 00 01 00 00 03 00 78
+      0020  E8 40 00 4C 4B 00 00 13 12 D1 BD EF 83 B4 38 65
+   MF_MT_MPEG_SEQUENCE_HEADER (51 bytes):
+      0000  00 00 01 27 4D 00 2A 95 B0 1E 00 89 F9 70 11 00
+      0010  00 03 00 01 00 00 03 00 78 E8 40 00 4C 4B 00 00
+      0020  13 12 D1 BD EF 83 B4 38 65 C0 00 00 00 01 28 EE
+      0030  3C 80 00
+
+-- Intel® Quick Sync Video H.264 Encoder MFT | H.264 eAVEncH264VProfile_High (value=100) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=436509   mean_latency=8.25 ms  max=17.96 ms
+   bitstream says   : profile_idc=100 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(100) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 09 10 00 00 00 01 27 64 00 2A AC 2B
+      0010  60 3C 01 13 F2 E0 22 00 00 03 00 02 00 00 03 00
+      0020  F1 D0 80 00 98 96 00 00 26 25 A3 7B DF 07 68 70
+   MF_MT_MPEG_SEQUENCE_HEADER (52 bytes):
+      0000  00 00 01 27 64 00 2A AC 2B 60 3C 01 13 F2 E0 22
+      0010  00 00 03 00 02 00 00 03 00 F1 D0 80 00 98 96 00
+      0020  00 26 25 A3 7B DF 07 68 70 CB 80 00 00 00 01 28
+      0030  EE 3C B0 00
+
+-- Intel® Quick Sync Video H.264 Encoder MFT | H.264 eAVEncH264VProfile_High10 (value=110) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=436509   mean_latency=8.16 ms  max=19.00 ms
+   bitstream says   : profile_idc=100 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(100) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 09 10 00 00 00 01 27 64 00 2A AC 2B
+      0010  60 3C 01 13 F2 E0 22 00 00 03 00 02 00 00 03 00
+      0020  F1 D0 80 00 98 96 00 00 26 25 A3 7B DF 07 68 70
+   MF_MT_MPEG_SEQUENCE_HEADER (52 bytes):
+      0000  00 00 01 27 64 00 2A AC 2B 60 3C 01 13 F2 E0 22
+      0010  00 00 03 00 02 00 00 03 00 F1 D0 80 00 98 96 00
+      0020  00 26 25 A3 7B DF 07 68 70 CB 80 00 00 00 01 28
+      0030  EE 3C B0 00
+
+-- Intel® Quick Sync Video H.264 Encoder MFT | H.264 eAVEncH264VProfile_422 (value=122) | 1920x1080 | input {3231564E-3961-42AE-BA67-FF47CCC13EED} --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=505998   mean_latency=12.43 ms  max=22.76 ms
+   bitstream says   : profile_idc=100 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(100) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 09 10 00 00 00 01 27 64 00 2A AC 2B
+      0010  60 3C 01 13 F2 E0 22 00 00 03 00 02 00 00 03 00
+      0020  F1 D0 80 00 98 96 00 00 26 25 A3 7B DF 07 68 70
+   MF_MT_MPEG_SEQUENCE_HEADER (52 bytes):
+      0000  00 00 01 27 64 00 2A AC 2B 60 3C 01 13 F2 E0 22
+      0010  00 00 03 00 02 00 00 03 00 F1 D0 80 00 98 96 00
+      0020  00 26 25 A3 7B DF 07 68 70 CB 80 00 00 00 01 28
+      0030  EE 3C B0 00
+
+-- Intel® Quick Sync Video H.264 Encoder MFT | H.264 eAVEncH264VProfile_444 (value=244) | 1920x1080 | input ARGB32 (4:4:4 RGB) --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=385901   mean_latency=12.84 ms  max=24.26 ms
+   bitstream says   : profile_idc=100 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(100) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 09 10 00 00 00 01 27 64 00 2A AC 2B
+      0010  60 3C 01 13 F2 E0 22 00 00 03 00 02 00 00 03 00
+      0020  F1 D0 80 00 98 96 00 00 26 25 A3 7B DF 07 68 70
+   MF_MT_MPEG_SEQUENCE_HEADER (52 bytes):
+      0000  00 00 01 27 64 00 2A AC 2B 60 3C 01 13 F2 E0 22
+      0010  00 00 03 00 02 00 00 03 00 F1 D0 80 00 98 96 00
+      0020  00 26 25 A3 7B DF 07 68 70 CB 80 00 00 00 01 28
+      0030  EE 3C B0 00
+
+-- H264 Encoder MFT | H.264 eAVEncH264VProfile_Main (value=77) | 1920x1080 | input NV12 --
+   route A (sync, without d3d manager, system-memory samples) -> OK
+   route            : sync, without d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=386853   mean_latency=3.04 ms  max=10.76 ms
+   bitstream says   : profile_idc=77 4:2:0 8-bit   [note: chroma_format_idc not coded for this profile_idc; inferred 1]
+   parsed fields    : profile_idc=Some(77) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 09 10 00 00 00 01 67 4D 40 2A 95 A0
+      0010  1E 00 89 F9 70 11 00 00 03 00 01 00 00 03 00 78
+      0020  0D A0 88 46 A0 00 00 00 01 68 CE 3C 80 00 00 00
+   MF_MT_MPEG_SEQUENCE_HEADER (39 bytes):
+      0000  00 00 00 01 67 4D 40 2A 95 A0 1E 00 89 F9 70 11
+      0010  00 00 03 00 01 00 00 03 00 78 0D A0 88 46 A0 00
+      0020  00 00 01 68 CE 3C 80
+
+-- H264 Encoder MFT | H.264 eAVEncH264VProfile_Main (value=77) | 5120x2880 | input NV12 --
+   route A (sync, without d3d manager, system-memory samples) -> OK
+   route            : sync, without d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=898340   mean_latency=14.58 ms  max=51.54 ms
+   bitstream says   : profile_idc=77 4:2:0 8-bit   [note: chroma_format_idc not coded for this profile_idc; inferred 1]
+   parsed fields    : profile_idc=Some(77) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 09 10 00 00 00 01 67 4D 40 3C 95 A0
+      0010  05 00 05 A6 C0 44 00 00 03 00 04 00 00 03 01 E0
+      0020  36 82 21 1A 80 00 00 00 01 68 CE 3C 80 00 00 00
+   MF_MT_MPEG_SEQUENCE_HEADER (39 bytes):
+      0000  00 00 00 01 67 4D 40 3C 95 A0 05 00 05 A6 C0 44
+      0010  00 00 03 00 04 00 00 03 01 E0 36 82 21 1A 80 00
+      0020  00 00 01 68 CE 3C 80
+
+-- H264 Encoder MFT | H.264 eAVEncH264VProfile_High (value=100) | 1920x1080 | input NV12 --
+   route A (sync, without d3d manager, system-memory samples) -> OK
+   route            : sync, without d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=386855   mean_latency=2.99 ms  max=11.46 ms
+   bitstream says   : profile_idc=100 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(100) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 09 10 00 00 00 01 67 64 00 2A AC 2B
+      0010  40 3C 01 13 F2 E0 22 00 00 03 00 02 00 00 03 00
+      0020  F0 1B 41 10 8D 40 00 00 00 01 68 CE 3C 30 00 00
+   MF_MT_MPEG_SEQUENCE_HEADER (40 bytes):
+      0000  00 00 00 01 67 64 00 2A AC 2B 40 3C 01 13 F2 E0
+      0010  22 00 00 03 00 02 00 00 03 00 F0 1B 41 10 8D 40
+      0020  00 00 00 01 68 CE 3C 30
+
+-- H264 Encoder MFT | H.264 eAVEncH264VProfile_High (value=100) | 5120x2880 | input NV12 --
+   route A (sync, without d3d manager, system-memory samples) -> OK
+   route            : sync, without d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=898341   mean_latency=14.78 ms  max=54.27 ms
+   bitstream says   : profile_idc=100 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(100) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 09 10 00 00 00 01 67 64 00 3C AC 2B
+      0010  40 0A 00 0B 4D 80 88 00 00 03 00 08 00 00 03 03
+      0020  C0 6D 04 42 35 00 00 00 01 68 CE 3C 30 00 00 00
+   MF_MT_MPEG_SEQUENCE_HEADER (39 bytes):
+      0000  00 00 00 01 67 64 00 3C AC 2B 40 0A 00 0B 4D 80
+      0010  88 00 00 03 00 08 00 00 03 03 C0 6D 04 42 35 00
+      0020  00 00 01 68 CE 3C 30
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_420_8 (value=1) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=780069   mean_latency=10.12 ms  max=40.47 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 21 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 7B 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 21 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_420_8 (value=1) | 5120x2880 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=855464   mean_latency=44.96 ms  max=110.89 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 01 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 B4 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 01 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_420_10 (value=2) | 1920x1080 | input P010 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=849653   mean_latency=12.39 ms  max=40.81 ms
+   bitstream says   : general_profile_idc=2 4:2:0 10-bit
+   parsed fields    : profile_idc=Some(2) chroma_format_idc=Some(1) bit_depth=Some(10)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 22 20 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 7B 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 22 20 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_420_10 (value=2) | 5120x2880 | input P010 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=760820   mean_latency=72.18 ms  max=150.87 ms
+   bitstream says   : general_profile_idc=2 4:2:0 10-bit
+   parsed fields    : profile_idc=Some(2) chroma_format_idc=Some(1) bit_depth=Some(10)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 02 20 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 B4 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 02 20 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_420_12 (value=3) | 1920x1080 | input P010 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=849653   mean_latency=12.59 ms  max=43.81 ms
+   bitstream says   : general_profile_idc=2 4:2:0 10-bit
+   parsed fields    : profile_idc=Some(2) chroma_format_idc=Some(1) bit_depth=Some(10)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 22 20 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 7B 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 22 20 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_420_12 (value=3) | 5120x2880 | input P010 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=760820   mean_latency=72.58 ms  max=153.43 ms
+   bitstream says   : general_profile_idc=2 4:2:0 10-bit
+   parsed fields    : profile_idc=Some(2) chroma_format_idc=Some(1) bit_depth=Some(10)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 02 20 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 B4 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 02 20 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_422_10 (value=4) | 1920x1080 | input {3231564E-3961-42AE-BA67-FF47CCC13EED} --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=808248   mean_latency=14.12 ms  max=39.55 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 21 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 7B 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 21 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_422_10 (value=4) | 5120x2880 | input {3231564E-3961-42AE-BA67-FF47CCC13EED} --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=2188844   mean_latency=86.50 ms  max=150.11 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 01 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 B4 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 01 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_422_12 (value=5) | 1920x1080 | input {3231564E-3961-42AE-BA67-FF47CCC13EED} --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=808248   mean_latency=13.98 ms  max=38.60 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 21 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 7B 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 21 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_422_12 (value=5) | 5120x2880 | input {3231564E-3961-42AE-BA67-FF47CCC13EED} --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=2188844   mean_latency=86.47 ms  max=148.59 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 01 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 B4 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 01 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_444_8 (value=6) | 1920x1080 | input ARGB32 (4:4:4 RGB) --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=580154   mean_latency=14.43 ms  max=41.03 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 21 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 7B 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 21 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_444_8 (value=6) | 5120x2880 | input ARGB32 (4:4:4 RGB) --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=457278   mean_latency=88.42 ms  max=158.62 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 01 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 B4 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 01 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_444_10 (value=7) | 1920x1080 | input {3231564E-3961-42AE-BA67-FF47CCC13EED} --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=808248   mean_latency=14.06 ms  max=39.29 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 21 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 7B 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 21 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_444_10 (value=7) | 5120x2880 | input {3231564E-3961-42AE-BA67-FF47CCC13EED} --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=2188844   mean_latency=86.46 ms  max=148.71 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 01 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 B4 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 01 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_444_12 (value=8) | 1920x1080 | input {3231564E-3961-42AE-BA67-FF47CCC13EED} --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=808248   mean_latency=14.06 ms  max=39.26 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 21 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 7B 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 21 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware H265 Encoder MFT | HEVC eAVEncH265VProfile_Main_444_12 (value=8) | 5120x2880 | input {3231564E-3961-42AE-BA67-FF47CCC13EED} --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=2188844   mean_latency=86.89 ms  max=153.71 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 01 40 00 00 03 00
+      0010  90 00 00 03 00 00 03 00 B4 3C 0C 00 00 03 00 04
+      0020  00 00 03 00 F1 40 00 00 00 01 42 01 01 01 40 00
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- HEVCVideoExtensionEncoder | HEVC eAVEncH265VProfile_Main_420_8 (value=1) | 1920x1080 | input NV12 --
+   route A (sync, without d3d manager, system-memory samples) -> OK
+   route            : sync, without d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=427003   mean_latency=5.91 ms  max=40.84 ms
+   bitstream says   : general_profile_idc=1 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(1) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 01 40 00 00 03 00
+      0010  B0 00 00 03 00 00 03 00 7B 2A 02 40 00 00 00 01
+      0020  42 01 01 01 40 00 00 03 00 B0 00 00 03 00 00 03
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- HEVCVideoExtensionEncoder | HEVC eAVEncH265VProfile_Main_444_8 (value=6) | 1920x1080 | input I444 (planar 4:4:4 8-bit) --
+   route A (sync, without d3d manager, system-memory samples) -> OK
+   route            : sync, without d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=553227   mean_latency=9.55 ms  max=64.16 ms
+   bitstream says   : general_profile_idc=4 4:4:4 8-bit
+   parsed fields    : profile_idc=Some(4) chroma_format_idc=Some(3) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  00 00 00 01 40 01 0C 01 FF FF 04 08 00 00 03 00
+      0010  BE 20 00 00 03 00 00 7B 2A 02 40 00 00 00 01 42
+      0020  01 01 04 08 00 00 03 00 BE 20 00 00 03 00 00 7B
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Microsoft HEVC DX12 Encoder | HEVC eAVEncH265VProfile_Main_420_8 (value=1) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route B (async, with d3d manager, D3D11 texture samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route C (async, without d3d manager, system-memory samples) -> FAILED: SetOutputType 0x80041000 ()
+
+-- Microsoft HEVC DX12 Encoder | HEVC eAVEncH265VProfile_Main_420_8 (value=1) | 5120x2880 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route B (async, with d3d manager, D3D11 texture samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route C (async, without d3d manager, system-memory samples) -> FAILED: SetOutputType 0x80041000 ()
+
+-- Microsoft HEVC DX12 Encoder | HEVC eAVEncH265VProfile_Main_420_10 (value=2) | 1920x1080 | input P010 --
+   route A (async, with d3d manager, system-memory samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route B (async, with d3d manager, D3D11 texture samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route C (async, without d3d manager, system-memory samples) -> FAILED: SetOutputType 0x80041000 ()
+
+-- Microsoft HEVC DX12 Encoder | HEVC eAVEncH265VProfile_Main_420_10 (value=2) | 5120x2880 | input P010 --
+   route A (async, with d3d manager, system-memory samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route B (async, with d3d manager, D3D11 texture samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route C (async, without d3d manager, system-memory samples) -> FAILED: SetOutputType 0x80041000 ()
+
+-- Microsoft HEVC DX12 Encoder | HEVC eAVEncH265VProfile_Main_444_8 (value=6) | 1920x1080 | input AYUV (4:4:4 8-bit) --
+   route A (async, with d3d manager, system-memory samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route B (async, with d3d manager, D3D11 texture samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route C (async, without d3d manager, system-memory samples) -> FAILED: SetOutputType 0x80041000 ()
+
+-- Microsoft HEVC DX12 Encoder | HEVC eAVEncH265VProfile_Main_444_8 (value=6) | 5120x2880 | input AYUV (4:4:4 8-bit) --
+   route A (async, with d3d manager, system-memory samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route B (async, with d3d manager, D3D11 texture samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route C (async, without d3d manager, system-memory samples) -> FAILED: SetOutputType 0x80041000 ()
+
+-- Microsoft HEVC DX12 Encoder | HEVC eAVEncH265VProfile_Main_444_10 (value=7) | 1920x1080 | input Y410 (4:4:4 10-bit) --
+   route A (async, with d3d manager, system-memory samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route B (async, with d3d manager, D3D11 texture samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route C (async, without d3d manager, system-memory samples) -> FAILED: SetOutputType 0x80041000 ()
+
+-- Microsoft HEVC DX12 Encoder | HEVC eAVEncH265VProfile_Main_444_10 (value=7) | 5120x2880 | input Y410 (4:4:4 10-bit) --
+   route A (async, with d3d manager, system-memory samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route B (async, with d3d manager, D3D11 texture samples) -> FAILED: timed out after 5s waiting for METransformNeedInput at frame 1
+   route C (async, without d3d manager, system-memory samples) -> FAILED: SetOutputType 0x80041000 ()
+
+-- Intel® Hardware VP9 Encoder MFT | VP9 eAVEncVP9VProfile_unknown (value=0) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=713864   mean_latency=8.68 ms  max=23.77 ms
+   bitstream says   : vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(0) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  82 49 83 42 00 77 F0 43 74 24 0B 60 00 01 80 70
+      0010  00 00 75 75 EF FF FC 2E A1 D8 DA C8 78 1B 75 28
+      0020  00 39 7C 31 14 3B B1 8D F0 C9 E0 97 34 CC 9B E0
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware VP9 Encoder MFT | VP9 eAVEncVP9VProfile_420_8 (value=1) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=713864   mean_latency=9.10 ms  max=24.18 ms
+   bitstream says   : vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(0) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  82 49 83 42 00 77 F0 43 74 24 0B 60 00 01 80 70
+      0010  00 00 75 75 EF FF FC 2E A1 D8 DA C8 78 1B 75 28
+      0020  00 39 7C 31 14 3B B1 8D F0 C9 E0 97 34 CC 9B E0
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware VP9 Encoder MFT | VP9 eAVEncVP9VProfile_420_10 (value=2) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=713864   mean_latency=9.37 ms  max=24.21 ms
+   bitstream says   : vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(0) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  82 49 83 42 00 77 F0 43 74 24 0B 60 00 01 80 70
+      0010  00 00 75 75 EF FF FC 2E A1 D8 DA C8 78 1B 75 28
+      0020  00 39 7C 31 14 3B B1 8D F0 C9 E0 97 34 CC 9B E0
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware VP9 Encoder MFT | VP9 eAVEncVP9VProfile_420_12 (value=3) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=713864   mean_latency=9.37 ms  max=25.70 ms
+   bitstream says   : vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(0) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  82 49 83 42 00 77 F0 43 74 24 0B 60 00 01 80 70
+      0010  00 00 75 75 EF FF FC 2E A1 D8 DA C8 78 1B 75 28
+      0020  00 39 7C 31 14 3B B1 8D F0 C9 E0 97 34 CC 9B E0
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware VP9 Encoder MFT | VP9 <UNSYMBOLISED raw 4> (value=4) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=713864   mean_latency=9.70 ms  max=24.35 ms
+   bitstream says   : vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(0) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  82 49 83 42 00 77 F0 43 74 24 0B 60 00 01 80 70
+      0010  00 00 75 75 EF FF FC 2E A1 D8 DA C8 78 1B 75 28
+      0020  00 39 7C 31 14 3B B1 8D F0 C9 E0 97 34 CC 9B E0
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+-- Intel® Hardware VP9 Encoder MFT | VP9 <UNSYMBOLISED raw 5> (value=5) | 1920x1080 | input NV12 --
+   route A (async, with d3d manager, system-memory samples) -> OK
+   route            : async, with d3d manager, system-memory samples
+   frames_in/out    : 12/12   total_bytes=713864   mean_latency=10.29 ms  max=24.91 ms
+   bitstream says   : vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+   parsed fields    : profile_idc=Some(0) chroma_format_idc=Some(1) bit_depth=Some(8)
+   first sample, first 48 bytes:
+      0000  82 49 83 42 00 77 F0 43 74 24 0B 60 00 01 80 70
+      0010  00 00 75 75 EF FF FC 2E A1 D8 DA C8 78 1B 75 28
+      0020  00 39 7C 31 14 3B B1 8D F0 C9 E0 97 34 CC 9B E0
+   MF_MT_MPEG_SEQUENCE_HEADER: <not published>
+
+=== 5. SUMMARY MATRIX ===
+encoder                                      codec  chroma depth  profile symbol                         hw enc   accepted 1080/5K   encoded 1080/5K  bitstream says
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Intel® Quick Sync Video H.264 Encoder MFT    H.264  4:2:0  8      eAVEncH264VProfile_Main                yes      yes / no           yes / no         profile_idc=77 4:2:0 8-bit
+Intel® Quick Sync Video H.264 Encoder MFT    H.264  4:2:0  8      eAVEncH264VProfile_High                yes      yes / no           yes / no         profile_idc=100 4:2:0 8-bit
+Intel® Quick Sync Video H.264 Encoder MFT    H.264  4:2:0  10     eAVEncH264VProfile_High10              yes      yes / no           yes / no         profile_idc=100 4:2:0 8-bit
+Intel® Quick Sync Video H.264 Encoder MFT    H.264  4:2:2  10     eAVEncH264VProfile_422                 yes      yes / no           yes / no         profile_idc=100 4:2:0 8-bit
+Intel® Quick Sync Video H.264 Encoder MFT    H.264  4:4:4  8      eAVEncH264VProfile_444                 yes      yes / no           yes / no         profile_idc=100 4:2:0 8-bit
+H264 Encoder MFT                             H.264  4:2:0  8      eAVEncH264VProfile_Main                no       yes / yes          yes / yes        profile_idc=77 4:2:0 8-bit
+H264 Encoder MFT                             H.264  4:2:0  8      eAVEncH264VProfile_High                no       yes / yes          yes / yes        profile_idc=100 4:2:0 8-bit
+Intel® Hardware H265 Encoder MFT             HEVC   4:2:0  8      eAVEncH265VProfile_Main_420_8          yes      yes / yes          yes / yes        general_profile_idc=1 4:2:0 8-bit
+Intel® Hardware H265 Encoder MFT             HEVC   4:2:0  10     eAVEncH265VProfile_Main_420_10         yes      yes / yes          yes / yes        general_profile_idc=2 4:2:0 10-bit
+Intel® Hardware H265 Encoder MFT             HEVC   4:2:0  12     eAVEncH265VProfile_Main_420_12         yes      yes / yes          yes / yes        general_profile_idc=2 4:2:0 10-bit
+Intel® Hardware H265 Encoder MFT             HEVC   4:2:2  10     eAVEncH265VProfile_Main_422_10         yes      yes / yes          yes / yes        general_profile_idc=1 4:2:0 8-bit
+Intel® Hardware H265 Encoder MFT             HEVC   4:2:2  12     eAVEncH265VProfile_Main_422_12         yes      yes / yes          yes / yes        general_profile_idc=1 4:2:0 8-bit
+Intel® Hardware H265 Encoder MFT             HEVC   4:4:4  8      eAVEncH265VProfile_Main_444_8          yes      yes / yes          yes / yes        general_profile_idc=1 4:2:0 8-bit
+Intel® Hardware H265 Encoder MFT             HEVC   4:4:4  10     eAVEncH265VProfile_Main_444_10         yes      yes / yes          yes / yes        general_profile_idc=1 4:2:0 8-bit
+Intel® Hardware H265 Encoder MFT             HEVC   4:4:4  12     eAVEncH265VProfile_Main_444_12         yes      yes / yes          yes / yes        general_profile_idc=1 4:2:0 8-bit
+HEVCVideoExtensionEncoder                    HEVC   4:2:0  8      eAVEncH265VProfile_Main_420_8          no       yes / no           yes / no         general_profile_idc=1 4:2:0 8-bit
+HEVCVideoExtensionEncoder                    HEVC   4:4:4  8      eAVEncH265VProfile_Main_444_8          no       yes / no           yes / no         general_profile_idc=4 4:4:4 8-bit
+Microsoft HEVC DX12 Encoder                  HEVC   4:2:0  8      eAVEncH265VProfile_Main_420_8          yes      yes / yes          no / no          -
+Microsoft HEVC DX12 Encoder                  HEVC   4:2:0  10     eAVEncH265VProfile_Main_420_10         yes      yes / yes          no / no          -
+Microsoft HEVC DX12 Encoder                  HEVC   4:4:4  8      eAVEncH265VProfile_Main_444_8          yes      yes / yes          no / no          -
+Microsoft HEVC DX12 Encoder                  HEVC   4:4:4  10     eAVEncH265VProfile_Main_444_10         yes      yes / yes          no / no          -
+Intel® Hardware VP9 Encoder MFT              VP9    ?      ?      eAVEncVP9VProfile_unknown              yes      yes / yes          yes / no         vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+Intel® Hardware VP9 Encoder MFT              VP9    4:2:0  8      eAVEncVP9VProfile_420_8                yes      yes / yes          yes / no         vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+Intel® Hardware VP9 Encoder MFT              VP9    4:2:0  10     eAVEncVP9VProfile_420_10               yes      yes / yes          yes / no         vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+Intel® Hardware VP9 Encoder MFT              VP9    4:2:0  12     eAVEncVP9VProfile_420_12               yes      yes / yes          yes / no         vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+Intel® Hardware VP9 Encoder MFT              VP9    ?      ?      <UNSYMBOLISED raw 4>                   yes      yes / yes          yes / no         vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+Intel® Hardware VP9 Encoder MFT              VP9    ?      ?      <UNSYMBOLISED raw 5>                   yes      yes / yes          yes / no         vp9 profile=0 color_space=0 subsampling_x=1 subsampling_y=1 => 4:2:0 8-bit
+Microsoft AVC DX12 Encoder                   H.264  4:2:0  8      eAVEncH264VProfile_Main                yes      no / no            no / no          -
+Microsoft AVC DX12 Encoder                   H.264  4:2:0  8      eAVEncH264VProfile_High                yes      no / no            no / no          -
+Microsoft AVC DX12 Encoder                   H.264  4:2:0  10     eAVEncH264VProfile_High10              yes      no / no            no / no          -
+Microsoft AVC DX12 Encoder                   H.264  4:2:2  10     eAVEncH264VProfile_422                 yes      no / no            no / no          -
+Microsoft AVC DX12 Encoder                   H.264  4:4:4  8      eAVEncH264VProfile_444                 yes      no / no            no / no          -
+H264 Encoder MFT                             H.264  4:2:0  10     eAVEncH264VProfile_High10              no       no / no            no / no          -
+H264 Encoder MFT                             H.264  4:2:2  10     eAVEncH264VProfile_422                 no       no / no            no / no          -
+H264 Encoder MFT                             H.264  4:4:4  8      eAVEncH264VProfile_444                 no       no / no            no / no          -
+HEVCVideoExtensionEncoder                    HEVC   4:2:0  10     eAVEncH265VProfile_Main_420_10         no       no / no            no / no          -
+HEVCVideoExtensionEncoder                    HEVC   4:2:0  12     eAVEncH265VProfile_Main_420_12         no       no / no            no / no          -
+HEVCVideoExtensionEncoder                    HEVC   4:2:2  10     eAVEncH265VProfile_Main_422_10         no       no / no            no / no          -
+HEVCVideoExtensionEncoder                    HEVC   4:2:2  12     eAVEncH265VProfile_Main_422_12         no       no / no            no / no          -
+HEVCVideoExtensionEncoder                    HEVC   4:4:4  10     eAVEncH265VProfile_Main_444_10         no       no / no            no / no          -
+HEVCVideoExtensionEncoder                    HEVC   4:4:4  12     eAVEncH265VProfile_Main_444_12         no       no / no            no / no          -
+Microsoft HEVC DX12 Encoder                  HEVC   4:2:0  12     eAVEncH265VProfile_Main_420_12         yes      no / no            no / no          -
+Microsoft HEVC DX12 Encoder                  HEVC   4:2:2  10     eAVEncH265VProfile_Main_422_10         yes      no / no            no / no          -
+Microsoft HEVC DX12 Encoder                  HEVC   4:2:2  12     eAVEncH265VProfile_Main_422_12         yes      no / no            no / no          -
+Microsoft HEVC DX12 Encoder                  HEVC   4:4:4  12     eAVEncH265VProfile_Main_444_12         yes      no / no            no / no          -
+
+=== 6. D3D12 VIDEO ENCODE CAPABILITIES (CheckFeatureSupport only, no encoding) ===
+(input formats marked * can carry 4:4:4. This section queries the API the Microsoft DX12 encoder MFTs wrap, so it answers what section 4 could not drive.)
+
+-- adapter[0] "Intel(R) Graphics" vendor=0x8086 device=0x7D67 --
+   video device interface : ID3D12VideoDevice3
+   (a) D3D12_FEATURE_VIDEO_ENCODER_CODEC
+       H264  IsSupported=YES
+       HEVC  IsSupported=YES
+       AV1   IsSupported=YES
+   (b) D3D12_FEATURE_VIDEO_ENCODER_PROFILE_LEVEL
+       H264  H264_MAIN        (value=0) IsSupported=YES  Min[Level=0]  Max[Level=16]
+       H264  H264_HIGH        (value=1) IsSupported=YES  Min[Level=0]  Max[Level=16]
+       H264  H264_HIGH_10     (value=2) IsSupported=no   Min[Level=0]  Max[Level=0]
+       HEVC  HEVC_MAIN        (value=0) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=12 Tier=1]
+       HEVC  HEVC_MAIN10      (value=1) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=12 Tier=1]
+       HEVC  HEVC_MAIN12      (value=2) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       HEVC  HEVC_MAIN10_422  (value=3) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       HEVC  HEVC_MAIN12_422  (value=4) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       HEVC  HEVC_MAIN_444    (value=5) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=12 Tier=1]
+       HEVC  HEVC_MAIN10_444  (value=6) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=12 Tier=1]
+       HEVC  HEVC_MAIN12_444  (value=7) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       HEVC  HEVC_MAIN16_444  (value=8) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       AV1   AV1_MAIN         (value=0) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=16 Tier=1]
+       AV1   AV1_HIGH         (value=1) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=16 Tier=1]
+       AV1   AV1_PROFESSIONAL (value=2) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+   (c) D3D12_FEATURE_VIDEO_ENCODER_INPUT_FORMAT
+       profile \ format          NV12    P010    YUY2    Y210   AYUV*   Y410*   Y416*  RGBA8*  BGRA8*
+       H264 H264_MAIN             YES       -       -       -       -       -       -       -       -
+       H264 H264_HIGH             YES       -       -       -       -       -       -       -       -
+       HEVC HEVC_MAIN             YES     YES       -       -     YES     YES       -       -       -
+       HEVC HEVC_MAIN10           YES     YES       -       -     YES     YES       -       -       -
+       HEVC HEVC_MAIN_444         YES     YES       -       -     YES     YES       -       -       -
+       HEVC HEVC_MAIN10_444       YES     YES       -       -     YES     YES       -       -       -
+       AV1 AV1_MAIN               YES     YES       -       -       -       -       -       -       -
+       AV1 AV1_HIGH               YES     YES       -       -       -       -       -       -       -
+   (d) D3D12_FEATURE_VIDEO_ENCODER_OUTPUT_RESOLUTION_RATIOS_COUNT / _OUTPUT_RESOLUTION
+       H264  IsSupported=YES ratios=0 min=16x16 max=4096x4096 multiple=w1/h1  5120x2880 fits: NO
+       HEVC  IsSupported=YES ratios=0 min=64x64 max=16384x16384 multiple=w1/h1  5120x2880 fits: YES
+       AV1   IsSupported=YES ratios=0 min=64x64 max=4096x4096 multiple=w1/h1  5120x2880 fits: NO
+   (e) D3D12_FEATURE_VIDEO_ENCODER_SUPPORT
+       NOTE: a row whose ValidationFlags say CODEC_CONFIGURATION_NOT_SUPPORTED is INCONCLUSIVE, not negative —
+       the driver is rejecting the codec configuration this probe supplied, so the row says nothing about the
+       chroma format. Read (c) for that. A row reading GENERAL_SUPPORT_OK with ValidationFlags NONE is a real yes.
+       HEVC  HEVC_MAIN        + NV12   @ 1920x1080
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC reports IsSupported=false; using defaults]
+       HEVC  HEVC_MAIN        + NV12   @ 5120x2880
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC reports IsSupported=false; using defaults]
+       HEVC  HEVC_MAIN_444    + AYUV*  @ 1920x1080
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC query failed 0x80070057 (The parameter is incorrect.); using defaults]
+       HEVC  HEVC_MAIN_444    + AYUV*  @ 5120x2880
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC query failed 0x80070057 (The parameter is incorrect.); using defaults]
+       HEVC  HEVC_MAIN10_444  + Y410*  @ 1920x1080
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC query failed 0x80070057 (The parameter is incorrect.); using defaults]
+       HEVC  HEVC_MAIN10_444  + Y410*  @ 5120x2880
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC query failed 0x80070057 (The parameter is incorrect.); using defaults]
+       H264  H264_HIGH        + NV12   @ 1920x1080
+           SupportFlags=0x0000178D [GENERAL_SUPPORT_OK | RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | SUBREGION_LAYOUT_RECONFIGURATION_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000000 [NONE]  SuggestedLevel(Level=13) MaxSubregions=1 SubregionBlockPixels=16
+       H264  H264_HIGH        + NV12   @ 5120x2880
+           SupportFlags=0x00000000 [NONE]  ValidationFlags=0x00000200 [RESOLUTION_NOT_SUPPORTED_IN_LIST]  SuggestedLevel(Level=0) MaxSubregions=0 SubregionBlockPixels=0
+       AV1   AV1_MAIN         + NV12   @ 1920x1080
+           SupportFlags=0x00000000 [NONE]  ValidationFlags=0x00000001 [CODEC_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+       AV1   AV1_MAIN         + NV12   @ 5120x2880
+           SupportFlags=0x00000000 [NONE]  ValidationFlags=0x00000001 [CODEC_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+
+-- adapter[1] "Intel(R) Graphics" vendor=0x8086 device=0x7D67 --
+   video device interface : ID3D12VideoDevice3
+   (a) D3D12_FEATURE_VIDEO_ENCODER_CODEC
+       H264  IsSupported=YES
+       HEVC  IsSupported=YES
+       AV1   IsSupported=YES
+   (b) D3D12_FEATURE_VIDEO_ENCODER_PROFILE_LEVEL
+       H264  H264_MAIN        (value=0) IsSupported=YES  Min[Level=0]  Max[Level=16]
+       H264  H264_HIGH        (value=1) IsSupported=YES  Min[Level=0]  Max[Level=16]
+       H264  H264_HIGH_10     (value=2) IsSupported=no   Min[Level=0]  Max[Level=0]
+       HEVC  HEVC_MAIN        (value=0) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=12 Tier=1]
+       HEVC  HEVC_MAIN10      (value=1) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=12 Tier=1]
+       HEVC  HEVC_MAIN12      (value=2) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       HEVC  HEVC_MAIN10_422  (value=3) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       HEVC  HEVC_MAIN12_422  (value=4) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       HEVC  HEVC_MAIN_444    (value=5) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=12 Tier=1]
+       HEVC  HEVC_MAIN10_444  (value=6) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=12 Tier=1]
+       HEVC  HEVC_MAIN12_444  (value=7) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       HEVC  HEVC_MAIN16_444  (value=8) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+       AV1   AV1_MAIN         (value=0) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=16 Tier=1]
+       AV1   AV1_HIGH         (value=1) IsSupported=YES  Min[Level=0 Tier=0]  Max[Level=16 Tier=1]
+       AV1   AV1_PROFESSIONAL (value=2) IsSupported=no   Min[Level=0 Tier=0]  Max[Level=0 Tier=0]
+   (c) D3D12_FEATURE_VIDEO_ENCODER_INPUT_FORMAT
+       profile \ format          NV12    P010    YUY2    Y210   AYUV*   Y410*   Y416*  RGBA8*  BGRA8*
+       H264 H264_MAIN             YES       -       -       -       -       -       -       -       -
+       H264 H264_HIGH             YES       -       -       -       -       -       -       -       -
+       HEVC HEVC_MAIN             YES     YES       -       -     YES     YES       -       -       -
+       HEVC HEVC_MAIN10           YES     YES       -       -     YES     YES       -       -       -
+       HEVC HEVC_MAIN_444         YES     YES       -       -     YES     YES       -       -       -
+       HEVC HEVC_MAIN10_444       YES     YES       -       -     YES     YES       -       -       -
+       AV1 AV1_MAIN               YES     YES       -       -       -       -       -       -       -
+       AV1 AV1_HIGH               YES     YES       -       -       -       -       -       -       -
+   (d) D3D12_FEATURE_VIDEO_ENCODER_OUTPUT_RESOLUTION_RATIOS_COUNT / _OUTPUT_RESOLUTION
+       H264  IsSupported=YES ratios=0 min=16x16 max=4096x4096 multiple=w1/h1  5120x2880 fits: NO
+       HEVC  IsSupported=YES ratios=0 min=64x64 max=16384x16384 multiple=w1/h1  5120x2880 fits: YES
+       AV1   IsSupported=YES ratios=0 min=64x64 max=4096x4096 multiple=w1/h1  5120x2880 fits: NO
+   (e) D3D12_FEATURE_VIDEO_ENCODER_SUPPORT
+       NOTE: a row whose ValidationFlags say CODEC_CONFIGURATION_NOT_SUPPORTED is INCONCLUSIVE, not negative —
+       the driver is rejecting the codec configuration this probe supplied, so the row says nothing about the
+       chroma format. Read (c) for that. A row reading GENERAL_SUPPORT_OK with ValidationFlags NONE is a real yes.
+       HEVC  HEVC_MAIN        + NV12   @ 1920x1080
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC reports IsSupported=false; using defaults]
+       HEVC  HEVC_MAIN        + NV12   @ 5120x2880
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC reports IsSupported=false; using defaults]
+       HEVC  HEVC_MAIN_444    + AYUV*  @ 1920x1080
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC query failed 0x80070057 (The parameter is incorrect.); using defaults]
+       HEVC  HEVC_MAIN_444    + AYUV*  @ 5120x2880
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC query failed 0x80070057 (The parameter is incorrect.); using defaults]
+       HEVC  HEVC_MAIN10_444  + Y410*  @ 1920x1080
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC query failed 0x80070057 (The parameter is incorrect.); using defaults]
+       HEVC  HEVC_MAIN10_444  + Y410*  @ 5120x2880
+           SupportFlags=0x0000174C [RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | RATE_CONTROL_DELTA_QP_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000010 [CODEC_CONFIGURATION_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+           [HEVC query failed 0x80070057 (The parameter is incorrect.); using defaults]
+       H264  H264_HIGH        + NV12   @ 1920x1080
+           SupportFlags=0x0000178D [GENERAL_SUPPORT_OK | RESOLUTION_RECONFIGURATION_AVAILABLE | RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE | SUBREGION_LAYOUT_RECONFIGURATION_AVAILABLE | RATE_CONTROL_ADJUSTABLE_QP_RANGE_AVAILABLE | RATE_CONTROL_INITIAL_QP_AVAILABLE | RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE | MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE]  ValidationFlags=0x00000000 [NONE]  SuggestedLevel(Level=13) MaxSubregions=1 SubregionBlockPixels=16
+       H264  H264_HIGH        + NV12   @ 5120x2880
+           SupportFlags=0x00000000 [NONE]  ValidationFlags=0x00000200 [RESOLUTION_NOT_SUPPORTED_IN_LIST]  SuggestedLevel(Level=0) MaxSubregions=0 SubregionBlockPixels=0
+       AV1   AV1_MAIN         + NV12   @ 1920x1080
+           SupportFlags=0x00000000 [NONE]  ValidationFlags=0x00000001 [CODEC_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+       AV1   AV1_MAIN         + NV12   @ 5120x2880
+           SupportFlags=0x00000000 [NONE]  ValidationFlags=0x00000001 [CODEC_NOT_SUPPORTED]  SuggestedLevel(Level=0 Tier=0) MaxSubregions=0 SubregionBlockPixels=0
+
+-- adapter[2] "Microsoft Basic Render Driver": WARP, skipped --
+
+probe complete.
