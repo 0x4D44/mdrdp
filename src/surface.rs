@@ -229,11 +229,21 @@ impl Surface {
 pub enum SurfaceError {
     NoSuchSurface(u16),
     NoSuchCacheSlot(u16),
-    ShortSource { needed: usize, got: usize },
+    ShortSource {
+        needed: usize,
+        got: usize,
+    },
     /// A buffer whose length does not match what the operation requires exactly.
-    SizeMismatch { expected: usize, got: usize },
+    SizeMismatch {
+        expected: usize,
+        got: usize,
+    },
     /// A strict-bounds blit whose rectangle does not fit the surface.
-    OutOfBounds { rect: Rect, width: u16, height: u16 },
+    OutOfBounds {
+        rect: Rect,
+        width: u16,
+        height: u16,
+    },
 }
 
 impl std::fmt::Display for SurfaceError {
@@ -248,7 +258,10 @@ impl std::fmt::Display for SurfaceError {
                 )
             }
             SurfaceError::SizeMismatch { expected, got } => {
-                write!(f, "buffer size mismatch: expected {expected} bytes, got {got}")
+                write!(
+                    f,
+                    "buffer size mismatch: expected {expected} bytes, got {got}"
+                )
             }
             SurfaceError::OutOfBounds {
                 rect,
@@ -628,7 +641,10 @@ mod tests {
         store
             .blit_bgra_strict(0, Rect::new(0, 0, 1, 1), &[1, 2, 3, 4])
             .unwrap();
-        assert!(store.generation() > g1, "strict blit must mark the store changed");
+        assert!(
+            store.generation() > g1,
+            "strict blit must mark the store changed"
+        );
     }
 
     #[test]
