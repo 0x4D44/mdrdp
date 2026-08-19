@@ -36,6 +36,28 @@ pub enum WindowSize {
     Fullscreen,
 }
 
+/// Whether a favourite prefers the native (rhydra) transport.
+///
+/// `Auto` probes for a deployed rhydra host and falls back to RDP; `Always`
+/// insists (a failed probe is an error, never a fallback); `Never` skips the
+/// probe entirely. The command-line `--native`/`--rdp` flags override this,
+/// exactly as `--port` overrides a favourite's port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl NativeMode {
+    /// For `skip_serializing_if`: the default keeps saved files clean.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, NativeMode::Auto)
+    }
+}
+
 /// One saved connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Favourite {
@@ -64,6 +86,14 @@ pub struct Favourite {
     /// the launcher list sorts and captions with it; nothing else reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<u64>,
+    /// Transport preference for this favourite. Defaults to `Auto`, so files
+    /// written before the field existed load unchanged.
+    #[serde(default, skip_serializing_if = "NativeMode::is_auto")]
+    pub native: NativeMode,
+    /// SSH login for the native transport. `None` lets `~/.ssh/config` decide.
+    /// Distinct from `username`, which is the RDP account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_user: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -83,6 +113,8 @@ impl Favourite {
             window_size: WindowSize::default(),
             keychain_account: None,
             last_used: None,
+            native: NativeMode::default(),
+            ssh_user: None,
         }
     }
 }
@@ -628,6 +660,45 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_native_file_loads_with_auto_and_no_ssh_user() {
+        let dir = tmpdir();
+        let path = dir.join("favourites.toml");
+        std::fs::write(&path, "[[favourite]]\nname = \"Old\"\nhost = \"old.lan\"\n").unwrap();
+        let favs = Favourites::load_from(&path).expect("legacy file loads");
+        let f = favs.find("Old").unwrap();
+        assert_eq!(f.native, NativeMode::Auto);
+        assert_eq!(f.ssh_user, None);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn native_mode_serialises_snake_case_and_rejects_unknown_values() {
+        let dir = tmpdir();
+        let path = dir.join("favourites.toml");
+        std::fs::write(
+            &path,
+            "[[favourite]]\nname = \"N\"\nhost = \"n.lan\"\nnative = \"always\"\n",
+        )
+        .unwrap();
+        let favs = Favourites::load_from(&path).expect("snake_case value loads");
+        assert_eq!(favs.find("N").unwrap().native, NativeMode::Always);
+
+        std::fs::write(
+            &path,
+            "[[favourite]]\nname = \"N\"\nhost = \"n.lan\"\nnative = \"sometimes\"\n",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                Favourites::load_from(&path),
+                Err(FavouritesError::Malformed { .. })
+            ),
+            "an unknown mode must be a load error, not a silent default"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
     fn round_trip_preserves_order_and_every_field() {
         let dir = tmpdir();
         let path = dir.join("favourites.toml");
@@ -646,6 +717,8 @@ mod tests {
             },
             keychain_account: Some("office-account".to_owned()),
             last_used: Some(1_755_300_000),
+            native: NativeMode::Always,
+            ssh_user: Some("deploy-login".to_owned()),
         };
         let sparse = Favourite {
             name: "Home Lab".to_owned(),
@@ -656,6 +729,8 @@ mod tests {
             window_size: WindowSize::Fullscreen,
             keychain_account: None,
             last_used: None,
+            native: NativeMode::default(),
+            ssh_user: None,
         };
 
         let mut favs = Favourites::default();

@@ -207,13 +207,17 @@ impl LauncherApp {
             .favourites
             .find(original_name)
             .and_then(|f| f.keychain_account.clone());
-        let last_used = self
-            .favourites
-            .find(original_name)
-            .and_then(|f| f.last_used);
+        let original = self.favourites.find(original_name);
+        let last_used = original.and_then(|f| f.last_used);
+        // The edit dialog does not expose the native-transport fields (config-file
+        // only this tranche), so a save must carry them over, not reset them.
+        let native = original.map(|f| f.native).unwrap_or_default();
+        let ssh_user = original.and_then(|f| f.ssh_user.clone());
         let new_account = favourite.keychain_account.clone();
         let mut favourite = favourite;
         favourite.last_used = last_used;
+        favourite.native = native;
+        favourite.ssh_user = ssh_user;
         match self.favourites.update(original_name, favourite) {
             Ok(()) => {
                 if let Err(e) = self.favourites.save_to(&self.config_path) {
@@ -872,7 +876,7 @@ impl LauncherApp {
                 let ctx = ui.ctx().clone();
                 if save_favourite {
                     let name = favourite.name.clone();
-                    match self.favourites.add(favourite) {
+                    match self.favourites.add(*favourite) {
                         Ok(()) => {
                             if let Err(e) = self.favourites.save_to(&self.config_path) {
                                 eprintln!("warning: could not save favourites: {e}");

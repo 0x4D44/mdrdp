@@ -792,6 +792,9 @@ impl EditState {
             window_size,
             keychain_account: stores_password.then(|| self.account_key()),
             last_used: None, // The caller preserves the original's timestamp.
+            // As with last_used: not edited here, carried over by the caller.
+            native: crate::favourites::NativeMode::default(),
+            ssh_user: None,
         })
     }
 }

@@ -60,6 +60,9 @@ pub struct DefaultsSettings {
     pub height: u16,
     pub keep_launcher_open: bool,
     pub reconnect_last: bool,
+    /// Transport preference when the favourite does not say (and for bare hosts):
+    /// probe for rhydra (`auto`), insist on it (`always`), or never probe (`never`).
+    pub native: crate::favourites::NativeMode,
 }
 
 impl Default for DefaultsSettings {
@@ -72,6 +75,7 @@ impl Default for DefaultsSettings {
             height: 1080,
             keep_launcher_open: true,
             reconnect_last: false,
+            native: crate::favourites::NativeMode::Auto,
         }
     }
 }

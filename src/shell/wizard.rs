@@ -21,7 +21,7 @@
 
 use std::fmt;
 
-use crate::favourites::{DEFAULT_PORT, Favourite, WindowSize};
+use crate::favourites::{DEFAULT_PORT, Favourite, NativeMode, WindowSize};
 use crate::shell::widgets;
 // FormError/FormField moved here verbatim when the software-rendered form was
 // deleted (handoff decision 1): the wizard is the wording's home now.
@@ -164,7 +164,8 @@ pub enum WizardOutcome {
     Cancelled,
     /// Step 3's "Save and connect". `favourite` has passed every step's validation.
     Finished {
-        favourite: Favourite,
+        /// Boxed: `Favourite` outgrew the other variants (clippy: large_enum_variant).
+        favourite: Box<Favourite>,
         /// Mirrors step 3's "Save as a favourite named …" checkbox.
         save_favourite: bool,
         /// `Some` only when the user typed a password *and* ticked step 2's
@@ -309,7 +310,7 @@ impl Wizard {
             }
             Step::Display => match self.draft.favourite(self.save_password) {
                 Ok(favourite) => WizardOutcome::Finished {
-                    favourite,
+                    favourite: Box::new(favourite),
                     save_favourite: self.save_favourite,
                     password: self.take_password(),
                     save_password: self.save_password,
@@ -1113,6 +1114,8 @@ impl Draft {
                 None
             },
             last_used: None,
+            native: NativeMode::default(),
+            ssh_user: None,
         })
     }
 

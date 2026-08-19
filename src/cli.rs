@@ -115,6 +115,15 @@ const OPTIONS: &[(&str, &str)] = &[
         "--foreground, -F",
         "stay attached to the terminal (a GUI run normally detaches\nand logs under the config directory)",
     ),
+    (
+        "--native",
+        "insist on the native (rhydra) transport — fail rather than\nfall back to RDP",
+    ),
+    ("--rdp", "skip the rhydra probe and connect over RDP"),
+    (
+        "--ssh-user <account>",
+        "SSH login for the native transport (default: ~/.ssh/config)",
+    ),
     ("--list, -l", "print saved favourites and exit"),
     (
         "--sessions, -S",
@@ -249,6 +258,9 @@ mod tests {
             "--size",
             "--fullscreen",
             "--foreground",
+            "--native",
+            "--rdp",
+            "--ssh-user",
             "--list",
             "--sessions",
             "--duration",

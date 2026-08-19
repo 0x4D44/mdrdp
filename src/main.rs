@@ -85,6 +85,10 @@ struct Target {
     size: (u16, u16),
     /// Whether the session window should open borderless fullscreen.
     fullscreen: bool,
+    /// The resolved transport preference (flag > favourite > settings).
+    native: mdrdp::favourites::NativeMode,
+    /// SSH login for the native transport; `None` lets `~/.ssh/config` decide.
+    ssh_user: Option<String>,
 }
 
 fn session_end_state(end: &session::SessionEnd) -> &'static str {
@@ -266,6 +270,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut sessions_only = false;
     let mut force_fullscreen = false;
     let mut foreground = false;
+    let mut native_flag = false;
+    let mut rdp_flag = false;
+    let mut ssh_user: Option<String> = None;
 
     // Human-typed flags carry a single-letter short code as well; harness-facing ones
     // (--stage-json, --metrics-json, …) stay long-only — a script types them once.
@@ -316,6 +323,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 continue;
             }
+            "--native" => {
+                native_flag = true;
+                i += 1;
+                continue;
+            }
+            "--rdp" => {
+                rdp_flag = true;
+                i += 1;
+                continue;
+            }
+            "--ssh-user" => ssh_user = Some(value()?.clone()),
             "--user" | "-u" => user = Some(value()?.clone()),
             "--port" | "-p" => port = Some(value()?.parse()?),
             "--domain" | "-d" => domain = Some(value()?.clone()),
@@ -332,6 +350,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown flag {other}\n{}", usage()).into()),
         }
         i += 2;
+    }
+
+    if native_flag && rdp_flag {
+        return Err("--native and --rdp contradict each other; pass at most one".into());
     }
 
     if ask_password && !stage_json {
@@ -503,6 +525,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             && size.is_none()
             && settings.defaults.window == mdrdp::settings::WindowMode::Fullscreen);
     let explicit_size = size.is_some();
+    let native_mode = mdrdp::native::resolve_mode(
+        native_flag,
+        rdp_flag,
+        chosen.as_ref().map(|f| f.native),
+        settings.defaults.native,
+    );
     let target = reconcile(
         Some(positional),
         chosen,
@@ -511,7 +539,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         port,
         domain,
         size,
+        native_mode,
+        ssh_user,
     )?;
+
+    // TEMPORARY (tranche 3 in progress): the native connect arm is not wired yet.
+    // `Always` must fail loudly rather than silently connect over RDP against the
+    // user's explicit word; `Auto` proceeds as RDP exactly as before this tranche.
+    if target.native == mdrdp::favourites::NativeMode::Always {
+        return Err(format!(
+            "--native/'native = always' is not wired up yet in this build \
+             (ssh {}@{}); the RDP path is unaffected",
+            target.ssh_user.as_deref().unwrap_or("<ssh-config>"),
+            target.host
+        )
+        .into());
+    }
 
     // Whether the last session against this target closed fullscreen. Remembered state
     // beats the favourite's setting — "reopen how I left it" is the point — but an
@@ -1516,6 +1559,7 @@ fn write_cache_metrics(
 /// The account precedence is flag > favourite > `[defaults]` username: an explicit flag
 /// is the user speaking now, a favourite is what they saved for this host, and the
 /// default is what they use everywhere else.
+#[allow(clippy::too_many_arguments)]
 fn reconcile(
     positional: Option<String>,
     chosen: Option<Favourite>,
@@ -1524,6 +1568,8 @@ fn reconcile(
     port: Option<u16>,
     domain: Option<String>,
     size: Option<(u16, u16)>,
+    native: mdrdp::favourites::NativeMode,
+    ssh_user: Option<String>,
 ) -> Result<Target, String> {
     let host = match (&chosen, &positional) {
         // A resolved favourite names its own host; the argument was its *name*.
@@ -1558,6 +1604,9 @@ fn reconcile(
         .and_then(|f| f.keychain_account.clone())
         .unwrap_or_else(|| user.clone());
 
+    // SSH identity: flag beats favourite; absent means `~/.ssh/config` decides.
+    let ssh_user = ssh_user.or_else(|| chosen.as_ref().and_then(|f| f.ssh_user.clone()));
+
     Ok(Target {
         host,
         keychain_account,
@@ -1568,6 +1617,8 @@ fn reconcile(
         domain: domain.or_else(|| chosen.as_ref().and_then(|f| f.domain.clone())),
         size,
         fullscreen,
+        native,
+        ssh_user,
     })
 }
 
@@ -1606,6 +1657,93 @@ mod tests {
         );
     }
 
+    /// The pre-native reconcile shape: transport Auto, no ssh identity. Keeps the
+    /// account/port/size precedence tests focused on what they test.
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_basic(
+        positional: Option<String>,
+        chosen: Option<Favourite>,
+        user: Option<String>,
+        default_user: Option<String>,
+        port: Option<u16>,
+        domain: Option<String>,
+        size: Option<(u16, u16)>,
+    ) -> Result<Target, String> {
+        reconcile(
+            positional,
+            chosen,
+            user,
+            default_user,
+            port,
+            domain,
+            size,
+            mdrdp::favourites::NativeMode::Auto,
+            None,
+        )
+    }
+
+    #[test]
+    fn ssh_user_flag_beats_favourite_and_absence_defers_to_ssh_config() {
+        let mut f = temper();
+        f.ssh_user = Some("saved-ssh".into());
+        let with_flag = reconcile(
+            Some("Temper".into()),
+            Some(f.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            mdrdp::favourites::NativeMode::Auto,
+            Some("flag-ssh".into()),
+        )
+        .unwrap();
+        assert_eq!(with_flag.ssh_user.as_deref(), Some("flag-ssh"));
+
+        let with_favourite = reconcile(
+            Some("Temper".into()),
+            Some(f),
+            None,
+            None,
+            None,
+            None,
+            None,
+            mdrdp::favourites::NativeMode::Auto,
+            None,
+        )
+        .unwrap();
+        assert_eq!(with_favourite.ssh_user.as_deref(), Some("saved-ssh"));
+
+        let bare = reconcile_basic(
+            Some("Temper".into()),
+            Some(temper()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(bare.ssh_user, None, "absent means ~/.ssh/config decides");
+    }
+
+    #[test]
+    fn resolved_native_mode_rides_the_target() {
+        let t = reconcile(
+            Some("Temper".into()),
+            Some(temper()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            mdrdp::favourites::NativeMode::Always,
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.native, mdrdp::favourites::NativeMode::Always);
+    }
+
     fn temper() -> Favourite {
         Favourite {
             username: Some("saved-user".into()),
@@ -1621,7 +1759,7 @@ mod tests {
 
     #[test]
     fn a_favourite_supplies_every_field_it_knows() {
-        let t = reconcile(
+        let t = reconcile_basic(
             Some("Temper".into()),
             Some(temper()),
             None,
@@ -1644,7 +1782,7 @@ mod tests {
 
     #[test]
     fn every_flag_overrides_the_favourite_it_clashes_with() {
-        let t = reconcile(
+        let t = reconcile_basic(
             Some("Temper".into()),
             Some(temper()),
             Some("flag-user".into()),
@@ -1667,7 +1805,7 @@ mod tests {
 
     #[test]
     fn an_unmatched_argument_is_treated_as_a_bare_host() {
-        let t = reconcile(
+        let t = reconcile_basic(
             Some("192.0.2.50".into()),
             None,
             Some("martin".into()),
@@ -1686,13 +1824,14 @@ mod tests {
 
     #[test]
     fn a_host_with_no_account_anywhere_is_an_error_not_a_guess() {
-        let err = reconcile(Some("box".into()), None, None, None, None, None, None).unwrap_err();
+        let err =
+            reconcile_basic(Some("box".into()), None, None, None, None, None, None).unwrap_err();
         assert!(err.contains("no account for box"), "got: {err}");
     }
 
     #[test]
     fn the_default_username_covers_a_bare_host() {
-        let t = reconcile(
+        let t = reconcile_basic(
             Some("box".into()),
             None,
             None,
@@ -1711,7 +1850,7 @@ mod tests {
 
     #[test]
     fn a_favourite_account_beats_the_default_and_a_flag_beats_both() {
-        let with_favourite = reconcile(
+        let with_favourite = reconcile_basic(
             Some("Temper".into()),
             Some(temper()),
             None,
@@ -1723,7 +1862,7 @@ mod tests {
         .unwrap();
         assert_eq!(with_favourite.user, "saved-user");
 
-        let with_flag = reconcile(
+        let with_flag = reconcile_basic(
             Some("Temper".into()),
             Some(temper()),
             Some("flag-user".into()),
@@ -1747,7 +1886,8 @@ mod tests {
             keychain_account: Some("MicrosoftAccount\\user@example.com".into()),
             ..Favourite::new("Temper", "temper")
         };
-        let t = reconcile(Some("Temper".into()), Some(f), None, None, None, None, None).unwrap();
+        let t =
+            reconcile_basic(Some("Temper".into()), Some(f), None, None, None, None, None).unwrap();
         assert_eq!(t.user, "user@example.com", "what we log on as");
         assert_eq!(
             t.keychain_account, "MicrosoftAccount\\user@example.com",
@@ -1762,13 +1902,14 @@ mod tests {
             keychain_account: None,
             ..Favourite::new("Plain", "host")
         };
-        let t = reconcile(Some("Plain".into()), Some(f), None, None, None, None, None).unwrap();
+        let t =
+            reconcile_basic(Some("Plain".into()), Some(f), None, None, None, None, None).unwrap();
         assert_eq!(t.keychain_account, t.user, "one name unless told otherwise");
     }
 
     #[test]
     fn nothing_at_all_is_a_usage_error() {
-        assert!(reconcile(None, None, None, None, None, None, None).is_err());
+        assert!(reconcile_basic(None, None, None, None, None, None, None).is_err());
     }
 
     #[test]
@@ -1778,7 +1919,7 @@ mod tests {
             window_size: WindowSize::Fullscreen,
             ..Favourite::new("FS", "fs.local")
         };
-        let t = reconcile(Some("FS".into()), Some(f), None, None, None, None, None).unwrap();
+        let t = reconcile_basic(Some("FS".into()), Some(f), None, None, None, None, None).unwrap();
         assert_eq!(
             t.size, DEFAULT_SIZE,
             "fullscreen cannot be resolved to pixels before a window exists"
@@ -1796,7 +1937,7 @@ mod tests {
             window_size: WindowSize::Fullscreen,
             ..Favourite::new("Fullscreen", "fullscreen.local")
         };
-        let t = reconcile(
+        let t = reconcile_basic(
             Some("Fullscreen".into()),
             Some(f),
             None,
