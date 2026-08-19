@@ -154,6 +154,64 @@ impl Surface {
         }
     }
 
+    /// Replace the pixel buffer wholesale with a caller-produced one, returning the
+    /// old buffer for reuse.
+    ///
+    /// This is the native transport's AU path: the decoder hands over a full frame it
+    /// already owns, and swapping `Vec`s costs nothing where a `blit_rgba` of the same
+    /// frame would copy ~8 MB under the store lock on every decoded frame — a cost the
+    /// spike's baselines deliberately never paid. The buffer must be exactly
+    /// `width * height * 4` bytes; anything else is a producer bug or a mid-stream
+    /// mode change, both of which the native session treats as terminal.
+    pub fn adopt_pixels(&mut self, pixels: Vec<u8>) -> Result<Vec<u8>, SurfaceError> {
+        let expected = self.width as usize * self.height as usize * BPP;
+        if pixels.len() != expected {
+            return Err(SurfaceError::SizeMismatch {
+                expected,
+                got: pixels.len(),
+            });
+        }
+        Ok(std::mem::replace(&mut self.pixels, pixels))
+    }
+
+    /// Blit a tightly packed **BGRA** rectangle, swizzling to RGBA in place.
+    ///
+    /// The native transport's rect path: wire payloads arrive BGRA (the capture
+    /// format) and are converted during the copy, with no intermediate allocation.
+    /// Unlike [`Surface::blit_rgba`], bounds are **strict**: the native wire's rects
+    /// are validated against the advertised frame size before they get here, so an
+    /// overhanging rectangle is a protocol violation, not tile-grid slack.
+    pub fn blit_bgra_strict(&mut self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
+        if dest.right > self.width || dest.bottom > self.height || dest.is_empty() {
+            return Err(SurfaceError::OutOfBounds {
+                rect: dest,
+                width: self.width,
+                height: self.height,
+            });
+        }
+        let row_px = dest.width() as usize;
+        let expected = row_px * dest.height() as usize * BPP;
+        if src.len() != expected {
+            return Err(SurfaceError::SizeMismatch {
+                expected,
+                got: src.len(),
+            });
+        }
+        for row in 0..dest.height() {
+            let src_off = row as usize * row_px * BPP;
+            let dst_off = self.row_start(dest.top + row) + dest.left as usize * BPP;
+            let src_row = &src[src_off..src_off + row_px * BPP];
+            let dst_row = &mut self.pixels[dst_off..dst_off + row_px * BPP];
+            for (s, d) in src_row.chunks_exact(BPP).zip(dst_row.chunks_exact_mut(BPP)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+        }
+        Ok(())
+    }
+
     /// Extract a rectangle as a tightly packed RGBA buffer.
     pub fn extract(&self, src: Rect) -> Option<Vec<u8>> {
         let src = src.clip_to(self.width, self.height)?;
@@ -172,6 +230,10 @@ pub enum SurfaceError {
     NoSuchSurface(u16),
     NoSuchCacheSlot(u16),
     ShortSource { needed: usize, got: usize },
+    /// A buffer whose length does not match what the operation requires exactly.
+    SizeMismatch { expected: usize, got: usize },
+    /// A strict-bounds blit whose rectangle does not fit the surface.
+    OutOfBounds { rect: Rect, width: u16, height: u16 },
 }
 
 impl std::fmt::Display for SurfaceError {
@@ -183,6 +245,20 @@ impl std::fmt::Display for SurfaceError {
                 write!(
                     f,
                     "source buffer too small: needed {needed} bytes, got {got}"
+                )
+            }
+            SurfaceError::SizeMismatch { expected, got } => {
+                write!(f, "buffer size mismatch: expected {expected} bytes, got {got}")
+            }
+            SurfaceError::OutOfBounds {
+                rect,
+                width,
+                height,
+            } => {
+                write!(
+                    f,
+                    "rect {},{}..{},{} outside {width}x{height} surface",
+                    rect.left, rect.top, rect.right, rect.bottom
                 )
             }
         }
@@ -295,6 +371,36 @@ impl SurfaceStore {
         // through `Surface` directly, so cached pixels are not counted twice here.
         let written = surface.blit_rgba(dest, src, src_stride_px)?;
         self.cache_stats.bytes_from_wire += written as u64;
+        self.touch();
+        Ok(())
+    }
+
+    /// Swap a full decoded frame into a surface (the native AU path). Returns the
+    /// displaced buffer for reuse. See [`Surface::adopt_pixels`].
+    pub fn adopt_pixels(&mut self, id: u16, pixels: Vec<u8>) -> Result<Vec<u8>, SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(SurfaceError::NoSuchSurface(id))?;
+        let old = surface.adopt_pixels(pixels)?;
+        self.cache_stats.bytes_from_wire += old.len() as u64;
+        self.touch();
+        Ok(old)
+    }
+
+    /// Strict-bounds BGRA blit (the native rect path). See [`Surface::blit_bgra_strict`].
+    pub fn blit_bgra_strict(
+        &mut self,
+        id: u16,
+        dest: Rect,
+        src: &[u8],
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(SurfaceError::NoSuchSurface(id))?;
+        surface.blit_bgra_strict(dest, src)?;
+        self.cache_stats.bytes_from_wire += src.len() as u64;
         self.touch();
         Ok(())
     }
@@ -445,6 +551,85 @@ mod tests {
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    #[test]
+    fn adopt_swaps_the_buffer_and_returns_the_old_one() {
+        let mut s = Surface::new(2, 2);
+        // Distinct per-pixel values so a swapped-vs-copied mixup is distinguishable.
+        let fresh: Vec<u8> = (0..2 * 2 * BPP as u8).collect();
+        let old = s.adopt_pixels(fresh.clone()).unwrap();
+        assert!(old.iter().all(|&b| b == 0), "old buffer is the zeroed one");
+        assert_eq!(s.pixels(), fresh.as_slice());
+    }
+
+    #[test]
+    fn adopt_rejects_a_wrong_size_buffer_without_touching_pixels() {
+        let mut s = Surface::new(2, 2);
+        s.blit_rgba(Rect::new(0, 0, 2, 2), &solid(2, 2, RED), 2)
+            .unwrap();
+        let err = s.adopt_pixels(vec![7u8; 5]).unwrap_err();
+        assert_eq!(
+            err,
+            SurfaceError::SizeMismatch {
+                expected: 2 * 2 * BPP,
+                got: 5
+            }
+        );
+        assert_eq!(&s.pixels()[0..4], RED, "pixels untouched after rejection");
+    }
+
+    #[test]
+    fn bgra_strict_blit_swizzles_and_lands_at_the_right_offset() {
+        // One BGRA pixel with four DIFFERENT channel values, blitted at (1,1) of 3x3:
+        // any channel-order or offset mistake changes the result.
+        let mut s = Surface::new(3, 3);
+        let bgra = [10u8, 20, 30, 40]; // B=10 G=20 R=30 A=40
+        s.blit_bgra_strict(Rect::new(1, 1, 2, 2), &bgra).unwrap();
+        let off = (3 + 1) * BPP;
+        assert_eq!(&s.pixels()[off..off + BPP], &[30, 20, 10, 40]); // RGBA
+        // Every other pixel untouched.
+        for (i, px) in s.pixels().chunks_exact(BPP).enumerate() {
+            if i != 4 {
+                assert_eq!(px, [0, 0, 0, 0], "pixel {i} should be untouched");
+            }
+        }
+    }
+
+    #[test]
+    fn bgra_strict_blit_rejects_overhang_and_short_payloads() {
+        let mut s = Surface::new(3, 3);
+        // Overhang: 2x2 at (2,2) of a 3x3 surface.
+        let err = s
+            .blit_bgra_strict(Rect::new(2, 2, 4, 4), &solid(2, 2, RED))
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::OutOfBounds { .. }));
+        // In-bounds rect, payload one byte short of 1x1.
+        let err = s
+            .blit_bgra_strict(Rect::new(0, 0, 1, 1), &[1, 2, 3])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SurfaceError::SizeMismatch {
+                expected: BPP,
+                got: 3
+            }
+        );
+        assert!(s.pixels().iter().all(|&b| b == 0), "nothing written");
+    }
+
+    #[test]
+    fn store_adopt_and_strict_blit_bump_the_generation() {
+        let mut store = SurfaceStore::new();
+        store.create(0, 2, 2);
+        let g0 = store.generation();
+        store.adopt_pixels(0, vec![9u8; 2 * 2 * BPP]).unwrap();
+        let g1 = store.generation();
+        assert!(g1 > g0, "adopt must mark the store changed");
+        store
+            .blit_bgra_strict(0, Rect::new(0, 0, 1, 1), &[1, 2, 3, 4])
+            .unwrap();
+        assert!(store.generation() > g1, "strict blit must mark the store changed");
+    }
 
     #[test]
     fn a_new_surface_is_transparent_black() {

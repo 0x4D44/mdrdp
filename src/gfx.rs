@@ -303,6 +303,9 @@ impl GfxHandler {
                 SurfaceError::NoSuchSurface(_) => "no_such_surface",
                 SurfaceError::NoSuchCacheSlot(_) => "no_such_cache_slot",
                 SurfaceError::ShortSource { .. } => "short_source",
+                // Native-transport-only errors; the EGFX path never produces them.
+                SurfaceError::SizeMismatch { .. } => "size_mismatch",
+                SurfaceError::OutOfBounds { .. } => "out_of_bounds",
             };
             self.note_surface_error(reason, 1);
         }
