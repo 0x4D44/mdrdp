@@ -6,6 +6,11 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Windows AVC444 alternates LC=1/LC=2; a luma pass must PRESERVE delivered odd chroma or colours pump (`avc444::apply_luma`).
+  FreeRDP replicates the luma frame's averaged chroma into all four 2x2 positions on every luma
+  pass, wiping the aux samples — on dithered content that flips 33k/48k probe pixels by up to 98
+  RGB units at every L↔C transition (measured, temper). The encoder re-sends chroma only when it
+  changed. Repro/attribution recipe: `--capture-failures` + `examples/avcreplay.rs`.
 - Suppress Output "allow" does NOT repaint: EGFX resumes only FUTURE deltas — reveal must send Refresh Rect (`session::visibility_pdus`).
   A session that connects occluded stays black forever: the logon-black connect burst is all it
   ever painted, the desktop appears server-side while suppressed (never sent), and a static desktop
