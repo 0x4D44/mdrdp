@@ -245,6 +245,22 @@ fn report_session_epilogue(
         // Counts only — no content, ever. "Exactly one message each way per
         // copy, and none after" is a claim about the wire, and nothing else
         // this session records can settle it.
+        // Audio, reported for the native path at last. This was gated behind
+        // `!is_native` along with everything else audio-related, so a working
+        // native audio path would have printed nothing at all — which is the
+        // same failure as silence that looks like a working connection.
+        let (audio_frames, left_hz, right_hz) = mdrdp::native::session::AUDIO.report();
+        if audio_frames > 0 {
+            let underruns = audio_stats.snapshot().underruns;
+            eprintln!("  native: audio frames {audio_frames}  underruns {underruns}");
+            if left_hz > 0 || right_hz > 0 {
+                // The signal check, not a frame count. Reported with both ears
+                // named because the whole point is that they differ: the host
+                // sends 440 Hz left and 660 Hz right precisely so a swap cannot
+                // pass for a correct decode.
+                eprintln!("  native: audio tone left {left_hz} Hz  right {right_hz} Hz");
+            }
+        }
         let (sent, applied, echoes, refused) = mdrdp::native::clipboard::COUNTERS.snapshot();
         if sent + applied + echoes + refused > 0 {
             eprintln!(
@@ -1622,7 +1638,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Connected::Native(_) => {
             eprintln!(
-                "channels: n/a — native transport (clipboard and audio land in later tranches)"
+                "channels: n/a — the native transport carries clipboard and audio \
+                 on its own auxiliary channel, not as RDP static channels"
             );
         }
     }

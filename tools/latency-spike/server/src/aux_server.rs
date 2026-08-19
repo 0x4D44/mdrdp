@@ -240,9 +240,21 @@ pub fn serve_one(
             .spawn(move || {
                 let block = Duration::from_millis(audio_source::FRAME_MS as u64);
                 let mut said_unavailable = false;
+                // **Paced against a deadline, not by sleeping a fixed amount.**
+                //
+                // `generate; sleep(block)` makes each period `block` PLUS however
+                // long generation took, so the source runs permanently slower
+                // than real time and the client's ring can never fill. Measured
+                // live before this fix: 1882 frames delivered and 1588 underrun
+                // episodes across 19 s — a continuous stream of gaps on a link
+                // that was dropping nothing. The audio was correct and the
+                // timing was not, which is a failure a frame counter cannot see.
+                let mut due = std::time::Instant::now();
                 while !audio_stop.load(Ordering::Relaxed) {
                     if !audio_enabled.load(Ordering::Relaxed) {
                         std::thread::sleep(block);
+                        // Nothing is owed for time spent disabled.
+                        due = std::time::Instant::now();
                         continue;
                     }
                     match source.next_block() {
@@ -268,9 +280,21 @@ pub fn serve_one(
                             }
                             // Back off hard: there is nothing to poll for.
                             std::thread::sleep(Duration::from_secs(1));
+                            due = std::time::Instant::now();
                         }
                     }
-                    std::thread::sleep(block);
+                    due += block;
+                    let now = std::time::Instant::now();
+                    if due > now {
+                        std::thread::sleep(due - now);
+                    } else {
+                        // Behind. Do not try to catch up by generating faster:
+                        // the samples are synthesised from a sample counter, so
+                        // a burst would be correct audio delivered too quickly
+                        // and would simply overrun the ring at the far end.
+                        // Give up the debt and carry on from now.
+                        due = now;
+                    }
                 }
             })?,
     );

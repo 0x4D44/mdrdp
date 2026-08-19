@@ -20,7 +20,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -63,6 +63,75 @@ const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Absent whenever the host does not advertise the channel or its connect
 /// failed — a session without a clipboard is a working session, and every path
 /// here is written so that losing the clipboard cannot end one.
+/// What the native transport observed about audio this session.
+///
+/// A process global for the same reason the clipboard counters are: the audio
+/// thread is spawned deep inside `spawn_aux` and the epilogue that reports it
+/// lives in `main`, with no value plumbed between them. **Session-scoped by
+/// convention, not by construction** — one session per process is the product's
+/// architecture, and this is only true for as long as that holds.
+pub static AUDIO: AudioCounters = AudioCounters::new();
+
+/// Counters and a one-shot signal check.
+pub struct AudioCounters {
+    frames: AtomicU64,
+    /// The measured left/right peak frequencies, in Hz, or zero if not measured.
+    ///
+    /// Stored as integers because there is no atomic float and this is a
+    /// diagnostic, not a measurement anyone will do arithmetic on.
+    left_hz: AtomicU64,
+    right_hz: AtomicU64,
+}
+
+impl AudioCounters {
+    const fn new() -> Self {
+        Self {
+            frames: AtomicU64::new(0),
+            left_hz: AtomicU64::new(0),
+            right_hz: AtomicU64::new(0),
+        }
+    }
+
+    fn note_frame(&self) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Measure the dominant frequency in each channel, once.
+    ///
+    /// This is the oracle the acceptance criteria rest on. A frame counter says
+    /// bytes moved; this says the *right* bytes moved, in the right ears, at the
+    /// right rate — which is what a channel swap, a resample error and a
+    /// byte-order mistake all fail.
+    fn note_probe(&self, interleaved: &[f32], rate: u32, channels: u16) {
+        use rhydra::audio_source::{deinterleave, peak_frequency};
+        let left = deinterleave(interleaved, channels as u8, 0);
+        let right = if channels >= 2 {
+            deinterleave(interleaved, channels as u8, 1)
+        } else {
+            left.clone()
+        };
+        // A generous search window: wide enough that a badly wrong rate still
+        // lands inside it and is reported as wrong, rather than falling outside
+        // and being reported as absent.
+        let range = 100..=2_000;
+        if let Some(hz) = peak_frequency(&left, rate, range.clone()) {
+            self.left_hz.store(hz as u64, Ordering::Relaxed);
+        }
+        if let Some(hz) = peak_frequency(&right, rate, range) {
+            self.right_hz.store(hz as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Frames received, and the measured tone in each channel if any.
+    pub fn report(&self) -> (u64, u64, u64) {
+        (
+            self.frames.load(Ordering::Relaxed),
+            self.left_hz.load(Ordering::Relaxed),
+            self.right_hz.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// What the client needs to turn wire audio into sound.
 ///
 /// The device format travels with the ring because every frame is converted to
@@ -319,9 +388,20 @@ fn spawn_aux(
             std::thread::Builder::new()
                 .name("native-audio".to_owned())
                 .spawn(move || {
+                    // A short window of what actually arrived, kept once and
+                    // then never again. It is what turns "frames arrived" into
+                    // "the right signal arrived": a frame counter cannot see a
+                    // channel swap, a resampling error or wrong endianness, and
+                    // those are the faults most likely to occur.
+                    let mut probe: Vec<f32> = Vec::new();
+                    let probe_target =
+                        playout.device.sample_rate as usize * playout.device.channels as usize / 4; // a quarter-second
+                    let mut probed = false;
+
                     // Ends when the reader thread drops its sender, which is
                     // exactly when there is no more audio coming.
                     while let Ok(frame) = rx.recv() {
+                        AUDIO.note_frame();
                         let samples = crate::audio::pcm16_le_to_f32(&frame.pcm);
                         let matched = crate::audio::remap_channels(
                             &samples,
@@ -334,6 +414,18 @@ fn spawn_aux(
                             frame.sample_rate,
                             playout.device.sample_rate,
                         );
+                        if !probed {
+                            probe.extend_from_slice(&ready);
+                            if probe.len() >= probe_target {
+                                AUDIO.note_probe(
+                                    &probe,
+                                    playout.device.sample_rate,
+                                    playout.device.channels,
+                                );
+                                probed = true;
+                                probe = Vec::new();
+                            }
+                        }
                         playout.ring.push(&ready);
                     }
                 })?,

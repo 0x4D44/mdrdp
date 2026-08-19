@@ -394,9 +394,10 @@ impl AgentOps for WinOps {
         // name, so no output-index guessing. Stats land beside the logs.
         let stats = self.root.join("logs").join("server-stats.jsonl");
         let stats = stats.to_string_lossy().into_owned();
+        let audio = audio_source_arg(&self.root);
         self.server = Some(self.spawn(
             "rhydra-server.exe",
-            &["--source", "idd", "--out", &stats],
+            &["--source", "idd", "--out", &stats, "--audio-source", &audio],
             "server.log",
         )?);
         Ok(())
@@ -457,4 +458,25 @@ pub fn exe_root() -> Result<PathBuf, String> {
     exe.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| "agent exe has no parent directory".to_owned())
+}
+
+/// Which audio source the supervised server should use.
+///
+/// Read from a one-word file, `audio-source`, beside the binaries; absent means
+/// `off`, which is the only safe default.
+///
+/// **This knob is temporary and exists for one reason.** WASAPI loopback capture
+/// does not exist yet, so the only working host source is the synthetic tone —
+/// and baking that into the agent would ship a test signal as the product's
+/// audio. When loopback lands, the agent should pass it unconditionally and this
+/// function should go.
+///
+/// Anything other than the exact word `tone` reads as `off`, including a typo. A
+/// value that silently fell back to the tone would put a 440 Hz sine into a real
+/// session; a value that falls back to silence is merely unhelpful.
+fn audio_source_arg(root: &std::path::Path) -> String {
+    match std::fs::read_to_string(root.join("audio-source")) {
+        Ok(s) if s.trim() == "tone" => "tone".to_owned(),
+        _ => "off".to_owned(),
+    }
 }
