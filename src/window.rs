@@ -269,6 +269,19 @@ const DIAG_REFRESH: Duration = Duration::from_secs(1);
 /// inside a second on a healthy host, even at 400 ms RTT.
 const REPAINT_GRACE: Duration = Duration::from_secs(5);
 
+/// Title of the card raised while a reveal's repaint is outstanding. Matched to find and
+/// refresh the standing card, so the condition is identified by this string, not by
+/// position in the stack.
+const STALL_TOAST_TITLE: &str = "No picture from the server";
+
+/// Sample every Nth pixel when asking whether a stalled frame is black.
+///
+/// Sampled, never exhaustive. This runs only while a repaint is already overdue — a rare
+/// fault state — and even at this stride a 2560x1440 window still reads over 14,000
+/// pixels, which is ample to tell a black screen from a desktop. Scanning whole frames on
+/// the present path is precisely what MDR-BUG-FLUX-00005 was raised to stop.
+const BLACK_SAMPLE_STRIDE: usize = 256;
+
 /// A remote pointer change, already decoded to pixels. Session-layer types stay out of
 /// this module, so the session thread translates IronRDP's pointer outputs into this.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -551,6 +564,22 @@ pub fn blank_notice_lines(waiting: Option<Duration>) -> Vec<String> {
         detail,
         "The connection is up — this is not a dropped session.".to_owned(),
     ]
+}
+
+/// Whether the composited frame is, on a sampled basis, entirely black.
+///
+/// Pure so the threshold and the sampling are testable. Used only to decide whether the
+/// blank-window notice may be drawn over a frame we already know is stalled — never on
+/// its own. A black *desktop* is legitimate (a lock screen, a full-screen terminal, a
+/// screensaver), so blackness alone must never trigger anything; blackness plus a repaint
+/// we asked for and never got is not legitimate, and that pairing is what makes it safe
+/// to write over the frame.
+fn frame_looks_black(buffer: &[u32], stride: usize) -> bool {
+    const DARK: u32 = 0x10;
+    buffer
+        .iter()
+        .step_by(stride.max(1))
+        .all(|&px| (px & 0xff) <= DARK && ((px >> 8) & 0xff) <= DARK && ((px >> 16) & 0xff) <= DARK)
 }
 
 /// Whether a reveal's outstanding repaint has become a stall.
@@ -1165,9 +1194,9 @@ impl SessionApp {
             return;
         }
         let secs = asked.elapsed().as_secs();
-        // The log line and the card fire once; the overlay line is re-asserted each tick
-        // so its count stays live, and only into a free slot — an audio warning already
-        // standing there is not worth stomping for this.
+        // The log line fires once. The overlay line is re-asserted each tick so its count
+        // stays live, and only into a free slot — an audio warning already standing there
+        // is not worth stomping for this.
         if !self.stall_announced {
             self.stall_announced = true;
             eprintln!(
@@ -1175,14 +1204,29 @@ impl SessionApp {
                  has arrived; the window is showing stale or black pixels (the connection \
                  is otherwise healthy — see MDR-BUG-FLUX-00008)"
             );
-            self.toasts.push((
+        }
+        // The card is held up for as long as the fault lasts, by refreshing its birth
+        // instant rather than letting TOAST_TTL retire it. A six-second card for a
+        // condition that persists for hours told the user nothing if they happened to be
+        // looking elsewhere, which is exactly what happened in the field.
+        let body = format!("repaint requested {secs}s ago, nothing arrived");
+        match self
+            .toasts
+            .iter_mut()
+            .find(|(t, _)| t.title == STALL_TOAST_TITLE)
+        {
+            Some((toast, born)) => {
+                toast.body = body;
+                *born = Instant::now();
+            }
+            None => self.toasts.push((
                 Toast {
                     warn: false,
-                    title: "No picture from the server".to_owned(),
-                    body: format!("repaint requested {secs}s ago, nothing arrived"),
+                    title: STALL_TOAST_TITLE.to_owned(),
+                    body,
                 },
                 Instant::now(),
-            ));
+            )),
         }
         if self.warn_line.is_none() {
             self.warn_line = Some(format!("display  no repaint for {secs}s after reveal"));
@@ -1687,13 +1731,20 @@ impl SessionApp {
             (generation, blank)
         };
 
-        // A window with no surface mapped to output is painting black because it has
-        // nothing at all, not because the desktop is dark. Say which, in place: there is
-        // no content to obscure here, and the alternative is the unexplained black
-        // rectangle that cost a day of diagnosis (MDR-BUG-FLUX-00008). Only this branch
-        // gets text drawn over it — once a surface exists its pixels are the truth, even
-        // when they are black, and a stale desktop must not be painted over.
-        if blank {
+        // Explain the black rectangle rather than leaving the user to guess, in the two
+        // cases where there is provably nothing to obscure (MDR-BUG-FLUX-00008):
+        //
+        // 1. No surface is mapped to output, so the window is blank because we have
+        //    nothing at all — not because the desktop is dark.
+        // 2. A repaint we asked for never arrived AND the frame is black. Either half
+        //    alone must stay silent: a black desktop is legitimate (lock screen,
+        //    full-screen terminal, screensaver), and a stall over a *stale* desktop is
+        //    still showing the user real content that must not be painted over. Together
+        //    they are not legitimate, and this was the case the field failure actually
+        //    hit — the first version of this notice stayed silent through it.
+        let stalled_and_dark =
+            self.stall_announced && frame_looks_black(&buffer, BLACK_SAMPLE_STRIDE);
+        if blank || stalled_and_dark {
             let waiting = self.repaint_awaited.map(|(asked, _)| asked.elapsed());
             draw_blank_notice(&mut buffer, size.width, size.height, waiting);
         }
@@ -2567,6 +2618,48 @@ mod tests {
             100,
             100
         ));
+    }
+
+    #[test]
+    fn a_black_frame_reads_as_black() {
+        let buf = vec![0x0000_0000u32; 4096];
+        assert!(frame_looks_black(&buf, BLACK_SAMPLE_STRIDE));
+    }
+
+    #[test]
+    fn a_frame_with_any_sampled_colour_is_not_black() {
+        // Whichever channel carries it: a red-only desktop must not read as blank, and a
+        // per-channel test written as one combined comparison would let two of these
+        // through.
+        for bright in [0x00ff_0000u32, 0x0000_ff00, 0x0000_00ff] {
+            let mut buf = vec![0x0000_0000u32; 4096];
+            buf[0] = bright;
+            assert!(
+                !frame_looks_black(&buf, BLACK_SAMPLE_STRIDE),
+                "{bright:#010x} should defeat the blackness test"
+            );
+        }
+    }
+
+    #[test]
+    fn very_dark_but_not_quite_black_still_counts_as_black() {
+        // A real "black" desktop is rarely all zeroes — compression and colour conversion
+        // leave a little noise, and an exact-zero test would call a black screen "content"
+        // and stay silent through the very failure this exists for.
+        let buf = vec![0x000f_0f0fu32; 4096];
+        assert!(frame_looks_black(&buf, BLACK_SAMPLE_STRIDE));
+    }
+
+    #[test]
+    fn sampling_can_miss_colour_that_falls_between_samples() {
+        // Documents the trade-off rather than pretending it away: this is a sampled test,
+        // so a single bright pixel between two samples is not seen. That is acceptable
+        // only because the result is never used alone — it gates a notice that already
+        // requires an overdue repaint. If this ever becomes load-bearing on its own, the
+        // stride is the thing to revisit.
+        let mut buf = vec![0x0000_0000u32; 4096];
+        buf[1] = 0x00ff_ffff;
+        assert!(frame_looks_black(&buf, BLACK_SAMPLE_STRIDE));
     }
 
     #[test]
