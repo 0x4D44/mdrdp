@@ -13,6 +13,7 @@
 //! gets only the portable half (HLD tranche 3 §3).
 
 pub mod annexb;
+pub mod audio_source;
 pub mod aux_proto;
 pub mod aux_server;
 pub mod auxchan;
