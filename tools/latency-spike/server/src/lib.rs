@@ -14,6 +14,7 @@
 
 pub mod annexb;
 pub mod aux_proto;
+pub mod aux_server;
 pub mod auxchan;
 pub mod cli;
 pub mod clipboard;
