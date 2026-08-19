@@ -3,6 +3,28 @@
 //! No clap: this crate is meant to cross-compile with nothing in the tree that
 //! cannot be read in an afternoon, and the flag surface is nine options wide.
 
+/// Where the host's audio comes from.
+///
+/// `loopback` is deliberately absent until the WASAPI capture behind it exists.
+/// A flag value that silently produced nothing would be worse than no flag: it
+/// would look like a working configuration and sound like a broken product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioKind {
+    /// Capture nothing. The default.
+    Off,
+    /// A synthetic two-tone generator, for proving the path end to end.
+    Tone,
+}
+
+impl AudioKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioKind::Off => "off",
+            AudioKind::Tone => "tone",
+        }
+    }
+}
+
 /// Where frames come from. `dxgi` is the default until the IDD source is proven
 /// against the gate (HLD decision 7) — it works against any output on any host,
 /// where `idd` needs our own driver installed and running.
@@ -50,6 +72,8 @@ pub struct Config {
     pub diff: bool,
     /// Which capture source to run.
     pub source: Source,
+    /// Where audio comes from, if the client asks for any.
+    pub audio_source: AudioKind,
 }
 
 pub const DEFAULT_VIDEO_PORT: u16 = 9500;
@@ -81,6 +105,10 @@ impl Default for Config {
             rects: true,
             diff: true,
             source: Source::Dxgi,
+            // Off by default. Audio is opt-in on the host as well as
+            // client-requested: nothing should start capturing because a binary
+            // was launched.
+            audio_source: AudioKind::Off,
         }
     }
 }
@@ -91,6 +119,7 @@ pub fn usage() -> &'static str {
      [--aux-port 9503 | --aux-port 0 to disable]\n               \
                   [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]\n               \
                   [--no-rects] [--no-diff] [--source dxgi|idd]\n  \
+     [--audio-source off|tone]\n  \
      rhydra-server --source idd [--video-port 9500] ...\n  \
      rhydra-server --list-outputs\n\n\
      --no-rects withholds the raw dirty-rect fast path, forcing every update down\n  \
@@ -165,6 +194,13 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             }
             "--gop" => cfg.gop = value.parse().map_err(|e| format!("--gop {value:?}: {e}"))?,
             "--out" => cfg.out = Some(value.clone()),
+            "--audio-source" => {
+                cfg.audio_source = match value.as_str() {
+                    "off" => AudioKind::Off,
+                    "tone" => AudioKind::Tone,
+                    other => return Err(format!("--audio-source {other:?}: expected off or tone")),
+                }
+            }
             "--source" => {
                 cfg.source = match value.as_str() {
                     "dxgi" => Source::Dxgi,

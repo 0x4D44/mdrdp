@@ -190,7 +190,7 @@ pub fn downmix_stereo_to_mono(stereo: &[f32]) -> Vec<f32> {
 /// Both sides are constrained to {1, 2} — [`is_playable`] on the wire side,
 /// [`AudioPlayback`]'s device-config check on the device side — so this is a total
 /// function over the four combinations that can actually occur.
-fn remap_channels(samples: &[f32], from_channels: u16, to_channels: u16) -> Vec<f32> {
+pub fn remap_channels(samples: &[f32], from_channels: u16, to_channels: u16) -> Vec<f32> {
     match (from_channels, to_channels) {
         (1, 2) => duplicate_mono_to_stereo(samples),
         (2, 1) => downmix_stereo_to_mono(samples),

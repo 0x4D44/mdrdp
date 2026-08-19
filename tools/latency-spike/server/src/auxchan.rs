@@ -342,6 +342,8 @@ pub struct ReaderStats {
     pub malformed: u64,
     /// Payloads refused before decoding, because the policy forbids inbound.
     pub refused_by_policy: u64,
+    /// Audio frames decoded off the wire.
+    pub audio_frames: u64,
 }
 
 /// Read framed messages until EOF, handing clipboard text to `on_text`.
@@ -353,10 +355,25 @@ pub struct ReaderStats {
 /// An unknown message type is skipped, never fatal — the property the framing
 /// buys, and one that was previously true server→client only. That is what lets
 /// a later tranche add audio to this channel without a flag day.
+/// Where each kind of inbound message goes.
+///
+/// A struct rather than four positional closures. With clipboard, audio and
+/// audio-control all arriving on one socket the argument list had reached the
+/// point where transposing two same-shaped closures would still compile — and
+/// the resulting bug (clipboard text handed to the audio sink) is exactly the
+/// kind that type-checks and then behaves strangely at runtime.
+pub struct ReaderSinks<'a> {
+    /// Whether inbound clipboard content is allowed by policy right now.
+    pub accepts_clipboard: &'a mut dyn FnMut() -> bool,
+    pub on_text: &'a mut dyn FnMut(&str),
+    pub on_audio: &'a mut dyn FnMut(AudioFrame),
+    /// The peer asking us to start or stop capturing.
+    pub on_audio_control: &'a mut dyn FnMut(bool),
+}
+
 pub fn pump_reader(
     mut input: impl Read,
-    accepts: &mut impl FnMut() -> bool,
-    on_text: &mut impl FnMut(&str),
+    sinks: &mut ReaderSinks<'_>,
     stats: &mut ReaderStats,
 ) -> ReaderEnd {
     let mut reassembler = Reassembler::new(framing::DEFAULT_MAX_PAYLOAD);
@@ -371,25 +388,45 @@ pub fn pump_reader(
         loop {
             match reassembler.next_message() {
                 Ok(None) => break,
-                Ok(Some(message)) => {
-                    if message.msg_type != aux_proto::MSG_CLIPBOARD {
-                        stats.unknown_type += 1;
-                        continue;
+                Ok(Some(message)) => match message.msg_type {
+                    aux_proto::MSG_CLIPBOARD => {
+                        if !(sinks.accepts_clipboard)() {
+                            stats.refused_by_policy += 1;
+                            continue;
+                        }
+                        stats.decoded += 1;
+                        match aux_proto::decode_clipboard(&message.payload) {
+                            Ok(AuxMessage::ClipboardText(text)) => (sinks.on_text)(&text),
+                            // `decode_clipboard` yields only ClipboardText. Any
+                            // other variant here would mean this dispatch was
+                            // wired to the wrong decoder — a defect worth
+                            // counting rather than a case worth ignoring.
+                            Ok(_) | Err(_) => stats.malformed += 1,
+                        }
                     }
-                    if !accepts() {
-                        stats.refused_by_policy += 1;
-                        continue;
+                    aux_proto::MSG_AUDIO => {
+                        // No policy gate: audio is requested by the client with
+                        // MSG_AUDIO_CONTROL and stops when it says so, which is
+                        // a cleaner control point than refusing frames that have
+                        // already crossed the wire.
+                        match aux_proto::decode_audio(&message.payload) {
+                            Ok(AuxMessage::Audio(frame)) => {
+                                stats.audio_frames += 1;
+                                (sinks.on_audio)(frame);
+                            }
+                            Ok(_) | Err(_) => stats.malformed += 1,
+                        }
                     }
-                    stats.decoded += 1;
-                    match aux_proto::decode_clipboard(&message.payload) {
-                        Ok(AuxMessage::ClipboardText(text)) => on_text(&text),
-                        // `decode_clipboard` yields only ClipboardText. Any other
-                        // variant reaching here would mean this dispatch was wired
-                        // to the wrong decoder, which is a defect worth counting
-                        // rather than a case worth silently ignoring.
-                        Ok(_) | Err(_) => stats.malformed += 1,
+                    aux_proto::MSG_AUDIO_CONTROL => {
+                        match aux_proto::decode_audio_control(&message.payload) {
+                            Ok(AuxMessage::AudioControl { enable }) => {
+                                (sinks.on_audio_control)(enable)
+                            }
+                            Ok(_) | Err(_) => stats.malformed += 1,
+                        }
                     }
-                }
+                    _ => stats.unknown_type += 1,
+                },
                 // Framing is structural: a bad length means the stream is no
                 // longer parseable, so there is nothing to resynchronise to.
                 Err(e) => return ReaderEnd::Io(format!("{e:?}")),
@@ -400,6 +437,23 @@ pub fn pump_reader(
 
 #[cfg(test)]
 mod tests {
+    /// Reader sinks for a test that only cares about clipboard.
+    ///
+    /// A macro rather than a function because the no-op audio closures are
+    /// temporaries: expanded at the call site they live to the end of the
+    /// enclosing statement, which a function returning the struct could not
+    /// arrange.
+    macro_rules! clip_sinks {
+        ($accepts:expr, $on_text:expr) => {
+            &mut ReaderSinks {
+                accepts_clipboard: &mut $accepts,
+                on_text: &mut $on_text,
+                on_audio: &mut |_: AudioFrame| {},
+                on_audio_control: &mut |_: bool| {},
+            }
+        };
+    }
+
     use super::*;
 
     /// Poll a condition rather than sleeping a guessed interval.
@@ -680,8 +734,7 @@ mod tests {
         let mut stats = ReaderStats::default();
         let end = pump_reader(
             &wire[..],
-            &mut || true,
-            &mut |t| got.push(t.to_owned()),
+            clip_sinks!(|| true, |t: &str| got.push(t.to_owned())),
             &mut stats,
         );
         assert_eq!(end, ReaderEnd::Eof);
@@ -695,14 +748,16 @@ mod tests {
         // adds audio here; an old client must skip it, not die on it — and the
         // proof is that a *later* message is still delivered.
         let mut wire = Vec::new();
-        framing::encode(0x21, b"audio, one day", &mut wire);
+        // 0x7F, not 0x21: 0x21 became MSG_AUDIO in tranche 6, so the original
+        // byte here would now be a malformed AUDIO frame rather than an unknown
+        // type — the test would still pass, against a different property.
+        framing::encode(0x7F, b"something from a later build", &mut wire);
         wire.extend_from_slice(&framed_clipboard("still here"));
         let mut got = Vec::new();
         let mut stats = ReaderStats::default();
         let end = pump_reader(
             &wire[..],
-            &mut || true,
-            &mut |t| got.push(t.to_owned()),
+            clip_sinks!(|| true, |t: &str| got.push(t.to_owned())),
             &mut stats,
         );
         assert_eq!(end, ReaderEnd::Eof);
@@ -720,8 +775,7 @@ mod tests {
         let mut stats = ReaderStats::default();
         let end = pump_reader(
             &wire[..],
-            &mut || false,
-            &mut |t| got.push(t.to_owned()),
+            clip_sinks!(|| false, |t: &str| got.push(t.to_owned())),
             &mut stats,
         );
         assert_eq!(end, ReaderEnd::Eof);
@@ -739,8 +793,7 @@ mod tests {
         let mut stats = ReaderStats::default();
         let end = pump_reader(
             &wire[..],
-            &mut || true,
-            &mut |t| got.push(t.to_owned()),
+            clip_sinks!(|| true, |t: &str| got.push(t.to_owned())),
             &mut stats,
         );
         assert_eq!(end, ReaderEnd::Eof);
@@ -766,8 +819,7 @@ mod tests {
         let mut stats = ReaderStats::default();
         let end = pump_reader(
             Dribble(framed_clipboard("a byte at a time"), 0),
-            &mut || true,
-            &mut |t| got.push(t.to_owned()),
+            clip_sinks!(|| true, |t: &str| got.push(t.to_owned())),
             &mut stats,
         );
         assert_eq!(end, ReaderEnd::Eof);
@@ -782,8 +834,7 @@ mod tests {
         let mut stats = ReaderStats::default();
         pump_reader(
             &wire[..],
-            &mut || true,
-            &mut |t| got.push(t.to_owned()),
+            clip_sinks!(|| true, |t: &str| got.push(t.to_owned())),
             &mut stats,
         );
         assert_eq!(got, vec!["first".to_owned(), "second".to_owned()]);

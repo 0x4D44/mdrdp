@@ -27,11 +27,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ironrdp_egfx::decode::H264Decoder;
+use rhydra::aux_proto::AudioFrame;
 use rhydra::auxchan::{self, Outbox};
 use rhydra::framing::{self, Reassembler};
 use rhydra::input_proto::{MouseButton as WireButton, Record, WheelAxis, encode_record};
 use rhydra::rects::{self, RectUpdate};
 
+use crate::audio::{AudioFormatSummary, AudioRing};
 use crate::clipboard::ArboardClipboard;
 use crate::input::{InputEvent, MouseButton, ScrollAxis};
 use crate::session::{SessionCommand, SessionEnd};
@@ -61,6 +63,16 @@ const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Absent whenever the host does not advertise the channel or its connect
 /// failed — a session without a clipboard is a working session, and every path
 /// here is written so that losing the clipboard cannot end one.
+/// What the client needs to turn wire audio into sound.
+///
+/// The device format travels with the ring because every frame is converted to
+/// it: the wire is self-describing, so the host's rate and the device's rate are
+/// independent and either can change without the other knowing.
+pub struct AudioPlayout {
+    pub ring: AudioRing,
+    pub device: AudioFormatSummary,
+}
+
 struct AuxChannel {
     socket: TcpStream,
     slot: Arc<Outbox>,
@@ -135,6 +147,7 @@ pub fn spawn(
     stats: StatsHandle,
     wake_rx: DoorbellReceiver,
     clipboard_policy: Policy,
+    audio: Option<AudioPlayout>,
 ) -> std::io::Result<NativeHandle> {
     let ProbedTransport { conn, tunnel, .. } = transport;
     let stop = Arc::new(AtomicBool::new(false));
@@ -161,6 +174,7 @@ pub fn spawn(
             &mut || Box::new(TextOnly(ArboardClipboard::new())),
             clipboard_policy,
             Arc::clone(&stop),
+            audio,
         ) {
             Ok(channel) => Some(channel),
             Err(e) => {
@@ -247,9 +261,23 @@ fn spawn_aux(
     make_clipboard: &mut dyn FnMut() -> Box<dyn TextClipboard>,
     policy: Policy,
     stop: Arc<AtomicBool>,
+    audio: Option<AudioPlayout>,
 ) -> std::io::Result<AuxChannel> {
     // Nagle would add up to 40 ms to a small, bursty clipboard message.
     socket.set_nodelay(true)?;
+
+    // **Ask for audio, or none arrives.** The host captures nothing until a
+    // client requests it, so a client with a working device has to say so. Sent
+    // here, before either pump thread exists, so it cannot race the writer for
+    // the socket — and a failure is reported and dropped, because a session
+    // without sound is still a working session.
+    if audio.is_some() {
+        let mut request = Vec::new();
+        rhydra::aux_proto::encode_audio_control(true, &mut request);
+        if let Err(e) = (&socket).write_all(&request) {
+            report(&format!("audio not requested: {e}"));
+        }
+    }
 
     // **One clipboard handle per thread, not one shared behind a mutex**, and
     // the same reasoning as the host: a write that blocks would otherwise hold
@@ -273,6 +301,45 @@ fn spawn_aux(
     let slot = Outbox::new();
     let mut joins = Vec::new();
 
+    // Audio gets its own thread and a channel to reach it.
+    //
+    // The reader must not do the decode/remap/resample work itself: that cost
+    // would land on the latency of every clipboard message sharing the thread,
+    // and the whole point of this channel is that lower-priority traffic never
+    // delays higher-priority traffic.
+    let (audio_tx, audio_rx) = match audio {
+        Some(_) => {
+            let (tx, rx) = std::sync::mpsc::channel::<AudioFrame>();
+            (Some(tx), Some(rx))
+        }
+        None => (None, None),
+    };
+    if let (Some(rx), Some(playout)) = (audio_rx, audio) {
+        joins.push(
+            std::thread::Builder::new()
+                .name("native-audio".to_owned())
+                .spawn(move || {
+                    // Ends when the reader thread drops its sender, which is
+                    // exactly when there is no more audio coming.
+                    while let Ok(frame) = rx.recv() {
+                        let samples = crate::audio::pcm16_le_to_f32(&frame.pcm);
+                        let matched = crate::audio::remap_channels(
+                            &samples,
+                            u16::from(frame.channels),
+                            playout.device.channels,
+                        );
+                        let ready = crate::audio::linear_resample(
+                            &matched,
+                            playout.device.channels as usize,
+                            frame.sample_rate,
+                            playout.device.sample_rate,
+                        );
+                        playout.ring.push(&ready);
+                    }
+                })?,
+        );
+    }
+
     let rx_socket = socket.try_clone()?;
     let rx_bridge = Arc::clone(&bridge);
     let rx_os = Arc::clone(&apply_os);
@@ -283,22 +350,37 @@ fn spawn_aux(
                 let mut stats = auxchan::ReaderStats::default();
                 let end = auxchan::pump_reader(
                     rx_socket,
-                    &mut || lock(&rx_bridge).accepts_incoming(),
-                    &mut |text| {
-                        // Both locks are taken here and nowhere else together,
-                        // and never while the reader holds either — so the
-                        // ordering cannot deadlock against the poll thread.
-                        let mut os = lock(&rx_os);
-                        // Counted from what `apply_remote` reports rather than
-                        // decided again here: two places deciding the same
-                        // policy eventually disagree.
-                        match clip::apply_remote(&mut **os, &rx_bridge, text, &mut report) {
-                            clip::Applied::Written => COUNTERS.note_applied(),
-                            clip::Applied::Suppressed => COUNTERS.note_echo_suppressed(),
-                            clip::Applied::Disabled
-                            | clip::Applied::TooLarge
-                            | clip::Applied::WriteFailed => COUNTERS.note_refused(),
-                        }
+                    &mut auxchan::ReaderSinks {
+                        accepts_clipboard: &mut || lock(&rx_bridge).accepts_incoming(),
+                        on_text: &mut |text| {
+                            // Both locks are taken here and nowhere else together,
+                            // and never while the reader holds either — so the
+                            // ordering cannot deadlock against the poll thread.
+                            let mut os = lock(&rx_os);
+                            // Counted from what `apply_remote` reports rather than
+                            // decided again here: two places deciding the same
+                            // policy eventually disagree.
+                            match clip::apply_remote(&mut **os, &rx_bridge, text, &mut report) {
+                                clip::Applied::Written => COUNTERS.note_applied(),
+                                clip::Applied::Suppressed => COUNTERS.note_echo_suppressed(),
+                                clip::Applied::Disabled
+                                | clip::Applied::TooLarge
+                                | clip::Applied::WriteFailed => COUNTERS.note_refused(),
+                            }
+                        },
+                        // **Handed off, never processed here.** Decode, channel
+                        // remap and resample are the expensive part, and doing them
+                        // on the reader would add their cost to the latency of every
+                        // clipboard message sharing this thread. The send never
+                        // blocks; if nothing is playing, the frame is dropped, which
+                        // is the right answer for audio nobody can hear.
+                        on_audio: &mut |frame| {
+                            if let Some(tx) = audio_tx.as_ref() {
+                                let _ = tx.send(frame);
+                            }
+                        },
+                        // Client -> host only; the client never receives it.
+                        on_audio_control: &mut |_| {},
                     },
                     &mut stats,
                 );
@@ -791,6 +873,8 @@ mod tests {
             &mut || Box::new(InertClipboard) as Box<dyn TextClipboard>,
             Policy::default(),
             Arc::clone(&stop),
+            // The teardown test is about threads, not sound.
+            None,
         )
         .expect("threads should start");
 

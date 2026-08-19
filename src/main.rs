@@ -1019,13 +1019,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let audio_ring = AudioRing::for_device(48_000, 2, audio_stats.clone());
     // Settings ▸ Audio: playback off means no device is opened and no RDPSND channel
     // is claimed — the honest form of "no sound", not a joined channel that discards.
-    // Native has no audio yet (tranche 6): no device is opened and no channel claimed.
-    let playback = if settings.audio.playback && !is_native {
+    //
+    // **The `!is_native` that used to be here was load-bearing and is gone.**
+    // `AudioPlayback::disabled` calls `ring.disable()`, which latches off with no
+    // way back, so with it every `ring.push()` on the native transport was
+    // silently discarded and no device was ever opened. Tranche 6's design
+    // called the client side "almost free" on the strength of reusing this
+    // ring; it was not, and this line is why.
+    let playback = if settings.audio.playback {
         AudioPlayback::start(audio_ring.clone(), audio_stats.clone())
     } else {
         AudioPlayback::disabled(audio_ring.clone())
     };
-    let rdpsnd = if playback.is_active() {
+    // The native transport carries its own audio on the auxiliary channel, so it
+    // wants the device and the ring but never an RDPSND channel.
+    let native_audio = if is_native && playback.is_active() {
+        Some(mdrdp::native::session::AudioPlayout {
+            ring: audio_ring.clone(),
+            device: playback.format(),
+        })
+    } else {
+        None
+    };
+    let rdpsnd = if !is_native && playback.is_active() {
         let fmt = playback.format();
         eprintln!("audio: {} Hz, {} channel(s)", fmt.sample_rate, fmt.channels);
         let static_channel = Box::new(RdpsndBackend::new(
@@ -1644,6 +1660,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // default already carries it.
                     ..Default::default()
                 },
+                native_audio,
             )
             .map_err(|e| format!("native session: {e}"))?,
         ),

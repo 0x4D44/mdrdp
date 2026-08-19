@@ -24,10 +24,11 @@
 
 use std::io::Result;
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::audio_source::{self, AudioSource, Captured};
 use crate::auxchan::{self, Outbox};
 use crate::clipboard::{self, Bridge, Policy, TextClipboard};
 
@@ -67,6 +68,15 @@ impl ApplyCounts {
 pub struct ConnectionReport {
     pub reader: auxchan::ReaderStats,
     pub applied: ApplyCounts,
+    /// Audio frames handed to the outbox.
+    pub audio_sent: u64,
+    /// Audio frames the outbox discarded because the link was behind.
+    ///
+    /// Reported separately from `audio_sent` because they mean different
+    /// things to whoever is diagnosing: frames sent is "the source is working",
+    /// frames dropped is "the link cannot keep up". A single number would
+    /// conflate a healthy quiet session with a congested one.
+    pub audio_dropped: u64,
 }
 
 /// How often the host's clipboard is read.
@@ -85,6 +95,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub fn serve(
     port: u16,
     mut make_clipboard: impl FnMut() -> Box<dyn TextClipboard>,
+    mut make_audio: impl FnMut() -> Box<dyn AudioSource>,
     policy: Policy,
 ) -> Result<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
@@ -93,19 +104,22 @@ pub fn serve(
         match listener.accept() {
             Ok((stream, peer)) => {
                 eprintln!("aux: connected {peer}");
-                match serve_one(stream, &mut make_clipboard, policy) {
+                match serve_one(stream, &mut make_clipboard, &mut make_audio, policy) {
                     // ASCII only: this goes to server.log, which is read
                     // through the Windows console codepage, where an em-dash
                     // comes out as mojibake.
                     Ok(report) => eprintln!(
                         "aux: disconnected - written {}, echo {}, \
-                         write-failed {}, refused-by-policy {}, malformed {}, unknown-type {}",
+                         write-failed {}, refused-by-policy {}, malformed {}, unknown-type {}, \
+                         audio-sent {}, audio-dropped {}",
                         report.applied.written,
                         report.applied.suppressed,
                         report.applied.write_failed,
                         report.reader.refused_by_policy,
                         report.reader.malformed,
-                        report.reader.unknown_type
+                        report.reader.unknown_type,
+                        report.audio_sent,
+                        report.audio_dropped
                     ),
                     Err(e) => eprintln!("aux: connection ended: {e}"),
                 }
@@ -132,6 +146,7 @@ pub fn serve(
 pub fn serve_one(
     socket: TcpStream,
     make_clipboard: &mut dyn FnMut() -> Box<dyn TextClipboard>,
+    make_audio: &mut dyn FnMut() -> Box<dyn AudioSource>,
     policy: Policy,
 ) -> Result<ConnectionReport> {
     // Clipboard messages are small and bursty; Nagle would add up to 40 ms.
@@ -208,6 +223,58 @@ pub fn serve_one(
             })?,
     );
 
+    // **Audio runs only when the client asks.** Nothing is captured or sent
+    // until a MSG_AUDIO_CONTROL enable arrives, so a client that does not want
+    // audio pays no bandwidth on a channel the parent HLD says must never back
+    // up video — and a host with no render endpoint never spins.
+    let audio_on = Arc::new(AtomicBool::new(false));
+    let audio_slot = Arc::clone(&slot);
+    let audio_stop = Arc::clone(&stop);
+    let audio_enabled = Arc::clone(&audio_on);
+    let mut source = make_audio();
+    let audio_sent = Arc::new(AtomicU64::new(0));
+    let sent_counter = Arc::clone(&audio_sent);
+    joins.push(
+        std::thread::Builder::new()
+            .name("aux-audio".to_owned())
+            .spawn(move || {
+                let block = Duration::from_millis(audio_source::FRAME_MS as u64);
+                let mut said_unavailable = false;
+                while !audio_stop.load(Ordering::Relaxed) {
+                    if !audio_enabled.load(Ordering::Relaxed) {
+                        std::thread::sleep(block);
+                        continue;
+                    }
+                    match source.next_block() {
+                        Captured::Frame(frame) => {
+                            audio_slot.put_audio(frame);
+                            sent_counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Nothing on the wire, and the capture position has
+                        // already advanced inside the source — which is what
+                        // keeps elided silence distinguishable from loss.
+                        Captured::Silence { .. } => {}
+                        Captured::Unavailable => {
+                            if !said_unavailable {
+                                // **Once, not every lap.** A host with no render
+                                // endpoint is a supported configuration, and a
+                                // log line per 10 ms would turn a supported
+                                // state into a fault report.
+                                eprintln!(
+                                    "aux: no audio render endpoint on this host; \
+                                     audio is unavailable (see audio-probe)"
+                                );
+                                said_unavailable = true;
+                            }
+                            // Back off hard: there is nothing to poll for.
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                    std::thread::sleep(block);
+                }
+            })?,
+    );
+
     // Counted from what `apply_remote` actually did, not from what reached the
     // decoder. Those differ exactly when it matters: a payload refused by the
     // OS clipboard is decoded and NOT applied, and a summary that conflated
@@ -217,18 +284,26 @@ pub fn serve_one(
     let outcome = Arc::new(Mutex::new(ApplyCounts::default()));
     let reader_outcome = Arc::clone(&outcome);
     let mut stats = auxchan::ReaderStats::default();
+    let control_flag = Arc::clone(&audio_on);
     let end = auxchan::pump_reader(
         &socket,
-        &mut || {
-            bridge
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .accepts_incoming()
-        },
-        &mut |text| {
-            let mut os = lock(&apply_os);
-            let applied = clipboard::apply_remote(&mut **os, &bridge, text, &mut report);
-            lock(&reader_outcome).note(applied);
+        &mut auxchan::ReaderSinks {
+            accepts_clipboard: &mut || {
+                bridge
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .accepts_incoming()
+            },
+            on_text: &mut |text| {
+                let mut os = lock(&apply_os);
+                let applied = clipboard::apply_remote(&mut **os, &bridge, text, &mut report);
+                lock(&reader_outcome).note(applied);
+            },
+            // The host never receives audio; this direction is host -> client.
+            on_audio: &mut |_frame| {},
+            on_audio_control: &mut |enable| {
+                control_flag.store(enable, Ordering::Relaxed);
+            },
         },
         &mut stats,
     );
@@ -248,6 +323,8 @@ pub fn serve_one(
         auxchan::ReaderEnd::Eof => Ok(ConnectionReport {
             reader: stats,
             applied: *lock(&outcome),
+            audio_sent: audio_sent.load(Ordering::Relaxed),
+            audio_dropped: slot.audio_dropped(),
         }),
         auxchan::ReaderEnd::Io(reason) => Err(std::io::Error::other(reason)),
     }
@@ -378,6 +455,87 @@ mod tests {
     }
 
     /// Connect a client to a `serve_one` running on its own thread.
+    /// Like [`connected`], but the host has a working audio source.
+    fn connected_with_tone(
+        held: Pasteboard,
+        policy: Policy,
+    ) -> (TcpStream, std::thread::JoinHandle<Result<ConnectionReport>>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut make = || Box::new(FakeClipboard(held.clone())) as Box<dyn TextClipboard>;
+            serve_one(
+                stream,
+                &mut make,
+                &mut || Box::new(crate::audio_source::ToneSource::new(48_000, 2)),
+                policy,
+            )
+        });
+        let client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+        (client, server)
+    }
+
+    /// Read framed messages for up to `budget`, returning how many audio frames
+    /// arrived.
+    fn count_audio_for(client: &mut TcpStream, budget: Duration) -> u64 {
+        use std::io::Read;
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut reassembler = crate::framing::Reassembler::new(crate::framing::DEFAULT_MAX_PAYLOAD);
+        let mut buf = [0u8; 8192];
+        let mut frames = 0u64;
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => reassembler.push(&buf[..n]),
+                Err(_) => {}
+            }
+            while let Ok(Some(message)) = reassembler.next_message() {
+                if message.msg_type == aux_proto::MSG_AUDIO {
+                    // Decoded, not merely counted: a byte with the right type
+                    // and a malformed body would otherwise pass for audio.
+                    aux_proto::decode_audio(&message.payload).expect("a well-formed frame");
+                    frames += 1;
+                }
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn the_host_sends_no_audio_until_the_client_asks_for_it() {
+        // Audio is opt-in on the wire. A host that streamed the moment a client
+        // connected would spend bandwidth on a channel the parent HLD says must
+        // never back up video, for a client that may have no output device.
+        let held = Pasteboard::holding("irrelevant");
+        let (mut client, server) = connected_with_tone(held, Policy::default());
+
+        let unasked = count_audio_for(&mut client, Duration::from_millis(400));
+        assert_eq!(unasked, 0, "audio arrived without being requested");
+
+        // Now ask, and it should start.
+        let mut request = Vec::new();
+        aux_proto::encode_audio_control(true, &mut request);
+        client.write_all(&request).unwrap();
+
+        let asked = count_audio_for(&mut client, Duration::from_millis(600));
+        assert!(
+            asked > 0,
+            "no audio arrived after asking for it (got {asked} frames)"
+        );
+
+        drop(client);
+        let report = join_server(server);
+        assert!(
+            report.audio_sent > 0,
+            "the host should report what it sent: {report:?}"
+        );
+    }
+
     fn connected(
         held: Pasteboard,
         policy: Policy,
@@ -389,7 +547,15 @@ mod tests {
             // A factory, so each thread gets its own handle exactly as the real
             // host does — sharing one here would test a design we do not ship.
             let mut make = || Box::new(FakeClipboard(held.clone())) as Box<dyn TextClipboard>;
-            serve_one(stream, &mut make, policy)
+            // The existing tests are about the clipboard; an unavailable
+            // source is the right stand-in because it is also the state every
+            // fleet host is actually in.
+            serve_one(
+                stream,
+                &mut make,
+                &mut || Box::new(crate::audio_source::UnavailableSource),
+                policy,
+            )
         });
         let client = TcpStream::connect(addr).unwrap();
         client.set_nodelay(true).unwrap();

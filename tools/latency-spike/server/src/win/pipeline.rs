@@ -244,6 +244,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     // structural rather than promised.
     if cfg.aux_port != 0 {
         let aux_port = cfg.aux_port;
+        let audio_kind = cfg.audio_source;
         std::thread::Builder::new()
             .name("spike-aux".into())
             .spawn(move || {
@@ -251,6 +252,16 @@ pub fn run(cfg: &Config) -> Result<()> {
                 if let Err(e) = crate::aux_server::serve(
                     aux_port,
                     || Box::new(super::clipboard::ClipboardOwner::new()),
+                    move || -> Box<dyn crate::audio_source::AudioSource> {
+                        match audio_kind {
+                            crate::cli::AudioKind::Off => {
+                                Box::new(crate::audio_source::UnavailableSource)
+                            }
+                            crate::cli::AudioKind::Tone => {
+                                Box::new(crate::audio_source::ToneSource::new(48_000, 2))
+                            }
+                        }
+                    },
                     policy,
                 ) {
                     // Never fatal: a session without a clipboard is a working
