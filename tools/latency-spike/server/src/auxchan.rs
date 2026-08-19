@@ -1,5 +1,11 @@
-//! The auxiliary channel's client-side I/O: one reader loop, one writer loop,
-//! and the outbound slot between the clipboard poller and the writer.
+//! The auxiliary channel's I/O: one reader loop, one writer loop, and the
+//! outbound slot between whatever produces payloads and the writer.
+//!
+//! **Both ends use this.** It lives beside `framing` and `aux_proto` rather
+//! than in the client because it is wire plumbing, not client policy — the
+//! host serves the same channel with the same loops, and a second copy of
+//! this would be two chances to get the teardown or the skip-unknown rule
+//! subtly different.
 //!
 //! Both loops are written against `Read`/`Write` rather than `TcpStream`, so
 //! every property below is tested against in-memory pipes — no socket, no ssh,
@@ -25,8 +31,8 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use rhydra::aux_proto::{self, AuxMessage};
-use rhydra::framing::{self, Reassembler};
+use crate::aux_proto::{self, AuxMessage};
+use crate::framing::{self, Reassembler};
 
 /// How long a taker parks before looping, so a closed slot is noticed promptly
 /// without a busy wait.

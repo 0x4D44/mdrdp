@@ -6,7 +6,6 @@
 //! this module. Design: `wrk_docs/2026.08.18 - HLD - rhydra tranche 3 - mdrdp
 //! native MVP.md`.
 
-pub mod auxchan;
 pub mod clipboard;
 pub mod deployed;
 pub mod doctor;

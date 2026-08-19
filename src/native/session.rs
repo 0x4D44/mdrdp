@@ -27,6 +27,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ironrdp_egfx::decode::H264Decoder;
+use rhydra::auxchan::{self, Slot};
 use rhydra::framing::{self, Reassembler};
 use rhydra::input_proto::{MouseButton as WireButton, Record, WheelAxis, encode_record};
 use rhydra::rects::{self, RectUpdate};
@@ -39,7 +40,6 @@ use crate::surface::{Rect, SurfaceStore};
 use crate::wake::{self, DoorbellReceiver};
 use crate::window::Waker;
 
-use super::auxchan::{self, Slot};
 use super::clipboard::{self as clip, Bridge, Policy};
 use super::probe::ProbedTransport;
 use super::ssh::Tunnel;
