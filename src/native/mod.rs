@@ -6,6 +6,7 @@
 //! this module. Design: `wrk_docs/2026.08.18 - HLD - rhydra tranche 3 - mdrdp
 //! native MVP.md`.
 
+pub mod probe;
 pub mod ssh;
 
 use crate::favourites::NativeMode;
