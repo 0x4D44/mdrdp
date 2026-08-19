@@ -434,6 +434,60 @@ pub fn query_status(
         .map_err(|e| QueryError::Bad(format!("bad status shape: {e}")))
 }
 
+/// Send one command and read its acknowledgement.
+///
+/// The write counterpart of [`query_status`], and it carries the same hazards, so
+/// it takes the same explicit `timeout` rather than hiding a constant: the caller
+/// owns the budget. `line` is the request JSON, already serialised by the caller —
+/// the client crate builds these by hand rather than depending on a serialiser for
+/// three shapes.
+///
+/// An agent that does not know the command answers `{"ok":false,...}`, which
+/// arrives here as [`QueryError::Bad`] carrying the agent's own words. That is the
+/// intended degrade for a schema-2 agent asked to cycle its device: refused with a
+/// reason, never silently ignored.
+pub fn send_request(
+    addr: (&str, u16),
+    line: &str,
+    timeout: std::time::Duration,
+) -> Result<(), QueryError> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let sock_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| QueryError::NoAnswer(format!("resolve {}:{}: {e}", addr.0, addr.1)))?
+        .next()
+        .ok_or_else(|| {
+            QueryError::NoAnswer(format!("resolve {}:{}: no addresses", addr.0, addr.1))
+        })?;
+    let stream = TcpStream::connect_timeout(&sock_addr, timeout)
+        .map_err(|e| QueryError::NoAnswer(format!("connect {}:{}: {e}", addr.0, addr.1)))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| QueryError::NoAnswer(e.to_string()))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| QueryError::NoAnswer(e.to_string()))?;
+    writeln!(writer, "{}", line.trim()).map_err(|e| QueryError::NoAnswer(e.to_string()))?;
+    let mut reply = String::new();
+    BufReader::new(stream)
+        .read_line(&mut reply)
+        .map_err(|e| QueryError::NoAnswer(format!("read: {e}")))?;
+    if reply.trim().is_empty() {
+        return Err(QueryError::NoAnswer("empty reply".to_owned()));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&reply).map_err(|e| QueryError::Bad(format!("not JSON: {e}")))?;
+    if value["ok"] != true {
+        // The agent's refusal text is the useful part — a rejected cycle-device
+        // says why, and the operator needs to read it verbatim.
+        let why = value["error"].as_str().unwrap_or(reply.trim()).to_owned();
+        return Err(QueryError::Bad(why));
+    }
+    Ok(())
+}
+
 /// The outcome of waiting for stable green.
 #[derive(Debug)]
 pub enum WaitOutcome {
@@ -908,6 +962,105 @@ mod tests {
             }
         });
         port
+    }
+
+    /// Serve one line, reply with `reply`, and hand back the request we saw.
+    fn one_shot_server(reply: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port is available");
+        let port = listener.local_addr().expect("bound").port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("one client");
+            let mut writer = stream.try_clone().expect("clone");
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).expect("read");
+            writeln!(writer, "{reply}").expect("write");
+            line.trim().to_owned()
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn send_request_writes_the_line_and_accepts_an_ack() {
+        let (port, handle) = one_shot_server(r#"{"ok":true,"schema":3}"#);
+        let sent = send_request(
+            ("127.0.0.1", port),
+            r#"{"cmd":"cycle-device","confirm":"g7-c3-s5"}"#,
+            std::time::Duration::from_secs(2),
+        );
+        assert!(sent.is_ok(), "{sent:?}");
+        assert_eq!(
+            handle.join().expect("thread"),
+            r#"{"cmd":"cycle-device","confirm":"g7-c3-s5"}"#,
+            "the agent must receive exactly what the caller asked for"
+        );
+    }
+
+    #[test]
+    fn send_request_surfaces_a_refusal_verbatim() {
+        // The refusal text IS the useful part: a rejected cycle-device explains
+        // what was wrong with the confirmation, and an operator has to read that
+        // rather than a generic "failed".
+        let (port, handle) = one_shot_server(
+            r#"{"ok":false,"schema":3,"error":"cycle-device needs the confirmation token"}"#,
+        );
+        let sent = send_request(
+            ("127.0.0.1", port),
+            r#"{"cmd":"cycle-device"}"#,
+            std::time::Duration::from_secs(2),
+        );
+        let _ = handle.join();
+        match sent {
+            Err(QueryError::Bad(why)) => {
+                assert_eq!(why, "cycle-device needs the confirmation token");
+            }
+            other => panic!("expected the agent's own words, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_request_distinguishes_nothing_listening_from_a_refusal() {
+        // A closed port is NoAnswer, never Bad: "the agent is not there" and "the
+        // agent said no" lead an operator to completely different next steps.
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port is available");
+        let port = listener.local_addr().expect("bound").port();
+        drop(listener);
+        match send_request(
+            ("127.0.0.1", port),
+            r#"{"cmd":"status"}"#,
+            std::time::Duration::from_millis(500),
+        ) {
+            Err(QueryError::NoAnswer(_)) => {}
+            other => panic!("expected NoAnswer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_request_honours_its_timeout_against_a_silent_peer() {
+        // The hazard that forced query_status to take an explicit timeout: an
+        // agent that accepts and never answers must not hold the caller past its
+        // own budget.
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port is available");
+        let port = listener.local_addr().expect("bound").port();
+        let _silent = std::thread::spawn(move || {
+            let _held = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        let started = std::time::Instant::now();
+        let outcome = send_request(
+            ("127.0.0.1", port),
+            r#"{"cmd":"status"}"#,
+            std::time::Duration::from_millis(300),
+        );
+        assert!(outcome.is_err(), "a silent peer must not read as success");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}, so the timeout was not honoured",
+            started.elapsed()
+        );
     }
 
     #[test]
