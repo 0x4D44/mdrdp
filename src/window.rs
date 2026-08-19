@@ -561,6 +561,80 @@ pub fn draw_overlay(dst: &mut [u32], window_width: u32, window_height: u32, line
 /// Pure so the wording is testable — it is the whole point of the notice, and the last
 /// line is load-bearing: the failure this exists for looks exactly like a dropped
 /// connection to the user, and it is not one.
+/// The Davidson tartan sett, as (colour, thread count) from one selvedge to the pivot.
+///
+/// Approximate, and deliberately labelled so: this is a recognisable Davidson — dark blue
+/// and green grounds, black guards, a red overstripe and a white line — not an
+/// authoritative reproduction of a registered thread count. It exists to be
+/// unmistakable, not accurate.
+const TARTAN_SETT: &[(u32, u16)] = &[
+    (0x0000_0000, 8),  // black
+    (0x0010_2A4A, 34), // navy
+    (0x0000_0000, 30),
+    (0x000E_3B26, 34), // forest green
+    (0x0000_0000, 6),
+    (0x008E_1B1B, 8), // red overstripe
+    (0x0000_0000, 6),
+    (0x000E_3B26, 34),
+    (0x0000_0000, 30),
+    (0x0010_2A4A, 34),
+    (0x0000_0000, 8),
+    (0x00D8_D8D8, 4), // white line at the pivot
+];
+
+/// Expand [`TARTAN_SETT`] into one full repeat, reflected about the pivot.
+///
+/// A tartan sett is symmetric: it runs to a pivot and mirrors back. Building the mirrored
+/// half here rather than spelling it out keeps the constant honest — the two halves cannot
+/// drift apart.
+fn tartan_threads() -> Vec<u32> {
+    let mut threads = Vec::new();
+    for &(colour, count) in TARTAN_SETT {
+        threads.extend(std::iter::repeat_n(colour, usize::from(count)));
+    }
+    // Mirror everything except the pivot thread itself, so the reflection has no seam.
+    let reflected: Vec<u32> = threads.iter().rev().skip(1).copied().collect();
+    threads.extend(reflected);
+    threads
+}
+
+/// Fill `dst` with tartan.
+///
+/// Pure so the weave is testable without a window. Warp is indexed by column and weft by
+/// row from the same sett — that is what makes a tartan a tartan — and the 2/2 twill picks
+/// between them, which produces the diagonal texture the eye reads as woven rather than as
+/// a checkerboard.
+///
+/// Drawn only where the window would otherwise be black with nothing behind it. Black is
+/// ambiguous: a locked desktop, a screensaver and a dead session all look identical, and
+/// that ambiguity is what made MDR-BUG-FLUX-00008 take a day to pin down. Nothing about a
+/// tartan screen looks like a working remote desktop.
+///
+/// Note this never touches surface memory. ClearCodec seeds its decode from whatever the
+/// surface already holds (`gfx::apply_wire_to_surface1`), so writing a pattern into a
+/// surface would corrupt live decodes — FreeRDP memsets surfaces on ResetGraphics, and we
+/// deliberately do not.
+pub fn fill_tartan(dst: &mut [u32], window_width: u32, window_height: u32) {
+    if window_width == 0 || window_height == 0 {
+        return;
+    }
+    let threads = tartan_threads();
+    let period = threads.len();
+    if period == 0 {
+        return;
+    }
+    let width = window_width as usize;
+    for (i, px) in dst.iter_mut().enumerate() {
+        let (x, y) = (i % width, i / width);
+        // 2/2 twill: two-pixel diagonal bands decide warp or weft.
+        *px = if ((x + y) / 2) % 2 == 0 {
+            threads[x % period]
+        } else {
+            threads[y % period]
+        };
+    }
+}
+
 pub fn blank_notice_lines(waiting: Option<Duration>) -> Vec<String> {
     let detail = match waiting {
         Some(d) => format!(
@@ -626,6 +700,26 @@ pub fn draw_blank_notice(
 
     let block_h = font::CHAR_H * lines.len() as i32;
     let top = (window_height as i32 - block_h) / 2;
+    let widest = lines.iter().map(|l| font::text_width(l)).max().unwrap_or(0);
+
+    // Darken a panel behind the text. The notice now sits on tartan, and plain glyphs over
+    // a woven pattern are unreadable — the same reason `draw_overlay` dims rather than
+    // writing straight onto the desktop.
+    const PAD: i32 = 12;
+    let x0 = ((window_width as i32 - widest) / 2 - PAD).max(0);
+    let y0 = (top - PAD).max(0);
+    let x1 = (x0 + widest + PAD * 2).min(window_width as i32);
+    let y1 = (y0 + block_h + PAD * 2).min(window_height as i32);
+    for y in y0..y1 {
+        let row = y as usize * window_width as usize;
+        for x in x0..x1 {
+            let Some(px) = dst.get_mut(row + x as usize) else {
+                continue;
+            };
+            *px = (*px >> 2) & 0x003f_3f3f;
+        }
+    }
+
     for (i, line) in lines.iter().enumerate() {
         let x = (window_width as i32 - font::text_width(line)) / 2;
         font::draw_text(
@@ -635,8 +729,7 @@ pub fn draw_blank_notice(
             x.max(0),
             top + font::CHAR_H * i as i32,
             line,
-            // Grey, not white: this is an explanation on an empty screen, not an alarm.
-            0x00b0_b0b0,
+            0x00ff_ffff,
         );
     }
 }
@@ -1755,6 +1848,11 @@ impl SessionApp {
         let stalled_and_dark =
             self.stall_announced && frame_looks_black(&buffer, BLACK_SAMPLE_STRIDE);
         if blank || stalled_and_dark {
+            // Tartan, then the explanation over it. Overwriting the frame is safe on
+            // exactly the same evidence that justifies writing text on it: either no
+            // surface exists at all, or a repaint we asked for never arrived and the frame
+            // samples as black. Anything else keeps its pixels untouched.
+            fill_tartan(&mut buffer, size.width, size.height);
             let waiting = self.repaint_awaited.map(|(asked, _)| asked.elapsed());
             draw_blank_notice(&mut buffer, size.width, size.height, waiting);
         }
@@ -2637,6 +2735,89 @@ mod tests {
     }
 
     #[test]
+    fn the_sett_is_symmetric_about_its_pivot() {
+        // A tartan sett runs to a pivot and reflects. If the mirror is wrong the pattern
+        // has a visible seam every repeat, which is the one thing that would make this
+        // read as a bug rather than as a deliberate screen.
+        let threads = tartan_threads();
+        assert!(!threads.is_empty());
+        for (i, colour) in threads.iter().enumerate() {
+            let mirrored = threads[threads.len() - 1 - i];
+            assert_eq!(
+                *colour, mirrored,
+                "thread {i} does not mirror its opposite; the sett has a seam"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tartan_covers_every_pixel_and_uses_more_than_one_colour() {
+        const SENTINEL: u32 = 0x00de_adbe;
+        let (w, h) = (200u32, 120u32);
+        let mut buf = vec![SENTINEL; (w * h) as usize];
+        fill_tartan(&mut buf, w, h);
+
+        assert!(
+            !buf.contains(&SENTINEL),
+            "every pixel must be painted, or the black shows through"
+        );
+        let distinct: std::collections::BTreeSet<u32> = buf.iter().copied().collect();
+        assert!(
+            distinct.len() >= 4,
+            "a tartan needs its stripes; got {} colours",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn the_weave_reads_from_both_warp_and_weft() {
+        // The twill is what makes this a weave rather than vertical stripes. If the warp
+        // and weft branches ever collapse to one, every column would be a single colour —
+        // so the oracle is that some column is not uniform.
+        let (w, h) = (200u32, 200u32);
+        let mut buf = vec![0u32; (w * h) as usize];
+        fill_tartan(&mut buf, w, h);
+        let mixed_column = (0..w).any(|x| {
+            let first = buf[x as usize];
+            (0..h).any(|y| buf[(y * w + x) as usize] != first)
+        });
+        assert!(mixed_column, "no column varies; the weft never contributes");
+    }
+
+    #[test]
+    fn a_zero_sized_window_does_not_panic_filling_tartan() {
+        let mut buf: Vec<u32> = Vec::new();
+        fill_tartan(&mut buf, 0, 0);
+        assert!(buf.is_empty());
+    }
+
+    /// Render a corner of the tartan as letters, one per colour, for a human to look at.
+    /// Not an assertion — the same reasoning as `font::render_ascii_art`: no pixel check
+    /// can tell a convincing tartan from a mess, so this exists to be read.
+    #[test]
+    fn tartan_swatch_for_eyeballing() {
+        let (w, h) = (96u32, 32u32);
+        let mut buf = vec![0u32; (w * h) as usize];
+        fill_tartan(&mut buf, w, h);
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push(match buf[(y * w + x) as usize] {
+                    0x0000_0000 => '.',
+                    0x0010_2A4A => 'B',
+                    0x000E_3B26 => 'G',
+                    0x008E_1B1B => 'R',
+                    0x00D8_D8D8 => 'W',
+                    _ => '?',
+                });
+            }
+            out.push('\n');
+        }
+        println!("{out}");
+        assert!(!out.contains('?'), "unexpected colour in the weave");
+    }
+
+    #[test]
     fn a_black_frame_reads_as_black() {
         let buf = vec![0x0000_0000u32; 4096];
         assert!(frame_looks_black(&buf, BLACK_SAMPLE_STRIDE));
@@ -2748,7 +2929,10 @@ mod tests {
         let mut buf = vec![SENTINEL; (w * h) as usize];
         draw_blank_notice(&mut buf, w, h, None);
 
-        let top = (h as i32 - font::CHAR_H * 3) / 2;
+        // The notice dims a padded panel behind its text so the words stay readable over
+        // tartan, so the clear band starts above that panel, not above the glyphs.
+        const NOTICE_PAD: i32 = 12;
+        let top = (h as i32 - font::CHAR_H * 3) / 2 - NOTICE_PAD;
         assert!(
             top > 0,
             "this window must be tall enough to have a clear band"
