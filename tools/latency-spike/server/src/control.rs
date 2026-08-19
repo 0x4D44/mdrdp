@@ -17,7 +17,13 @@ pub const CONTROL_PORT: u16 = 9502;
 
 /// Bumped on any incompatible change to the request or response shapes.
 /// 2: `StatusReport.version` (defaulted on read, so a 2-client reads a 1-agent).
-pub const SCHEMA: u32 = 2;
+/// 3: the health ladder — `rungs`, `pool`, `viewer_connected`, all defaulted on
+///    read so a schema-3 client still parses a schema-2 agent, and `CycleDevice`.
+///    Nothing gates on this number: `query_status` never reads it and the probe
+///    deliberately declines to version-check the control port, which is why a
+///    schema-2 *client* reading a schema-3 agent is also safe (serde ignores the
+///    fields it does not know).
+pub const SCHEMA: u32 = 3;
 
 /// A parsed control request: `{"cmd":"status"}` and friends.
 ///
@@ -25,7 +31,8 @@ pub const SCHEMA: u32 = 2;
 /// arguments an older agent does not know, and the command name alone decides
 /// what happens. (serde's `deny_unknown_fields` is a no-op on internally tagged
 /// enums anyway — the tolerance is documented rather than accidental.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+// Not `Copy`: `CycleDevice` carries its confirmation token.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Request {
     /// Report the reconcile loop's view of the stack.
@@ -34,12 +41,144 @@ pub enum Request {
     RestartServer,
     /// Kill all children and exit the agent.
     Shutdown,
+    /// Cycle the virtual display device, then rebuild the stack on it (HLD §6
+    /// rung 7). **Destructive**: it recreates the display, renumbers it, and
+    /// drops every session on the box.
+    ///
+    /// `confirm` must echo the challenge from the *current* status
+    /// ([`StatusReport::cycle_challenge`]). Loopback is not an authorisation
+    /// boundary — the probe opens a control forward on every Auto connect, and
+    /// any script on the host can reach the port — so the guard lives here, in
+    /// the agent, rather than in a client-side convention. Echoing a challenge
+    /// derived from live state also means a blind retry after a read timeout
+    /// cannot cycle the display a second time.
+    CycleDevice {
+        #[serde(default)]
+        confirm: String,
+    },
 }
 
 /// Parse one request line. The error string is sent back to the client verbatim,
 /// so it names what was wrong rather than echoing serde internals wholesale.
 pub fn parse_request(line: &str) -> Result<Request, String> {
     serde_json::from_str(line).map_err(|e| format!("unrecognised request: {e}"))
+}
+
+/// The health ladder's rungs, in bring-up order (HLD tranche 4 §6).
+///
+/// The order is the ladder: a rung is only meaningful once the ones before it
+/// are satisfied. **Rungs 0–4 are the bring-up ladder** and are the only ones
+/// [`StatusReport::stuck`] may name — see [`Rung::gates_bring_up`], which is
+/// load-bearing rather than cosmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Rung {
+    /// The creator process that owns the virtual device's lifetime.
+    Creator,
+    /// The virtual display device is present.
+    Device,
+    /// The driver publishes a pool, and the running server is attached to the
+    /// generation it publishes *now* (HLD §6 rung 2 — the rung that catches the
+    /// capture server stranded on a section nothing writes to any more).
+    Pool,
+    /// The display is in the mode the agent wants.
+    DisplayMode,
+    /// The capture server is supervised *and* accepting on its video port.
+    Server,
+    /// The input desktop is the one injected input would land on.
+    InputDesktop,
+    /// Frames are actually being presented to the virtual display.
+    Liveness,
+}
+
+impl Rung {
+    /// Every rung, in ladder order. The client renders from this list, so a rung
+    /// an older agent omits shows as [`RungState::Unknown`] rather than vanishing
+    /// — an absent rung must never read as a green one.
+    pub const ALL: [Rung; 7] = [
+        Rung::Creator,
+        Rung::Device,
+        Rung::Pool,
+        Rung::DisplayMode,
+        Rung::Server,
+        Rung::InputDesktop,
+        Rung::Liveness,
+    ];
+
+    /// Whether this rung may appear in [`StatusReport::stuck`].
+    ///
+    /// **Only the bring-up rungs may.** `stuck` feeds [`green`], `green` gates the
+    /// client's native connect, and `deploy.rs` carries a second hand-rolled copy
+    /// of the same rule — so a rung that stops no pixel (a locked console) must
+    /// never reach it, or every client on the fleet refuses to open a session on a
+    /// host whose console merely happens to be locked (HLD §8).
+    pub fn gates_bring_up(self) -> bool {
+        match self {
+            Rung::Creator | Rung::Device | Rung::Pool | Rung::DisplayMode | Rung::Server => true,
+            Rung::InputDesktop | Rung::Liveness => false,
+        }
+    }
+
+    /// The wire/display name, matching the serde rename.
+    pub fn name(self) -> &'static str {
+        match self {
+            Rung::Creator => "creator",
+            Rung::Device => "device",
+            Rung::Pool => "pool",
+            Rung::DisplayMode => "display-mode",
+            Rung::Server => "server",
+            Rung::InputDesktop => "input-desktop",
+            Rung::Liveness => "liveness",
+        }
+    }
+}
+
+/// What a rung has to say. Four-way on purpose: "I could not judge this" and "this
+/// does not apply right now" are different from "this is broken", and reporting
+/// either as `Fail` is how a diagnostic tells a confident wrong story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RungState {
+    Ok,
+    Fail,
+    /// Could not be judged — e.g. `OpenInputDesktop` returning access-denied,
+    /// which is also what a different session or window station returns.
+    Unknown,
+    /// Not applicable right now — e.g. liveness with nothing drawing.
+    Untested,
+}
+
+/// One rung's verdict, with the detail a human needs to act on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RungReport {
+    pub rung: Rung,
+    pub state: RungState,
+    /// Free text for the doctor to print. Never a credential, never a payload.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// The first bring-up rung that is not `Ok`, as `stuck` reports it.
+///
+/// Rungs that do not gate bring-up are skipped entirely, whatever their state:
+/// this is the single place that rule is enforced, so it is the single place to
+/// test it.
+///
+/// A bring-up rung **missing** from `rungs` counts as not-ok, not as ok. Absence
+/// is ignorance, and ignorance must not read as health — the same rule that makes
+/// an empty ladder render as `unknown` per rung rather than green.
+pub fn stuck_from_rungs(rungs: &[RungReport]) -> Option<String> {
+    Rung::ALL
+        .iter()
+        .filter(|rung| rung.gates_bring_up())
+        .find(|rung| {
+            rungs
+                .iter()
+                .find(|r| r.rung == **rung)
+                .map(|r| r.state != RungState::Ok)
+                .unwrap_or(true)
+        })
+        .map(|rung| rung.name().to_owned())
 }
 
 /// One supervised child, as the status report describes it.
@@ -83,7 +222,67 @@ pub struct StatusReport {
     pub mode_ok: bool,
     pub server: ChildReport,
     /// The first unsatisfied step in bring-up order, or absent when green.
+    ///
+    /// **Only bring-up rungs ever appear here** — see [`Rung::gates_bring_up`].
+    /// Its meaning is unchanged from schema 2 on purpose: it feeds [`green`],
+    /// which gates the client's native connect.
     pub stuck: Option<String>,
+    /// The full ladder (schema 3). `#[serde(default)]` is load-bearing, not
+    /// tidiness: `query_status` deserialises with `serde_json::from_value`, so a
+    /// field a schema-2 agent does not send would otherwise be a hard parse
+    /// error, and the client turns that into a failed connect. Without this, the
+    /// day this lands every not-yet-redeployed host loses the native transport.
+    /// An empty vec means "this agent predates the ladder", which the client
+    /// renders as `unknown` per rung — never as green.
+    #[serde(default)]
+    pub rungs: Vec<RungReport>,
+    /// What the driver's shared section says (schema 3). Absent on a schema-2
+    /// agent, and absent when the section could not be read at all.
+    #[serde(default)]
+    pub pool: Option<PoolReport>,
+    /// Whether a viewer currently holds the capture server's single slot
+    /// (schema 3) — the doctor needs this to explain *why* liveness is untested,
+    /// and to refuse `--live` rather than time out against a held slot.
+    #[serde(default)]
+    pub viewer_connected: Option<bool>,
+}
+
+/// What the IDD shared section publishes, read by the agent every tick.
+///
+/// This is the tranche's central observation: the section name is fixed, the
+/// header's `generation` is 0 exactly when the driver publishes no pool, and
+/// `frame_seq` is advanced by the driver as the compositor presents — none of
+/// which needs a viewer, or even a capture server, to be true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolReport {
+    /// 0 means the driver has published no pool.
+    pub generation: u32,
+    /// The driver's presented-frame counter for this generation.
+    pub frame_seq: u64,
+    /// The generation the running capture server attached to, when known. A
+    /// mismatch against `generation` is the stranded-server signature.
+    #[serde(default)]
+    pub server_generation: Option<u32>,
+}
+
+impl StatusReport {
+    /// The token a [`Request::CycleDevice`] must echo to be honoured.
+    ///
+    /// Derived from state that a completed cycle necessarily changes: the pool
+    /// generation and the two children's respawn counts. That gives the guard
+    /// both properties it needs. A caller must have *read* current status to
+    /// produce it, so a stray loopback peer firing `cycle-device` blind is
+    /// refused; and a blind retry after a read timeout — the hazard the fleet
+    /// rules call out for any state-changing op — carries a token the cycle it
+    /// may already have performed has just invalidated.
+    pub fn cycle_challenge(&self) -> String {
+        format!(
+            "g{}-c{}-s{}",
+            self.pool.map(|p| p.generation).unwrap_or(0),
+            self.creator.restarts,
+            self.server.restarts
+        )
+    }
 }
 
 /// Whether one sample reads fully green: everything present, right mode, server
@@ -314,7 +513,230 @@ mod tests {
                 cooldown_s: 4,
             },
             stuck: Some("display-mode".to_owned()),
+            rungs: vec![RungReport {
+                rung: Rung::DisplayMode,
+                state: RungState::Fail,
+                detail: Some("60 Hz, wanted 240".to_owned()),
+            }],
+            pool: Some(PoolReport {
+                generation: 7,
+                frame_seq: 12345,
+                server_generation: Some(6),
+            }),
+            viewer_connected: Some(true),
         }
+    }
+
+    /// A ladder with every rung `Ok`, as the base for single-rung mutations.
+    fn all_ok() -> Vec<RungReport> {
+        Rung::ALL
+            .iter()
+            .map(|&rung| RungReport {
+                rung,
+                state: RungState::Ok,
+                detail: None,
+            })
+            .collect()
+    }
+
+    fn with_state(rung: Rung, state: RungState) -> Vec<RungReport> {
+        let mut rungs = all_ok();
+        rungs.iter_mut().find(|r| r.rung == rung).unwrap().state = state;
+        rungs
+    }
+
+    // --- the ladder ----------------------------------------------------------
+
+    #[test]
+    fn stuck_names_the_first_failing_bring_up_rung_in_ladder_order() {
+        // Two bring-up rungs red at once: the EARLIER one is the answer, because
+        // the ladder is an order, not a set. A fixture that reddened only one
+        // rung could not tell a correct implementation from one that returns
+        // whichever it happens to find first.
+        //
+        // The vec is built DELIBERATELY OUT OF LADDER ORDER, with the later rung
+        // first. An `all_ok()`-ordered fixture cannot distinguish "ladder order"
+        // from "input order" — it agrees with both — so it would pass against an
+        // implementation that simply trusts the order the agent happened to send.
+        // Proven: iterating the input order leaves this test green until the vec
+        // disagrees with the ladder.
+        let mut rungs = vec![
+            RungReport {
+                rung: Rung::Server,
+                state: RungState::Fail,
+                detail: None,
+            },
+            RungReport {
+                rung: Rung::Device,
+                state: RungState::Fail,
+                detail: None,
+            },
+        ];
+        rungs.extend(
+            all_ok()
+                .into_iter()
+                .filter(|r| r.rung != Rung::Server && r.rung != Rung::Device),
+        );
+        assert_eq!(stuck_from_rungs(&rungs).as_deref(), Some("device"));
+    }
+
+    #[test]
+    fn every_bring_up_rung_can_be_named_by_stuck() {
+        // The expected set is written out LONGHAND rather than derived from
+        // `Rung::ALL` / `gates_bring_up`. A test that derives its expectation
+        // from the constant under test can only ever agree with it: dropping a
+        // rung from `ALL` left the derived version green, because it then simply
+        // stopped checking that rung. This list is the independent oracle.
+        let expected: [(Rung, &str); 5] = [
+            (Rung::Creator, "creator"),
+            (Rung::Device, "device"),
+            (Rung::Pool, "pool"),
+            (Rung::DisplayMode, "display-mode"),
+            (Rung::Server, "server"),
+        ];
+        for (rung, name) in expected {
+            let rungs = with_state(rung, RungState::Fail);
+            assert_eq!(
+                stuck_from_rungs(&rungs).as_deref(),
+                Some(name),
+                "{name} gates bring-up so stuck must name it"
+            );
+        }
+        // …and the ladder holds exactly these five, so a rung that quietly stops
+        // gating bring-up is caught here too.
+        let gating: Vec<&str> = Rung::ALL
+            .iter()
+            .filter(|r| r.gates_bring_up())
+            .map(|r| r.name())
+            .collect();
+        assert_eq!(
+            gating,
+            expected.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+            "the set of bring-up rungs changed"
+        );
+    }
+
+    #[test]
+    fn a_red_non_bring_up_rung_never_reaches_stuck_or_green() {
+        // THE load-bearing test of this tranche. `stuck` feeds `green`, `green`
+        // gates the client's native connect, and deploy.rs carries a second copy
+        // of that rule in PowerShell. A locked console (input-desktop) stops no
+        // pixel arriving, so if it could reach `stuck` every client on the fleet
+        // would refuse to open a session on a host whose console merely locked.
+        for rung in [Rung::InputDesktop, Rung::Liveness] {
+            for state in [RungState::Fail, RungState::Unknown, RungState::Untested] {
+                let rungs = with_state(rung, state);
+                assert_eq!(
+                    stuck_from_rungs(&rungs),
+                    None,
+                    "{} in state {state:?} must not reach stuck",
+                    rung.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_untested_bring_up_rung_is_not_treated_as_ok() {
+        // Only `Ok` is ok. "I could not judge the pool" must not read as a pool.
+        for state in [RungState::Unknown, RungState::Untested] {
+            let rungs = with_state(Rung::Pool, state);
+            assert_eq!(stuck_from_rungs(&rungs).as_deref(), Some("pool"));
+        }
+    }
+
+    #[test]
+    fn a_schema_2_status_line_still_parses_and_reports_no_rungs() {
+        // The compatibility guarantee the whole schema bump rests on: a schema-2
+        // agent sends none of the new fields. Built by REMOVING them from a
+        // serialised schema-3 report, so the test breaks if a future field is
+        // added without #[serde(default)] — which would take the native
+        // transport down against every host not yet redeployed.
+        let mut value = serde_json::to_value(distinct_report()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in ["rungs", "pool", "viewer_connected"] {
+            object.remove(field);
+        }
+        let back: StatusReport = serde_json::from_value(value).expect("schema-2 report must parse");
+        assert!(back.rungs.is_empty(), "no ladder from a schema-2 agent");
+        assert_eq!(back.pool, None);
+        assert_eq!(back.viewer_connected, None);
+        // And it must still be judgeable by the unchanged bring-up rule.
+        assert_eq!(back.stuck.as_deref(), Some("display-mode"));
+    }
+
+    #[test]
+    fn a_bring_up_rung_missing_from_the_ladder_is_not_treated_as_ok() {
+        // Absence is ignorance. A ladder that simply omits `pool` must not read
+        // as "pool fine" — otherwise a partial report (an agent that failed to
+        // sample a rung, or a future rung an older builder forgot) silently
+        // manufactures health, which is the exact failure this tranche exists to
+        // stop.
+        let rungs: Vec<RungReport> = all_ok()
+            .into_iter()
+            .filter(|r| r.rung != Rung::Pool)
+            .collect();
+        assert_eq!(stuck_from_rungs(&rungs).as_deref(), Some("pool"));
+
+        // …and an empty ladder is maximal ignorance: the FIRST bring-up rung.
+        assert_eq!(stuck_from_rungs(&[]).as_deref(), Some("creator"));
+    }
+
+    #[test]
+    fn rung_all_covers_every_variant_and_keeps_ladder_order() {
+        // ALL is what the client renders from, so a rung missing here would be
+        // invisible in the doctor rather than reported as unknown.
+        assert_eq!(Rung::ALL.len(), 7);
+        let mut sorted = Rung::ALL;
+        sorted.sort();
+        assert_eq!(sorted, Rung::ALL, "ALL must already be in ladder order");
+        assert_eq!(Rung::ALL[0], Rung::Creator);
+        assert_eq!(Rung::ALL[Rung::ALL.len() - 1], Rung::Liveness);
+    }
+
+    #[test]
+    fn cycle_device_parses_and_carries_its_confirmation() {
+        assert_eq!(
+            parse_request(r#"{"cmd":"cycle-device","confirm":"g7-c3-s5"}"#),
+            Ok(Request::CycleDevice {
+                confirm: "g7-c3-s5".to_owned()
+            })
+        );
+        // Absent confirmation parses to empty rather than failing, so the AGENT
+        // decides — a parse error would report "unrecognised request" for what is
+        // really a refused one.
+        assert_eq!(
+            parse_request(r#"{"cmd":"cycle-device"}"#),
+            Ok(Request::CycleDevice {
+                confirm: String::new()
+            })
+        );
+    }
+
+    #[test]
+    fn the_cycle_challenge_changes_when_a_cycle_would_have_changed_it() {
+        let base = distinct_report();
+        let token = base.cycle_challenge();
+        assert_eq!(token, "g7-c3-s5");
+
+        // A completed cycle bumps the generation and respawns both children. Any
+        // of those alone must invalidate a replayed confirmation — that is what
+        // makes a blind retry after a read timeout safe.
+        let mut bumped = base.clone();
+        bumped.pool = Some(PoolReport {
+            generation: 8,
+            frame_seq: 0,
+            server_generation: Some(8),
+        });
+        assert_ne!(bumped.cycle_challenge(), token);
+
+        let mut respawned = base.clone();
+        respawned.creator.restarts += 1;
+        assert_ne!(respawned.cycle_challenge(), token);
+
+        let mut server_respawned = base;
+        server_respawned.server.restarts += 1;
+        assert_ne!(server_respawned.cycle_challenge(), token);
     }
 
     #[test]
@@ -367,6 +789,13 @@ mod tests {
                 cooldown_s: 0,
             },
             stuck: None,
+            rungs: all_ok(),
+            pool: Some(PoolReport {
+                generation: 7,
+                frame_seq: 900,
+                server_generation: Some(7),
+            }),
+            viewer_connected: Some(false),
         }
     }
 

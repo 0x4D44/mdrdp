@@ -310,6 +310,13 @@ mod tests {
                 cooldown_s: 0,
             },
             stuck: None,
+            // A schema-2 agent sends none of these, and the client must connect
+            // against one exactly as it does against a schema-3 one — the whole
+            // point of their serde defaults. The dedicated compatibility test
+            // lives beside the wire type in rhydra's `control`.
+            rungs: Vec::new(),
+            pool: None,
+            viewer_connected: None,
         }
     }
 

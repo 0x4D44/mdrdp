@@ -72,6 +72,10 @@ mod win {
         status_line: String,
         restart_requested: bool,
         shutdown_requested: bool,
+        /// The token `cycle-device` must echo, refreshed with the status each
+        /// tick. Kept beside the serialised line rather than re-derived, so the
+        /// guard and the status a caller read can never disagree.
+        cycle_challenge: String,
     }
 
     /// One timestamped line to the agent log and stderr. The log is the record;
@@ -119,10 +123,12 @@ mod win {
         ops.sweep_orphans();
 
         let mut rec = Reconciler::new();
+        let first = rec.status(0);
         let shared = Arc::new(Mutex::new(Shared {
-            status_line: control::status_line(&rec.status(0)),
+            status_line: control::status_line(&first),
             restart_requested: false,
             shutdown_requested: false,
+            cycle_challenge: first.cycle_challenge(),
         }));
 
         let listener = match TcpListener::bind(("127.0.0.1", CONTROL_PORT)) {
@@ -170,7 +176,11 @@ mod win {
                 }
                 last_stuck = report.stuck.clone();
             }
-            shared.lock().expect("not poisoned").status_line = control::status_line(&report);
+            {
+                let mut shared = shared.lock().expect("not poisoned");
+                shared.status_line = control::status_line(&report);
+                shared.cycle_challenge = report.cycle_challenge();
+            }
 
             std::thread::sleep(Duration::from_secs(u64::from(TICK_SECS)));
         }
@@ -210,6 +220,35 @@ mod win {
                     shared.lock().expect("not poisoned").shutdown_requested = true;
                     let _ = writeln!(writer, "{}", control::ok_line());
                     return Ok(());
+                }
+                // The guard runs here, in the agent, because loopback is not an
+                // authorisation boundary: the probe forwards this port on every
+                // Auto connect, and anything on the box can reach it. A caller
+                // must prove it read current status, which also makes a blind
+                // retry after a read timeout safe (the token a completed cycle
+                // would have invalidated no longer matches).
+                Ok(Request::CycleDevice { confirm }) => {
+                    let expected = {
+                        let shared = shared.lock().expect("not poisoned");
+                        shared.cycle_challenge.clone()
+                    };
+                    if confirm != expected {
+                        eprintln!(
+                            "control: refused cycle-device (confirmation {:?} does not match \
+                             current state)",
+                            confirm
+                        );
+                        control::error_line(
+                            "cycle-device needs the confirmation token from the current status: \
+                             it recreates the display and drops every session on this host",
+                        )
+                    } else {
+                        // The cycle itself is the next unit; refuse loudly rather
+                        // than pretend, so a caller is never told a destructive
+                        // op succeeded when nothing happened.
+                        eprintln!("control: cycle-device confirmed but not implemented yet");
+                        control::error_line("cycle-device is not implemented in this build")
+                    }
                 }
             };
             writeln!(writer, "{reply}")?;

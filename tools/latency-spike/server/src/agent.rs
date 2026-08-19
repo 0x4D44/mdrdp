@@ -17,7 +17,7 @@
 //! server attached to a dead instance's section captures nothing, silently,
 //! forever (see [`AgentOps::device_id`]).
 
-use crate::control::{ChildReport, ModeReport, StatusReport, SCHEMA};
+use crate::control::{ChildReport, ModeReport, Rung, RungReport, RungState, StatusReport, SCHEMA};
 
 /// How often the runner calls [`Reconciler::tick`]. Cooldowns below are counted in
 /// ticks, so every duration here is a multiple of this.
@@ -263,6 +263,55 @@ impl Reconciler {
         }
     }
 
+    /// The ladder as this reconciler can currently answer it (HLD tranche 4 §6).
+    ///
+    /// Rungs whose samplers have not landed yet report [`RungState::Unknown`]
+    /// rather than being omitted or guessed green — the four-way vocabulary
+    /// exists precisely so "not implemented in this build" and "broken" are
+    /// different answers.
+    fn rungs(&self) -> Vec<RungReport> {
+        let ok_or_fail = |ok: bool| {
+            if ok {
+                RungState::Ok
+            } else {
+                RungState::Fail
+            }
+        };
+        let unimplemented = |rung| RungReport {
+            rung,
+            state: RungState::Unknown,
+            detail: Some("not sampled by this build".to_owned()),
+        };
+        vec![
+            RungReport {
+                rung: Rung::Creator,
+                state: ok_or_fail(self.creator.running),
+                detail: None,
+            },
+            RungReport {
+                rung: Rung::Device,
+                state: ok_or_fail(self.device_present),
+                detail: None,
+            },
+            unimplemented(Rung::Pool),
+            RungReport {
+                rung: Rung::DisplayMode,
+                state: ok_or_fail(self.mode_ok),
+                detail: self
+                    .actual_mode
+                    .filter(|_| !self.mode_ok)
+                    .map(|m| format!("{}x{} @ {} Hz", m.width, m.height, m.hz)),
+            },
+            RungReport {
+                rung: Rung::Server,
+                state: ok_or_fail(self.server.running),
+                detail: None,
+            },
+            unimplemented(Rung::InputDesktop),
+            unimplemented(Rung::Liveness),
+        ]
+    }
+
     /// Assemble the wire status. `uptime_s` comes from the runner, which owns time.
     pub fn status(&self, uptime_s: u64) -> StatusReport {
         StatusReport {
@@ -274,7 +323,16 @@ impl Reconciler {
             display_mode: self.actual_mode.map(Mode::report),
             mode_ok: self.mode_ok,
             server: self.server.report(),
+            // Deliberately NOT `stuck_from_rungs(&rungs)` yet. `stuck` feeds
+            // `green`, which gates the client's native connect, and the pool rung
+            // still reports `Unknown` — routing that through the rung derivation
+            // would make every host read as stuck on a rung this build cannot yet
+            // sample. `stuck` keeps its schema-2 meaning until every bring-up
+            // rung has a real sampler, and the two agree by construction then.
             stuck: self.stuck().map(str::to_owned),
+            rungs: self.rungs(),
+            pool: None,
+            viewer_connected: None,
         }
     }
 }
