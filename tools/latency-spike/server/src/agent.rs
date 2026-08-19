@@ -434,21 +434,6 @@ impl Reconciler {
         }
     }
 
-    /// The first unsatisfied step in bring-up order.
-    fn stuck(&self) -> Option<&'static str> {
-        if !self.creator.running {
-            Some("creator")
-        } else if !self.device_present {
-            Some("device")
-        } else if !self.mode_ok {
-            Some("display-mode")
-        } else if !self.server.running {
-            Some("server")
-        } else {
-            None
-        }
-    }
-
     /// The `pool` rung: is there a pool, and is the running server attached to
     /// the generation the driver publishes *now*?
     ///
@@ -608,6 +593,9 @@ impl Reconciler {
 
     /// Assemble the wire status. `uptime_s` comes from the runner, which owns time.
     pub fn status(&self, uptime_s: u64) -> StatusReport {
+        // Derived from the ladder, so there is exactly one definition of "which
+        // step is broken". Only `Fail` gates the connect: see `stuck_from_rungs`.
+        let rungs = self.rungs();
         StatusReport {
             schema: SCHEMA,
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -617,14 +605,8 @@ impl Reconciler {
             display_mode: self.actual_mode.map(Mode::report),
             mode_ok: self.mode_ok,
             server: self.server.report(),
-            // Deliberately NOT `stuck_from_rungs(&rungs)` yet. `stuck` feeds
-            // `green`, which gates the client's native connect, and the pool rung
-            // still reports `Unknown` — routing that through the rung derivation
-            // would make every host read as stuck on a rung this build cannot yet
-            // sample. `stuck` keeps its schema-2 meaning until every bring-up
-            // rung has a real sampler, and the two agree by construction then.
-            stuck: self.stuck().map(str::to_owned),
-            rungs: self.rungs(),
+            stuck: crate::control::stuck_from_rungs(&rungs),
+            rungs,
             pool: self.pool_report(),
             viewer_connected: None,
         }
@@ -877,6 +859,43 @@ mod tests {
                 .any(|c| c == "kill_server" || c == "kill_creator"),
             "report-only rungs must provoke no remediation: {:?}",
             ops.calls
+        );
+    }
+
+    #[test]
+    fn stuck_now_comes_from_the_ladder_and_can_name_the_pool() {
+        // The wiring's whole point: `stuck` is derived from the rungs, so it can
+        // name a step the old field-based version had no concept of. Before this,
+        // a stranded pool was invisible to `stuck` and therefore to `green` —
+        // the client connected happily to a server capturing nothing.
+        let (mut rec, mut ops) = settled();
+        assert_eq!(rec.status(1).stuck, None, "healthy to begin with");
+
+        ops.pool = Some(PoolObservation::NoPool);
+        rec.tick(&mut ops);
+        let status = rec.status(1);
+        assert_eq!(status.stuck.as_deref(), Some("pool"));
+        assert!(
+            !crate::control::green(&status),
+            "a host publishing no pool must not read as green"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_section_does_not_gate_the_connect() {
+        // The counterpart rule. A torn read on the tick a client happens to probe
+        // must not refuse a session that would have worked: ignorance is not
+        // health, but it is not breakage either.
+        let (mut rec, mut ops) = settled();
+        ops.pool = Some(PoolObservation::Unreadable("mid-write".into()));
+        rec.tick(&mut ops);
+        let status = rec.status(1);
+        assert_eq!(status.stuck, None, "ignorance must not gate");
+        assert!(crate::control::green(&status));
+        // …but it is still visible to a human.
+        assert_eq!(
+            crate::control::first_unsatisfied_rung(&status.rungs).as_deref(),
+            Some("pool")
         );
     }
 

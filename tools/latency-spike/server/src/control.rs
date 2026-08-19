@@ -158,16 +158,41 @@ pub struct RungReport {
     pub detail: Option<String>,
 }
 
-/// The first bring-up rung that is not `Ok`, as `stuck` reports it.
+/// The first bring-up rung that is demonstrably **broken** — what `stuck` reports.
+///
+/// This is a **gate**, not a summary: `stuck` feeds [`green`], `green` gates the
+/// client's native connect, and `deploy.rs` carries a second hand-rolled copy of
+/// the same rule. So it keys on [`RungState::Fail`] alone.
+///
+/// `Unknown` deliberately does NOT gate. Ignorance must not read as health — but
+/// in a gate it must not read as failure either, or a section that happens to be
+/// mid-write on the tick a client probes would refuse a session that would have
+/// worked perfectly. Use [`first_unsatisfied_rung`] when the question is "what
+/// should a human look at?" rather than "may a client connect?".
 ///
 /// Rungs that do not gate bring-up are skipped entirely, whatever their state:
 /// this is the single place that rule is enforced, so it is the single place to
 /// test it.
-///
-/// A bring-up rung **missing** from `rungs` counts as not-ok, not as ok. Absence
-/// is ignorance, and ignorance must not read as health — the same rule that makes
-/// an empty ladder render as `unknown` per rung rather than green.
 pub fn stuck_from_rungs(rungs: &[RungReport]) -> Option<String> {
+    Rung::ALL
+        .iter()
+        .filter(|rung| rung.gates_bring_up())
+        .find(|rung| {
+            rungs
+                .iter()
+                .any(|r| r.rung == **rung && r.state == RungState::Fail)
+        })
+        .map(|rung| rung.name().to_owned())
+}
+
+/// The first bring-up rung that is not demonstrably `Ok` — including `Unknown`,
+/// `Untested`, and a rung the report omits entirely.
+///
+/// The reporting counterpart of [`stuck_from_rungs`]: this is what the agent log
+/// and `--doctor` want, because "I could not tell" is exactly what a human needs
+/// to see. A missing rung counts as unsatisfied, so a partial report can never
+/// manufacture health.
+pub fn first_unsatisfied_rung(rungs: &[RungReport]) -> Option<String> {
     Rung::ALL
         .iter()
         .filter(|rung| rung.gates_bring_up())
@@ -637,12 +662,52 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_or_untested_bring_up_rung_is_not_treated_as_ok() {
-        // Only `Ok` is ok. "I could not judge the pool" must not read as a pool.
+    fn an_unknown_bring_up_rung_is_reported_but_does_not_gate_the_connect() {
+        // The two questions have different answers, and conflating them costs
+        // real sessions either way round.
+        //
+        // "What should a human look at?" — ignorance counts: `Unknown` must not
+        // read as health, or a partial report manufactures a green stack.
+        //
+        // "May a client connect?" — ignorance must NOT block: a section that is
+        // merely mid-write on the tick a client happens to probe would otherwise
+        // refuse a session that would have worked perfectly.
         for state in [RungState::Unknown, RungState::Untested] {
             let rungs = with_state(Rung::Pool, state);
-            assert_eq!(stuck_from_rungs(&rungs).as_deref(), Some("pool"));
+            assert_eq!(
+                first_unsatisfied_rung(&rungs).as_deref(),
+                Some("pool"),
+                "{state:?} must be reported as unsatisfied"
+            );
+            assert_eq!(
+                stuck_from_rungs(&rungs),
+                None,
+                "{state:?} must not gate the connect"
+            );
         }
+
+        // A demonstrable failure gates both.
+        let failed = with_state(Rung::Pool, RungState::Fail);
+        assert_eq!(first_unsatisfied_rung(&failed).as_deref(), Some("pool"));
+        assert_eq!(stuck_from_rungs(&failed).as_deref(), Some("pool"));
+    }
+
+    #[test]
+    fn a_bring_up_rung_missing_from_the_ladder_is_reported_but_does_not_gate() {
+        // Absence is ignorance. It must not read as health in a report — a
+        // partial ladder that omits `pool` must not look like a working pool —
+        // and it must not gate a connect either, because a schema-2 agent sends
+        // no ladder at all and has to stay usable.
+        let rungs: Vec<RungReport> = all_ok()
+            .into_iter()
+            .filter(|r| r.rung != Rung::Pool)
+            .collect();
+        assert_eq!(first_unsatisfied_rung(&rungs).as_deref(), Some("pool"));
+        assert_eq!(stuck_from_rungs(&rungs), None);
+
+        // An empty ladder is maximal ignorance: the FIRST bring-up rung.
+        assert_eq!(first_unsatisfied_rung(&[]).as_deref(), Some("creator"));
+        assert_eq!(stuck_from_rungs(&[]), None);
     }
 
     #[test]
@@ -663,23 +728,6 @@ mod tests {
         assert_eq!(back.viewer_connected, None);
         // And it must still be judgeable by the unchanged bring-up rule.
         assert_eq!(back.stuck.as_deref(), Some("display-mode"));
-    }
-
-    #[test]
-    fn a_bring_up_rung_missing_from_the_ladder_is_not_treated_as_ok() {
-        // Absence is ignorance. A ladder that simply omits `pool` must not read
-        // as "pool fine" — otherwise a partial report (an agent that failed to
-        // sample a rung, or a future rung an older builder forgot) silently
-        // manufactures health, which is the exact failure this tranche exists to
-        // stop.
-        let rungs: Vec<RungReport> = all_ok()
-            .into_iter()
-            .filter(|r| r.rung != Rung::Pool)
-            .collect();
-        assert_eq!(stuck_from_rungs(&rungs).as_deref(), Some("pool"));
-
-        // …and an empty ladder is maximal ignorance: the FIRST bring-up rung.
-        assert_eq!(stuck_from_rungs(&[]).as_deref(), Some("creator"));
     }
 
     #[test]
