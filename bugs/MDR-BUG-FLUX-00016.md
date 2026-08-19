@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00016 — ironrdp-egfx test avc444_lc1_updates_luma_only_inside_its_rects fails on origin/main
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** gfx
 - **Raised:** 2026-08-19T16:10:47Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260819T230526Z-p7070-n733698000-c1
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00016-run-fix-20260819T230526Z-p7070-n733698000-c1
-- **Owner base:** 666fdc7e812e80b6071dd3bf55ded75bf161cfa8
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-19T23:05:26Z
-- **Owner until:** 2026-08-20T01:05:26Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T16:10:47Z, raised via `deltic bugs new` model=claude-opus-5@high)
+- **State history:** Open (2026-08-19T16:10:47Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-19T23:05:42Z, deltic:auto role=fix run=fix-20260819T230526Z-p7070-n733698000-c1 branch=task/bug-MDR-BUG-FLUX-00016-run-fix-20260819T230526Z-p7070-n733698000-c1 code=8aae123 gate=manual)
 
 ## Observation
 
