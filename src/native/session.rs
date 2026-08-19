@@ -32,7 +32,7 @@ use rhydra::framing::{self, Reassembler};
 use rhydra::input_proto::{MouseButton as WireButton, Record, WheelAxis, encode_record};
 use rhydra::rects::{self, RectUpdate};
 
-use crate::clipboard::{ArboardClipboard, ClipboardContent, OsClipboard};
+use crate::clipboard::ArboardClipboard;
 use crate::input::{InputEvent, MouseButton, ScrollAxis};
 use crate::session::{SessionCommand, SessionEnd};
 use crate::stats::StatsHandle;
@@ -40,9 +40,10 @@ use crate::surface::{Rect, SurfaceStore};
 use crate::wake::{self, DoorbellReceiver};
 use crate::window::Waker;
 
-use super::clipboard::{self as clip, Bridge, Policy};
+use super::clipboard::TextOnly;
 use super::probe::ProbedTransport;
 use super::ssh::Tunnel;
+use rhydra::clipboard::{self as clip, Bridge, Policy, TextClipboard};
 
 /// The surface id the native session paints. There is only ever one.
 pub const OUTPUT_SURFACE: u16 = 0;
@@ -156,7 +157,8 @@ pub fn spawn(
     let aux = match conn.aux {
         Some(socket) => match spawn_aux(
             socket,
-            Box::new(ArboardClipboard::new()),
+            // The shared bridge speaks text only; `TextOnly` is the adapter.
+            Box::new(TextOnly(ArboardClipboard::new())),
             clipboard_policy,
             Arc::clone(&stop),
         ) {
@@ -242,7 +244,7 @@ pub fn spawn(
 /// can run without touching the developer's own pasteboard.
 fn spawn_aux(
     socket: TcpStream,
-    clipboard: Box<dyn OsClipboard>,
+    clipboard: Box<dyn TextClipboard>,
     policy: Policy,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<AuxChannel> {
@@ -257,12 +259,9 @@ fn spawn_aux(
     // user action — and which end wins is a race.
     {
         let mut guard = lock(&bridge);
-        let seed = match lock(&os).get_content() {
-            Ok(ClipboardContent::Text(text)) => Some(text),
-            // An image or an unreadable pasteboard both mean "no text we could
-            // have sent", which is exactly what an empty seed says.
-            _ => None,
-        };
+        // An image or an unreadable pasteboard both mean "no text we could
+        // have sent", which is exactly what an empty seed says.
+        let seed = lock(&os).read_text().ok().flatten();
         guard.seed(seed.as_deref());
     }
 
@@ -751,11 +750,11 @@ mod tests {
     /// runs its real loop without touching the developer's own clipboard.
     struct InertClipboard;
 
-    impl OsClipboard for InertClipboard {
-        fn get_content(&mut self) -> Result<ClipboardContent, String> {
-            Ok(ClipboardContent::Text(String::new()))
+    impl TextClipboard for InertClipboard {
+        fn read_text(&mut self) -> Result<Option<String>, String> {
+            Ok(Some(String::new()))
         }
-        fn set_content(&mut self, _: ClipboardContent) -> Result<(), String> {
+        fn write_text(&mut self, _: &str) -> Result<(), String> {
             Ok(())
         }
     }
