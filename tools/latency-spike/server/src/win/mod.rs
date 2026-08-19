@@ -9,6 +9,7 @@
 //! the Increment 3 pixel diff, whose portable comparison lives in [`crate::diff`].
 
 pub mod agent_ops;
+pub mod clipboard;
 pub mod convert;
 pub mod dxgi;
 pub mod encode;

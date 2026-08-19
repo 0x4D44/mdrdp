@@ -31,6 +31,11 @@ pub struct Config {
     pub output: usize,
     pub video_port: u16,
     pub input_port: u16,
+    /// The auxiliary channel's port: clipboard now, audio in tranche 6.
+    ///
+    /// `0` means "do not serve it", which is how a run can opt out without a
+    /// separate flag — and how the header knows not to advertise it.
+    pub aux_port: u16,
     pub bitrate_kbps: u32,
     pub gop: u32,
     pub out: Option<String>,
@@ -57,6 +62,9 @@ pub const DEFAULT_GOP: u32 = 120;
 /// Desktop Duplication has no frame rate of its own — it hands over whatever the
 /// compositor presented — so this is a rate *hint* for the encoder's rate control,
 /// not a cadence the server enforces.
+/// The auxiliary channel's default port. `0` on the command line turns it off.
+pub const DEFAULT_AUX_PORT: u16 = 9503;
+
 pub const DECLARED_FPS: u32 = 60;
 
 impl Default for Config {
@@ -65,6 +73,7 @@ impl Default for Config {
             output: 0,
             video_port: DEFAULT_VIDEO_PORT,
             input_port: DEFAULT_INPUT_PORT,
+            aux_port: DEFAULT_AUX_PORT,
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             gop: DEFAULT_GOP,
             out: None,
@@ -79,6 +88,7 @@ impl Default for Config {
 pub fn usage() -> &'static str {
     "usage:\n  \
      rhydra-server --output N [--video-port 9500] [--input-port 9501]\n               \
+     [--aux-port 9503 | --aux-port 0 to disable]\n               \
                   [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]\n               \
                   [--no-rects] [--no-diff] [--source dxgi|idd]\n  \
      rhydra-server --source idd [--video-port 9500] ...\n  \
@@ -143,6 +153,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                     .parse()
                     .map_err(|e| format!("--input-port {value:?}: {e}"))?
             }
+            "--aux-port" => {
+                cfg.aux_port = value
+                    .parse()
+                    .map_err(|e| format!("--aux-port {value:?}: {e}"))?
+            }
             "--bitrate-kbps" => {
                 cfg.bitrate_kbps = value
                     .parse()
@@ -182,6 +197,14 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         return Err(format!(
             "--video-port and --input-port are both {}; they are separate connections",
             cfg.video_port
+        ));
+    }
+    // No `aux_port != 0` guard: the check above has already refused a zero video
+    // or input port, so the documented "off" value cannot collide with either.
+    if cfg.aux_port == cfg.video_port || cfg.aux_port == cfg.input_port {
+        return Err(format!(
+            "--aux-port {} collides with the video or input port; they are separate connections",
+            cfg.aux_port
         ));
     }
     if cfg.bitrate_kbps == 0 {
@@ -351,6 +374,37 @@ mod tests {
     fn an_unknown_flag_is_refused() {
         let err = parse(&args(&["--output", "0", "--bind", "0.0.0.0"])).unwrap_err();
         assert!(err.contains("unknown flag --bind"), "{err}");
+    }
+
+    #[test]
+    fn the_aux_port_defaults_on_and_can_be_turned_off_with_zero() {
+        // Zero is the documented "off". It is also what the header reads to
+        // decide whether to advertise the channel at all, so it has to be a
+        // value the parser accepts rather than a separate flag.
+        assert_eq!(Config::default().aux_port, DEFAULT_AUX_PORT);
+        let cfg = parse(&args(&["--source", "idd", "--aux-port", "0"])).unwrap();
+        assert_eq!(cfg.aux_port, 0);
+    }
+
+    #[test]
+    fn an_aux_port_colliding_with_another_channel_is_refused() {
+        for other in ["--video-port", "--input-port"] {
+            let cfg = parse(&args(&[
+                "--source",
+                "idd",
+                other,
+                "19000",
+                "--aux-port",
+                "19000",
+            ]));
+            assert!(
+                cfg.is_err(),
+                "--aux-port sharing {other} should be refused, got {cfg:?}"
+            );
+        }
+        // …and zero, the "off" value, collides with nothing — which holds only
+        // because a zero video or input port is refused before this check.
+        assert!(parse(&args(&["--source", "idd", "--aux-port", "0"])).is_ok());
     }
 
     #[test]

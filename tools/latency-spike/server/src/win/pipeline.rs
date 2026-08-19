@@ -238,6 +238,28 @@ pub fn run(cfg: &Config) -> Result<()> {
             }
         })?;
 
+    // The auxiliary channel: clipboard now, audio in tranche 6. Its own thread
+    // and its own listener, so neither the capture loop nor the input channel
+    // can be delayed by it — the priority separation Arthur set out, made
+    // structural rather than promised.
+    if cfg.aux_port != 0 {
+        let aux_port = cfg.aux_port;
+        std::thread::Builder::new()
+            .name("spike-aux".into())
+            .spawn(move || {
+                let policy = crate::clipboard::Policy::default();
+                if let Err(e) = crate::aux_server::serve(
+                    aux_port,
+                    || Box::new(super::clipboard::ClipboardOwner::new()),
+                    policy,
+                ) {
+                    // Never fatal: a session without a clipboard is a working
+                    // session, and the capture loop must not care.
+                    eprintln!("aux: listener stopped: {e}");
+                }
+            })?;
+    }
+
     let outcome = capture_loop(capture_state(
         source.as_mut(),
         &mut converter,
@@ -306,6 +328,11 @@ fn build_header(
     h.qpc_frequency = clock.freq();
     h.video_port = cfg.video_port;
     h.input_port = cfg.input_port;
+    // Advertised only when the channel is actually being served. The client's
+    // whole safety gate is this flag: it opens 9503 if and only if this says
+    // true, and a host that advertises a port nothing is listening on would
+    // make every session pay a failed connect for no reason.
+    h.clipboard = cfg.aux_port != 0;
     h.bitrate_kbps = cfg.bitrate_kbps;
     h.gop = cfg.gop;
     h.fps = DECLARED_FPS;
