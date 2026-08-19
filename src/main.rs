@@ -33,7 +33,7 @@ use mdrdp::input::InputEvent;
 use mdrdp::metrics::{ResourceMetrics, SessionMetricsReport};
 use mdrdp::process_metrics::{ProcessSnapshot, snapshot as process_snapshot};
 use mdrdp::session::{self, SessionServices};
-use mdrdp::stats::StatsHandle;
+use mdrdp::stats::{SlotStatsHandle, StatsHandle};
 use mdrdp::surface::SurfaceStore;
 use mdrdp::trust::KnownHosts;
 use mdrdp::wake::{WakingSender, doorbell};
@@ -48,6 +48,17 @@ use std::sync::{Arc, Mutex};
 /// `mdrdp::cli` so the plain and coloured forms cannot drift apart.
 fn usage() -> String {
     mdrdp::cli::help_text(false)
+}
+
+/// The missing-RDP-account error, raised by `reconcile` for an RDP-only target
+/// and by the RDP connect arm when a native-capable target lands on RDP after
+/// all — the same words either way, so where it fires is invisible to the user.
+fn no_account_error(host: &str) -> String {
+    format!(
+        "no account for {host}: pass --user <account>, set one on the favourite, \
+         or add a [defaults] username to favourites.toml\n{}",
+        usage()
+    )
 }
 
 /// The size a session gets when nothing asks for a specific one.
@@ -67,12 +78,40 @@ fn main() -> ExitCode {
     }
 }
 
+/// A connection whose window is not yet built: the server has told us the desktop
+/// size, nothing is pumping yet. Boxed contents keep the enum pocket-sized.
+enum Connected {
+    Rdp(Box<mdrdp::connect::Established>),
+    Native(Box<mdrdp::native::probe::ProbedTransport>),
+}
+
+/// The running session, whichever transport carries it. One slot, one shutdown —
+/// the window's exit hook and the epilogue both go through here, so a disconnect
+/// happens exactly once regardless of transport.
+enum ActiveSession {
+    Rdp(session::SessionHandle),
+    Native(mdrdp::native::session::NativeHandle),
+}
+
+impl ActiveSession {
+    fn shutdown(self) -> session::SessionEnd {
+        match self {
+            ActiveSession::Rdp(handle) => handle.shutdown(),
+            ActiveSession::Native(handle) => handle.shutdown(),
+        }
+    }
+}
+
 /// Everything the connection needs, after favourites and flags have been reconciled.
 #[derive(Debug)]
 struct Target {
     host: String,
     port: u16,
-    user: String,
+    /// The RDP logon account. `None` is representable only for a native-mode
+    /// target (the ssh identity is separate): the RDP connect arm re-imposes the
+    /// requirement the moment the transport is RDP — moved out of `reconcile` so
+    /// a native connect never demands an account it will not use (review P-M5).
+    user: Option<String>,
     /// Which keychain entry holds the password.
     ///
     /// Separate from `user` because they are genuinely different strings: `temper` wants
@@ -544,19 +583,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ssh_user,
     )?;
 
-    // TEMPORARY (tranche 3 in progress): the native connect arm is not wired yet.
-    // `Always` must fail loudly rather than silently connect over RDP against the
-    // user's explicit word; `Auto` proceeds as RDP exactly as before this tranche.
-    if target.native == mdrdp::favourites::NativeMode::Always {
-        return Err(format!(
-            "--native/'native = always' is not wired up yet in this build \
-             (ssh {}@{}); the RDP path is unaffected",
-            target.ssh_user.as_deref().unwrap_or("<ssh-config>"),
-            target.host
-        )
-        .into());
-    }
-
     // Whether the last session against this target closed fullscreen. Remembered state
     // beats the favourite's setting — "reopen how I left it" is the point — but an
     // explicit --size flag beats both and means windowed.
@@ -573,129 +599,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // rather than after a connection has been established and a logon spent.
     let event_loop = SessionWindow::event_loop()?;
 
-    // Stdin beats the keychain when asked for: a scripted run must not depend on a
-    // keychain that can prompt, and must never be answered by an interactive prompt
-    // nobody is there to see.
-    let secret = if password_stdin {
-        mdrdp::creds::from_stdin()?
-    } else if stage_json && ask_password {
-        // The launcher saw a sign-in rejected with the stored password and wants a
-        // fresh one; the keychain is deliberately not consulted.
-        ask_password_over_pipe(
-            &target.keychain_account,
-            "the saved password was not accepted",
-        )?
-    } else if stage_json {
-        // A launcher is driving: a missing password is its dialog, not a tty prompt.
-        match mdrdp::creds::lookup(&target.keychain_account) {
-            Ok(secret) => secret,
-            // The reason names the store failure kind, never a secret.
-            Err(e) => ask_password_over_pipe(&target.keychain_account, &e.to_string())?,
-        }
-    } else if mdrdp::detach::already_detached() {
-        // No terminal behind us: reading the tty from a background process group would
-        // stop the process on SIGTTIN, invisibly. Fail with a message in the log — the
-        // lingering parent replays it — rather than hang where nobody can answer.
-        mdrdp::creds::lookup(&target.keychain_account)?
-    } else {
-        mdrdp::creds::lookup_or_prompt(&target.keychain_account)?
-    };
-
-    let store = Arc::new(Mutex::new(SurfaceStore::new()));
-    // Every sender of input or commands rings this doorbell, so the session pump
-    // acts immediately instead of on its next read timeout.
-    let (session_bell, session_wake_rx) =
-        doorbell().map_err(|e| format!("session doorbell: {e}"))?;
-    let (raw_input_tx, input_rx) = mpsc::channel::<InputEvent>();
-    let (raw_command_tx, command_rx) = mpsc::channel::<session::SessionCommand>();
-    let input_tx = WakingSender::new(raw_input_tx, session_bell.clone());
-    let command_tx = WakingSender::new(raw_command_tx, session_bell.clone());
-
-    // The stats handle must be taken before the handler is boxed away.
-    let handler = GfxHandler::new(Arc::clone(&store));
-    // Advertise AVC (AVC444 via V10.7, AVC420 via V8.1) only where connect() will
-    // actually configure a decoder, or the server sends H.264 into a void and every
-    // video region goes black.
-    // --no-avc withholds the AVC capability sets entirely, so the server falls
-    // back to its non-AVC mix (ClearCodec / RFX Progressive). A diagnostic lever:
-    // codec A/B comparisons on the same host, and triage when an AVC decode bug
-    // is suspected. The decoder requirement is unchanged when it is off.
-    let handler = if !no_avc && mdrdp::h264::hardware_decode_available() {
-        handler.advertising_avc()
-    } else {
-        handler
-    };
-    if no_avc {
-        eprintln!("AVC withheld (--no-avc): the server will fall back to its non-AVC codecs");
-    }
-    let handler = match &capture {
-        Some(dir) => {
-            eprintln!("capturing undecodable tiles to {dir} (session content — your call)");
-            handler.capturing_failures_to(dir)
-        }
-        None => handler,
-    };
-    let gfx_stats = handler.stats();
-    let slot_stats = handler.slot_stats();
-
-    // The backend goes into the connection (CLIPRDR is static, so it must be registered
-    // before the channel join); the bridge stays here and is driven by the session loop.
-    let clipboard_enabled =
-        settings.clipboard.direction != mdrdp::settings::ClipboardDirection::Off;
-    let (clipboard_backend, clipboard_bridge) =
-        clipboard_channel(Box::new(ArboardClipboard::new()));
-    let clipboard_bridge = clipboard_bridge.with_policy(mdrdp::clipboard::ClipboardPolicy {
-        to_remote: matches!(
-            settings.clipboard.direction,
-            mdrdp::settings::ClipboardDirection::Both
-                | mdrdp::settings::ClipboardDirection::ToRemote
-        ),
-        from_remote: matches!(
-            settings.clipboard.direction,
-            mdrdp::settings::ClipboardDirection::Both
-                | mdrdp::settings::ClipboardDirection::FromRemote
-        ),
-        max_image_bytes: settings.clipboard.max_image_bytes,
-        paste_timeout_ms: settings.clipboard.timeout_secs.saturating_mul(1000),
-    });
-
-    // Audio. The output stream is opened here and deliberately kept on the main thread for
-    // the life of the window: `cpal::Stream` has thread affinity on some platforms, and
-    // dropping it stops playback. Only the ring and the counters cross to the session
-    // thread, and both are built to be shared.
-    //
-    // The ring is sized from a nominal 48kHz stereo rather than the device's real format,
-    // which is not known until the stream is open. That affects only how many milliseconds
-    // of slack it holds; the conversion below uses the device's actual format.
-    let audio_stats = AudioStatsHandle::new();
-    let audio_ring = AudioRing::for_device(48_000, 2, audio_stats.clone());
-    // Settings ▸ Audio: playback off means no device is opened and no RDPSND channel
-    // is claimed — the honest form of "no sound", not a joined channel that discards.
-    let playback = if settings.audio.playback {
-        AudioPlayback::start(audio_ring.clone(), audio_stats.clone())
-    } else {
-        AudioPlayback::disabled(audio_ring.clone())
-    };
-    let rdpsnd = if playback.is_active() {
-        let fmt = playback.format();
-        eprintln!("audio: {} Hz, {} channel(s)", fmt.sample_rate, fmt.channels);
-        let static_channel = Box::new(RdpsndBackend::new(
-            audio_ring.clone(),
-            audio_stats.clone(),
-            fmt,
-        ));
-        let dynamic_channel = DynamicRdpsndListener::new(audio_ring, audio_stats.clone(), fmt);
-        Some(RdpsndHandlers::new(static_channel, dynamic_channel))
-    } else {
-        // Joining the channel and then discarding every wave would give the server every
-        // reason to believe audio works. Better not to claim it.
-        eprintln!("audio: no output device available; continuing without sound");
-        None
-    };
-
     // With --stage-json each connect stage goes to stdout as one JSON line, live, so
     // a launcher can drive a progress display. The forwarder thread ends when the
     // channel does; stdout carries only this protocol, human chatter stays on stderr.
+    // Built before the transport decision: a native probe feeds the same stream.
     let live_stages = stage_json.then(|| {
         let (tx, rx) = mpsc::channel::<mdrdp::connect::LiveStage>();
         std::thread::spawn(move || {
@@ -714,107 +621,380 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         tx
     });
 
-    // A session that will open fullscreen connects AT the resolution and scale the
-    // window would otherwise renegotiate to. Two wins: the server renders at the right
-    // DPI from logon (a mid-session DPI change leaves every non-DPI-aware remote app
-    // DWM-stretched and blurry until relaunch), and there is no resize round at all —
-    // the window's start-up request matches the session state and is skipped. Probe
-    // failure (headless, non-macOS) falls back to today's connect-then-renegotiate.
-    // The probe reads the *primary* monitor; if the window actually opens elsewhere,
-    // the start-up renegotiation still corrects it.
-    let fullscreen_plan = (fullscreen && !explicit_size && settings.graphics.dynamic_resolution)
-        .then(mdrdp::display::primary_display)
-        .flatten()
-        .map(|d| {
-            mdrdp::session::fullscreen_request(
-                d.width,
-                d.height,
-                d.scale_percent,
-                settings.graphics.integer_fullscreen_fit,
-            )
-        });
-
-    #[allow(clippy::cast_possible_truncation)]
-    let opts = ConnectOptions {
-        host: target.host.clone(),
-        port: target.port,
-        username: target.user.clone(),
-        domain: target.domain.clone(),
-        // fullscreen_request only returns encodable sizes (≤ 4096x2304), so u16 holds.
-        desktop_size: match fullscreen_plan {
-            Some((width, height, _)) => DesktopSize {
-                width: width as u16,
-                height: height as u16,
-            },
-            None => DesktopSize {
-                width: target.size.0,
-                height: target.size.1,
-            },
-        },
-        desktop_scale_percent: fullscreen_plan.and_then(|(_, _, scale)| scale),
-        known_hosts: KnownHosts::default_path()?,
-        observe_egfx: None,
-        // The same --capture opt-in that dumps undecodable ClearCodec tiles also
-        // dumps the first few AVC444 payloads for offline replay.
-        avc_capture: capture.as_ref().map(std::path::PathBuf::from),
-        live_stages,
-        // With --stage-json, a first-sight certificate is the launcher's question:
-        // emit a cert_prompt event and block on one decision line from stdin. EOF or
-        // garbage is a rejection — trust fails closed, never open.
-        trust_prompt: stage_json.then(|| {
-            std::sync::Arc::new(|sight: &mdrdp::trust::FirstSight| {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "cert_prompt",
-                        "host": sight.host,
-                        "fingerprint": sight.fingerprint.to_hex(),
-                        "store_path": sight.store_path.display().to_string(),
-                    })
-                );
-                let mut line = String::new();
-                if std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).is_err() {
-                    return mdrdp::trust::TrustDecision::Reject;
-                }
-                match serde_json::from_str::<serde_json::Value>(&line)
-                    .ok()
-                    .and_then(|v| v["decision"].as_str().map(str::to_owned))
-                    .as_deref()
-                {
-                    Some("pin") => mdrdp::trust::TrustDecision::PinAndConnect,
-                    Some("once") => mdrdp::trust::TrustDecision::ConnectOnce,
-                    _ => mdrdp::trust::TrustDecision::Reject,
-                }
-            }) as mdrdp::trust::TrustPrompt
-        }),
-    };
-
-    eprintln!("connecting to {}:{} …", target.host, target.port);
-    let established = match establish(
-        &opts,
-        &secret,
-        Channels {
-            gfx: Some(Box::new(handler)),
-            cliprdr: clipboard_enabled.then(|| {
-                Box::new(clipboard_backend) as Box<dyn ironrdp::cliprdr::backend::CliprdrBackend>
-            }),
-            rdpsnd,
-            // Lets the fullscreen toggle renegotiate the session resolution.
-            display_control: true,
-        },
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            if stage_json {
-                println!(
-                    "{}",
-                    serde_json::json!({ "event": "failed", "error": e.to_string() })
-                );
+    // ---- The transport decision (native HLD §4) ----
+    // `Never` costs nothing. `Auto` probes only hosts the local deploy record names,
+    // so it never sprays SSH logon attempts at boxes that never opted in. `Always`
+    // probes regardless and fails hard with the remedy rather than silently
+    // connecting over RDP against the user's explicit word. Decided entirely before
+    // any RDP credential is read: ssh is the native transport's boundary, and under
+    // Auto the keychain is consulted only once the probe has settled on RDP.
+    let native_conn: Option<mdrdp::native::probe::ProbedTransport> = 'native: {
+        if target.native == mdrdp::favourites::NativeMode::Never {
+            break 'native None;
+        }
+        let always = target.native == mdrdp::favourites::NativeMode::Always;
+        if !mdrdp::h264::hardware_decode_available() {
+            let why =
+                "no hardware H.264 decoder is available, and the native transport is AVC-only";
+            if always {
+                return Err(format!("--native: {why}").into());
             }
-            return Err(e.into());
+            eprintln!("native auto-detect skipped: {why}");
+            break 'native None;
+        }
+        if !always {
+            let recorded = mdrdp::native::deployed::default_path()
+                .map(|p| {
+                    mdrdp::native::deployed::NativeHosts::load_from(&p).is_recorded(&target.host)
+                })
+                .unwrap_or(false);
+            if !recorded {
+                // Unrecorded host under Auto: straight RDP at zero probe cost.
+                break 'native None;
+            }
+        }
+        eprintln!("probing {} for a native (rhydra) session …", target.host);
+        match mdrdp::native::probe::establish(
+            &target.host,
+            target.ssh_user.as_deref(),
+            live_stages.as_ref(),
+        ) {
+            Ok(transport) => Some(transport),
+            Err(failure) if always => {
+                let remedy = failure.remedy(&target.host);
+                if stage_json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "failed",
+                            "error": remedy,
+                            "qualifier": failure.qualifier(),
+                        })
+                    );
+                }
+                return Err(remedy.into());
+            }
+            Err(failure) => {
+                // Auto falls back to RDP — unless a live native session already holds
+                // this host's console, in which case an RDP logon would zero-frame it.
+                // An explicit --rdp is not guarded: the user asked.
+                if let Some(dir) = mdrdp::presence::default_dir()
+                    && let Some(live) = mdrdp::presence::live_native_for(
+                        &dir,
+                        &target.host,
+                        mdrdp::presence::unix_now(),
+                    )
+                {
+                    let refusal = format!(
+                        "native probe failed ({}), and a native session to {} is already \
+                         live (pid {}): an RDP logon would take the console out from \
+                         under it. Close that session first, or connect with --rdp if \
+                         that is what you want.",
+                        failure.qualifier(),
+                        target.host,
+                        live.pid
+                    );
+                    if stage_json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "event": "failed", "error": refusal })
+                        );
+                    }
+                    return Err(refusal.into());
+                }
+                eprintln!(
+                    "native probe failed ({}); falling back to RDP — {}",
+                    failure.qualifier(),
+                    failure.remedy(&target.host)
+                );
+                None
+            }
         }
     };
-    let desktop = established.desktop_size;
+    let is_native = native_conn.is_some();
+    if is_native && explicit_size {
+        eprintln!("note: --size is ignored on the native transport (the host owns the resolution)");
+    }
+
+    let store = Arc::new(Mutex::new(SurfaceStore::new()));
+    // Every sender of input or commands rings this doorbell, so the session pump
+    // acts immediately instead of on its next read timeout.
+    let (session_bell, session_wake_rx) =
+        doorbell().map_err(|e| format!("session doorbell: {e}"))?;
+    let (raw_input_tx, input_rx) = mpsc::channel::<InputEvent>();
+    let (raw_command_tx, command_rx) = mpsc::channel::<session::SessionCommand>();
+    let input_tx = WakingSender::new(raw_input_tx, session_bell.clone());
+    let command_tx = WakingSender::new(raw_command_tx, session_bell.clone());
+
+    // The EGFX handler is RDP machinery; a native session keeps fresh (all-zero)
+    // stats handles so the diagnostics windows and the exit report still have
+    // something honest to read. The stats handles must be taken before the handler
+    // is boxed away into the connection.
+    let (handler, gfx_stats, slot_stats) = if is_native {
+        (None, GfxStatsHandle::new(), SlotStatsHandle::new())
+    } else {
+        let handler = GfxHandler::new(Arc::clone(&store));
+        // Advertise AVC (AVC444 via V10.7, AVC420 via V8.1) only where connect() will
+        // actually configure a decoder, or the server sends H.264 into a void and every
+        // video region goes black.
+        // --no-avc withholds the AVC capability sets entirely, so the server falls
+        // back to its non-AVC mix (ClearCodec / RFX Progressive). A diagnostic lever:
+        // codec A/B comparisons on the same host, and triage when an AVC decode bug
+        // is suspected. The decoder requirement is unchanged when it is off.
+        let handler = if !no_avc && mdrdp::h264::hardware_decode_available() {
+            handler.advertising_avc()
+        } else {
+            handler
+        };
+        if no_avc {
+            eprintln!("AVC withheld (--no-avc): the server will fall back to its non-AVC codecs");
+        }
+        let handler = match &capture {
+            Some(dir) => {
+                eprintln!("capturing undecodable tiles to {dir} (session content — your call)");
+                handler.capturing_failures_to(dir)
+            }
+            None => handler,
+        };
+        let gfx_stats = handler.stats();
+        let slot_stats = handler.slot_stats();
+        (Some(handler), gfx_stats, slot_stats)
+    };
+
+    // The backend goes into the connection (CLIPRDR is static, so it must be registered
+    // before the channel join); the bridge stays here and is driven by the session loop.
+    // Native has no clipboard yet (tranche 5), so it opens no OS clipboard at all.
+    let clipboard_enabled =
+        !is_native && settings.clipboard.direction != mdrdp::settings::ClipboardDirection::Off;
+    let clipboard = (!is_native).then(|| {
+        let (backend, bridge) = clipboard_channel(Box::new(ArboardClipboard::new()));
+        let bridge = bridge.with_policy(mdrdp::clipboard::ClipboardPolicy {
+            to_remote: matches!(
+                settings.clipboard.direction,
+                mdrdp::settings::ClipboardDirection::Both
+                    | mdrdp::settings::ClipboardDirection::ToRemote
+            ),
+            from_remote: matches!(
+                settings.clipboard.direction,
+                mdrdp::settings::ClipboardDirection::Both
+                    | mdrdp::settings::ClipboardDirection::FromRemote
+            ),
+            max_image_bytes: settings.clipboard.max_image_bytes,
+            paste_timeout_ms: settings.clipboard.timeout_secs.saturating_mul(1000),
+        });
+        (backend, bridge)
+    });
+
+    // Audio. The output stream is opened here and deliberately kept on the main thread for
+    // the life of the window: `cpal::Stream` has thread affinity on some platforms, and
+    // dropping it stops playback. Only the ring and the counters cross to the session
+    // thread, and both are built to be shared.
+    //
+    // The ring is sized from a nominal 48kHz stereo rather than the device's real format,
+    // which is not known until the stream is open. That affects only how many milliseconds
+    // of slack it holds; the conversion below uses the device's actual format.
+    let audio_stats = AudioStatsHandle::new();
+    let audio_ring = AudioRing::for_device(48_000, 2, audio_stats.clone());
+    // Settings ▸ Audio: playback off means no device is opened and no RDPSND channel
+    // is claimed — the honest form of "no sound", not a joined channel that discards.
+    // Native has no audio yet (tranche 6): no device is opened and no channel claimed.
+    let playback = if settings.audio.playback && !is_native {
+        AudioPlayback::start(audio_ring.clone(), audio_stats.clone())
+    } else {
+        AudioPlayback::disabled(audio_ring.clone())
+    };
+    let rdpsnd = if playback.is_active() {
+        let fmt = playback.format();
+        eprintln!("audio: {} Hz, {} channel(s)", fmt.sample_rate, fmt.channels);
+        let static_channel = Box::new(RdpsndBackend::new(
+            audio_ring.clone(),
+            audio_stats.clone(),
+            fmt,
+        ));
+        let dynamic_channel = DynamicRdpsndListener::new(audio_ring, audio_stats.clone(), fmt);
+        Some(RdpsndHandlers::new(static_channel, dynamic_channel))
+    } else {
+        // Joining the channel and then discarding every wave would give the server every
+        // reason to believe audio works. Better not to claim it.
+        if !is_native {
+            eprintln!("audio: no output device available; continuing without sound");
+        }
+        None
+    };
+
+    // The clipboard bridge stays out here (the session loop drives it); the backend
+    // goes into the RDP connection below.
+    let (clipboard_backend, clipboard_bridge) = match clipboard {
+        Some((backend, bridge)) => (Some(backend), Some(bridge)),
+        None => (None, None),
+    };
+
+    let connected = if let Some(transport) = native_conn {
+        Connected::Native(Box::new(transport))
+    } else {
+        // The transport is RDP, so now — and only now — an RDP account is required.
+        // Deferred from `reconcile` so a native connect never demands one (P-M5).
+        if target.user.is_none() {
+            return Err(no_account_error(&target.host).into());
+        }
+
+        // Stdin beats the keychain when asked for: a scripted run must not depend on a
+        // keychain that can prompt, and must never be answered by an interactive prompt
+        // nobody is there to see. This read happens only once the transport is RDP —
+        // the native transport authenticates over ssh and reads no RDP credential.
+        let secret = if password_stdin {
+            mdrdp::creds::from_stdin()?
+        } else if stage_json && ask_password {
+            // The launcher saw a sign-in rejected with the stored password and wants a
+            // fresh one; the keychain is deliberately not consulted.
+            ask_password_over_pipe(
+                &target.keychain_account,
+                "the saved password was not accepted",
+            )?
+        } else if stage_json {
+            // A launcher is driving: a missing password is its dialog, not a tty prompt.
+            match mdrdp::creds::lookup(&target.keychain_account) {
+                Ok(secret) => secret,
+                // The reason names the store failure kind, never a secret.
+                Err(e) => ask_password_over_pipe(&target.keychain_account, &e.to_string())?,
+            }
+        } else if mdrdp::detach::already_detached() {
+            // No terminal behind us: reading the tty from a background process group would
+            // stop the process on SIGTTIN, invisibly. Fail with a message in the log — the
+            // lingering parent replays it — rather than hang where nobody can answer.
+            mdrdp::creds::lookup(&target.keychain_account)?
+        } else {
+            mdrdp::creds::lookup_or_prompt(&target.keychain_account)?
+        };
+        // A session that will open fullscreen connects AT the resolution and scale the
+        // window would otherwise renegotiate to. Two wins: the server renders at the right
+        // DPI from logon (a mid-session DPI change leaves every non-DPI-aware remote app
+        // DWM-stretched and blurry until relaunch), and there is no resize round at all —
+        // the window's start-up request matches the session state and is skipped. Probe
+        // failure (headless, non-macOS) falls back to today's connect-then-renegotiate.
+        // The probe reads the *primary* monitor; if the window actually opens elsewhere,
+        // the start-up renegotiation still corrects it.
+        let fullscreen_plan =
+            (fullscreen && !explicit_size && settings.graphics.dynamic_resolution)
+                .then(mdrdp::display::primary_display)
+                .flatten()
+                .map(|d| {
+                    mdrdp::session::fullscreen_request(
+                        d.width,
+                        d.height,
+                        d.scale_percent,
+                        settings.graphics.integer_fullscreen_fit,
+                    )
+                });
+
+        #[allow(clippy::cast_possible_truncation)]
+        let opts = ConnectOptions {
+            host: target.host.clone(),
+            port: target.port,
+            username: target.user.clone().expect("checked at the top of this arm"),
+            domain: target.domain.clone(),
+            // fullscreen_request only returns encodable sizes (≤ 4096x2304), so u16 holds.
+            desktop_size: match fullscreen_plan {
+                Some((width, height, _)) => DesktopSize {
+                    width: width as u16,
+                    height: height as u16,
+                },
+                None => DesktopSize {
+                    width: target.size.0,
+                    height: target.size.1,
+                },
+            },
+            desktop_scale_percent: fullscreen_plan.and_then(|(_, _, scale)| scale),
+            known_hosts: KnownHosts::default_path()?,
+            observe_egfx: None,
+            // The same --capture opt-in that dumps undecodable ClearCodec tiles also
+            // dumps the first few AVC444 payloads for offline replay.
+            avc_capture: capture.as_ref().map(std::path::PathBuf::from),
+            live_stages,
+            // With --stage-json, a first-sight certificate is the launcher's question:
+            // emit a cert_prompt event and block on one decision line from stdin. EOF or
+            // garbage is a rejection — trust fails closed, never open.
+            trust_prompt: stage_json.then(|| {
+                std::sync::Arc::new(|sight: &mdrdp::trust::FirstSight| {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "cert_prompt",
+                            "host": sight.host,
+                            "fingerprint": sight.fingerprint.to_hex(),
+                            "store_path": sight.store_path.display().to_string(),
+                        })
+                    );
+                    let mut line = String::new();
+                    if std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).is_err()
+                    {
+                        return mdrdp::trust::TrustDecision::Reject;
+                    }
+                    match serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|v| v["decision"].as_str().map(str::to_owned))
+                        .as_deref()
+                    {
+                        Some("pin") => mdrdp::trust::TrustDecision::PinAndConnect,
+                        Some("once") => mdrdp::trust::TrustDecision::ConnectOnce,
+                        _ => mdrdp::trust::TrustDecision::Reject,
+                    }
+                }) as mdrdp::trust::TrustPrompt
+            }),
+        };
+
+        eprintln!("connecting to {}:{} …", target.host, target.port);
+        let handler = handler.expect("the RDP path always builds a gfx handler");
+        match establish(
+            &opts,
+            &secret,
+            Channels {
+                gfx: Some(Box::new(handler)),
+                cliprdr: clipboard_backend
+                    .filter(|_| clipboard_enabled)
+                    .map(|b| Box::new(b) as Box<dyn ironrdp::cliprdr::backend::CliprdrBackend>),
+                rdpsnd,
+                // Lets the fullscreen toggle renegotiate the session resolution.
+                display_control: true,
+            },
+        ) {
+            Ok(e) => Connected::Rdp(Box::new(e)),
+            Err(e) => {
+                if stage_json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "event": "failed", "error": e.to_string() })
+                    );
+                }
+                return Err(e.into());
+            }
+        }
+    };
+
+    let desktop = match &connected {
+        Connected::Rdp(established) => established.desktop_size,
+        Connected::Native(transport) => {
+            // The header's u32 dimensions size a real display; anything that does
+            // not fit a session's u16 is the server talking nonsense.
+            let width = u16::try_from(transport.conn.header.width).map_err(|_| {
+                format!(
+                    "host reports an impossible width {}",
+                    transport.conn.header.width
+                )
+            })?;
+            let height = u16::try_from(transport.conn.header.height).map_err(|_| {
+                format!(
+                    "host reports an impossible height {}",
+                    transport.conn.header.height
+                )
+            })?;
+            DesktopSize { width, height }
+        }
+    };
+    let transport_label = match &connected {
+        Connected::Rdp(_) => mdrdp::presence::TRANSPORT_RDP,
+        Connected::Native(_) => mdrdp::presence::TRANSPORT_NATIVE,
+    };
     if stage_json {
         println!(
             "{}",
@@ -822,33 +1002,57 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "event": "connected",
                 "width": desktop.width,
                 "height": desktop.height,
+                "transport": transport_label,
             })
         );
     }
-    eprintln!(
-        // The prefix is the marker a detaching parent watches the log for.
-        "{} {}x{}, {}, {}",
-        mdrdp::detach::CONNECTED_MARKER,
-        desktop.width,
-        desktop.height,
-        established.report.trust,
-        established
-            .report
-            .tls_version
-            .clone()
-            .unwrap_or_else(|| "?".to_owned())
-    );
+    // The prefix is the marker a detaching parent watches the log for; the tail
+    // names the transport's trust story (TLS for RDP, the ssh tunnel's wire for native).
+    match &connected {
+        Connected::Rdp(established) => eprintln!(
+            "{} {}x{}, {}, {}",
+            mdrdp::detach::CONNECTED_MARKER,
+            desktop.width,
+            desktop.height,
+            established.report.trust,
+            established
+                .report
+                .tls_version
+                .clone()
+                .unwrap_or_else(|| "?".to_owned())
+        ),
+        Connected::Native(transport) => eprintln!(
+            "{} {}x{}, native, wire v{}",
+            mdrdp::detach::CONNECTED_MARKER,
+            desktop.width,
+            desktop.height,
+            transport.conn.header.wire_version
+        ),
+    }
+
+    // Transport visibility: the title base says which pipe carries the pixels, and
+    // every diagnostics window's identity line repeats it.
+    let title_base = match &connected {
+        Connected::Rdp(_) => format!("mdrdp — {display_name}"),
+        Connected::Native(_) => format!("mdrdp — {display_name} (native)"),
+    };
+    let diag_detail = match &connected {
+        Connected::Rdp(_) => format!(
+            "{}@{}:{} · pid {}",
+            target.user.as_deref().unwrap_or("?"),
+            target.host,
+            target.port,
+            std::process::id()
+        ),
+        Connected::Native(_) => format!("{} (native) · pid {}", target.host, std::process::id()),
+    };
 
     // Window on the main thread, before the session thread that needs its waker.
-    let mut window_config = WindowConfig::new(
-        format!("mdrdp — {display_name}"),
-        desktop.width,
-        desktop.height,
-    )
-    .with_fullscreen(fullscreen)
-    .with_overlay_on_start(settings.diagnostics.overlay_on_connect)
-    .with_dynamic_resolution(settings.graphics.dynamic_resolution)
-    .with_integer_fullscreen_fit(settings.graphics.integer_fullscreen_fit);
+    let mut window_config = WindowConfig::new(title_base, desktop.width, desktop.height)
+        .with_fullscreen(fullscreen)
+        .with_overlay_on_start(settings.diagnostics.overlay_on_connect)
+        .with_dynamic_resolution(settings.graphics.dynamic_resolution)
+        .with_integer_fullscreen_fit(settings.graphics.integer_fullscreen_fit);
     if explicit_size {
         // Flags always win: --size names the session resolution, fullscreen or not.
         window_config = window_config.keeping_stated_resolution();
@@ -897,13 +1101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let stats = session_stats.clone();
                 let slots = slot_stats.clone();
                 let name = display_name.clone();
-                let detail = format!(
-                    "{}@{}:{} · pid {}",
-                    target.user,
-                    target.host,
-                    target.port,
-                    std::process::id()
-                );
+                let detail = diag_detail.clone();
                 let metrics_dir = settings.diagnostics.metrics_dir.clone();
                 let mut window_state = mdrdp::diag::cache::CacheWindow::new();
                 Box::new(move |ui: &mut egui::Ui| {
@@ -928,13 +1126,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             latency: {
                 let stats = session_stats.clone();
                 let name = display_name.clone();
-                let detail = format!(
-                    "{}@{}:{} · pid {}",
-                    target.user,
-                    target.host,
-                    target.port,
-                    std::process::id()
-                );
+                let detail = diag_detail.clone();
                 let metrics_dir = settings.diagnostics.metrics_dir.clone();
                 Box::new(move |ui: &mut egui::Ui| {
                     let snapshot = stats.snapshot();
@@ -957,35 +1149,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let gfx = gfx_stats.clone();
                 let audio = audio_stats.clone();
                 let name = display_name.clone();
-                let detail = format!(
-                    "{}@{}:{} · pid {}",
-                    target.user,
-                    target.host,
-                    target.port,
-                    std::process::id()
-                );
-                let joined = established.report.joined_static_channels.clone();
-                let timeline: Vec<mdrdp::diag::channels::TimelineEntry> = {
-                    let mut entries = Vec::new();
-                    for stage in &established.report.stages {
-                        if stage.name == "post_tls_sequence" {
-                            // The connector's own legs break this blob down; insert
-                            // them first, then the blob total, mirroring the mock.
-                            for leg in &established.report.connector_stages {
-                                entries.push(mdrdp::diag::channels::TimelineEntry {
-                                    stage: leg.state.clone(),
-                                    elapsed_ms: leg.elapsed_ms,
-                                });
-                            }
-                        }
-                        entries.push(mdrdp::diag::channels::TimelineEntry {
-                            stage: stage.name.to_owned(),
-                            elapsed_ms: stage.elapsed_ms,
-                        });
+                let detail = diag_detail.clone();
+                let joined = match &connected {
+                    Connected::Rdp(established) => {
+                        established.report.joined_static_channels.clone()
                     }
-                    entries
+                    // Honest emptiness: a native session joins no static channels.
+                    Connected::Native(_) => Vec::new(),
                 };
-                let total_ms = established.report.total_ms;
+                let timeline: Vec<mdrdp::diag::channels::TimelineEntry> = match &connected {
+                    Connected::Rdp(established) => {
+                        let mut entries = Vec::new();
+                        for stage in &established.report.stages {
+                            if stage.name == "post_tls_sequence" {
+                                // The connector's own legs break this blob down; insert
+                                // them first, then the blob total, mirroring the mock.
+                                for leg in &established.report.connector_stages {
+                                    entries.push(mdrdp::diag::channels::TimelineEntry {
+                                        stage: leg.state.clone(),
+                                        elapsed_ms: leg.elapsed_ms,
+                                    });
+                                }
+                            }
+                            entries.push(mdrdp::diag::channels::TimelineEntry {
+                                stage: stage.name.to_owned(),
+                                elapsed_ms: stage.elapsed_ms,
+                            });
+                        }
+                        entries
+                    }
+                    // The window still opens on a native session; one row says why
+                    // there is no RDP connect timeline rather than looking broken.
+                    Connected::Native(_) => vec![mdrdp::diag::channels::TimelineEntry {
+                        stage: "n/a — native transport".to_owned(),
+                        elapsed_ms: 0.0,
+                    }],
+                };
+                let total_ms = match &connected {
+                    Connected::Rdp(established) => established.report.total_ms,
+                    Connected::Native(_) => 0.0,
+                };
                 Box::new(move |ui: &mut egui::Ui| {
                     let elapsed_ms =
                         u64::try_from(session_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1011,7 +1214,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // exactly once, whichever way the loop ends. On macOS a Cmd+Q makes AppKit call
     // `exit(0)` from inside `run()`, so a disconnect written after `run()` returns would
     // simply never happen and the session would be abandoned on the host.
-    let session_slot: Arc<Mutex<Option<session::SessionHandle>>> = Arc::new(Mutex::new(None));
+    let session_slot: Arc<Mutex<Option<ActiveSession>>> = Arc::new(Mutex::new(None));
     // How the session ended, written by whichever path performed the shutdown. The
     // exit hook runs at LoopExiting on EVERY close (not only Cmd+Q), so by the time
     // the epilogue runs the handle is long gone — this slot is what survives.
@@ -1023,8 +1226,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let gfx_for_exit = gfx_stats.clone();
     let audio_for_exit = audio_stats.clone();
     let slots_for_exit = slot_stats.clone();
-    let joined_channels_for_exit = established.report.joined_static_channels.clone();
-    let established_channels = established.report.joined_static_channels.clone();
+    let joined_channels_for_exit = match &connected {
+        Connected::Rdp(established) => established.report.joined_static_channels.clone(),
+        Connected::Native(_) => Vec::new(),
+    };
+    let established_channels = joined_channels_for_exit.clone();
     let state_key_for_exit = state_key.clone();
     let state_path_for_exit = state_path.clone();
     let fullscreen_for_exit = Arc::clone(&fullscreen_at_exit);
@@ -1038,7 +1244,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::clone(&store);
         let name = display_name.clone();
         let host = target.host.clone();
-        let user = target.user.clone();
+        // A native session's identity is its ssh login (possibly ~/.ssh/config's
+        // choice, hence empty), not the RDP account it never used.
+        let user = match &connected {
+            Connected::Rdp(_) => target.user.clone().unwrap_or_default(),
+            Connected::Native(_) => target.ssh_user.clone().unwrap_or_default(),
+        };
         let port = target.port;
         let pid = std::process::id();
         let started_unix = mdrdp::presence::unix_now();
@@ -1060,7 +1271,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 user: user.clone(),
                 version: mdrdp::cli::VERSION.to_owned(),
-                transport: mdrdp::presence::TRANSPORT_RDP.to_owned(),
+                transport: transport_label.to_owned(),
                 width,
                 height,
                 started_unix,
@@ -1126,38 +1337,65 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Which redirections are actually live. Worth printing every time: "the clipboard
     // isn't working" and "the clipboard channel never joined" are different problems with
-    // the same symptom, and this is the one line that tells them apart.
-    eprintln!(
-        "channels: {}",
-        if established.report.joined_static_channels.is_empty() {
-            "(none)".to_owned()
-        } else {
-            established.report.joined_static_channels.join(", ")
+    // the same symptom, and this is the one line that tells them apart. A native session
+    // says so explicitly rather than printing "(none)" and looking broken.
+    match &connected {
+        Connected::Rdp(established) => {
+            eprintln!(
+                "channels: {}",
+                if established.report.joined_static_channels.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    established.report.joined_static_channels.join(", ")
+                }
+            );
+            if !established
+                .report
+                .joined_static_channels
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("cliprdr"))
+            {
+                eprintln!(
+                    "note: the server did not join CLIPRDR — clipboard sharing is unavailable"
+                );
+            }
         }
-    );
-    if !established
-        .report
-        .joined_static_channels
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case("cliprdr"))
-    {
-        eprintln!("note: the server did not join CLIPRDR — clipboard sharing is unavailable");
+        Connected::Native(_) => {
+            eprintln!(
+                "channels: n/a — native transport (clipboard and audio land in later tranches)"
+            );
+        }
     }
 
-    let session = session::spawn(
-        established,
-        Arc::clone(&store),
-        input_rx,
-        command_rx,
-        waker,
-        SessionServices {
-            clipboard: clipboard_enabled.then_some(clipboard_bridge),
-            stats: session_stats.clone(),
-            gfx: Some(gfx_stats.clone()),
-        },
-        session_bell,
-        session_wake_rx,
-    );
+    let session = match connected {
+        Connected::Rdp(established) => ActiveSession::Rdp(session::spawn(
+            *established,
+            Arc::clone(&store),
+            input_rx,
+            command_rx,
+            waker,
+            SessionServices {
+                clipboard: clipboard_enabled.then_some(clipboard_bridge).flatten(),
+                stats: session_stats.clone(),
+                gfx: Some(gfx_stats.clone()),
+            },
+            session_bell,
+            session_wake_rx,
+        )),
+        Connected::Native(transport) => ActiveSession::Native(
+            mdrdp::native::session::spawn(
+                *transport,
+                mdrdp::h264::hardware_decoder(),
+                Arc::clone(&store),
+                input_rx,
+                command_rx,
+                waker,
+                session_stats.clone(),
+                session_wake_rx,
+            )
+            .map_err(|e| format!("native session: {e}"))?,
+        ),
+    };
 
     // A scripted run must end the way a user closing the window does — through the
     // waker, so the session thread still sends a Shutdown Request. Killing the process
@@ -1230,29 +1468,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .cache_stats();
 
-    eprintln!(
-        "  frames {}  decode errors {}  undecoded regions {}  surface errors {}\n  \
-         surfaces +{} -{}  reset {:?}  unhandled pdus {}\n  codecs {:?}",
-        s.frames_completed,
-        s.decode_errors,
-        s.undecoded_regions,
-        s.surface_errors,
-        s.surfaces_created,
-        s.surfaces_deleted,
-        s.reset_graphics,
-        s.unhandled_pdus,
-        s.codec_ids_seen
-    );
-    match (cache.hit_rate(), cache.byte_savings()) {
-        (Some(hit), Some(saved)) => eprintln!(
-            "  bitmap cache: {:.0}% of {} lookups hit, saving {:.0}% of painted pixels \
-             ({} evictions)",
-            hit * 100.0,
-            cache.hits + cache.misses,
-            saved * 100.0,
-            cache.evictions
-        ),
-        _ => eprintln!("  bitmap cache: never used by this server"),
+    // The RDP epilogue reads the EGFX pipeline; a native session never fed it, so
+    // all-zero counters would be noise pretending to be a report. Its own summary
+    // comes from the shared session stats the native sink does feed.
+    if is_native {
+        let stats = session_stats.snapshot();
+        eprintln!(
+            "  native: frames {}  bytes in {}  decode errors {}",
+            stats.frames, stats.bytes_in, stats.decode_errors
+        );
+    } else {
+        eprintln!(
+            "  frames {}  decode errors {}  undecoded regions {}  surface errors {}\n  \
+             surfaces +{} -{}  reset {:?}  unhandled pdus {}\n  codecs {:?}",
+            s.frames_completed,
+            s.decode_errors,
+            s.undecoded_regions,
+            s.surface_errors,
+            s.surfaces_created,
+            s.surfaces_deleted,
+            s.reset_graphics,
+            s.unhandled_pdus,
+            s.codec_ids_seen
+        );
+        match (cache.hit_rate(), cache.byte_savings()) {
+            (Some(hit), Some(saved)) => eprintln!(
+                "  bitmap cache: {:.0}% of {} lookups hit, saving {:.0}% of painted pixels \
+                 ({} evictions)",
+                hit * 100.0,
+                cache.hits + cache.misses,
+                saved * 100.0,
+                cache.evictions
+            ),
+            _ => eprintln!("  bitmap cache: never used by this server"),
+        }
     }
     let audio = audio_stats.snapshot();
     // Printed unconditionally. Reporting only when packets arrived hides the single most
@@ -1263,19 +1512,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // silent, or audio actually played. Only `negotiated_formats` can tell the first two
     // apart — `current_format` alone is `None` for both, and calling that "negotiated no
     // format" blamed a stage that had not been measured.
-    match (audio.current_format, audio.negotiated_formats) {
-        (Some(fmt), _) => eprintln!(
-            "  audio: {} packets at {} Hz/{}ch, {} dropped to overrun, {} underruns",
-            audio.packets_received, fmt.sample_rate, fmt.channels, audio.overruns, audio.underruns
-        ),
-        (None, None) => {
-            eprintln!("  audio: no audio channel was opened by the server this session")
-        }
-        (None, Some(0)) => eprintln!(
-            "  audio: formats exchanged, but the server shared none of the formats we offer"
-        ),
-        (None, Some(n)) => {
-            eprintln!("  audio: {n} format(s) negotiated; the server sent no audio this session")
+    if !is_native {
+        match (audio.current_format, audio.negotiated_formats) {
+            (Some(fmt), _) => eprintln!(
+                "  audio: {} packets at {} Hz/{}ch, {} dropped to overrun, {} underruns",
+                audio.packets_received,
+                fmt.sample_rate,
+                fmt.channels,
+                audio.overruns,
+                audio.underruns
+            ),
+            (None, None) => {
+                eprintln!("  audio: no audio channel was opened by the server this session")
+            }
+            (None, Some(0)) => eprintln!(
+                "  audio: formats exchanged, but the server shared none of the formats we offer"
+            ),
+            (None, Some(n)) => {
+                eprintln!(
+                    "  audio: {n} format(s) negotiated; the server sent no audio this session"
+                )
+            }
         }
     }
     if !s.decode_error_reasons.is_empty() {
@@ -1585,14 +1842,14 @@ fn reconcile(
 
     let user = user
         .or_else(|| chosen.as_ref().and_then(|f| f.username.clone()))
-        .or(default_user)
-        .ok_or_else(|| {
-            format!(
-                "no account for {host}: pass --user <account>, set one on the favourite, \
-                 or add a [defaults] username to favourites.toml\n{}",
-                usage()
-            )
-        })?;
+        .or(default_user);
+    // The account is an RDP credential, so only a target that can end up on RDP
+    // needs one here. A native-capable target defers the requirement to the RDP
+    // connect arm — demanded then with this same message — so `--native` against
+    // a host with no saved account works without inventing an unused logon.
+    if user.is_none() && native == mdrdp::favourites::NativeMode::Never {
+        return Err(no_account_error(&host));
+    }
 
     let fullscreen = size.is_none()
         && matches!(
@@ -1607,7 +1864,8 @@ fn reconcile(
     let keychain_account = chosen
         .as_ref()
         .and_then(|f| f.keychain_account.clone())
-        .unwrap_or_else(|| user.clone());
+        .or_else(|| user.clone())
+        .unwrap_or_default();
 
     // SSH identity: flag beats favourite; absent means `~/.ssh/config` decides.
     let ssh_user = ssh_user.or_else(|| chosen.as_ref().and_then(|f| f.ssh_user.clone()));
@@ -1778,7 +2036,7 @@ mod tests {
             t.host, "temper.local",
             "the argument was a name, not a host"
         );
-        assert_eq!(t.user, "saved-user");
+        assert_eq!(t.user.as_deref(), Some("saved-user"));
         assert_eq!(t.domain.as_deref(), Some("SAVED"));
         assert_eq!(t.port, 4000);
         assert_eq!(t.size, (1280, 800));
@@ -1798,7 +2056,7 @@ mod tests {
         )
         .unwrap();
         // Distinct values throughout, so a field copied from the wrong source shows up.
-        assert_eq!(t.user, "flag-user");
+        assert_eq!(t.user.as_deref(), Some("flag-user"));
         assert_eq!(t.port, 3389);
         assert_eq!(t.domain.as_deref(), Some("FLAG"));
         assert_eq!(t.size, (800, 600));
@@ -1829,9 +2087,25 @@ mod tests {
 
     #[test]
     fn a_host_with_no_account_anywhere_is_an_error_not_a_guess() {
-        let err =
-            reconcile_basic(Some("box".into()), None, None, None, None, None, None).unwrap_err();
+        // RDP-only (`Never`): the requirement bites here, at reconcile.
+        let err = reconcile(
+            Some("box".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            mdrdp::favourites::NativeMode::Never,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("no account for box"), "got: {err}");
+        // A native-capable target defers the requirement to the RDP connect arm:
+        // `--native` must never demand an RDP logon it will not use (review P-M5).
+        let t = reconcile_basic(Some("box".into()), None, None, None, None, None, None)
+            .expect("a native-capable target defers the account requirement");
+        assert_eq!(t.user, None);
     }
 
     #[test]
@@ -1846,7 +2120,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(t.user, "default-user");
+        assert_eq!(t.user.as_deref(), Some("default-user"));
         assert_eq!(
             t.keychain_account, "default-user",
             "the default account also names the keychain entry"
@@ -1865,7 +2139,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(with_favourite.user, "saved-user");
+        assert_eq!(with_favourite.user.as_deref(), Some("saved-user"));
 
         let with_flag = reconcile_basic(
             Some("Temper".into()),
@@ -1877,7 +2151,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(with_flag.user, "flag-user");
+        assert_eq!(with_flag.user.as_deref(), Some("flag-user"));
     }
 
     #[test]
@@ -1893,7 +2167,11 @@ mod tests {
         };
         let t =
             reconcile_basic(Some("Temper".into()), Some(f), None, None, None, None, None).unwrap();
-        assert_eq!(t.user, "user@example.com", "what we log on as");
+        assert_eq!(
+            t.user.as_deref(),
+            Some("user@example.com"),
+            "what we log on as"
+        );
         assert_eq!(
             t.keychain_account, "MicrosoftAccount\\user@example.com",
             "where the password is stored"
@@ -1909,7 +2187,11 @@ mod tests {
         };
         let t =
             reconcile_basic(Some("Plain".into()), Some(f), None, None, None, None, None).unwrap();
-        assert_eq!(t.keychain_account, t.user, "one name unless told otherwise");
+        assert_eq!(
+            Some(t.keychain_account.as_str()),
+            t.user.as_deref(),
+            "one name unless told otherwise"
+        );
     }
 
     #[test]
