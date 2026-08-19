@@ -6,6 +6,28 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Installing the OpenSSH capability REWRITES any firewall rule sharing its name back to Private; give ours its own (`hostscripts::setup_ssh`).
+  Two traps, one symptom. Windows' built-in `OpenSSH-Server-In-TCP` is Private-profile only,
+  and these hosts sit on a network Windows categorises Public, so it never applies — SSH
+  connects time out while sshd runs and listens perfectly, which reads as a network fault.
+  Worse, adding a correct Profile-Any rule under that same built-in name is silently undone
+  the next time the capability is installed. Hence `mdrdp-sshd-in`, added AFTER the install.
+  Diagnose from the client: timeout = firewall drop, refused = sshd absent. They are opposite
+  fixes (`sshsetup::classify`).
+
+- PowerShell 7 fails DISM with "Class not registered" and returns SILENT EMPTIES from Get-Net* — self-elevate to 5.1 (`hostscripts::setup_ssh`).
+  Not a broken servicing stack, though it looks exactly like one. On temper the same
+  `Add-WindowsCapability` that failed under pwsh 7 succeeded via `DISM.exe`, and
+  `Get-NetTCPConnection -LocalPort 22` returned nothing while sshd was listening on
+  0.0.0.0:22 — so the empty output read as "sshd is dead" and cost a wrong diagnosis.
+  `Start-Process powershell -Verb RunAs` gets a 5.1 child from whatever shell was pasted
+  into, which is why every host script here self-elevates.
+
+- Windows OpenSSH ignores `~/.ssh/authorized_keys` for ANY admin; only `administrators_authorized_keys` counts (`hostscripts::setup_ssh`).
+  Machine-wide, so one key there serves every admin account on the box — `marti` and `ano`
+  both authenticate on quench from one entry. It also needs its ACL stripped to SYSTEM +
+  Administrators or sshd refuses the file outright, silently.
+
 - A fixed-size dialog holding server-supplied text loses its own buttons; measure the layout headlessly first (`end_dialog::window_size`).
   Aux windows are `with_resizable(false)`, so overflow is not a scrollbar — it is content
   drawn past an edge nobody can move. An IronRDP failure chain wraps to ten lines and pushed
