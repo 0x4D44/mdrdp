@@ -785,6 +785,15 @@ pub fn run(args: &[String]) -> i32 {
     let ssh = Ssh::new(&cfg);
     if let Err(e) = upload_scripts(&ssh) {
         eprintln!("deploy: uploading probe scripts: {e}");
+        // This is deploy's first contact with the host, so it is also where "SSH
+        // was never set up" surfaces — as a raw scp error that names no cause.
+        // Ask the diagnosis for one before giving up.
+        let d = crate::sshsetup::diagnose(&cfg.host);
+        if !d.is_working() {
+            eprintln!("deploy: {}.", d.headline());
+            eprintln!("deploy: {}", d.remedy());
+            eprintln!("deploy: run `mdrdp ssh-setup {}` to set it up.", cfg.host);
+        }
         return 1;
     }
     let probe_out = match ssh.run_script(
