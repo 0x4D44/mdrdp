@@ -185,6 +185,54 @@ being fixed separately from the trigger.
 
 ## Fix
 
-<unfixed — raised only>
+**Root cause: the client destroyed its own H.264 decoder on every ResetGraphics.**
+
+`H264Decoder::reset` is not a flush — it drops the VideoToolbox decompression session
+(`h264.rs`, `self.session = None`). A session rebuilt mid-GOP holds no reference frames,
+so every P-frame after it fails until the server's next IDR, and the server has no way to
+know the decoder was thrown away. `h264.rs` already carried that measurement — "a rebuild
+mid-GOP fails every P-frame until the next IDR (measured -12909), so rebuilds must never
+be routine" — but `handle_reset_graphics` was calling `reset()` unconditionally.
+
+ResetGraphics is routine on any host with a screen attached: idle display power-off,
+backlight, lid, dock all produce one, and so does a window resize (which renegotiates the
+resolution). That is why resizing a few times appeared to "fix" it — the resize forced a
+fresh keyframe.
+
+The reset was unnecessary as well as harmful. `decode_yuv420` rebuilds the session itself
+whenever parameter sets first arrive or change, so a genuinely new stream heals at its
+first IDR; a restarted stream reusing the same SPS/PPS decodes correctly on the live
+session, because an IDR resets reference state inside the codec.
+
+**Decisive evidence**, Arthur's session on 0.1.78, 2026-08-19 — the epilogue that
+MDR-BUG-FLUX-00009 made reachable:
+
+```
+frames 168  decode errors 105  undecoded regions 0  surface errors 0
+surfaces +4 -3  reset Some((2560, 1440))  unhandled pdus 0
+codecs {"Avc444v2": 163}
+decode failures by reason:
+     67  Avc444v2: avc444 luma decode failed
+     38  Avc444v2: avc444 chroma decode failed
+```
+
+105 failures across 163 AVC444 updates, with a ResetGraphics in the same session. Healthy
+sessions on the same client show `surfaces +2 -1` and zero failures. The stall diagnostic
+also fired in the log, catching a reveal that produced no frames for 5 s.
+
+**Why only kiln:** it is the only machine with a real screen attached. Every fleet test
+host is headless and therefore cannot produce a display-mode transition at all — raised
+separately as MDR-BUG-FLUX-00015, because no test written on this fleet could have caught
+this.
+
+Two earlier hypotheses recorded above are **superseded** and should not be re-run: the
+display power-off timeout correlation (real but incidental — it is one of several ways to
+reach a ResetGraphics), and the Intel driver version difference (kiln's 32.0.101.8974 was
+installed 2026-08-19 at 14:01, after the failures began, so it cannot be the cause).
+
+Fixed on the branch that carries this note, with a regression test proven red-then-green
+by restoring the reset. `on_decode_failure` was also widened from `&'static str` to `&str`
+so the reason tally carries the decoder's own error — including the VideoToolbox
+OSStatus — rather than a bare label that says a decode failed and nothing about why.
 
 ## Notes
