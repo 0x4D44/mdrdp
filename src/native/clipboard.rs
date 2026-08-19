@@ -53,6 +53,8 @@ use sha2::{Digest, Sha256};
 
 use rhydra::aux_proto::{MAX_CLIPBOARD_BYTES, to_wire_newlines};
 
+use crate::clipboard::{ClipboardContent, OsClipboard};
+
 /// How much of a payload the fingerprint reads.
 ///
 /// Equal to the wire ceiling on purpose, so every payload this bridge can carry
@@ -316,12 +318,324 @@ fn fresh_salt() -> [u8; 16] {
     out
 }
 
+/// One poll of the local clipboard: what should go to the host, if anything.
+///
+/// Everything the poll thread decides lives here, so the thread itself is a
+/// timer and nothing more.
+///
+/// **A read failure leaves the slot untouched on purpose.** `ArboardClipboard`
+/// drops and rebuilds its handle on any error, so failures are transient by
+/// design; treating one as "no content" would move the suppression slot to a
+/// value the pasteboard never held, and the copy that follows would be
+/// suppressed as unchanged. Doing nothing costs one poll interval.
+pub fn poll_local(
+    os: &mut dyn OsClipboard,
+    bridge: &mut Bridge,
+    report: &mut impl FnMut(&str),
+) -> Option<String> {
+    let content = match os.get_content() {
+        Ok(content) => content,
+        Err(e) => {
+            // Third-party error text, so it may not be quoted near content.
+            report(&format!("clipboard read failed: {e}"));
+            return None;
+        }
+    };
+    let text = match content {
+        ClipboardContent::Text(text) => text,
+        // Images are out of scope this tranche. Ignored rather than recorded:
+        // moving the slot for content we cannot send would make the next text
+        // copy look unchanged if it happened to match.
+        ClipboardContent::Image { .. } => return None,
+    };
+    match bridge.on_local_change(&text) {
+        Outgoing::Send(wire) => Some(wire),
+        Outgoing::Suppressed | Outgoing::Disabled => None,
+        Outgoing::TooLarge { bytes, limit } => {
+            report(&format!(
+                "clipboard not shared: {bytes} bytes is over the {limit}-byte limit"
+            ));
+            None
+        }
+    }
+}
+
+/// Apply one payload that arrived from the host to the local clipboard.
+///
+/// The read-back after the set is what closes the normalisation loop — see
+/// [`Bridge::note_applied`]. It matters only for mangling that canonicalisation
+/// does not already undo: a pasteboard that stores CRLF needs no help here,
+/// because the fingerprint is taken over the canonical LF form either way.
+///
+/// A failed read-back needs no fallback — deciding to apply already recorded
+/// the text.
+pub fn apply_remote(
+    os: &mut dyn OsClipboard,
+    bridge: &mut Bridge,
+    text: &str,
+    report: &mut impl FnMut(&str),
+) {
+    match bridge.on_remote_text(text) {
+        Incoming::Apply(wire) => {
+            if let Err(e) = os.set_content(ClipboardContent::Text(wire.clone())) {
+                report(&format!("clipboard write failed: {e}"));
+                return;
+            }
+            // A failed read-back needs no `else`: deciding to apply already
+            // recorded the text, which is the best guess available. What would
+            // be actively wrong is *clearing* the slot on failure — the next
+            // poll would read the content we just wrote, find no record of it,
+            // and send it straight back to the host.
+            if let Ok(ClipboardContent::Text(read_back)) = os.get_content() {
+                bridge.note_applied(&read_back);
+            }
+        }
+        Incoming::Suppressed | Incoming::Disabled => {}
+        Incoming::TooLarge { bytes, limit } => {
+            report(&format!(
+                "clipboard from the host not applied: {bytes} bytes is over the {limit}-byte limit"
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn bridge() -> Bridge {
         Bridge::new(Policy::default())
+    }
+
+    /// A pasteboard that records what it was asked to do and can be told to
+    /// fail or to mangle what it stores — all three are real `arboard`
+    /// behaviours this code has to survive.
+    struct FakeClipboard {
+        content: Option<ClipboardContent>,
+        read_fails: bool,
+        /// Fail this many reads, then behave. Lets a read-BACK fail while the
+        /// poll that follows succeeds — `read_fails` alone cannot express that,
+        /// and a test using it would be measuring the wrong read.
+        fail_next_reads: usize,
+        write_fails: bool,
+        /// Applied to anything stored, standing in for OS normalisation.
+        mangle: Option<fn(&str) -> String>,
+        sets: usize,
+    }
+
+    impl FakeClipboard {
+        fn holding(text: &str) -> Self {
+            Self {
+                content: Some(ClipboardContent::Text(text.to_owned())),
+                read_fails: false,
+                fail_next_reads: 0,
+                write_fails: false,
+                mangle: None,
+                sets: 0,
+            }
+        }
+        fn text(&self) -> Option<&str> {
+            match &self.content {
+                Some(ClipboardContent::Text(t)) => Some(t),
+                _ => None,
+            }
+        }
+    }
+
+    impl OsClipboard for FakeClipboard {
+        fn get_content(&mut self) -> Result<ClipboardContent, String> {
+            if self.fail_next_reads > 0 {
+                self.fail_next_reads -= 1;
+                return Err("the pasteboard is busy".to_owned());
+            }
+            if self.read_fails {
+                return Err("the pasteboard is busy".to_owned());
+            }
+            self.content.clone().ok_or_else(|| "empty".to_owned())
+        }
+        fn set_content(&mut self, content: ClipboardContent) -> Result<(), String> {
+            if self.write_fails {
+                return Err("the pasteboard refused".to_owned());
+            }
+            self.sets += 1;
+            self.content = Some(match (content, self.mangle) {
+                (ClipboardContent::Text(t), Some(f)) => ClipboardContent::Text(f(&t)),
+                (other, _) => other,
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_local_change_is_offered_to_the_host_and_an_unchanged_poll_is_not() {
+        let mut os = FakeClipboard::holding("copied");
+        let mut b = bridge();
+        let mut reports = Vec::new();
+        let mut r = |m: &str| reports.push(m.to_owned());
+        assert_eq!(
+            poll_local(&mut os, &mut b, &mut r),
+            Some("copied".to_owned())
+        );
+        // The clipboard has not changed, so the next lap must be silent — this
+        // runs four times a second for the life of the session.
+        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn a_read_failure_leaves_the_suppression_slot_alone() {
+        // arboard drops and rebuilds its handle on error, so failures are
+        // transient. Recording one as "no content" would move the slot to a
+        // value the pasteboard never held, and the NEXT copy of that same text
+        // would then be suppressed as unchanged — a silently lost copy.
+        let mut os = FakeClipboard::holding("copied");
+        os.read_fails = true;
+        let mut b = bridge();
+        // A RefCell rather than a plain Vec: this test has to read the log
+        // BETWEEN two uses of the reporting closure.
+        let reports = std::cell::RefCell::new(Vec::new());
+        let mut r = |m: &str| reports.borrow_mut().push(m.to_owned());
+        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert_eq!(reports.borrow().len(), 1);
+
+        os.read_fails = false;
+        assert_eq!(
+            poll_local(&mut os, &mut b, &mut r),
+            Some("copied".to_owned()),
+            "the copy that was unreadable during the failure must still be sent"
+        );
+    }
+
+    #[test]
+    fn an_image_on_the_clipboard_is_ignored_without_disturbing_suppression() {
+        let mut os = FakeClipboard::holding("text first");
+        let mut b = bridge();
+        let mut r = |_: &str| {};
+        assert_eq!(
+            poll_local(&mut os, &mut b, &mut r),
+            Some("text first".to_owned())
+        );
+
+        os.content = Some(ClipboardContent::Image {
+            width: 2,
+            height: 2,
+            rgba: vec![0; 16],
+        });
+        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+
+        // Back to the same text: still unchanged, so still silent. If the image
+        // had moved the slot this would send a copy the user never made.
+        os.content = Some(ClipboardContent::Text("text first".to_owned()));
+        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+    }
+
+    #[test]
+    fn an_oversize_local_copy_is_reported_and_not_offered() {
+        let mut os = FakeClipboard::holding(&"x".repeat(MAX_CLIPBOARD_BYTES + 1));
+        let mut b = bridge();
+        let mut reports = Vec::new();
+        let mut r = |m: &str| reports.push(m.to_owned());
+        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].contains("over the"));
+        assert!(
+            !reports[0].contains("xxx"),
+            "a report names sizes, never content"
+        );
+    }
+
+    #[test]
+    fn applying_a_host_payload_writes_it_and_records_what_the_os_kept() {
+        // The mangle here is deliberately NOT a line-ending change. A CRLF
+        // mangle cannot test this: the fingerprint is taken over the canonical
+        // LF form, so the request and the read-back hash identically and the
+        // assertion passes whether or not the read-back is used at all — this
+        // test was written that way first, and a mutation proved it vacuous. It
+        // has to be a mangle canonicalisation does not undo; here, a pasteboard
+        // that strips trailing whitespace.
+        let mut os = FakeClipboard::holding("something else");
+        os.mangle = Some(|t| t.trim_end().to_owned());
+        let mut b = bridge();
+        let mut r = |_: &str| {};
+        apply_remote(&mut os, &mut b, "host text\n", &mut r);
+        assert_eq!(os.text(), Some("host text"));
+        assert_eq!(os.sets, 1);
+
+        // The next poll reads what the OS actually kept. It must be silent: if
+        // the slot held what we ASKED for, this would look like a new local copy
+        // and bounce straight back to the host, and round it would go.
+        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+    }
+
+    #[test]
+    fn our_own_content_arriving_back_never_touches_the_pasteboard() {
+        let mut os = FakeClipboard::holding("mine");
+        let mut b = bridge();
+        let mut r = |_: &str| {};
+        assert_eq!(poll_local(&mut os, &mut b, &mut r), Some("mine".to_owned()));
+        apply_remote(&mut os, &mut b, "mine", &mut r);
+        assert_eq!(
+            os.sets, 0,
+            "an echo must not be written back to the pasteboard"
+        );
+    }
+
+    #[test]
+    fn from_remote_off_leaves_the_pasteboard_byte_identical() {
+        // AC7: the payload is refused, and the local clipboard is untouched.
+        let mut os = FakeClipboard::holding("local content");
+        let mut b = Bridge::new(Policy {
+            from_remote: false,
+            ..Policy::default()
+        });
+        let mut r = |_: &str| {};
+        apply_remote(&mut os, &mut b, "from the host", &mut r);
+        assert_eq!(os.text(), Some("local content"));
+        assert_eq!(os.sets, 0);
+    }
+
+    #[test]
+    fn a_write_failure_is_reported_and_does_not_claim_the_content_was_applied() {
+        let mut os = FakeClipboard::holding("untouched");
+        os.write_fails = true;
+        let mut b = bridge();
+        let mut reports = Vec::new();
+        let mut r = |m: &str| reports.push(m.to_owned());
+        apply_remote(&mut os, &mut b, "from the host", &mut r);
+        assert_eq!(os.text(), Some("untouched"));
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].contains("write failed"));
+        assert!(
+            !reports[0].contains("from the host"),
+            "an error must not quote the payload: {}",
+            reports[0]
+        );
+    }
+
+    #[test]
+    fn a_failed_read_back_still_leaves_the_bridge_able_to_suppress_the_echo() {
+        // The set works and the read-back does not. Exactly one read fails, so
+        // the poll that follows succeeds — otherwise this would be measuring a
+        // failed poll rather than a failed read-back, which is how it was
+        // written first, and a mutation proved it vacuous.
+        //
+        // What this pins is that the failure needs no repair: the record made
+        // when the payload was accepted still holds. The wrong implementation
+        // it guards against is clearing the slot because "we don't know what is
+        // there" — which would bounce the content straight back to the host.
+        let mut os = FakeClipboard::holding("before");
+        os.fail_next_reads = 1;
+        let mut b = bridge();
+        let mut r = |_: &str| {};
+        apply_remote(&mut os, &mut b, "from the host", &mut r);
+        assert_eq!(os.text(), Some("from the host"));
+        assert_eq!(
+            os.fail_next_reads, 0,
+            "the read-back must actually have been attempted"
+        );
+        // Falling back to the applied text is the best guess available, and it
+        // must still stop the next poll bouncing the content back to the host.
+        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
     }
 
     #[test]
