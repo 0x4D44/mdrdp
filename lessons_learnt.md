@@ -6,6 +6,14 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A fixed-size dialog holding server-supplied text loses its own buttons; measure the layout headlessly first (`end_dialog::window_size`).
+  Aux windows are `with_resizable(false)`, so overflow is not a scrollbar — it is content
+  drawn past an edge nobody can move. An IronRDP failure chain wraps to ten lines and pushed
+  the whole footer off the 300 px Session-lost dialog. Two halves to the fix: run one headless
+  `egui::Context::run_ui` pass at the fixed width and open at the height the content used, and
+  cap the unbounded part so the total cannot run off a display. A fit test only proves this if
+  it clips each galley to its own clip rect — otherwise a scroll area reads as overflow.
+
 - A locked Windows console eats injected input: SendInput succeeds, thread still reads `WinSta0\Default`, nothing lands.
   A locked session's *input* desktop is the secure `Winlogon` one, so every diagnostic you can
   reach from a service or SSH agrees the injector is healthy — station, desktop, integrity level,

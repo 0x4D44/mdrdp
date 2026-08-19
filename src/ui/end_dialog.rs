@@ -23,11 +23,23 @@ pub enum EndChoice {
     SaveMetricsAndClose,
 }
 
-/// Aux windows are not resizable, so each size is pinned by a fit test below. The two
-/// unexpected endings share a size: both carry a wrapped explanation whose length is
-/// the server's to choose, so both need the same headroom.
-const WARN_WINDOW: [f32; 2] = [480.0, 300.0];
-const ENDED_WINDOW: [f32; 2] = [460.0, 280.0];
+/// Aux windows are not resizable, so whatever falls past the bottom edge is simply
+/// never seen — that is how a dialog loses its own buttons. Width stays pinned by the
+/// mock; height is measured from the content each time the dialog opens
+/// ([`window_size`]), because the failure text is the server's to choose and a real
+/// IronRDP error chain wraps to a dozen lines.
+const WARN_WIDTH: f32 = 480.0;
+const ENDED_WIDTH: f32 = 460.0;
+/// The mock's designed heights, kept as floors so a one-line ending still looks like a
+/// dialog rather than a strip.
+const WARN_MIN_HEIGHT: f32 = 300.0;
+const ENDED_MIN_HEIGHT: f32 = 280.0;
+/// A taller dialog would start running off small displays, so growth stops here and the
+/// failure text scrolls inside [`REASON_MAX_HEIGHT`] instead.
+const MAX_HEIGHT: f32 = 640.0;
+/// Height the failure text may claim before it scrolls. Every other part of the dialog
+/// is bounded, so this is what keeps the footer on-window for any string at all.
+const REASON_MAX_HEIGHT: f32 = 260.0;
 
 /// How the session finished — one dialog variant per case.
 pub enum EndOutcome {
@@ -78,11 +90,11 @@ impl EndApp {
         if self.window.is_some() {
             return;
         }
-        let (title, size) = match self.info.outcome {
-            EndOutcome::Lost(_) => ("Session lost", WARN_WINDOW),
-            EndOutcome::ServerEnded(_) => ("Session ended", WARN_WINDOW),
-            EndOutcome::Ended => ("Session ended", ENDED_WINDOW),
+        let title = match self.info.outcome {
+            EndOutcome::Lost(_) => "Session lost",
+            EndOutcome::ServerEnded(_) | EndOutcome::Ended => "Session ended",
         };
+        let size = window_size(&self.info);
         match AuxWindow::open(event_loop, title, size) {
             Ok(win) => self.window = Some(win),
             Err(e) => {
@@ -144,7 +156,7 @@ impl ApplicationHandler<SessionEvent> for EndApp {
                 let info = &self.info;
                 let mut choice = None;
                 window.redraw(|ui| {
-                    choice = draw(ui, info);
+                    choice = draw(ui, info).choice;
                 });
                 if let Some(c) = choice {
                     self.choice = Some(c);
@@ -182,12 +194,59 @@ pub fn show(event_loop: &mut EventLoop<SessionEvent>, info: EndInfo) -> Option<E
     app.choice
 }
 
-fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Option<EndChoice> {
+/// The size this dialog needs for the text it is about to show.
+///
+/// An aux window cannot be resized, so the size is chosen once, up front: lay the
+/// dialog out headlessly at its fixed width and take the height the content used.
+fn window_size(info: &EndInfo) -> [f32; 2] {
+    let (width, min_height) = if info.outcome.unexpected() {
+        (WARN_WIDTH, WARN_MIN_HEIGHT)
+    } else {
+        (ENDED_WIDTH, ENDED_MIN_HEIGHT)
+    };
+    [
+        width,
+        measured_height(info, width).clamp(min_height, MAX_HEIGHT),
+    ]
+}
+
+/// One headless layout pass, purely to measure — the only way to know how tall a
+/// wrapped, server-supplied string lands. Costs a font atlas per dialog opened, which
+/// is once per process.
+fn measured_height(info: &EndInfo, width: f32) -> f32 {
+    let ctx = egui::Context::default();
+    theme::apply(&ctx);
+    let input = egui::RawInput {
+        // Tall enough that nothing is height-constrained, so the pass reports the
+        // dialog's natural height rather than the room it was given.
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(width, MAX_HEIGHT * 4.0),
+        )),
+        ..Default::default()
+    };
+    let mut height = 0.0;
+    let output = ctx.run_ui(input, |ui| height = draw(ui, info).height);
+    // FullOutput's destructor panics on unapplied deltas; nothing paints this pass.
+    output.drop_without_applying_deltas();
+    // The real window lays out at the display's scale factor, where glyph rounding can
+    // land a hair taller than this one-point-per-pixel pass.
+    height + 2.0
+}
+
+/// What one laid-out frame of the dialog produced.
+struct Drawn {
+    choice: Option<EndChoice>,
+    /// Height the content took, in points — what [`window_size`] measures.
+    height: f32,
+}
+
+fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Drawn {
     use crate::shell::widgets;
     use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
     let mut choice = None;
     let lost = info.outcome.unexpected();
-    Frame::new()
+    let outer = Frame::new()
         .fill(theme::BG_WINDOW)
         .inner_margin(Margin::same(0))
         .show(ui, |ui| {
@@ -242,11 +301,19 @@ fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Option<EndChoice> {
                                 .font(theme::sans(13.0))
                                 .color(theme::TEXT_SECONDARY),
                             );
-                            ui.label(
-                                RichText::new(reason)
-                                    .font(theme::mono(11.0))
-                                    .color(theme::TEXT_MUTED),
-                            );
+                            // The window grew for this text (`window_size`); past
+                            // MAX_HEIGHT it scrolls instead, so no failure string —
+                            // however long — can push the footer off the bottom.
+                            egui::ScrollArea::vertical()
+                                .max_height(REASON_MAX_HEIGHT)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(reason)
+                                            .font(theme::mono(11.0))
+                                            .color(theme::TEXT_MUTED),
+                                    );
+                                });
                         }
                         EndOutcome::Ended => {
                             ui.label(
@@ -316,7 +383,10 @@ fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Option<EndChoice> {
     if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter)) {
         choice = Some(EndChoice::Done);
     }
-    choice
+    Drawn {
+        choice,
+        height: outer.response.rect.height(),
+    }
 }
 
 fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -368,7 +438,9 @@ mod tests {
     }
 
     /// Lay out one real frame of the dialog at the size it opens at, and return every
-    /// text it drew with the rect that text occupies.
+    /// text it drew with the rect that text is *visible* in — the galley clipped to its
+    /// own clip rect, so text a scroll area has scrolled out of view is not counted as
+    /// having overflowed the window.
     fn frame(size: [f32; 2], info: &EndInfo) -> Vec<(String, egui::Rect)> {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
@@ -383,7 +455,7 @@ mod tests {
         // the caller's assert.
         let mut choice = Some(EndChoice::Reconnect);
         let output = ctx.run_ui(input, |ui| {
-            choice = draw(ui, info);
+            choice = draw(ui, info).choice;
         });
         let mut texts = Vec::new();
         for clipped in &output.shapes {
@@ -394,10 +466,11 @@ mod tests {
                     egui::Align::Center => t.pos.x - size.x / 2.0,
                     egui::Align::RIGHT => t.pos.x - size.x,
                 };
-                texts.push((
-                    t.galley.text().to_owned(),
-                    egui::Rect::from_min_size(egui::pos2(min_x, t.pos.y), size),
-                ));
+                let visible = egui::Rect::from_min_size(egui::pos2(min_x, t.pos.y), size)
+                    .intersect(clipped.clip_rect);
+                if visible.is_positive() {
+                    texts.push((t.galley.text().to_owned(), visible));
+                }
             }
         }
         // Consumed before the asserts: FullOutput's destructor panics on unapplied
@@ -410,10 +483,9 @@ mod tests {
     /// Nobody can resize an aux window, so anything laid out past its bottom edge is
     /// simply never seen — that is how a dialog loses its own buttons.
     ///
-    /// Only the overflow half of the fit is asserted. These §7 dialogs are drawn at a
-    /// fixed size with the footer stacked under the content, so a short message
-    /// legitimately leaves background below it; the length of the message is the
-    /// server's to choose, not ours.
+    /// Only the overflow half of the fit is asserted. The window height is floored at
+    /// the mock's designed size, so a short message legitimately leaves background
+    /// below it.
     fn assert_fits(texts: &[(String, egui::Rect)], size: [f32; 2]) {
         let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(size[0], size[1]));
         for (text, rect) in texts {
@@ -433,11 +505,12 @@ mod tests {
             detail: "The host is rebooting. It will take connections again once it is back."
                 .to_owned(),
         }));
-        let texts = frame(WARN_WINDOW, &info);
+        let size = window_size(&info);
+        let texts = frame(size, &info);
         let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
         assert!(drawn.contains(&"Kiln is restarting"), "{drawn:?}");
         assert!(drawn.contains(&"Reconnect"), "{drawn:?}");
-        assert_fits(&texts, WARN_WINDOW);
+        assert_fits(&texts, size);
     }
 
     /// The detail line is whatever the protocol says, and the wordiest code in
@@ -453,26 +526,87 @@ mod tests {
             ),
         )
         .expect("an error-info reason is a farewell");
-        let texts = frame(WARN_WINDOW, &info(EndOutcome::ServerEnded(detail)));
-        assert_fits(&texts, WARN_WINDOW);
+        let info = info(EndOutcome::ServerEnded(detail));
+        let size = window_size(&info);
+        let texts = frame(size, &info);
+        assert_fits(&texts, size);
     }
 
     #[test]
     fn a_lost_session_still_fits_its_window() {
         let info = info(EndOutcome::Lost("connection reset by peer".to_owned()));
-        let texts = frame(WARN_WINDOW, &info);
+        let size = window_size(&info);
+        assert_eq!(
+            size,
+            [WARN_WIDTH, WARN_MIN_HEIGHT],
+            "a one-line failure should still open at the designed size"
+        );
+        let texts = frame(size, &info);
         let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
         assert!(drawn.contains(&"Session to Kiln lost"), "{drawn:?}");
-        assert_fits(&texts, WARN_WINDOW);
+        assert_fits(&texts, size);
     }
 
     #[test]
     fn a_clean_end_still_fits_its_window() {
-        let texts = frame(ENDED_WINDOW, &info(EndOutcome::Ended));
+        let info = info(EndOutcome::Ended);
+        let size = window_size(&info);
+        assert_eq!(size, [ENDED_WIDTH, ENDED_MIN_HEIGHT]);
+        let texts = frame(size, &info);
         let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
         assert!(drawn.contains(&"Session Kiln ended"), "{drawn:?}");
         assert!(drawn.contains(&"12m 30s"), "{drawn:?}");
-        assert_fits(&texts, ENDED_WINDOW);
+        assert_fits(&texts, size);
         assert!(drawn.contains(&"Save metrics JSON"), "{drawn:?}");
+    }
+
+    /// Verbatim from a live session on 2026-08-19: IronRDP reports a failure as a
+    /// nested error chain with source locations, and this one wraps to ten lines. At
+    /// the old fixed 300 px it pushed the entire footer — Reconnect included — off the
+    /// bottom edge of a window nobody can resize.
+    const REAL_DECODE_FAILURE: &str = "RDP connection failed: [payload error @ \
+        /rustc/ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96/library/core/src/ops/function.rs:250] \
+        PDU error: [<ironrdp_egfx::client::GraphicsPipelineClient as \
+        ironrdp_dvc::DvcProcessor>::process::{{closure}} @ \
+        vendor/ironrdp-egfx/src/client.rs:1230] decode error: [<ironrdp_egfx::pdu::cmd::GfxPdu \
+        as ironrdp_core::decode::Decode<'_>>::decode @ \
+        ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ironrdp-core-0.2.1/src/error.rs:101] \
+        invalid `Type`: Unknown GFX PDU type";
+
+    #[test]
+    fn a_ten_line_failure_grows_the_window_instead_of_losing_the_buttons() {
+        let info = info(EndOutcome::Lost(REAL_DECODE_FAILURE.to_owned()));
+        let size = window_size(&info);
+        assert!(
+            size[1] > WARN_MIN_HEIGHT,
+            "the dialog did not grow for a ten-line failure: {size:?}"
+        );
+        let texts = frame(size, &info);
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(drawn.contains(&"Reconnect"), "{drawn:?}");
+        assert!(drawn.contains(&"Close"), "{drawn:?}");
+        assert_fits(&texts, size);
+    }
+
+    /// Nothing bounds the failure text, so the growth has to stop somewhere: past that
+    /// the text scrolls and the dialog still fits on a small display.
+    #[test]
+    fn a_runaway_failure_string_stops_growing_the_window() {
+        let info = info(EndOutcome::Lost("connection reset by peer. ".repeat(400)));
+        let size = window_size(&info);
+        assert!(size[1] <= MAX_HEIGHT, "{size:?} exceeds the height cap");
+        let texts = frame(size, &info);
+        // The reason itself runs to thousands of characters, so the buttons are
+        // reported by presence alone — printing `drawn` here would bury the failure.
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            drawn.contains(&"Reconnect"),
+            "no Reconnect button in a {size:?} window"
+        );
+        assert!(
+            drawn.contains(&"Close"),
+            "no Close button in a {size:?} window"
+        );
+        assert_fits(&texts, size);
     }
 }
