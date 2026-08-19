@@ -536,7 +536,11 @@ fn log_input_desktop() {
             String::from_utf16_lossy(&buf[..len])
         };
 
-        let station = name(&|| GetProcessWindowStation().ok().map(|s| windows::Win32::Foundation::HANDLE(s.0)));
+        let station = name(&|| {
+            GetProcessWindowStation()
+                .ok()
+                .map(|s| windows::Win32::Foundation::HANDLE(s.0))
+        });
         let desktop = name(&|| {
             GetThreadDesktop(GetCurrentThreadId())
                 .ok()

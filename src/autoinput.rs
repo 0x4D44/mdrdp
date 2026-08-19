@@ -249,7 +249,7 @@ fn send_scroll(input: &WakingSender<InputEvent>, x: u16, y: u16, notches: i16) -
     if input.send(InputEvent::MouseMove { x, y }).is_err() {
         return false;
     }
-    let step = i16::from(crate::input::WHEEL_UNITS_PER_NOTCH as i16) * notches.signum();
+    let step = crate::input::WHEEL_UNITS_PER_NOTCH as i16 * notches.signum();
     for _ in 0..notches.unsigned_abs() {
         std::thread::sleep(KEY_GAP);
         let sent = input
