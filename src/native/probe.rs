@@ -41,6 +41,11 @@ const CONTROL_BUDGET: Duration = Duration::from_secs(2);
 /// How long the input connect retries after the video channel is up.
 const INPUT_RETRY_WINDOW: Duration = Duration::from_secs(1);
 
+/// How much of the budget the optional auxiliary connect may consume. Small,
+/// because it is the least important step and must never be what makes a
+/// connect miss its deadline.
+const AUX_CONNECT_BUDGET: Duration = Duration::from_millis(500);
+
 /// The server's stats header, reduced to what the client gates and sizes on.
 /// Unknown fields are ignored by serde's default, so the server may grow its
 /// header freely.
@@ -50,6 +55,16 @@ pub struct ServerHeader {
     pub wire_version: u32,
     pub width: u32,
     pub height: u32,
+    /// Whether the host is listening on the auxiliary channel (clipboard now,
+    /// audio in tranche 6).
+    ///
+    /// **Defaulted false on purpose, and the default is the safety property.**
+    /// A host that predates the channel omits the field entirely, and this is
+    /// the only signal that tells the client not to try — there is nothing
+    /// listening on 9503 there. It gates opening that socket at all, not merely
+    /// what is sent on it.
+    #[serde(default)]
+    pub clipboard: bool,
 }
 
 /// What a successful probe hands the session: connected sockets, the parsed
@@ -60,6 +75,11 @@ pub struct ProbeSuccess {
     pub reassembler: Reassembler,
     pub header: ServerHeader,
     pub input: TcpStream,
+    /// The auxiliary channel, or `None` when the host does not advertise it or
+    /// the connect failed. **Never a session failure** — a session without a
+    /// clipboard is a working session, and degrading to one is the whole point
+    /// of putting this traffic on its own socket.
+    pub aux: Option<TcpStream>,
 }
 
 impl std::fmt::Debug for ProbeSuccess {
@@ -191,6 +211,25 @@ pub fn probe_over(
 
     // Step 4: the input channel, which the server binds moments after video.
     let input = connect_input(ports, deadline)?;
+
+    // Step 5: the auxiliary channel, gated on the host advertising it.
+    //
+    // The gate is a safety property, not an optimisation. Against a host that
+    // predates the channel nothing is listening on 9503, and this flag is the
+    // only thing that tells the client so. Connecting regardless would merely
+    // waste a round trip — but the failure this guards is the one *behind* it:
+    // with no aux socket there is no upstream channel at all, and the tempting
+    // alternative of sending clipboard on the input channel is terminal for the
+    // session, because an unknown input record kind closes the connection.
+    //
+    // Non-fatal in both directions: no flag, or a flag with nothing behind it,
+    // both yield a working session that simply has no clipboard.
+    let aux = if header.clipboard {
+        connect_aux(ports, deadline)
+    } else {
+        None
+    };
+
     stage(
         STAGE_HANDSHAKE,
         Some(format!("wire v{}", header.wire_version)),
@@ -201,6 +240,7 @@ pub fn probe_over(
         reassembler,
         header,
         input,
+        aux,
     })
 }
 
@@ -278,12 +318,28 @@ fn connect_input(ports: ForwardPorts, deadline: Instant) -> Result<TcpStream, Pr
     }
 }
 
+/// Connect the auxiliary channel, or give up quietly.
+///
+/// Bounded by [`AUX_CONNECT_BUDGET`] as well as the probe deadline: this is the
+/// last step and the least important one, so it may not be what makes a
+/// connect miss its budget. Every failure returns `None`; none is fatal.
+fn connect_aux(ports: ForwardPorts, deadline: Instant) -> Option<TcpStream> {
+    let budget = remaining(deadline, "aux").ok()?.min(AUX_CONNECT_BUDGET);
+    let stream = TcpStream::connect_timeout(&ports.aux_addr(), budget).ok()?;
+    // Clipboard messages are small and bursty; Nagle would add up to 40 ms to
+    // one for no gain.
+    stream.set_nodelay(true).ok()?;
+    Some(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rhydra::control::{ChildReport, ModeReport, StatusReport, status_line};
     use std::io::{BufRead, BufReader, Write};
     use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn green_report() -> StatusReport {
         StatusReport {
@@ -321,37 +377,106 @@ mod tests {
         }
     }
 
+    /// A header from a host that predates the auxiliary channel: the
+    /// `clipboard` field is **absent**, not false. That is the shape a deployed
+    /// 0.4.0 host actually sends, and the one the safety gate must survive.
     fn header_bytes(wire_version: u32) -> Vec<u8> {
-        let json = serde_json::json!({
+        header_json(serde_json::json!({
             "schema": 5,
             "wire_version": wire_version,
             "width": 1920,
             "height": 1080,
             "encoder": "quicksync-h264",
-        })
-        .to_string();
+        }))
+    }
+
+    /// A header from a host that states its auxiliary-channel capability either
+    /// way.
+    fn header_bytes_advertising(wire_version: u32, clipboard: bool) -> Vec<u8> {
+        header_json(serde_json::json!({
+            "schema": rhydra::stats::SCHEMA,
+            "wire_version": wire_version,
+            "width": 1920,
+            "height": 1080,
+            "encoder": "quicksync-h264",
+            "clipboard": clipboard,
+        }))
+    }
+
+    fn header_json(json: serde_json::Value) -> Vec<u8> {
         let mut framed = Vec::new();
-        framing::encode(framing::MSG_STATS, json.as_bytes(), &mut framed);
+        framing::encode(framing::MSG_STATS, json.to_string().as_bytes(), &mut framed);
         framed
     }
 
-    /// Bind the three roles on loopback and return the ports plus join guards.
+    /// Whether the fake host has anything listening on the auxiliary port.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AuxHost {
+        /// Bound and accepting, like a tranche-5 host.
+        Listening,
+        /// Bound then dropped, so the port is refused — a host that advertises
+        /// the channel but whose listener died.
+        Dead,
+    }
+
+    /// Bind the four roles on loopback and return the ports, a counter of
+    /// auxiliary-port connections, and join guards.
+    ///
     /// `agent_reply`: what the fake agent answers a status request with, or None
     /// to hang up without answering. `video_payload`: what the fake server
     /// writes on accept, or None for accept-then-close.
+    ///
+    /// The auxiliary counter is the oracle for the safety gate: "the client did
+    /// not open the socket" has to be observed at the listener, because a client
+    /// that connected and immediately closed would look identical from the
+    /// client side.
     fn fake_host(
         agent_reply: Option<String>,
         video_payload: Option<Vec<u8>>,
-    ) -> (ForwardPorts, Vec<std::thread::JoinHandle<()>>) {
+    ) -> (
+        ForwardPorts,
+        Arc<AtomicUsize>,
+        Vec<std::thread::JoinHandle<()>>,
+    ) {
+        fake_host_with(agent_reply, video_payload, AuxHost::Listening)
+    }
+
+    fn fake_host_with(
+        agent_reply: Option<String>,
+        video_payload: Option<Vec<u8>>,
+        aux_host: AuxHost,
+    ) -> (
+        ForwardPorts,
+        Arc<AtomicUsize>,
+        Vec<std::thread::JoinHandle<()>>,
+    ) {
         let control = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let video = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let input = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let aux = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let ports = ForwardPorts {
             video: video.local_addr().unwrap().port(),
             input: input.local_addr().unwrap().port(),
             control: control.local_addr().unwrap().port(),
+            aux: aux.local_addr().unwrap().port(),
         };
+        let aux_accepts = Arc::new(AtomicUsize::new(0));
         let mut joins = Vec::new();
+        match aux_host {
+            AuxHost::Listening => {
+                let counter = Arc::clone(&aux_accepts);
+                joins.push(std::thread::spawn(move || {
+                    while let Ok((stream, _)) = aux.accept() {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        // Hold it open; dropping would race the client's own
+                        // view of a successful connect.
+                        std::thread::sleep(Duration::from_millis(500));
+                        drop(stream);
+                    }
+                }));
+            }
+            AuxHost::Dead => drop(aux),
+        }
         joins.push(std::thread::spawn(move || {
             // First accept: the readiness poke (dropped unread). Then the query.
             for _ in 0..2 {
@@ -383,7 +508,7 @@ mod tests {
         joins.push(std::thread::spawn(move || {
             let _ = input.accept();
         }));
-        (ports, joins)
+        (ports, aux_accepts, joins)
     }
 
     fn far_deadline() -> Instant {
@@ -397,7 +522,7 @@ mod tests {
         let mut second = Vec::new();
         framing::encode(framing::MSG_VIDEO_SEQ, &[0u8; 12], &mut second);
         payload.extend_from_slice(&second[..7]); // a partial second message
-        let (ports, _joins) = fake_host(Some(status_line(&green_report())), Some(payload));
+        let (ports, _aux, _joins) = fake_host(Some(status_line(&green_report())), Some(payload));
 
         let mut stages: Vec<(&'static str, Option<String>)> = Vec::new();
         let ok = probe_over(
@@ -428,9 +553,98 @@ mod tests {
 
     #[test]
     fn a_wire_v2_host_is_refused_with_the_versions_named() {
-        let (ports, _joins) = fake_host(Some(status_line(&green_report())), Some(header_bytes(2)));
+        let (ports, _aux, _joins) =
+            fake_host(Some(status_line(&green_report())), Some(header_bytes(2)));
         let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
         assert_eq!(err, ProbeFailure::VersionMismatch { host: 2, client: 3 });
+    }
+
+    /// Poll the counter rather than sleeping a guessed interval.
+    fn wait_for_accepts(counter: &AtomicUsize, want: usize, timeout: Duration) -> usize {
+        let end = Instant::now() + timeout;
+        loop {
+            let seen = counter.load(Ordering::SeqCst);
+            if seen >= want || Instant::now() >= end {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// How long to let a forbidden connect happen before declaring it did not.
+    /// The client's own connect is synchronous and already complete when
+    /// `probe_over` returns, so this only covers the listener thread's accept.
+    const SETTLE: Duration = Duration::from_millis(250);
+
+    #[test]
+    fn a_host_that_never_heard_of_the_channel_is_never_connected_to() {
+        // The AC6 safety gate in unit form. The auxiliary port here is bound and
+        // accepting, so a client that tried would succeed — the counter stays at
+        // zero only because the absent `clipboard` field held the gate shut.
+        // That is the shape a deployed 0.4.0 host sends: the field is missing,
+        // not false.
+        let (ports, aux_accepts, _joins) =
+            fake_host(Some(status_line(&green_report())), Some(header_bytes(3)));
+        let ok =
+            probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
+        assert!(!ok.header.clipboard, "an absent flag must read as false");
+        assert!(
+            ok.aux.is_none(),
+            "no auxiliary socket may be handed to the session"
+        );
+        std::thread::sleep(SETTLE);
+        assert_eq!(
+            aux_accepts.load(Ordering::SeqCst),
+            0,
+            "the client opened the auxiliary socket against a host that never advertised it"
+        );
+    }
+
+    #[test]
+    fn an_explicit_false_binds_exactly_as_hard_as_an_absent_flag() {
+        // Absent and false must be indistinguishable, or the serde default is
+        // covering for a gate that only works by accident.
+        let (ports, aux_accepts, _joins) = fake_host(
+            Some(status_line(&green_report())),
+            Some(header_bytes_advertising(3, false)),
+        );
+        let ok =
+            probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
+        assert!(ok.aux.is_none());
+        std::thread::sleep(SETTLE);
+        assert_eq!(aux_accepts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_host_that_advertises_the_channel_is_connected_to_exactly_once() {
+        let (ports, aux_accepts, _joins) = fake_host(
+            Some(status_line(&green_report())),
+            Some(header_bytes_advertising(3, true)),
+        );
+        let ok =
+            probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
+        assert!(ok.header.clipboard);
+        assert!(ok.aux.is_some(), "an advertised channel must be connected");
+        assert_eq!(
+            wait_for_accepts(&aux_accepts, 1, Duration::from_secs(2)),
+            1,
+            "exactly one auxiliary connection per session"
+        );
+    }
+
+    #[test]
+    fn an_advertised_channel_with_nothing_behind_it_is_not_a_session_failure() {
+        // A host may advertise the channel and have its listener die. Degrading
+        // to a session without a clipboard is the designed outcome; failing the
+        // connect would make an optional feature able to break the product.
+        let (ports, _aux_accepts, _joins) = fake_host_with(
+            Some(status_line(&green_report())),
+            Some(header_bytes_advertising(3, true)),
+            AuxHost::Dead,
+        );
+        let ok = probe_over(ports, far_deadline(), || None, |_, _| {})
+            .expect("a refused auxiliary connect must not fail the probe");
+        assert!(ok.aux.is_none());
     }
 
     #[test]
@@ -438,7 +652,7 @@ mod tests {
         let mut report = green_report();
         report.server.running = false;
         report.stuck = Some("server".to_owned());
-        let (ports, _joins) = fake_host(Some(status_line(&report)), None);
+        let (ports, _aux, _joins) = fake_host(Some(status_line(&report)), None);
         let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
         assert_eq!(err, ProbeFailure::NotGreen("server".to_owned()));
     }
@@ -447,7 +661,7 @@ mod tests {
     fn a_forward_that_hangs_up_without_answering_means_no_agent() {
         // The control listener accepts and closes without a reply — exactly what
         // ssh does locally when the remote end refuses the forward.
-        let (ports, _joins) = fake_host(None, None);
+        let (ports, _aux, _joins) = fake_host(None, None);
         let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
         assert_eq!(err, ProbeFailure::NoAgent);
     }
@@ -463,6 +677,7 @@ mod tests {
             video: video_port,
             input: video_port,
             control: control.local_addr().unwrap().port(),
+            aux: video_port,
         };
         let reply = status_line(&green_report());
         let _agent = std::thread::spawn(move || {
@@ -487,7 +702,7 @@ mod tests {
     fn a_first_message_that_is_not_the_header_is_rejected() {
         let mut payload = Vec::new();
         framing::encode(framing::MSG_VIDEO_SEQ, &[0u8; 12], &mut payload);
-        let (ports, _joins) = fake_host(Some(status_line(&green_report())), Some(payload));
+        let (ports, _aux, _joins) = fake_host(Some(status_line(&green_report())), Some(payload));
         let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
         assert!(
             matches!(err, ProbeFailure::Io(ref m) if m.contains("expected the stats header")),

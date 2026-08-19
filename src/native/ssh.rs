@@ -31,19 +31,28 @@ use std::time::{Duration, Instant};
 pub const REMOTE_VIDEO_PORT: u16 = 9500;
 pub const REMOTE_INPUT_PORT: u16 = 9501;
 pub const REMOTE_CONTROL_PORT: u16 = 9502;
+/// The auxiliary session channel: clipboard now, audio in tranche 6. Kept off
+/// the video port because video latency is the product's premise and nothing
+/// lower-priority may back it up; kept off the input port because that dialect
+/// is frameless and an unknown record kind there is terminal.
+pub const REMOTE_AUX_PORT: u16 = 9503;
 
 /// How long ssh itself gets to establish TCP to the host.
 const SSH_CONNECT_TIMEOUT_SECS: u32 = 4;
 
-/// The local (Mac-side) ports the three forwards bind.
+/// The local (Mac-side) ports the four forwards bind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardPorts {
     pub video: u16,
     pub input: u16,
     pub control: u16,
+    pub aux: u16,
 }
 
 impl ForwardPorts {
+    pub fn aux_addr(&self) -> SocketAddr {
+        (Ipv4Addr::LOCALHOST, self.aux).into()
+    }
     pub fn video_addr(&self) -> SocketAddr {
         (Ipv4Addr::LOCALHOST, self.video).into()
     }
@@ -55,7 +64,7 @@ impl ForwardPorts {
     }
 }
 
-/// Pick three free loopback ports by bind-and-drop.
+/// Pick four free loopback ports by bind-and-drop.
 ///
 /// The race window between the drop and ssh's own bind spans ssh's whole
 /// connect+auth phase — real, not theoretical. `ExitOnForwardFailure` turns a lost
@@ -67,15 +76,17 @@ pub fn allocate_ports() -> std::io::Result<ForwardPorts> {
         let port = l.local_addr()?.port();
         Ok((l, port))
     };
-    // Hold all three listeners until every port is chosen, so they are distinct.
+    // Hold all four listeners until every port is chosen, so they are distinct.
     let (a, video) = bind()?;
     let (b, input) = bind()?;
     let (c, control) = bind()?;
-    drop((a, b, c));
+    let (d, aux) = bind()?;
+    drop((a, b, c, d));
     Ok(ForwardPorts {
         video,
         input,
         control,
+        aux,
     })
 }
 
@@ -117,6 +128,8 @@ pub fn ssh_args(spec: &TunnelSpec) -> Vec<String> {
         fwd(spec.local.input, REMOTE_INPUT_PORT),
         "-L".into(),
         fwd(spec.local.control, REMOTE_CONTROL_PORT),
+        "-L".into(),
+        fwd(spec.local.aux, REMOTE_AUX_PORT),
         dest,
     ]
 }
@@ -354,6 +367,7 @@ mod tests {
                 video: 50001,
                 input: 50002,
                 control: 50003,
+                aux: 50004,
             },
         }
     }
@@ -379,6 +393,9 @@ mod tests {
         assert!(joined.contains("127.0.0.1:50001:127.0.0.1:9500"));
         assert!(joined.contains("127.0.0.1:50002:127.0.0.1:9501"));
         assert!(joined.contains("127.0.0.1:50003:127.0.0.1:9502"));
+        // The auxiliary channel. Loopback on both ends like the rest: ssh is
+        // the security boundary, and nothing here may be reachable off-host.
+        assert!(joined.contains("127.0.0.1:50004:127.0.0.1:9503"));
         // Destination is last, with the user applied.
         assert_eq!(args.last().unwrap(), "ano@quench.lan.example");
     }
@@ -393,8 +410,12 @@ mod tests {
     #[test]
     fn allocated_ports_are_distinct_and_nonzero() {
         let p = allocate_ports().unwrap();
-        assert!(p.video != 0 && p.input != 0 && p.control != 0);
-        assert!(p.video != p.input && p.input != p.control && p.video != p.control);
+        let all = [p.video, p.input, p.control, p.aux];
+        assert!(all.iter().all(|&port| port != 0));
+        // Set-based rather than a hand-written chain of pairs: with four ports a
+        // chain is easy to write with a pair missing, and it would still pass.
+        let distinct: std::collections::HashSet<u16> = all.iter().copied().collect();
+        assert_eq!(distinct.len(), all.len(), "ports collided: {all:?}");
     }
 
     #[test]

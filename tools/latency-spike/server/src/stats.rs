@@ -83,16 +83,34 @@ pub struct Header {
     /// Whether the out-of-band `MF_MT_MPEG_SEQUENCE_HEADER` was available as a
     /// fallback source of parameter sets.
     pub sequence_header_available: bool,
+    /// Whether this host is listening on the auxiliary channel (port 9503).
+    ///
+    /// **A safety gate, not a courtesy.** The client must not open that socket
+    /// unless this says true. A host that predates the channel has nothing
+    /// listening there, and this flag is the only thing that stops the client
+    /// trying — the client has no other way to tell, and the alternative
+    /// (writing clipboard upstream on the input channel) would be terminal for
+    /// the session, because an unknown input record kind closes the connection.
+    ///
+    /// Absent from an older host's header, where serde defaults it to false on
+    /// the client side. That is why this is a schema bump and not a
+    /// `wire_version` bump: adding a capability the client may ignore does not
+    /// force a redeploy.
+    pub clipboard: bool,
 }
 
-/// Schema 5: the Increment 3 pixel diff becomes visible — the header gains
+/// Schema 6: the header gains `clipboard`, which says whether this host is
+/// listening on the auxiliary channel. `wire_version` deliberately does **not**
+/// move: a client that ignores the flag still speaks the same video, rects and
+/// input dialects, so an old client and a new host interoperate unchanged.
+/// (Schema 5: the Increment 3 pixel diff becomes visible — the header gains
 /// `diff_idle_gap_ms`, frame rows gain the cumulative `diff_runs`/`diff_hits`/
 /// `diff_us_total`, and rects rows gain `from_diff`, which says whether a rect
 /// message was metadata-driven or measured against the previous frame.
 /// (Schema 4: the header gained `source`, naming which capture path the run used.
 /// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
-pub const SCHEMA: u32 = 5;
+pub const SCHEMA: u32 = 6;
 /// Bumped 2 → 3 by tranche 3's input dialect (input-channel v2: scan/mouse/wheel
 /// kinds beside the original VK down/up) — the video/rects wire itself is
 /// unchanged, but the header's `wire_version` couples both dialects together so a
@@ -126,6 +144,9 @@ impl Header {
             diff_idle_gap_ms: 0,
             parameter_set_route: "in-band, out-of-band fallback",
             sequence_header_available: false,
+            // Off until something actually binds 9503. Defaulting this true
+            // would advertise a channel that may not exist.
+            clipboard: false,
         }
     }
 }
@@ -555,6 +576,9 @@ mod tests {
         h.rect_max_count = 32;
         h.rect_max_bytes = 98_304;
         h.diff_idle_gap_ms = 100;
+        // Set true here rather than left at the default, so the assertion below
+        // cannot pass against a header that hardcodes false.
+        h.clipboard = true;
         let v: Value = serde_json::from_str(&to_line(&h)).unwrap();
         assert_eq!(v["record"], "header");
         assert_eq!(v["schema"], SCHEMA);
@@ -569,7 +593,11 @@ mod tests {
         assert_eq!(v["rect_max_bytes"], 98_304);
         assert_eq!(v["diff_idle_gap_ms"], 100);
 
+        // The client's safety gate reads this and nothing else. A header that
+        // omitted it would silently disable clipboard on every session.
+        assert_eq!(v["clipboard"], true);
+
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 24, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 25, "unexpected field count: {keys:?}");
     }
 }
