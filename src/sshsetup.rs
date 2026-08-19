@@ -349,7 +349,16 @@ pub fn classify(
 /// Read-only: resolves, opens a TCP connection, and runs `ssh ... whoami` in
 /// batch mode so a missing key fails fast instead of prompting.
 pub fn diagnose(host: &str) -> Diagnosis {
-    let target = format!("{host}:{SSH_PORT}");
+    diagnose_on(host, SSH_PORT)
+}
+
+/// [`diagnose`] against an explicit port.
+///
+/// Exists so the resolve-and-connect plumbing can be tested against a port a
+/// test controls. Testing the real thing on 22 would depend on whether the
+/// machine running the suite happens to serve SSH, which is not a test.
+pub fn diagnose_on(host: &str, port: u16) -> Diagnosis {
+    let target = format!("{host}:{port}");
     let addr = match target.to_socket_addrs() {
         Ok(mut it) => it.next(),
         Err(_) => None,
@@ -386,6 +395,176 @@ pub fn diagnose(host: &str) -> Diagnosis {
         Err(e) => Some(Err(e.to_string())),
     };
     classify(true, tcp, ssh)
+}
+
+/// The login this machine guesses for a host when `--user` is not given.
+///
+/// The local username is the best available guess and is often right, but it is
+/// still a guess — which is why the host script prints `whoami`, and why a
+/// mismatch is reported rather than silently written over.
+pub fn default_user() -> String {
+    let var = if cfg!(windows) { "USERNAME" } else { "USER" };
+    std::env::var(var).unwrap_or_else(|_| "administrator".to_owned())
+}
+
+/// Read the `User` a config block declares for `host`, if there is a block.
+///
+/// Used to catch the one mismatch that silently breaks everything: a block
+/// written for a guessed username that turned out to be wrong.
+pub fn configured_user(config: &str, host: &str) -> Option<String> {
+    let short = host.split('.').next().unwrap_or(host);
+    let mut in_block = false;
+    for line in config.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Host ") {
+            in_block = rest.split_whitespace().any(|a| a == host || a == short);
+        } else if in_block && let Some(u) = t.strip_prefix("User ") {
+            return Some(u.trim().to_owned());
+        }
+    }
+    None
+}
+
+const HELP: &str = "\
+mdrdp ssh-setup <host> [--user <login>]
+
+Sets up SSH to a Windows host, both ends.
+
+This machine is configured automatically: an ed25519 key (shared across hosts)
+and a ~/.ssh/config entry. The host half cannot be automated -- you cannot SSH
+in to set up SSH -- so the matching PowerShell script is copied to the
+clipboard for you to paste into a PowerShell window over RDP or at the console.
+
+Re-run it afterwards: it verifies the result and, if SSH still is not working,
+names which failure it is rather than leaving you to guess.
+
+  --user <login>   the Windows login to connect as (default: this machine's)
+  --print          print the host script instead of copying it, and change
+                   nothing else (the script is the same for every host)
+  -h, --help       this text
+";
+
+/// `mdrdp ssh-setup <host>` — the whole flow, idempotent and re-runnable.
+///
+/// Returns 0 when SSH is working and 1 when it is not yet, so a script can gate
+/// on it. Deliberately does the client half *before* diagnosing: on the very
+/// first run there is nothing to diagnose until a key and a config block exist.
+pub fn run(args: &[String]) -> i32 {
+    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{HELP}");
+        return if args.is_empty() { 2 } else { 0 };
+    }
+    let mut host: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut print_only = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            // For a machine with no clipboard, and for piping the script
+            // somewhere else. Prints and does nothing to the host.
+            "--print" => print_only = true,
+            "--user" => match it.next() {
+                Some(u) => user = Some(u.clone()),
+                None => {
+                    eprintln!("--user needs a login name");
+                    return 2;
+                }
+            },
+            other if other.starts_with('-') => {
+                eprintln!("unknown option: {other}");
+                return 2;
+            }
+            other => host = Some(other.to_owned()),
+        }
+    }
+    // --print needs no host: the script is the same for every one of them, since
+    // all it carries is our public key.
+    let Some(host) = host.or_else(|| print_only.then(String::new)) else {
+        eprintln!("ssh-setup needs a host name");
+        return 2;
+    };
+    let user = user.unwrap_or_else(default_user);
+
+    // 1. This machine. Idempotent: an existing key is reused, never replaced.
+    let pubkey = match ensure_key() {
+        Ok((k, created)) => {
+            if created {
+                println!("Created {}", key_path().unwrap_or_default().display());
+            }
+            k
+        }
+        Err(e) => {
+            eprintln!("could not prepare the SSH key: {e}");
+            return 1;
+        }
+    };
+    // --print stops here: emit the script and touch nothing else. Useful on a
+    // machine with no clipboard, and for inspecting what would be pasted.
+    if print_only {
+        println!("{}", crate::hostscripts::setup_ssh(&pubkey));
+        return 0;
+    }
+
+    // Set when the existing config names a different login than we would have.
+    // Only worth reporting if SSH turns out not to work — see below.
+    let mut mismatch: Option<String> = None;
+    match ensure_config(&host, &user) {
+        Ok(true) => println!("Added a '{host}' block to ~/.ssh/config (User {user})"),
+        Ok(false) => {
+            println!("~/.ssh/config already has a '{host}' block");
+            // A block already exists. If it disagrees about the login, note it —
+            // but hold the note until we know whether SSH works. A block that
+            // authenticates is right by definition, whatever we would have
+            // guessed, and saying otherwise would send the user to edit a
+            // correct line.
+            let existing = config_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default();
+            if let Some(u) = configured_user(&existing, &host)
+                && u != user
+            {
+                mismatch = Some(u);
+            }
+        }
+        Err(e) => {
+            eprintln!("could not update ~/.ssh/config: {e}");
+            return 1;
+        }
+    }
+
+    // 2. Is it already working? Re-runs land here and stop.
+    let d = diagnose(&host);
+    if d.is_working() {
+        println!("\n{}.", d.headline());
+        println!("`mdrdp deploy {host}` can reach it.");
+        return 0;
+    }
+
+    // 3. Not working. Hand over the host half, and say what we saw.
+    let script = crate::hostscripts::setup_ssh(&pubkey);
+    let copied = arboard::Clipboard::new().and_then(|mut c| c.set_text(script.clone()));
+    println!("\nNot working yet: {}.", d.headline());
+    println!("{}\n", d.remedy());
+    if let Some(u) = mismatch {
+        println!(
+            "Note: the config connects as '{u}', not the '{user}' you asked for. \
+             If '{u}' is wrong, edit {}.\n",
+            config_path().unwrap_or_default().display()
+        );
+    }
+    match copied {
+        Ok(()) => println!("The host-side script is on your clipboard. On {host}:"),
+        Err(e) => {
+            eprintln!("(could not reach the clipboard: {e} — the script follows)\n");
+            println!("{script}");
+            println!("On {host}:");
+        }
+    }
+    println!("  1. Open a PowerShell window (over RDP, or at the console).");
+    println!("  2. Paste and run it. It elevates itself — accept the UAC prompt.");
+    println!("  3. Check the 'user:' line it prints matches '{user}'.");
+    println!("  4. Back here, run `mdrdp ssh-setup {host}` again to verify.");
+    1
 }
 
 #[cfg(test)]
@@ -456,6 +635,52 @@ mod tests {
     fn appending_normalises_a_config_with_no_trailing_newline() {
         let out = with_block("Host quench\n    User ano", "Host kiln\n");
         assert!(out.contains("User ano\n\nHost kiln\n"), "{out}");
+    }
+
+    #[test]
+    fn the_configured_user_is_read_from_the_matching_block() {
+        let c = "Host quench\n    User ano\n\nHost kiln kiln.lan.example\n    User marti\n";
+        assert_eq!(configured_user(c, "kiln").as_deref(), Some("marti"));
+        assert_eq!(configured_user(c, "quench").as_deref(), Some("ano"));
+    }
+
+    #[test]
+    fn a_later_blocks_user_is_not_attributed_to_an_earlier_host() {
+        // Reading past the end of a block would report the wrong login and send
+        // the user editing a line that is already correct. quench has no User of
+        // its own here, so the answer is None, not kiln's.
+        let c = "Host quench\n    HostName q\n\nHost kiln\n    User marti\n";
+        assert_eq!(configured_user(c, "quench"), None);
+    }
+
+    #[test]
+    fn an_absent_host_has_no_configured_user() {
+        assert_eq!(
+            configured_user("Host quench\n    User ano\n", "anvil"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_closed_port_is_diagnosed_as_nothing_listening_end_to_end() {
+        // Binding then dropping a listener gives a port that is guaranteed to
+        // refuse — so this exercises the real resolve-and-connect path into
+        // classify, not just the mapping. Without it, the plumbing between
+        // diagnose and classify would be untested.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = l.local_addr().expect("port").port();
+        drop(l);
+        assert_eq!(diagnose_on("127.0.0.1", port), Diagnosis::NothingListening);
+    }
+
+    #[test]
+    fn an_unresolvable_name_is_diagnosed_end_to_end() {
+        // .invalid is reserved by RFC 2606 and can never resolve, so this is a
+        // real DNS failure rather than a mocked one.
+        assert_eq!(
+            diagnose_on("nonexistent.invalid", 22),
+            Diagnosis::NameNotResolved
+        );
     }
 
     #[test]

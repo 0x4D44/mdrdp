@@ -553,6 +553,29 @@ impl LauncherApp {
                 Some(menus::MenuAction::Copy60FpsScript) => {
                     ctx.copy_text(crate::hostscripts::ENABLE_60FPS.to_owned());
                 }
+                Some(menus::MenuAction::CopySshSetupScript) => {
+                    // The launcher knows which host is selected, so it can do the
+                    // client-side half here too — key and ~/.ssh/config entry —
+                    // and leave only the paste for the user. Both steps are
+                    // idempotent, so a repeat click is harmless.
+                    match crate::sshsetup::ensure_key() {
+                        Ok((pubkey, _)) => {
+                            if let Some(i) = self.selected
+                                && let Some(f) = self.favourites.iter().nth(i)
+                            {
+                                let user = f
+                                    .username
+                                    .clone()
+                                    .unwrap_or_else(crate::sshsetup::default_user);
+                                if let Err(e) = crate::sshsetup::ensure_config(&f.host, &user) {
+                                    eprintln!("could not update ~/.ssh/config: {e}");
+                                }
+                            }
+                            ctx.copy_text(crate::hostscripts::setup_ssh(&pubkey));
+                        }
+                        Err(e) => eprintln!("could not prepare the SSH key: {e}"),
+                    }
+                }
                 Some(menus::MenuAction::CloseWindow) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1277,6 +1300,7 @@ mod menus {
         CopyCommandLine,
         CopyAvc444Script,
         Copy60FpsScript,
+        CopySshSetupScript,
         CloseWindow,
     }
 
@@ -1346,6 +1370,7 @@ mod menus {
             let copy_cli = item("Copy command line", MenuAction::CopyCommandLine);
             let copy_avc444 = item("Copy AVC444 enable script", MenuAction::CopyAvc444Script);
             let copy_60fps = item("Copy 60 fps enable script", MenuAction::Copy60FpsScript);
+            let copy_ssh = item("Copy SSH setup script", MenuAction::CopySshSetupScript);
             let _ = connection.append_items(&[
                 &connect,
                 &edit,
@@ -1355,6 +1380,7 @@ mod menus {
                 &copy_cli,
                 &copy_avc444,
                 &copy_60fps,
+                &copy_ssh,
             ]);
             let _ = menu.append(&connection);
 

@@ -255,6 +255,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(mdrdp::deploy::run(&args[1..]));
     }
 
+    // `ssh-setup` claims its positional for the same reasons `deploy` does, and
+    // additionally because it is deploy's prerequisite: a host with no SSH is a
+    // host deploy cannot reach at all.
+    if args.first().is_some_and(|a| a == "ssh-setup") {
+        std::process::exit(mdrdp::sshsetup::run(&args[1..]));
+    }
+
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
             "{}",

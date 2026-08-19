@@ -1131,6 +1131,21 @@ impl SessionApp {
                     eprintln!("could not copy the 60 fps script: {e}");
                 }
             }
+            session_menu::COPY_SSH_SETUP => {
+                // Unlike the other two this script is per-machine: it carries our
+                // public key. Minting the key here is deliberate — the script is
+                // useless without one, and this click is the request for it.
+                match crate::sshsetup::ensure_key() {
+                    Ok((pubkey, _)) => {
+                        let script = crate::hostscripts::setup_ssh(&pubkey);
+                        let copied = arboard::Clipboard::new().and_then(|mut c| c.set_text(script));
+                        if let Err(e) = copied {
+                            eprintln!("could not copy the SSH setup script: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("could not prepare the SSH key: {e}"),
+                }
+            }
             session_menu::FULLSCREEN => self.set_fullscreen_mode(!self.fullscreen),
             session_menu::DISCONNECT => event_loop.exit(),
             _ => {}
@@ -1917,6 +1932,7 @@ mod session_menu {
     pub const DISCONNECT: &str = "session.disconnect";
     pub const COPY_AVC444: &str = "session.copy_avc444_script";
     pub const COPY_60FPS: &str = "session.copy_60fps_script";
+    pub const COPY_SSH_SETUP: &str = "session.copy_ssh_setup_script";
     pub const FULLSCREEN: &str = "view.fullscreen";
     pub const DIAG_CACHE: &str = "diag.cache";
     pub const DIAG_LATENCY: &str = "diag.latency";
@@ -1950,6 +1966,7 @@ mod session_menu {
         let _ = session.append_items(&[
             &MenuItem::with_id(COPY_AVC444, "Copy AVC444 enable script", true, None),
             &MenuItem::with_id(COPY_60FPS, "Copy 60 fps enable script", true, None),
+            &MenuItem::with_id(COPY_SSH_SETUP, "Copy SSH setup script", true, None),
             &PredefinedMenuItem::separator(),
             &MenuItem::with_id(DISCONNECT, "Disconnect", true, None),
         ]);
