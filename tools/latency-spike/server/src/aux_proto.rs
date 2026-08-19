@@ -61,6 +61,49 @@ pub const CLIPBOARD_FORMAT_TEXT_UTF8: u8 = 1;
 /// that whole class by construction rather than documenting it as accepted risk.
 pub const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
 
+/// Host → client audio (HLD tranche 6 §3).
+pub const MSG_AUDIO: u8 = 0x21;
+
+/// Client → host audio control: one byte, 0 = stop capturing, 1 = start.
+///
+/// Audio is **not** server-push-always-on. Without this a client that does not
+/// want audio still pays the bandwidth on a channel the parent HLD says must
+/// never back up video. One byte is not a handshake with states to wedge in.
+pub const MSG_AUDIO_CONTROL: u8 = 0x22;
+
+/// The only audio format this build speaks: interleaved 16-bit LE PCM.
+///
+/// A tag rather than padding, declared now so a later codec is purely additive
+/// rather than a wire break.
+pub const AUDIO_FORMAT_PCM16: u8 = 0;
+
+/// `u32` rate + `u8` channels + `u8` format + `u64` capture position.
+pub const AUDIO_HEADER_BYTES: usize = 14;
+
+/// The largest audio payload this channel will carry, in bytes.
+///
+/// **Session-safety, not tuning** — the same class as [`MAX_CLIPBOARD_BYTES`],
+/// and enforced on both send and receive because a peer may ignore it.
+///
+/// Without a ceiling here the client's reassembler permits `DEFAULT_MAX_PAYLOAD`
+/// (64 MiB). One oversize frame would decode to a 128 MiB `Vec<f32>` and then be
+/// pushed into the playback ring one sample at a time **while holding the lock
+/// the cpal realtime callback needs** — a guaranteed device xrun and a
+/// multi-second stall, from a single bad length field.
+///
+/// 16 KiB is ~85 ms at 48 kHz stereo, comfortably above the 10 ms frame this
+/// tranche sends and far below anything that could stall the device.
+pub const MAX_AUDIO_BYTES: usize = 16 * 1024;
+
+/// Sample rates we will accept from a peer.
+///
+/// Unvalidated, `sample_rate` feeds the resampler directly: a rate of 1 with a
+/// 480-frame payload asks for `480 * 48000 / 1` output frames and allocates
+/// ~184 MB from a four-byte header field.
+pub const MIN_SAMPLE_RATE: u32 = 8_000;
+/// See [`MIN_SAMPLE_RATE`].
+pub const MAX_SAMPLE_RATE: u32 = 192_000;
+
 /// A decoded auxiliary-channel message.
 ///
 /// `Debug` is **hand-written** for the clipboard variant: deriving it would put
@@ -75,6 +118,56 @@ pub enum AuxMessage {
     /// Windows end converts to and from CRLF at exactly one place, because a
     /// round trip that is not byte-identical ping-pongs forever at poll cadence.
     ClipboardText(String),
+    /// One block of interleaved PCM from the host.
+    Audio(AudioFrame),
+    /// The client asking the host to start or stop capturing.
+    AudioControl { enable: bool },
+}
+
+/// One block of interleaved 16-bit PCM, with the timing reference that makes it
+/// interpretable.
+///
+/// `Debug` is **hand-written**, like every other payload-carrying type on this
+/// path. Session audio is user content — a voice call is as sensitive as a
+/// clipboard — and the repo rule is that session contents are never logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AudioFrame {
+    pub sample_rate: u32,
+    pub channels: u8,
+    /// The host's capture sample position of this frame's first sample.
+    ///
+    /// **This is the field that makes the stream interpretable, and revision 1
+    /// of the HLD did not have it.** It advances across silence the host elided,
+    /// so the client can tell "the desktop was quiet" from "frames were dropped"
+    /// from "the host's clock is running fast" — three causes that otherwise
+    /// present identically as a change in ring depth, which is exactly what both
+    /// correction mechanisms key off. Drift becomes a measurable slope rather
+    /// than an inference.
+    pub capture_pos: u64,
+    /// Interleaved 16-bit LE samples, still as bytes.
+    ///
+    /// Kept as bytes rather than `Vec<i16>` so the client hands them straight to
+    /// the already-tested `pcm16_le_to_f32` without an intermediate conversion.
+    pub pcm: Vec<u8>,
+}
+
+impl AudioFrame {
+    /// Bytes per whole frame of audio (one sample for each channel).
+    fn frame_stride(channels: u8) -> usize {
+        channels as usize * 2
+    }
+}
+
+impl std::fmt::Debug for AudioFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Shape and timing only. Never the samples.
+        f.debug_struct("AudioFrame")
+            .field("sample_rate", &self.sample_rate)
+            .field("channels", &self.channels)
+            .field("capture_pos", &self.capture_pos)
+            .field("pcm_bytes", &self.pcm.len())
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for AuxMessage {
@@ -86,6 +179,13 @@ impl std::fmt::Debug for AuxMessage {
             AuxMessage::ClipboardText(text) => f
                 .debug_struct("ClipboardText")
                 .field("bytes", &text.len())
+                .finish(),
+            // Delegates to AudioFrame's own hand-written Debug, which prints
+            // shape and never samples.
+            AuxMessage::Audio(frame) => f.debug_tuple("Audio").field(frame).finish(),
+            AuxMessage::AudioControl { enable } => f
+                .debug_struct("AudioControl")
+                .field("enable", enable)
                 .finish(),
         }
     }
@@ -106,6 +206,26 @@ pub enum AuxProtoError {
     /// Larger than [`MAX_CLIPBOARD_BYTES`]. Refused, never truncated: silently
     /// pasting half a document is a data-integrity bug.
     TooLarge { bytes: usize, limit: usize },
+    /// An audio payload too short to hold its own header.
+    AudioShortHeader { bytes: usize },
+    /// Larger than [`MAX_AUDIO_BYTES`].
+    AudioTooLarge { bytes: usize, limit: usize },
+    /// A sample rate outside [`MIN_SAMPLE_RATE`]..=[`MAX_SAMPLE_RATE`].
+    AudioBadRate(u32),
+    /// A channel count this build does not carry. Only mono and stereo.
+    AudioBadChannels(u8),
+    /// An audio format tag this build does not speak.
+    AudioBadFormat(u8),
+    /// A PCM length that is not a whole number of interleaved frames.
+    ///
+    /// Refused rather than trimmed. The playback ring is a flat buffer of
+    /// samples with no frame alignment of its own, so a single odd-length frame
+    /// flips its parity and swaps left and right **for the rest of the
+    /// session** — silently, with no counter and nothing in the audio that looks
+    /// wrong enough to investigate.
+    AudioMisaligned { bytes: usize, channels: u8 },
+    /// An audio-control payload that was not exactly one byte.
+    AudioControlMalformed { bytes: usize },
 }
 
 impl std::fmt::Display for AuxProtoError {
@@ -118,6 +238,28 @@ impl std::fmt::Display for AuxProtoError {
                 f,
                 "clipboard payload is {bytes} bytes, over the {limit}-byte share limit"
             ),
+            AuxProtoError::AudioShortHeader { bytes } => {
+                write!(
+                    f,
+                    "audio payload is {bytes} bytes, too short for its header"
+                )
+            }
+            AuxProtoError::AudioTooLarge { bytes, limit } => write!(
+                f,
+                "audio payload is {bytes} bytes, over the {limit}-byte frame limit"
+            ),
+            AuxProtoError::AudioBadRate(rate) => write!(f, "audio sample rate {rate} out of range"),
+            AuxProtoError::AudioBadChannels(ch) => {
+                write!(f, "audio channel count {ch} unsupported")
+            }
+            AuxProtoError::AudioBadFormat(id) => write!(f, "unknown audio format {id}"),
+            AuxProtoError::AudioMisaligned { bytes, channels } => write!(
+                f,
+                "audio payload of {bytes} bytes is not a whole number of {channels}-channel frames"
+            ),
+            AuxProtoError::AudioControlMalformed { bytes } => {
+                write!(f, "audio control payload is {bytes} bytes, expected 1")
+            }
         }
     }
 }
@@ -158,6 +300,91 @@ pub fn decode_clipboard(payload: &[u8]) -> Result<AuxMessage, AuxProtoError> {
     }
     let text = std::str::from_utf8(body).map_err(|_| AuxProtoError::NotUtf8)?;
     Ok(AuxMessage::ClipboardText(text.to_owned()))
+}
+
+/// Encode one audio frame onto the wire, refusing anything malformed here rather
+/// than letting the peer's reassembler meet it.
+pub fn encode_audio(frame: &AudioFrame, out: &mut Vec<u8>) -> Result<(), AuxProtoError> {
+    validate_audio_shape(frame.sample_rate, frame.channels, frame.pcm.len())?;
+    let mut payload = Vec::with_capacity(AUDIO_HEADER_BYTES + frame.pcm.len());
+    payload.extend_from_slice(&frame.sample_rate.to_le_bytes());
+    payload.push(frame.channels);
+    payload.push(AUDIO_FORMAT_PCM16);
+    payload.extend_from_slice(&frame.capture_pos.to_le_bytes());
+    payload.extend_from_slice(&frame.pcm);
+    framing::encode(MSG_AUDIO, &payload, out);
+    Ok(())
+}
+
+/// Decode one audio payload (type byte already consumed by the framing layer).
+///
+/// **Every header field is validated before anything is materialised.** An
+/// unvalidated header is not a self-describing format, it is an instruction to
+/// allocate whatever a peer says.
+pub fn decode_audio(payload: &[u8]) -> Result<AuxMessage, AuxProtoError> {
+    if payload.len() < AUDIO_HEADER_BYTES {
+        return Err(AuxProtoError::AudioShortHeader {
+            bytes: payload.len(),
+        });
+    }
+    let (header, pcm) = payload.split_at(AUDIO_HEADER_BYTES);
+    let sample_rate = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let channels = header[4];
+    let format = header[5];
+    let capture_pos = u64::from_le_bytes([
+        header[6], header[7], header[8], header[9], header[10], header[11], header[12], header[13],
+    ]);
+    if format != AUDIO_FORMAT_PCM16 {
+        return Err(AuxProtoError::AudioBadFormat(format));
+    }
+    validate_audio_shape(sample_rate, channels, pcm.len())?;
+    Ok(AuxMessage::Audio(AudioFrame {
+        sample_rate,
+        channels,
+        capture_pos,
+        pcm: pcm.to_vec(),
+    }))
+}
+
+/// The shape rules both directions enforce, in one place so send and receive
+/// cannot drift apart.
+fn validate_audio_shape(
+    sample_rate: u32,
+    channels: u8,
+    pcm_bytes: usize,
+) -> Result<(), AuxProtoError> {
+    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
+        return Err(AuxProtoError::AudioBadRate(sample_rate));
+    }
+    if channels != 1 && channels != 2 {
+        return Err(AuxProtoError::AudioBadChannels(channels));
+    }
+    if pcm_bytes > MAX_AUDIO_BYTES {
+        return Err(AuxProtoError::AudioTooLarge {
+            bytes: pcm_bytes,
+            limit: MAX_AUDIO_BYTES,
+        });
+    }
+    if !pcm_bytes.is_multiple_of(AudioFrame::frame_stride(channels)) {
+        return Err(AuxProtoError::AudioMisaligned {
+            bytes: pcm_bytes,
+            channels,
+        });
+    }
+    Ok(())
+}
+
+/// Encode the client's start/stop request.
+pub fn encode_audio_control(enable: bool, out: &mut Vec<u8>) {
+    framing::encode(MSG_AUDIO_CONTROL, &[u8::from(enable)], out);
+}
+
+/// Decode the client's start/stop request.
+pub fn decode_audio_control(payload: &[u8]) -> Result<AuxMessage, AuxProtoError> {
+    match payload {
+        [byte] => Ok(AuxMessage::AudioControl { enable: *byte != 0 }),
+        other => Err(AuxProtoError::AudioControlMalformed { bytes: other.len() }),
+    }
 }
 
 /// Normalise line endings for the wire: CRLF and lone CR both become LF.
@@ -364,6 +591,254 @@ mod tests {
         assert!(
             !rendered.contains('x'),
             "no payload bytes in an error: {rendered}"
+        );
+    }
+
+    // -- audio (tranche 6) ------------------------------------------------------
+
+    /// A frame with a distinguishable pattern, so a test can tell a correct
+    /// round trip from a plausible-looking one.
+    fn stereo_frame(frames: usize) -> AudioFrame {
+        let mut pcm = Vec::with_capacity(frames * 4);
+        for i in 0..frames {
+            // Left and right deliberately DIFFER, and both vary with i. A fixture
+            // whose fields all hold the same value cannot tell a channel swap
+            // from a correct decode, nor a reversed buffer from an intact one.
+            let left = (i as i16).wrapping_mul(3);
+            let right = (i as i16).wrapping_mul(3).wrapping_add(1);
+            pcm.extend_from_slice(&left.to_le_bytes());
+            pcm.extend_from_slice(&right.to_le_bytes());
+        }
+        AudioFrame {
+            sample_rate: 48_000,
+            channels: 2,
+            capture_pos: 123_456,
+            pcm,
+        }
+    }
+
+    #[test]
+    fn an_audio_frame_round_trips_byte_for_byte() {
+        let frame = stereo_frame(64);
+        let mut wire = Vec::new();
+        encode_audio(&frame, &mut wire).expect("a well-formed frame encodes");
+
+        // Skip the framing header the encoder added.
+        let payload = &wire[framing::HEADER_LEN..];
+        let decoded = decode_audio(payload).expect("what we encoded must decode");
+        match decoded {
+            AuxMessage::Audio(got) => {
+                assert_eq!(got.sample_rate, 48_000);
+                assert_eq!(got.channels, 2);
+                assert_eq!(
+                    got.capture_pos, 123_456,
+                    "the timing reference must survive"
+                );
+                assert_eq!(got.pcm, frame.pcm, "samples must be byte-identical");
+            }
+            other => panic!("expected audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_position_survives_a_value_that_needs_all_eight_bytes() {
+        // At 48 kHz a u32 position wraps after ~25 hours. This product is meant
+        // to run all day, so the field is u64 and the test uses a value that
+        // would be truncated by anything narrower.
+        let mut frame = stereo_frame(4);
+        frame.capture_pos = 0x0123_4567_89AB_CDEF;
+        let mut wire = Vec::new();
+        encode_audio(&frame, &mut wire).unwrap();
+        let decoded = decode_audio(&wire[framing::HEADER_LEN..]).unwrap();
+        match decoded {
+            AuxMessage::Audio(got) => assert_eq!(got.capture_pos, 0x0123_4567_89AB_CDEF),
+            other => panic!("expected audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversize_frame_is_refused_by_the_sender() {
+        let frame = AudioFrame {
+            sample_rate: 48_000,
+            channels: 2,
+            capture_pos: 0,
+            pcm: vec![0u8; MAX_AUDIO_BYTES + 4],
+        };
+        let mut wire = Vec::new();
+        assert_eq!(
+            encode_audio(&frame, &mut wire),
+            Err(AuxProtoError::AudioTooLarge {
+                bytes: MAX_AUDIO_BYTES + 4,
+                limit: MAX_AUDIO_BYTES,
+            })
+        );
+        assert!(wire.is_empty(), "nothing may reach the wire");
+    }
+
+    #[test]
+    fn an_oversize_frame_is_refused_by_the_receiver_too() {
+        // The send-side check is not enough: a peer may ignore the ceiling, and
+        // the receiver is where an oversize payload does its damage.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&48_000u32.to_le_bytes());
+        payload.push(2);
+        payload.push(AUDIO_FORMAT_PCM16);
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&vec![0u8; MAX_AUDIO_BYTES + 4]);
+        assert_eq!(
+            decode_audio(&payload),
+            Err(AuxProtoError::AudioTooLarge {
+                bytes: MAX_AUDIO_BYTES + 4,
+                limit: MAX_AUDIO_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn a_misaligned_payload_is_refused_rather_than_trimmed() {
+        // One odd-length frame flips the playback ring's parity and swaps L/R
+        // for the rest of the session. Trimming would hide it; refusing counts it.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&48_000u32.to_le_bytes());
+        payload.push(2);
+        payload.push(AUDIO_FORMAT_PCM16);
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&[1, 2, 3, 4, 5, 6]); // 6 bytes = 1.5 stereo frames
+        assert_eq!(
+            decode_audio(&payload),
+            Err(AuxProtoError::AudioMisaligned {
+                bytes: 6,
+                channels: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn an_absurd_sample_rate_is_refused_before_anything_is_allocated() {
+        // rate=1 with a 480-frame payload would ask the resampler for
+        // 480 * 48000 / 1 output frames: ~184 MB from a four-byte field.
+        for bad in [0u32, 1, 7_999, 192_001, u32::MAX] {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&bad.to_le_bytes());
+            payload.push(2);
+            payload.push(AUDIO_FORMAT_PCM16);
+            payload.extend_from_slice(&0u64.to_le_bytes());
+            payload.extend_from_slice(&[0, 0, 0, 0]);
+            assert_eq!(
+                decode_audio(&payload),
+                Err(AuxProtoError::AudioBadRate(bad)),
+                "rate {bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsupported_channel_count_is_refused() {
+        // channels=0 would divide by zero computing the stride; the catch-all in
+        // the client's channel remapper would otherwise push garbage interleaving.
+        for bad in [0u8, 3, 6, 255] {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&48_000u32.to_le_bytes());
+            payload.push(bad);
+            payload.push(AUDIO_FORMAT_PCM16);
+            payload.extend_from_slice(&0u64.to_le_bytes());
+            payload.extend_from_slice(&[0, 0, 0, 0]);
+            assert_eq!(
+                decode_audio(&payload),
+                Err(AuxProtoError::AudioBadChannels(bad)),
+                "channel count {bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_format_tag_is_refused_and_not_treated_as_pcm() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&48_000u32.to_le_bytes());
+        payload.push(2);
+        payload.push(9); // a codec this build does not speak
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            decode_audio(&payload),
+            Err(AuxProtoError::AudioBadFormat(9))
+        );
+    }
+
+    #[test]
+    fn a_payload_too_short_for_its_header_is_refused_without_indexing_past_it() {
+        // The obvious hostile input. Anything that reads the header before
+        // checking the length panics here instead of erroring.
+        for len in 0..AUDIO_HEADER_BYTES {
+            let payload = vec![0u8; len];
+            assert_eq!(
+                decode_audio(&payload),
+                Err(AuxProtoError::AudioShortHeader { bytes: len }),
+                "a {len}-byte payload must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_control_round_trips_both_ways() {
+        for enable in [true, false] {
+            let mut wire = Vec::new();
+            encode_audio_control(enable, &mut wire);
+            let decoded = decode_audio_control(&wire[framing::HEADER_LEN..]).unwrap();
+            assert_eq!(decoded, AuxMessage::AudioControl { enable });
+        }
+    }
+
+    #[test]
+    fn a_malformed_audio_control_payload_is_refused() {
+        assert_eq!(
+            decode_audio_control(&[]),
+            Err(AuxProtoError::AudioControlMalformed { bytes: 0 })
+        );
+        assert_eq!(
+            decode_audio_control(&[1, 2]),
+            Err(AuxProtoError::AudioControlMalformed { bytes: 2 })
+        );
+    }
+
+    #[test]
+    fn audio_kinds_stay_disjoint_from_every_other_user_of_this_wire() {
+        // input_proto's record kinds are 1..=7 and a stray byte there is a valid
+        // MouseMove, so a cross-wired byte must be obviously invalid instead.
+        let aux = [MSG_CLIPBOARD, MSG_AUDIO, MSG_AUDIO_CONTROL];
+        for kind in aux {
+            assert!(
+                kind >= 0x20,
+                "0x{kind:02x} collides with input record kinds"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for kind in aux {
+            assert!(seen.insert(kind), "0x{kind:02x} is used twice");
+        }
+    }
+
+    #[test]
+    fn debug_on_an_audio_frame_reports_shape_but_never_samples() {
+        // Session audio is user content. A voice call is as sensitive as a
+        // clipboard, and this path writes to a log file on the host.
+        let mut frame = stereo_frame(3);
+        // A byte pattern that would be unmistakable if it leaked.
+        frame.pcm = vec![0xAB, 0xCD, 0xAB, 0xCD];
+        let rendered = format!("{frame:?}");
+        assert!(
+            !rendered.contains("171") && !rendered.contains("205") && !rendered.contains("ab"),
+            "sample bytes must never render: {rendered}"
+        );
+        assert!(
+            rendered.contains('4'),
+            "the length should still show: {rendered}"
+        );
+        // And through the enum, which is what a debug!(?msg) would actually print.
+        let wrapped = format!("{:?}", AuxMessage::Audio(frame));
+        assert!(
+            !wrapped.contains("171") && !wrapped.contains("205"),
+            "sample bytes must not leak through AuxMessage either: {wrapped}"
         );
     }
 }

@@ -260,7 +260,11 @@ pub fn pump_reader(
                     stats.decoded += 1;
                     match aux_proto::decode_clipboard(&message.payload) {
                         Ok(AuxMessage::ClipboardText(text)) => on_text(&text),
-                        Err(_) => stats.malformed += 1,
+                        // `decode_clipboard` yields only ClipboardText. Any other
+                        // variant reaching here would mean this dispatch was wired
+                        // to the wrong decoder, which is a defect worth counting
+                        // rather than a case worth silently ignoring.
+                        Ok(_) | Err(_) => stats.malformed += 1,
                     }
                 }
                 // Framing is structural: a bad length means the stream is no

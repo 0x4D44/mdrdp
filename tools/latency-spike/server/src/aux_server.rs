@@ -406,7 +406,10 @@ mod tests {
             if let Ok(Some(message)) = reassembler.next_message() {
                 assert_eq!(message.msg_type, aux_proto::MSG_CLIPBOARD);
                 let aux_proto::AuxMessage::ClipboardText(text) =
-                    aux_proto::decode_clipboard(&message.payload).expect("well formed");
+                    aux_proto::decode_clipboard(&message.payload).expect("well formed")
+                else {
+                    panic!("the clipboard decoder yielded a non-clipboard message");
+                };
                 return text;
             }
             let n = client.read(&mut buf).expect("the host should send");
