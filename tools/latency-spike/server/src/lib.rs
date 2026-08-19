@@ -13,6 +13,7 @@
 //! gets only the portable half (HLD tranche 3 §3).
 
 pub mod annexb;
+pub mod aux_proto;
 pub mod cli;
 pub mod colorspace;
 pub mod control;
