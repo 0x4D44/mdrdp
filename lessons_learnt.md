@@ -44,6 +44,18 @@ Indented lines below the first are detail: kept for lookup, never injected.
   — which rebuilds the display and drops every session on the host for no reason. The real clue sits
   under `input-desktop`, two rungs BELOW the symptom. MDR-BUG-FLUX-00017.
 
+- Never hold a lock across an OS clipboard call — a stuck write freezes the other direction too (`clipboard::apply_remote`).
+  `EmptyClipboard` SENDS `WM_DESTROYCLIPBOARD` to a hung previous owner, so a write can block for
+  arbitrarily long. If the reader holds the shared clipboard handle *or* the bridge mutex while it
+  does, the 250 ms poll stalls behind it and a one-direction wedge becomes both. Give each thread its
+  own clipboard handle (the OS then serialises with bounded-retry `OpenClipboard`, which fails fast),
+  and take the bridge lock only to DECIDE, never across the write.
+
+- Record clipboard content as applied only AFTER the write succeeds, never when deciding (`Bridge::on_remote_text`).
+  Recording at the decision means that while a write is stuck the bridge believes the clipboard holds
+  the new text while it still holds the old — so the poll reads the OLD content, calls it a change,
+  and sends it back as though the user had copied it, clobbering what they actually copied.
+
 - `check-windows.sh` checked mdrdp only, so rhydra's whole `host` half went untype-checked (`scripts/check-windows.sh`).
   mdrdp takes rhydra with `default-features = false`, so a `cargo check` from the repo root never
   compiles `tools/latency-spike/server/src/win/**` — DXGI duplication, the MF encoder, the SendInput
