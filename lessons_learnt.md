@@ -6,6 +6,15 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A metric must encode the failure, not the change: B-spike count ROSE after fixing the blue flash; blue-flip count hit 0 (`avcreplay`).
+  Naive "pixel moved for one frame" counts the fix's deliberate flat-average softening alongside
+  the overshoot it removed (2,271 -> 3,603 while the defect went to zero). The decisive metric was
+  hue inversion — blue-dominant for one frame on yellow-dominant content — which no correct
+  rendering of the block's real colours can produce (MDR-BUG-FLUX-00010).
+- Preserved chroma goes STALE when content changes under LC=1; paint flat avg until catch-up or reconstruction overshoots (`avc444::chroma_stale`).
+  The FLUX-00007 preserve fix made gap frames worse: `4*new_avg - 3*stale` pushed U past any real
+  hue (blue flash on yellow, wrong-colour window restores, up to ~1.4 s). Average-delta detects the
+  change: re-encode noise <= 6, genuine change >= 41 (32 temper payloads) — threshold 10, no tuning.
 - Windows AVC444 alternates LC=1/LC=2; a luma pass must PRESERVE delivered odd chroma or colours pump (`avc444::apply_luma`).
   FreeRDP replicates the luma frame's averaged chroma into all four 2x2 positions on every luma
   pass, wiping the aux samples — on dithered content that flips 33k/48k probe pixels by up to 98
