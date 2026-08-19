@@ -20,6 +20,13 @@ Indented lines below the first are detail: kept for lookup, never injected.
   hosts is therefore not coverage of that class at all — MDR-BUG-FLUX-00008 was invisible to every
   test we could have written here while a real laptop sat black. MDR-BUG-FLUX-00015.
 
+- A disconnected Windows session enumerates NO displays, so rhydra's agent reports a healthy IDD device as gone (`agent` device rung).
+  `query session` is the check: if the console is a different session id from the one the agent runs
+  in, `EnumDisplayDevices` returns nothing and the ladder says `device FAIL` with the driver present
+  and OK in Device Manager. The remedy is `tscon` (the rig's `mdrdp-tocon` task), NOT `cycle-device`
+  — which rebuilds the display and drops every session on the host for no reason. The real clue sits
+  under `input-desktop`, two rungs BELOW the symptom. MDR-BUG-FLUX-00017.
+
 - A condvar wake-up test passes with the notify deleted unless it asserts elapsed time (`native::auxchan::Slot`).
   A taker parked on `wait_timeout` reaches the right answer anyway when the timeout fires — so
   "assert it eventually returns Closed" is green whether or not `close()` ever notified. The only
