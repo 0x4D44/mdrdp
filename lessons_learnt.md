@@ -44,6 +44,14 @@ Indented lines below the first are detail: kept for lookup, never injected.
   — which rebuilds the display and drops every session on the host for no reason. The real clue sits
   under `input-desktop`, two rungs BELOW the symptom. MDR-BUG-FLUX-00017.
 
+- A Windows clipboard lock does NOT persist on quench: a 30 s hold ends with 0x8007058A (`tools/clipboard-hold`).
+  Three runs, two implementations (PowerShell P/Invoke, native sleep, native with a message pump) all
+  report `opened=true`, `held_secs=30.00`, `closed=false — thread does not have a clipboard open`,
+  while the process under test writes happily throughout. Something on that host breaks the lock, so
+  a test that needs `OpenClipboard` to be refused CANNOT be staged there. Make any clipboard-holder
+  report its own `CloseClipboard` result: one that only prints "held for 30s" hides the fact that it
+  held nothing, and the run reads as a pass.
+
 - Never hold a lock across an OS clipboard call — a stuck write freezes the other direction too (`clipboard::apply_remote`).
   `EmptyClipboard` SENDS `WM_DESTROYCLIPBOARD` to a hung previous owner, so a write can block for
   arbitrarily long. If the reader holds the shared clipboard handle *or* the bridge mutex while it
