@@ -73,6 +73,21 @@ pub fn idd_display_origin() -> Option<(i32, i32)> {
 /// `None` means the table could not be read: that is ignorance, and the rung
 /// reports it as `Unknown` rather than inventing a fault.
 fn video_port_listening() -> Option<bool> {
+    tcp_video_port_states().map(|(listening, _)| listening)
+}
+
+/// Whether a viewer holds the capture server's single slot.
+///
+/// The same table read as the LISTEN check, so it costs nothing extra and — like
+/// that check — never touches the server. An ESTABLISHED connection to the video
+/// port is a viewer by construction: the port carries nothing else.
+fn video_port_has_viewer() -> Option<bool> {
+    tcp_video_port_states().map(|(_, established)| established)
+}
+
+/// One read of the OS's TCP table: is anything LISTENING on the video port, and
+/// is anything CONNECTED to it?
+fn tcp_video_port_states() -> Option<(bool, bool)> {
     use windows::Win32::NetworkManagement::IpHelper::{GetTcpTable2, MIB_TCPTABLE2};
 
     // Ask for the size first; the table is a variable-length trailing array, so
@@ -106,13 +121,18 @@ fn video_port_listening() -> Option<bool> {
     // that many rows.
     let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) };
 
-    // The port is big-endian in the table; the state constant for LISTEN is 2.
+    // The port is big-endian in the table; LISTEN is 2 and ESTABLISHED is 5.
     const MIB_TCP_STATE_LISTEN: u32 = 2;
+    const MIB_TCP_STATE_ESTAB: u32 = 5;
     let wanted = u32::from(crate::cli::DEFAULT_VIDEO_PORT.to_be());
-    Some(
-        rows.iter()
-            .any(|row| row.dwState == MIB_TCP_STATE_LISTEN && row.dwLocalPort == wanted),
-    )
+    let mine = rows.iter().filter(|row| row.dwLocalPort == wanted);
+    let mut listening = false;
+    let mut established = false;
+    for row in mine {
+        listening |= row.dwState == MIB_TCP_STATE_LISTEN;
+        established |= row.dwState == MIB_TCP_STATE_ESTAB;
+    }
+    Some((listening, established))
 }
 
 /// Whether the desktop that would receive injected input is the one this stack
@@ -409,6 +429,10 @@ impl AgentOps for WinOps {
 
     fn input_desktop(&mut self) -> InputDesktopObservation {
         observe_input_desktop()
+    }
+
+    fn viewer_connected(&mut self) -> Option<bool> {
+        video_port_has_viewer()
     }
 
     fn kill_all(&mut self) {

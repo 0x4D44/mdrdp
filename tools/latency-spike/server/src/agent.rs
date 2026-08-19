@@ -118,6 +118,12 @@ pub trait AgentOps {
     fn server_listening(&mut self) -> Option<bool>;
     /// Whether injected input can currently land on the desktop.
     fn input_desktop(&mut self) -> InputDesktopObservation;
+    /// Whether a viewer currently holds the capture server's single slot.
+    ///
+    /// `None` when it could not be determined. Read from the OS's connection
+    /// table alongside the LISTEN check — the same read, no extra cost, and no
+    /// contact with the server.
+    fn viewer_connected(&mut self) -> Option<bool>;
 }
 
 /// Whether the desktop that would receive injected input is the one the stack is
@@ -307,6 +313,15 @@ pub struct Reconciler {
     /// `Some` while a device cycle is running; bring-up is suppressed until it
     /// finishes so supervision cannot fight the rebuild.
     cycling: Option<Cycling>,
+    /// The driver's presented-frame counter as of the previous tick, for the
+    /// liveness rung. `None` until two readings exist — one sample cannot show
+    /// movement.
+    last_frame_seq: Option<u64>,
+    /// Consecutive ticks `frame_seq` has not moved. Not a fault counter: an idle
+    /// desktop legitimately presents nothing, so this only ever feeds a report.
+    frame_static_ticks: u32,
+    /// Whether a viewer holds the capture server's slot, as of this tick.
+    viewer_connected: Option<bool>,
 }
 
 impl Reconciler {
@@ -327,6 +342,9 @@ impl Reconciler {
             server_listening: None,
             input_desktop: InputDesktopObservation::Unknown("not sampled yet".to_owned()),
             cycling: None,
+            last_frame_seq: None,
+            frame_static_ticks: 0,
+            viewer_connected: None,
         }
     }
 
@@ -478,6 +496,22 @@ impl Reconciler {
         // both are report-only rungs (HLD §6).
         self.server_listening = ops.server_listening();
         self.input_desktop = ops.input_desktop();
+        self.viewer_connected = ops.viewer_connected();
+
+        // Liveness: did the driver's presented-frame counter move? Two readings
+        // are the minimum that can show movement, so the first tick after a
+        // (re)build establishes a baseline and claims nothing.
+        if let PoolObservation::Present { frame_seq, .. } = self.pool {
+            match self.last_frame_seq {
+                Some(previous) if frame_seq > previous => self.frame_static_ticks = 0,
+                Some(_) => self.frame_static_ticks = self.frame_static_ticks.saturating_add(1),
+                None => self.frame_static_ticks = 0,
+            }
+            self.last_frame_seq = Some(frame_seq);
+        } else {
+            self.last_frame_seq = None;
+            self.frame_static_ticks = 0;
+        }
     }
 
     /// What, if anything, this tick's pool reading calls for — before debouncing.
@@ -565,6 +599,50 @@ impl Reconciler {
         }
     }
 
+    /// The `liveness` rung: are pixels actually being presented?
+    ///
+    /// **Never `Fail`.** A static counter on an idle desktop is not a fault — it
+    /// is an idle desktop, and calling that broken would be the confident wrong
+    /// story this ladder exists to avoid. It reports movement when there is
+    /// movement and says "nothing is drawing" when there is not, leaving the
+    /// diagnosis to whichever rung below it is actually red.
+    fn liveness_rung(&self) -> RungReport {
+        let (state, detail) = match (&self.pool, self.last_frame_seq) {
+            (PoolObservation::Present { .. }, None) => (
+                RungState::Untested,
+                Some("no baseline yet — one sample cannot show movement".to_owned()),
+            ),
+            (PoolObservation::Present { frame_seq, .. }, Some(_)) => {
+                if self.frame_static_ticks == 0 {
+                    (
+                        RungState::Ok,
+                        Some(format!(
+                            "frames are being presented (frame_seq {frame_seq})"
+                        )),
+                    )
+                } else {
+                    (
+                        RungState::Untested,
+                        Some(format!(
+                            "frame_seq has been {frame_seq} for {}s — nothing is drawing, which \
+                             is normal on an idle desktop",
+                            self.frame_static_ticks * TICK_SECS
+                        )),
+                    )
+                }
+            }
+            _ => (
+                RungState::Untested,
+                Some("no pool to measure — see the pool rung".to_owned()),
+            ),
+        };
+        RungReport {
+            rung: Rung::Liveness,
+            state,
+            detail,
+        }
+    }
+
     /// The ladder as this reconciler can currently answer it (HLD tranche 4 §6).
     ///
     /// Rungs whose samplers have not landed yet report [`RungState::Unknown`]
@@ -578,11 +656,6 @@ impl Reconciler {
             } else {
                 RungState::Fail
             }
-        };
-        let unimplemented = |rung| RungReport {
-            rung,
-            state: RungState::Unknown,
-            detail: Some("not sampled by this build".to_owned()),
         };
         vec![
             RungReport {
@@ -606,7 +679,7 @@ impl Reconciler {
             },
             self.server_rung(),
             self.input_desktop_rung(),
-            unimplemented(Rung::Liveness),
+            self.liveness_rung(),
         ]
     }
 
@@ -681,7 +754,7 @@ impl Reconciler {
             stuck: crate::control::stuck_from_rungs(&rungs),
             rungs,
             pool: self.pool_report(),
-            viewer_connected: None,
+            viewer_connected: self.viewer_connected,
             cycling: self.is_cycling(),
         }
     }
@@ -718,6 +791,7 @@ mod tests {
         /// healthy answer"; `Some(None)` means the OS could not be asked.
         listening: Option<Option<bool>>,
         input_desktop: Option<InputDesktopObservation>,
+        viewer: Option<Option<bool>>,
     }
 
     impl AgentOps for FakeOps {
@@ -800,6 +874,9 @@ mod tests {
         }
         fn server_listening(&mut self) -> Option<bool> {
             self.listening.unwrap_or(Some(self.server_running))
+        }
+        fn viewer_connected(&mut self) -> Option<bool> {
+            self.viewer.unwrap_or(Some(false))
         }
         fn input_desktop(&mut self) -> InputDesktopObservation {
             self.input_desktop
@@ -1066,6 +1143,70 @@ mod tests {
             !rec.is_cycling(),
             "a repeated request restarted the clock and extended the teardown"
         );
+    }
+
+    #[test]
+    fn liveness_reads_ok_while_the_frame_counter_moves() {
+        // The MOVING direction only — an always-Ok implementation satisfies this
+        // test, and that is fine because the "only" half is its sibling's job
+        // (`a_static_frame_counter_is_untested_never_a_failure`). Naming it
+        // "only while" would have been a claim this test does not make; proven
+        // by mutation, which left it green.
+        let (mut rec, mut ops) = settled();
+        let mut seq = 100;
+        for _ in 0..3 {
+            seq += 5;
+            ops.pool = Some(PoolObservation::Present {
+                generation: 1,
+                frame_seq: seq,
+            });
+            rec.tick(&mut ops);
+        }
+        assert_eq!(rung_state(&rec, Rung::Liveness), RungState::Ok);
+    }
+
+    #[test]
+    fn a_static_frame_counter_is_untested_never_a_failure() {
+        // An idle desktop presents nothing. Calling that broken would be the
+        // confident wrong story this whole ladder exists to avoid — and it is
+        // exactly what a naive "no frames = wedged" check would say.
+        let (mut rec, mut ops) = settled();
+        ops.pool = Some(PoolObservation::Present {
+            generation: 1,
+            frame_seq: 100,
+        });
+        for _ in 0..5 {
+            rec.tick(&mut ops);
+        }
+        assert_eq!(
+            rung_state(&rec, Rung::Liveness),
+            RungState::Untested,
+            "a static counter must never read as Fail"
+        );
+        let status = rec.status(1);
+        assert_eq!(status.stuck, None, "and it must not gate the connect");
+    }
+
+    #[test]
+    fn liveness_claims_nothing_from_a_single_sample() {
+        // Movement needs two readings. A fresh reconciler that reported Ok from
+        // one sample would be asserting something it cannot know.
+        let (mut rec, mut ops) = settled();
+        rec.last_frame_seq = None;
+        ops.pool = Some(PoolObservation::Present {
+            generation: 2,
+            frame_seq: 7,
+        });
+        // The tick that establishes the baseline must not claim movement.
+        rec.last_frame_seq = None;
+        rec.frame_static_ticks = 0;
+        let baseline = rec.liveness_rung();
+        assert_eq!(baseline.state, RungState::Untested);
+        assert!(baseline
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("baseline"));
     }
 
     #[test]
