@@ -54,7 +54,15 @@
 //! `a\nb` and a Windows box holding `a\r\nb` hold the same clipboard, and any
 //! scheme that hashed the local bytes would call them different forever.
 
+use std::sync::Mutex;
+
 use crate::aux_proto::{to_wire_newlines, MAX_CLIPBOARD_BYTES};
+
+/// A poisoned bridge is not worth ending a session over: the state it guards is
+/// one string, and the next observation replaces it.
+fn lock(m: &Mutex<Bridge>) -> std::sync::MutexGuard<'_, Bridge> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// One platform's clipboard, reduced to the two operations this bridge needs.
 ///
@@ -263,7 +271,16 @@ impl Bridge {
         if self.last_observed.as_deref() == Some(wire.as_str()) {
             return Incoming::Suppressed;
         }
-        self.last_observed = Some(wire.clone());
+        // **Deciding does not record.** The slot moves only once the clipboard
+        // has actually taken the text, via `note_applied`.
+        //
+        // Recording here is the obvious shape and it is wrong: the write can
+        // block — on Windows for as long as a hung previous owner takes — and
+        // for that whole window the bridge would believe the clipboard holds
+        // the new text while it still holds the old. The poll would then read
+        // the OLD content, find it different from the record, and send it back
+        // as though the user had copied it, clobbering what they actually
+        // copied. AC4's unit half caught exactly that.
         Incoming::Apply(wire)
     }
 
@@ -297,7 +314,7 @@ impl Bridge {
 /// suppressed as unchanged. Doing nothing costs one poll interval.
 pub fn poll_local(
     os: &mut dyn TextClipboard,
-    bridge: &mut Bridge,
+    bridge: &Mutex<Bridge>,
     report: &mut impl FnMut(&str),
 ) -> Option<String> {
     let text = match os.read_text() {
@@ -312,7 +329,9 @@ pub fn poll_local(
             return None;
         }
     };
-    match bridge.on_local_change(&text) {
+    // The bridge lock is taken here and released before returning — never
+    // held across an OS clipboard call. See `apply_remote` for why.
+    match lock(bridge).on_local_change(&text) {
         Outgoing::Send(wire) => Some(wire),
         Outgoing::Suppressed | Outgoing::Disabled => None,
         Outgoing::TooLarge { bytes, limit } => {
@@ -354,23 +373,33 @@ pub enum Applied {
 /// the text.
 pub fn apply_remote(
     os: &mut dyn TextClipboard,
-    bridge: &mut Bridge,
+    bridge: &Mutex<Bridge>,
     text: &str,
     report: &mut impl FnMut(&str),
 ) -> Applied {
-    match bridge.on_remote_text(text) {
+    // **The bridge lock is taken to decide, then released before the write.**
+    //
+    // Holding it across `write_text` is the obvious shape and it is wrong: on
+    // Windows that call can block for as long as a hung previous owner takes to
+    // answer `WM_DESTROYCLIPBOARD`, and anything else wanting the bridge — the
+    // poll thread, four times a second — would be stuck behind it for exactly
+    // as long. The wedge this tranche exists to survive would spread from one
+    // direction to both. AC4's unit half failed against that version.
+    let decision = lock(bridge).on_remote_text(text);
+    match decision {
         Incoming::Apply(wire) => {
             if let Err(e) = os.write_text(&wire) {
                 report(&format!("clipboard write failed: {e}"));
                 return Applied::WriteFailed;
             }
-            // A failed read-back needs no `else`: deciding to apply already
-            // recorded the text, which is the best guess available. What would
-            // be actively wrong is *clearing* the slot on failure — the next
-            // poll would read the content we just wrote, find no record of it,
-            // and send it straight back to the host.
-            if let Ok(Some(read_back)) = os.read_text() {
-                bridge.note_applied(&read_back);
+            // The slot moves here, and only here, because only now does the
+            // clipboard actually hold it. A failed read-back falls back to the
+            // text we asked for: that costs at most one redundant message —
+            // the peer recognises its own content — where leaving the slot
+            // stale would send the *previous* clipboard back instead.
+            match os.read_text() {
+                Ok(Some(read_back)) => lock(bridge).note_applied(&read_back),
+                _ => lock(bridge).note_applied(&wire),
             }
             Applied::Written
         }
@@ -389,8 +418,16 @@ pub fn apply_remote(
 mod tests {
     use super::*;
 
-    fn bridge() -> Bridge {
-        Bridge::new(Policy::default())
+    /// A bridge behind the same `Mutex` the real callers use, so the tests
+    /// exercise the locking shape that ships rather than a simpler one.
+    fn bridge() -> Mutex<Bridge> {
+        Mutex::new(Bridge::new(Policy::default()))
+    }
+
+    /// Shorthand for the direct-method tests, which drive the bridge rather
+    /// than the functions above it.
+    fn at(b: &Mutex<Bridge>) -> std::sync::MutexGuard<'_, Bridge> {
+        b.lock().expect("not poisoned")
     }
 
     /// A pasteboard that records what it was asked to do and can be told to
@@ -469,16 +506,13 @@ mod tests {
     #[test]
     fn a_local_change_is_offered_to_the_host_and_an_unchanged_poll_is_not() {
         let mut os = FakeClipboard::holding("copied");
-        let mut b = bridge();
+        let b = bridge();
         let mut reports = Vec::new();
         let mut r = |m: &str| reports.push(m.to_owned());
-        assert_eq!(
-            poll_local(&mut os, &mut b, &mut r),
-            Some("copied".to_owned())
-        );
+        assert_eq!(poll_local(&mut os, &b, &mut r), Some("copied".to_owned()));
         // The clipboard has not changed, so the next lap must be silent — this
         // runs four times a second for the life of the session.
-        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert_eq!(poll_local(&mut os, &b, &mut r), None);
         assert!(reports.is_empty());
     }
 
@@ -490,17 +524,17 @@ mod tests {
         // would then be suppressed as unchanged — a silently lost copy.
         let mut os = FakeClipboard::holding("copied");
         os.read_fails = true;
-        let mut b = bridge();
+        let b = bridge();
         // A RefCell rather than a plain Vec: this test has to read the log
         // BETWEEN two uses of the reporting closure.
         let reports = std::cell::RefCell::new(Vec::new());
         let mut r = |m: &str| reports.borrow_mut().push(m.to_owned());
-        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert_eq!(poll_local(&mut os, &b, &mut r), None);
         assert_eq!(reports.borrow().len(), 1);
 
         os.read_fails = false;
         assert_eq!(
-            poll_local(&mut os, &mut b, &mut r),
+            poll_local(&mut os, &b, &mut r),
             Some("copied".to_owned()),
             "the copy that was unreadable during the failure must still be sent"
         );
@@ -509,29 +543,29 @@ mod tests {
     #[test]
     fn an_image_on_the_clipboard_is_ignored_without_disturbing_suppression() {
         let mut os = FakeClipboard::holding("text first");
-        let mut b = bridge();
+        let b = bridge();
         let mut r = |_: &str| {};
         assert_eq!(
-            poll_local(&mut os, &mut b, &mut r),
+            poll_local(&mut os, &b, &mut r),
             Some("text first".to_owned())
         );
 
         os.content = Some(Held::Other);
-        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert_eq!(poll_local(&mut os, &b, &mut r), None);
 
         // Back to the same text: still unchanged, so still silent. If the image
         // had moved the slot this would send a copy the user never made.
         os.content = Some(Held::Text("text first".to_owned()));
-        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert_eq!(poll_local(&mut os, &b, &mut r), None);
     }
 
     #[test]
     fn an_oversize_local_copy_is_reported_and_not_offered() {
         let mut os = FakeClipboard::holding(&"x".repeat(MAX_CLIPBOARD_BYTES + 1));
-        let mut b = bridge();
+        let b = bridge();
         let mut reports = Vec::new();
         let mut r = |m: &str| reports.push(m.to_owned());
-        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert_eq!(poll_local(&mut os, &b, &mut r), None);
         assert_eq!(reports.len(), 1);
         assert!(reports[0].contains("over the"));
         assert!(
@@ -551,25 +585,25 @@ mod tests {
         // that strips trailing whitespace.
         let mut os = FakeClipboard::holding("something else");
         os.mangle = Some(|t| t.trim_end().to_owned());
-        let mut b = bridge();
+        let b = bridge();
         let mut r = |_: &str| {};
-        apply_remote(&mut os, &mut b, "host text\n", &mut r);
+        apply_remote(&mut os, &b, "host text\n", &mut r);
         assert_eq!(os.text(), Some("host text"));
         assert_eq!(os.sets, 1);
 
         // The next poll reads what the OS actually kept. It must be silent: if
         // the slot held what we ASKED for, this would look like a new local copy
         // and bounce straight back to the host, and round it would go.
-        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert_eq!(poll_local(&mut os, &b, &mut r), None);
     }
 
     #[test]
     fn our_own_content_arriving_back_never_touches_the_pasteboard() {
         let mut os = FakeClipboard::holding("mine");
-        let mut b = bridge();
+        let b = bridge();
         let mut r = |_: &str| {};
-        assert_eq!(poll_local(&mut os, &mut b, &mut r), Some("mine".to_owned()));
-        apply_remote(&mut os, &mut b, "mine", &mut r);
+        assert_eq!(poll_local(&mut os, &b, &mut r), Some("mine".to_owned()));
+        apply_remote(&mut os, &b, "mine", &mut r);
         assert_eq!(
             os.sets, 0,
             "an echo must not be written back to the pasteboard"
@@ -580,12 +614,12 @@ mod tests {
     fn from_remote_off_leaves_the_pasteboard_byte_identical() {
         // AC7: the payload is refused, and the local clipboard is untouched.
         let mut os = FakeClipboard::holding("local content");
-        let mut b = Bridge::new(Policy {
+        let b = Mutex::new(Bridge::new(Policy {
             from_remote: false,
             ..Policy::default()
-        });
+        }));
         let mut r = |_: &str| {};
-        apply_remote(&mut os, &mut b, "from the host", &mut r);
+        apply_remote(&mut os, &b, "from the host", &mut r);
         assert_eq!(os.text(), Some("local content"));
         assert_eq!(os.sets, 0);
     }
@@ -594,10 +628,10 @@ mod tests {
     fn a_write_failure_is_reported_and_does_not_claim_the_content_was_applied() {
         let mut os = FakeClipboard::holding("untouched");
         os.write_fails = true;
-        let mut b = bridge();
+        let b = bridge();
         let mut reports = Vec::new();
         let mut r = |m: &str| reports.push(m.to_owned());
-        apply_remote(&mut os, &mut b, "from the host", &mut r);
+        apply_remote(&mut os, &b, "from the host", &mut r);
         assert_eq!(os.text(), Some("untouched"));
         assert_eq!(reports.len(), 1);
         assert!(reports[0].contains("write failed"));
@@ -621,9 +655,9 @@ mod tests {
         // there" — which would bounce the content straight back to the host.
         let mut os = FakeClipboard::holding("before");
         os.fail_next_reads = 1;
-        let mut b = bridge();
+        let b = bridge();
         let mut r = |_: &str| {};
-        apply_remote(&mut os, &mut b, "from the host", &mut r);
+        apply_remote(&mut os, &b, "from the host", &mut r);
         assert_eq!(os.text(), Some("from the host"));
         assert_eq!(
             os.fail_next_reads, 0,
@@ -631,7 +665,7 @@ mod tests {
         );
         // Falling back to the applied text is the best guess available, and it
         // must still stop the next poll bouncing the content back to the host.
-        assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+        assert_eq!(poll_local(&mut os, &b, &mut r), None);
     }
 
     #[test]
@@ -643,38 +677,35 @@ mod tests {
         let mut r = |_: &str| {};
 
         let mut os = FakeClipboard::holding("start");
-        let mut b = bridge();
+        let b = bridge();
         assert_eq!(
-            apply_remote(&mut os, &mut b, "from the host", &mut r),
+            apply_remote(&mut os, &b, "from the host", &mut r),
             Applied::Written
         );
         // Straight back again: now it is our own content.
         assert_eq!(
-            apply_remote(&mut os, &mut b, "from the host", &mut r),
+            apply_remote(&mut os, &b, "from the host", &mut r),
             Applied::Suppressed
         );
 
-        let mut off = Bridge::new(Policy {
+        let off = Mutex::new(Bridge::new(Policy {
             from_remote: false,
             ..Policy::default()
-        });
+        }));
         assert_eq!(
-            apply_remote(&mut os, &mut off, "anything", &mut r),
+            apply_remote(&mut os, &off, "anything", &mut r),
             Applied::Disabled
         );
 
-        let mut b2 = bridge();
+        let b2 = bridge();
         let huge = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
-        assert_eq!(
-            apply_remote(&mut os, &mut b2, &huge, &mut r),
-            Applied::TooLarge
-        );
+        assert_eq!(apply_remote(&mut os, &b2, &huge, &mut r), Applied::TooLarge);
 
         let mut broken = FakeClipboard::holding("start");
         broken.write_fails = true;
-        let mut b3 = bridge();
+        let b3 = bridge();
         assert_eq!(
-            apply_remote(&mut broken, &mut b3, "will not stick", &mut r),
+            apply_remote(&mut broken, &b3, "will not stick", &mut r),
             Applied::WriteFailed
         );
     }
@@ -684,12 +715,12 @@ mod tests {
         // Apply X, copy Y, copy X again. The rejected model suppressed that
         // last step permanently. This is the whole reason the model changed, so
         // it is asserted as a sequence rather than as three separate states.
-        let mut b = bridge();
-        assert_eq!(b.on_remote_text("X"), Incoming::Apply("X".to_owned()));
-        b.note_applied("X");
-        assert_eq!(b.on_local_change("Y"), Outgoing::Send("Y".to_owned()));
+        let b = bridge();
+        assert_eq!(at(&b).on_remote_text("X"), Incoming::Apply("X".to_owned()));
+        at(&b).note_applied("X");
+        assert_eq!(at(&b).on_local_change("Y"), Outgoing::Send("Y".to_owned()));
         assert_eq!(
-            b.on_local_change("X"),
+            at(&b).on_local_change("X"),
             Outgoing::Send("X".to_owned()),
             "re-copying earlier content must reach the peer, which now holds Y"
         );
@@ -697,24 +728,24 @@ mod tests {
 
     #[test]
     fn our_own_content_coming_back_from_the_host_is_suppressed() {
-        let mut b = bridge();
+        let b = bridge();
         assert_eq!(
-            b.on_local_change("hello"),
+            at(&b).on_local_change("hello"),
             Outgoing::Send("hello".to_owned())
         );
-        assert_eq!(b.on_remote_text("hello"), Incoming::Suppressed);
+        assert_eq!(at(&b).on_remote_text("hello"), Incoming::Suppressed);
     }
 
     #[test]
     fn content_applied_from_the_wire_is_not_immediately_sent_back() {
-        let mut b = bridge();
+        let b = bridge();
         assert_eq!(
-            b.on_remote_text("from host"),
+            at(&b).on_remote_text("from host"),
             Incoming::Apply("from host".to_owned())
         );
-        b.note_applied("from host");
+        at(&b).note_applied("from host");
         assert_eq!(
-            b.on_local_change("from host"),
+            at(&b).on_local_change("from host"),
             Outgoing::Suppressed,
             "the poll that follows an apply must not echo it"
         );
@@ -725,13 +756,13 @@ mod tests {
         // The crux. The peer stores CRLF and reports CRLF back. Hashing local
         // bytes would call that a different clipboard forever, and a multi-line
         // copy would ping-pong at poll cadence with no way to stop it.
-        let mut b = bridge();
+        let b = bridge();
         assert_eq!(
-            b.on_local_change("a\nb\nc"),
+            at(&b).on_local_change("a\nb\nc"),
             Outgoing::Send("a\nb\nc".to_owned())
         );
         assert_eq!(
-            b.on_remote_text("a\r\nb\r\nc"),
+            at(&b).on_remote_text("a\r\nb\r\nc"),
             Incoming::Suppressed,
             "CRLF and LF forms of the same text must fingerprint identically"
         );
@@ -739,18 +770,18 @@ mod tests {
 
     #[test]
     fn seeding_at_connect_stops_the_first_poll_clobbering_the_peer() {
-        let mut b = bridge();
-        b.seed(Some("already here"));
-        assert_eq!(b.on_local_change("already here"), Outgoing::Suppressed);
+        let b = bridge();
+        at(&b).seed(Some("already here"));
+        assert_eq!(at(&b).on_local_change("already here"), Outgoing::Suppressed);
     }
 
     #[test]
     fn an_unseeded_bridge_does_send_its_first_observation() {
         // The negative control for the test above: if a fresh bridge suppressed
         // everything, that test would pass without seeding doing anything.
-        let mut b = bridge();
+        let b = bridge();
         assert_eq!(
-            b.on_local_change("already here"),
+            at(&b).on_local_change("already here"),
             Outgoing::Send("already here".to_owned())
         );
     }
@@ -760,14 +791,14 @@ mod tests {
         // The pasteboard may hand back something other than what it was given.
         // If the slot held the applied text, the next poll would read a change
         // and send it, and the peer would answer — forever.
-        let mut b = bridge();
+        let b = bridge();
         assert_eq!(
-            b.on_remote_text("asked"),
+            at(&b).on_remote_text("asked"),
             Incoming::Apply("asked".to_owned())
         );
-        b.note_applied("what the OS actually kept");
+        at(&b).note_applied("what the OS actually kept");
         assert_eq!(
-            b.on_local_change("what the OS actually kept"),
+            at(&b).on_local_change("what the OS actually kept"),
             Outgoing::Suppressed,
             "the loop closes on the read-back, not on the request"
         );
@@ -775,10 +806,10 @@ mod tests {
 
     #[test]
     fn oversize_local_content_is_refused_and_reported_once_not_every_poll() {
-        let mut b = bridge();
+        let b = bridge();
         let huge = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
         assert_eq!(
-            b.on_local_change(&huge),
+            at(&b).on_local_change(&huge),
             Outgoing::TooLarge {
                 bytes: MAX_CLIPBOARD_BYTES + 1,
                 limit: MAX_CLIPBOARD_BYTES,
@@ -786,21 +817,21 @@ mod tests {
         );
         // The same content still sitting there on the next poll is not a new
         // event, or a big copy would shout on a 250 ms cadence until replaced.
-        assert_eq!(b.on_local_change(&huge), Outgoing::Suppressed);
+        assert_eq!(at(&b).on_local_change(&huge), Outgoing::Suppressed);
     }
 
     #[test]
     fn a_policy_ceiling_below_the_wire_ceiling_is_honoured() {
-        let mut b = Bridge::new(Policy {
+        let b = Mutex::new(Bridge::new(Policy {
             max_text_bytes: 8,
             ..Policy::default()
-        });
+        }));
         assert_eq!(
-            b.on_local_change("123456789"),
+            at(&b).on_local_change("123456789"),
             Outgoing::TooLarge { bytes: 9, limit: 8 }
         );
         assert_eq!(
-            b.on_local_change("12345678"),
+            at(&b).on_local_change("12345678"),
             Outgoing::Send("12345678".to_owned())
         );
     }
@@ -809,13 +840,13 @@ mod tests {
     fn a_policy_ceiling_above_the_wire_ceiling_cannot_raise_it() {
         // A policy may tighten the limit, never loosen it: above the wire
         // ceiling the framing error is terminal and drops the whole session.
-        let mut b = Bridge::new(Policy {
+        let b = Mutex::new(Bridge::new(Policy {
             max_text_bytes: usize::MAX,
             ..Policy::default()
-        });
+        }));
         let huge = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
         assert!(matches!(
-            b.on_local_change(&huge),
+            at(&b).on_local_change(&huge),
             Outgoing::TooLarge {
                 limit: MAX_CLIPBOARD_BYTES,
                 ..
@@ -826,44 +857,47 @@ mod tests {
     #[test]
     fn oversize_content_from_the_wire_is_refused_too() {
         // A peer may ignore the rule; the receiver must not depend on it.
-        let mut b = bridge();
+        let b = bridge();
         let huge = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
-        assert!(matches!(b.on_remote_text(&huge), Incoming::TooLarge { .. }));
+        assert!(matches!(
+            at(&b).on_remote_text(&huge),
+            Incoming::TooLarge { .. }
+        ));
     }
 
     #[test]
     fn to_remote_off_never_yields_something_to_send() {
-        let mut b = Bridge::new(Policy {
+        let b = Mutex::new(Bridge::new(Policy {
             to_remote: false,
             ..Policy::default()
-        });
-        assert_eq!(b.on_local_change("secret"), Outgoing::Disabled);
+        }));
+        assert_eq!(at(&b).on_local_change("secret"), Outgoing::Disabled);
         // …and a second, different copy is still refused rather than the gate
         // being consumed by the first one.
-        assert_eq!(b.on_local_change("another"), Outgoing::Disabled);
+        assert_eq!(at(&b).on_local_change("another"), Outgoing::Disabled);
     }
 
     #[test]
     fn from_remote_off_is_refusable_before_the_payload_is_decoded() {
         // AC7 requires the discard to happen before the bytes become a String,
         // so the reader needs a decision it can take from the policy alone.
-        let b = Bridge::new(Policy {
+        let b = Mutex::new(Bridge::new(Policy {
             from_remote: false,
             ..Policy::default()
-        });
-        assert!(!b.accepts_incoming());
-        assert!(bridge().accepts_incoming());
+        }));
+        assert!(!at(&b).accepts_incoming());
+        assert!(at(&bridge()).accepts_incoming());
     }
 
     #[test]
     fn from_remote_off_also_refuses_at_the_text_entry_point() {
         // Belt to accepts_incoming's braces: a caller that forgets the pre-check
         // must still not apply anything.
-        let mut b = Bridge::new(Policy {
+        let b = Mutex::new(Bridge::new(Policy {
             from_remote: false,
             ..Policy::default()
-        });
-        assert_eq!(b.on_remote_text("from host"), Incoming::Disabled);
+        }));
+        assert_eq!(at(&b).on_remote_text("from host"), Incoming::Disabled);
     }
 
     #[test]
@@ -872,16 +906,19 @@ mod tests {
         // interval. Each suppresses the other's arrival. That is a disagreement
         // and it is bounded — asserted here so a future change that turns it
         // into a loop is caught.
-        let mut b = bridge();
-        assert_eq!(b.on_local_change("mine"), Outgoing::Send("mine".to_owned()));
+        let b = bridge();
         assert_eq!(
-            b.on_remote_text("theirs"),
+            at(&b).on_local_change("mine"),
+            Outgoing::Send("mine".to_owned())
+        );
+        assert_eq!(
+            at(&b).on_remote_text("theirs"),
             Incoming::Apply("theirs".to_owned())
         );
-        b.note_applied("theirs");
+        at(&b).note_applied("theirs");
         // No further traffic without a new user action.
-        assert_eq!(b.on_local_change("theirs"), Outgoing::Suppressed);
-        assert_eq!(b.on_remote_text("theirs"), Incoming::Suppressed);
+        assert_eq!(at(&b).on_local_change("theirs"), Outgoing::Suppressed);
+        assert_eq!(at(&b).on_remote_text("theirs"), Incoming::Suppressed);
     }
 
     #[test]
@@ -892,9 +929,9 @@ mod tests {
         // fresh one proves nothing — its slot is empty, so every implementation
         // passes — and that matters more since the slot began holding the text
         // itself rather than a digest of it.
-        let mut loaded = bridge();
+        let loaded = bridge();
         assert_eq!(
-            loaded.on_local_change(secret),
+            at(&loaded).on_local_change(secret),
             Outgoing::Send(secret.to_owned()),
             "the bridge must actually be holding the secret for this to test anything"
         );

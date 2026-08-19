@@ -55,7 +55,7 @@ pub fn serve(
         match listener.accept() {
             Ok((stream, peer)) => {
                 eprintln!("aux: connected {peer}");
-                match serve_one(stream, make_clipboard(), policy) {
+                match serve_one(stream, &mut make_clipboard, policy) {
                     Ok(stats) => eprintln!(
                         "aux: disconnected — {} applied, {} refused by policy, \
                          {} malformed, {} of an unknown type",
@@ -88,21 +88,39 @@ pub fn serve(
 /// leave the clipboard equally untouched and be a different, weaker property.
 pub fn serve_one(
     socket: TcpStream,
-    clipboard: Box<dyn TextClipboard>,
+    make_clipboard: &mut dyn FnMut() -> Box<dyn TextClipboard>,
     policy: Policy,
 ) -> Result<auxchan::ReaderStats> {
     // Clipboard messages are small and bursty; Nagle would add up to 40 ms.
     socket.set_nodelay(true)?;
 
-    let os = Arc::new(Mutex::new(clipboard));
+    // **One clipboard handle per thread, not one shared behind a mutex.**
+    //
+    // Sharing one is the obvious design and it is wrong: a write that blocks —
+    // `EmptyClipboard` sending `WM_DESTROYCLIPBOARD` to a hung previous owner
+    // is the case this tranche exists to survive — would hold that mutex, and
+    // the poll thread would be stuck behind it for as long as the block lasts.
+    // The wedge would spread from one direction to both.
+    //
+    // With separate handles the OS does the serialising it was always going to
+    // do, and it does it the right way: the poll thread's `OpenClipboard` fails
+    // fast under contention, bounded retry gives up for that lap, and a read
+    // failure deliberately leaves the suppression slot alone so the copy is
+    // picked up next time. Found by AC4's unit half, which failed against the
+    // shared-handle version.
+    let apply_os = Arc::new(Mutex::new(make_clipboard()));
+    let poll_os = Arc::new(Mutex::new(make_clipboard()));
     let bridge = Arc::new(Mutex::new(Bridge::new(policy)));
 
     // Seed from what the host's clipboard already holds, or the first poll
     // reads as a change and the host clobbers the client's clipboard the
     // instant it connects — with no user action, and no way to get it back.
     {
-        let seed = lock(&os).read_text().ok().flatten();
-        lock(&bridge).seed(seed.as_deref());
+        let seed = lock(&poll_os).read_text().ok().flatten();
+        bridge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seed(seed.as_deref());
     }
 
     let slot = Slot::new();
@@ -125,7 +143,7 @@ pub fn serve_one(
 
     let poll_slot = Arc::clone(&slot);
     let poll_bridge = Arc::clone(&bridge);
-    let poll_os = Arc::clone(&os);
+    let poll_os = Arc::clone(&poll_os);
     let poll_stop = Arc::clone(&stop);
     joins.push(
         std::thread::Builder::new()
@@ -133,10 +151,11 @@ pub fn serve_one(
             .spawn(move || {
                 while !poll_stop.load(Ordering::Relaxed) {
                     {
-                        let mut bridge = lock(&poll_bridge);
+                        // Only the clipboard handle is locked here; the bridge
+                        // locks itself, briefly, inside.
                         let mut os = lock(&poll_os);
                         if let Some(text) =
-                            clipboard::poll_local(&mut **os, &mut bridge, &mut report)
+                            clipboard::poll_local(&mut **os, &poll_bridge, &mut report)
                         {
                             poll_slot.put(text);
                         }
@@ -149,11 +168,15 @@ pub fn serve_one(
     let mut stats = auxchan::ReaderStats::default();
     let end = auxchan::pump_reader(
         &socket,
-        &mut || lock(&bridge).accepts_incoming(),
+        &mut || {
+            bridge
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .accepts_incoming()
+        },
         &mut |text| {
-            let mut bridge = lock(&bridge);
-            let mut os = lock(&os);
-            clipboard::apply_remote(&mut **os, &mut bridge, text, &mut report);
+            let mut os = lock(&apply_os);
+            clipboard::apply_remote(&mut **os, &bridge, text, &mut report);
         },
         &mut stats,
     );
@@ -209,6 +232,8 @@ mod tests {
     struct Pasteboard {
         text: Arc<Mutex<Option<String>>>,
         reads: Arc<std::sync::atomic::AtomicUsize>,
+        /// While true, every write blocks — the OS-refusal case AC4 is about.
+        writes_block: Arc<AtomicBool>,
     }
 
     impl Pasteboard {
@@ -216,6 +241,7 @@ mod tests {
             Self {
                 text: Arc::new(Mutex::new(Some(text.to_owned()))),
                 reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                writes_block: Arc::new(AtomicBool::new(false)),
             }
         }
         fn empty() -> Self {
@@ -245,6 +271,12 @@ mod tests {
             Ok(lock(&self.0.text).clone())
         }
         fn write_text(&mut self, text: &str) -> Result2<()> {
+            // Stands in for a write sequence stuck in EmptyClipboard's
+            // synchronous WM_DESTROYCLIPBOARD to a hung previous owner: the
+            // call simply does not return.
+            while self.0.writes_block.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             *lock(&self.0.text) = Some(text.to_owned());
             Ok(())
         }
@@ -296,7 +328,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve_one(stream, Box::new(FakeClipboard(held)), policy)
+            // A factory, so each thread gets its own handle exactly as the real
+            // host does — sharing one here would test a design we do not ship.
+            let mut make = || Box::new(FakeClipboard(held.clone())) as Box<dyn TextClipboard>;
+            serve_one(stream, &mut make, policy)
         });
         let client = TcpStream::connect(addr).unwrap();
         client.set_nodelay(true).unwrap();
@@ -320,6 +355,46 @@ mod tests {
             assert_ne!(n, 0, "the host closed the channel");
             reassembler.push(&buf[..n]);
         }
+    }
+
+    #[test]
+    fn a_stuck_clipboard_write_does_not_stop_the_poll_loop() {
+        // AC4's unit half. The wedge this tranche exists to beat is
+        // EmptyClipboard blocking on a hung previous owner while the clipboard
+        // is held open for the whole desktop. It cannot be prevented — the
+        // question is whether it takes the rest of the session with it.
+        //
+        // Here a write blocks for ever. The poll thread is separate, so it must
+        // keep reading and keep sending: the session stays alive and the
+        // clipboard keeps working in the direction that is not stuck.
+        let held = Pasteboard::holding("start");
+        held.writes_block.store(true, Ordering::SeqCst);
+        let (mut client, server) = connected(held.clone(), Policy::default());
+
+        // Send a payload the host will block trying to apply.
+        let mut wire = Vec::new();
+        aux_proto::encode_clipboard_text("this write will hang", &mut wire).unwrap();
+        client.write_all(&wire).unwrap();
+
+        // The reads counter is the oracle: it can only advance if the poll
+        // thread is still running its loop while the writer is stuck.
+        let before = held.reads.load(Ordering::SeqCst);
+        wait_until(
+            || held.reads.load(Ordering::SeqCst) > before + 2,
+            "the poll thread to keep reading while a write is stuck",
+        );
+
+        // And the direction that is not stuck still works.
+        held.set("copied while the write is stuck");
+        assert_eq!(
+            read_one_clipboard_message(&mut client),
+            "copied while the write is stuck"
+        );
+
+        // Release the write so teardown can finish, then confirm it does.
+        held.writes_block.store(false, Ordering::SeqCst);
+        drop(client);
+        let _ = join_server(server);
     }
 
     #[test]

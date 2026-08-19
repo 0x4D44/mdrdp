@@ -158,7 +158,7 @@ pub fn spawn(
         Some(socket) => match spawn_aux(
             socket,
             // The shared bridge speaks text only; `TextOnly` is the adapter.
-            Box::new(TextOnly(ArboardClipboard::new())),
+            &mut || Box::new(TextOnly(ArboardClipboard::new())),
             clipboard_policy,
             Arc::clone(&stop),
         ) {
@@ -244,14 +244,19 @@ pub fn spawn(
 /// can run without touching the developer's own pasteboard.
 fn spawn_aux(
     socket: TcpStream,
-    clipboard: Box<dyn TextClipboard>,
+    make_clipboard: &mut dyn FnMut() -> Box<dyn TextClipboard>,
     policy: Policy,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<AuxChannel> {
     // Nagle would add up to 40 ms to a small, bursty clipboard message.
     socket.set_nodelay(true)?;
 
-    let os = Arc::new(Mutex::new(clipboard));
+    // **One clipboard handle per thread, not one shared behind a mutex**, and
+    // the same reasoning as the host: a write that blocks would otherwise hold
+    // that mutex and stall the poll thread for as long as the block lasted,
+    // spreading a one-direction wedge to both.
+    let apply_os = Arc::new(Mutex::new(make_clipboard()));
+    let poll_os = Arc::new(Mutex::new(make_clipboard()));
     let bridge = Arc::new(Mutex::new(Bridge::new(policy)));
 
     // Seed from whatever the pasteboard already holds. Without this the first
@@ -261,7 +266,7 @@ fn spawn_aux(
         let mut guard = lock(&bridge);
         // An image or an unreadable pasteboard both mean "no text we could
         // have sent", which is exactly what an empty seed says.
-        let seed = lock(&os).read_text().ok().flatten();
+        let seed = lock(&poll_os).read_text().ok().flatten();
         guard.seed(seed.as_deref());
     }
 
@@ -270,7 +275,7 @@ fn spawn_aux(
 
     let rx_socket = socket.try_clone()?;
     let rx_bridge = Arc::clone(&bridge);
-    let rx_os = Arc::clone(&os);
+    let rx_os = Arc::clone(&apply_os);
     joins.push(
         std::thread::Builder::new()
             .name("native-aux-rx".to_owned())
@@ -283,12 +288,11 @@ fn spawn_aux(
                         // Both locks are taken here and nowhere else together,
                         // and never while the reader holds either — so the
                         // ordering cannot deadlock against the poll thread.
-                        let mut bridge = lock(&rx_bridge);
                         let mut os = lock(&rx_os);
                         // Counted from what `apply_remote` reports rather than
                         // decided again here: two places deciding the same
                         // policy eventually disagree.
-                        match clip::apply_remote(&mut **os, &mut bridge, text, &mut report) {
+                        match clip::apply_remote(&mut **os, &rx_bridge, text, &mut report) {
                             clip::Applied::Written => COUNTERS.note_applied(),
                             clip::Applied::Suppressed => COUNTERS.note_echo_suppressed(),
                             clip::Applied::Disabled
@@ -320,16 +324,15 @@ fn spawn_aux(
 
     let poll_slot = Arc::clone(&slot);
     let poll_bridge = Arc::clone(&bridge);
-    let poll_os = Arc::clone(&os);
+    let poll_os = Arc::clone(&poll_os);
     joins.push(
         std::thread::Builder::new()
             .name("native-clipboard-poll".to_owned())
             .spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     {
-                        let mut bridge = lock(&poll_bridge);
                         let mut os = lock(&poll_os);
-                        if let Some(text) = clip::poll_local(&mut **os, &mut bridge, &mut report) {
+                        if let Some(text) = clip::poll_local(&mut **os, &poll_bridge, &mut report) {
                             COUNTERS.note_sent();
                             poll_slot.put(text);
                         }
@@ -785,7 +788,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let aux = spawn_aux(
             socket,
-            Box::new(InertClipboard),
+            &mut || Box::new(InertClipboard) as Box<dyn TextClipboard>,
             Policy::default(),
             Arc::clone(&stop),
         )

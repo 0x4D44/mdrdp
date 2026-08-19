@@ -39,7 +39,13 @@ use crate::framing::{self, Reassembler};
 pub const SLOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// What a taker got.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// `Debug` is **hand-written**, like every other type on this path that can
+/// hold a payload. It derived it first, and a `debug!(?take)` in the writer loop
+/// printed the whole clipboard — a password, a one-time code — which is the
+/// tranche-3 pattern exactly: a type whose derived `Debug` looks innocuous and
+/// carries content. AC9's leak check found it.
+#[derive(PartialEq, Eq)]
 pub enum Take {
     /// A payload to send.
     Item(String),
@@ -47,6 +53,17 @@ pub enum Take {
     Idle,
     /// The session is ending. Stop.
     Closed,
+}
+
+impl std::fmt::Debug for Take {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The variant and a length. Never the bytes.
+            Take::Item(text) => f.debug_struct("Item").field("bytes", &text.len()).finish(),
+            Take::Idle => f.write_str("Idle"),
+            Take::Closed => f.write_str("Closed"),
+        }
+    }
 }
 
 /// A depth-1, keep-latest outbound slot.
@@ -271,6 +288,42 @@ mod tests {
         let mut out = Vec::new();
         aux_proto::encode_clipboard_text(text, &mut out).expect("under the ceiling");
         out
+    }
+
+    #[test]
+    fn nothing_on_the_send_path_prints_clipboard_content() {
+        // AC9's mechanical leak check, as a test rather than a one-off: every
+        // type a `debug!(?x)` at the send site could reach must print no
+        // payload byte.
+        //
+        // This started RED. `Take` derived `Debug`, so `Take::Item(String)`
+        // printed the clipboard in full — the exact tranche-3 pattern (a type
+        // whose derived Debug looks innocuous and carries content), in code
+        // written two units after that lesson was recorded.
+        let secret = "hunter2-the-actual-secret";
+
+        let slot = Slot::with_interval(Duration::from_millis(10));
+        slot.put(secret.to_owned());
+        let taken = slot.take();
+        let rendered = format!("{taken:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "Take leaked clipboard content: {rendered}"
+        );
+        // …and still says which variant it is, or it is useless for debugging.
+        assert!(
+            rendered.contains("Item"),
+            "Take must still name its variant: {rendered}"
+        );
+
+        // The other two carry nothing, and must keep saying so plainly.
+        assert_eq!(format!("{:?}", Take::Idle), "Idle");
+        assert_eq!(format!("{:?}", Take::Closed), "Closed");
+
+        // The reader's counters are the one thing here that is safe to print
+        // whole — no content can reach them by construction.
+        let stats = ReaderStats::default();
+        assert!(!format!("{stats:?}").contains("hunter2"));
     }
 
     #[test]
