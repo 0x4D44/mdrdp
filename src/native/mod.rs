@@ -7,6 +7,7 @@
 //! native MVP.md`.
 
 pub mod deployed;
+pub mod doctor;
 pub mod probe;
 pub mod session;
 pub mod ssh;

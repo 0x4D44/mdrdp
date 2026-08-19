@@ -319,6 +319,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut foreground = false;
     let mut native_flag = false;
     let mut rdp_flag = false;
+    let mut doctor = false;
     let mut ssh_user: Option<String> = None;
 
     // Human-typed flags carry a single-letter short code as well; harness-facing ones
@@ -337,6 +338,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--sessions" | "-S" => {
                 sessions_only = true;
+                i += 1;
+                continue;
+            }
+            "--doctor" => {
+                doctor = true;
                 i += 1;
                 continue;
             }
@@ -403,6 +409,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--native and --rdp contradict each other; pass at most one".into());
     }
 
+    // `--doctor` diagnoses the NATIVE stack, so pairing it with --rdp asks for
+    // two different things at once. `probe stages <host>` is the RDP equivalent
+    // and the error says so rather than leaving the reader to guess.
+    if doctor && rdp_flag {
+        return Err(
+            "--doctor diagnoses the native (rhydra) stack, so it cannot be \
+             combined with --rdp; for the RDP side use `probe stages <host>`"
+                .into(),
+        );
+    }
+
     if ask_password && !stage_json {
         return Err("--ask-password needs --stage-json (a driving launcher); \
              for a scripted run use --password-stdin"
@@ -424,6 +441,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "{}",
                 mdrdp::presence::render_table(&sessions, now, mdrdp::cli::stdout_wants_color())
             );
+        }
+        return Ok(());
+    }
+
+    // The doctor opens no window, reads no credential and takes no session: it
+    // asks the agent one question and prints the answer. Handled beside the
+    // sessions listing, before the detach decision, so it always stays on the
+    // invoking terminal.
+    //
+    // It implies the native path whatever the favourite says — a favourite set to
+    // `native = never` is a statement about how to CONNECT, not a reason to
+    // refuse to diagnose — and it never falls back to RDP.
+    if doctor {
+        let host = positional
+            .as_deref()
+            .ok_or("--doctor needs a host: mdrdp <host> --doctor")?;
+        let (report, failed) = mdrdp::native::doctor::run(host, ssh_user.as_deref())?;
+        print!("{report}");
+        if failed {
+            std::process::exit(1);
         }
         return Ok(());
     }

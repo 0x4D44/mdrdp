@@ -121,6 +121,10 @@ const OPTIONS: &[(&str, &str)] = &[
     ),
     ("--rdp", "skip the rhydra probe and connect over RDP"),
     (
+        "--doctor",
+        "report the native host's health ladder and exit — read-only,\nopens no session and takes no viewer slot",
+    ),
+    (
         "--ssh-user <account>",
         "SSH login for the native transport (default: ~/.ssh/config)",
     ),
