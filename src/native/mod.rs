@@ -7,6 +7,7 @@
 //! native MVP.md`.
 
 pub mod probe;
+pub mod session;
 pub mod ssh;
 
 use crate::favourites::NativeMode;

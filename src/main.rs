@@ -97,6 +97,7 @@ fn session_end_state(end: &session::SessionEnd) -> &'static str {
         session::SessionEnd::WindowClosed => "window_closed",
         session::SessionEnd::ServerEnded(_) => "server_ended",
         session::SessionEnd::Failed(_) => "failed",
+        session::SessionEnd::TransportFailed(_) => "transport_failed",
     }
 }
 
@@ -1314,6 +1315,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 use mdrdp::ui::end_dialog::EndOutcome;
                 let outcome = match end {
                     session::SessionEnd::Failed(reason) => EndOutcome::Lost(reason.to_string()),
+                    session::SessionEnd::TransportFailed(reason) => {
+                        EndOutcome::Lost(format!("native transport: {reason}"))
+                    }
                     session::SessionEnd::ServerEnded(farewell) => {
                         EndOutcome::ServerEnded(farewell.clone())
                     }

@@ -124,6 +124,10 @@ pub enum SessionEnd {
     /// the session. Still an orderly end, but one the user is owed an explanation for.
     ServerEnded(ServerFarewell),
     Failed(ConnectError),
+    /// A native (rhydra) transport failure — the tunnel died, a channel closed, or
+    /// the wire was violated. Its own variant so the end dialog names the tunnel
+    /// rather than dressing it as an RDP error (HLD tranche 3 §6, review S-m6).
+    TransportFailed(String),
 }
 
 pub struct SessionHandle {
