@@ -257,6 +257,18 @@ const TOAST_TTL: Duration = Duration::from_secs(6);
 /// How often open diagnostics windows refresh (the handoff's `refresh 1s`).
 const DIAG_REFRESH: Duration = Duration::from_secs(1);
 
+/// How long a reveal's repaint may take before the session is called stalled.
+///
+/// Armed only by a reveal, never by idleness: a still desktop legitimately sends
+/// nothing for hours, so "no frames" alone says nothing. A reveal is different — it
+/// carries an explicit Refresh Rect for the whole desktop (`session::visibility_pdus`),
+/// which the server owes at least one frame in reply. Silence after *that* is a fault,
+/// and it is the exact state a session sat in, unreported, while showing a black window
+/// on a connection healthy by every other measure (MDR-BUG-FLUX-00008: a reveal produced
+/// zero bytes for 14 s). Generous next to the observed timings — a repaint burst arrives
+/// inside a second on a healthy host, even at 400 ms RTT.
+const REPAINT_GRACE: Duration = Duration::from_secs(5);
+
 /// A remote pointer change, already decoded to pixels. Session-layer types stay out of
 /// this module, so the session thread translates IronRDP's pointer outputs into this.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +529,75 @@ pub fn draw_overlay(dst: &mut [u32], window_width: u32, window_height: u32, line
             y0 + PAD + font::CHAR_H * i as i32,
             line,
             0x00ff_ffff,
+        );
+    }
+}
+
+/// What the blank-window notice says.
+///
+/// Pure so the wording is testable — it is the whole point of the notice, and the last
+/// line is load-bearing: the failure this exists for looks exactly like a dropped
+/// connection to the user, and it is not one.
+pub fn blank_notice_lines(waiting: Option<Duration>) -> Vec<String> {
+    let detail = match waiting {
+        Some(d) => format!(
+            "Repaint requested {}s ago — nothing has arrived yet.",
+            d.as_secs()
+        ),
+        None => "No desktop surface has been received yet.".to_owned(),
+    };
+    vec![
+        "Waiting for the server to send a picture.".to_owned(),
+        detail,
+        "The connection is up — this is not a dropped session.".to_owned(),
+    ]
+}
+
+/// Whether a reveal's outstanding repaint has become a stall.
+///
+/// Pure so the rule is testable without a window. Two ways to be fine: a frame arrived
+/// (the count moved), or the grace has not run out yet. Note what is deliberately NOT
+/// part of this — how long the desktop has been still. A static desktop legitimately
+/// sends nothing for hours; only a repaint we explicitly asked for and never got is a
+/// fault, which is why this is armed by a reveal and never by idleness.
+fn repaint_stalled(elapsed: Duration, frames_when_asked: u64, frames_now: u64) -> bool {
+    frames_now == frames_when_asked && elapsed >= REPAINT_GRACE
+}
+
+/// Explain a window that has no session pixels at all, centred on the blank frame.
+///
+/// Pure so the wording and geometry are testable without a window. Drawn ONLY when no
+/// surface is mapped to output — that is the one case where black means "we have
+/// nothing" rather than "the desktop is dark", so there is no content to obscure. A
+/// black-*pixel* test would be the wrong trigger: a locked Windows desktop, a full-screen
+/// terminal or a screensaver are all legitimately black, and painting over them would
+/// fire on healthy sessions and hide real content.
+///
+/// `waiting` is how long a reveal's repaint has been outstanding, when one is.
+pub fn draw_blank_notice(
+    dst: &mut [u32],
+    window_width: u32,
+    window_height: u32,
+    waiting: Option<Duration>,
+) {
+    if window_width == 0 || window_height == 0 {
+        return;
+    }
+    let lines = blank_notice_lines(waiting);
+
+    let block_h = font::CHAR_H * lines.len() as i32;
+    let top = (window_height as i32 - block_h) / 2;
+    for (i, line) in lines.iter().enumerate() {
+        let x = (window_width as i32 - font::text_width(line)) / 2;
+        font::draw_text(
+            dst,
+            window_width as usize,
+            window_height as usize,
+            x.max(0),
+            top + font::CHAR_H * i as i32,
+            line,
+            // Grey, not white: this is an explanation on an empty screen, not an alarm.
+            0x00b0_b0b0,
         );
     }
 }
@@ -975,6 +1056,12 @@ struct SessionApp {
     toasts: Vec<(Toast, Instant)>,
     /// The persistent warn line for the overlay, while a condition lasts.
     warn_line: Option<String>,
+    /// A reveal is waiting for its repaint: when it was asked for, and the frame count
+    /// at that moment. Cleared as soon as a frame lands, or when the stall is reported.
+    repaint_awaited: Option<(Instant, u64)>,
+    /// Whether the current stall has already been announced, so the log and the toast
+    /// fire once per episode rather than once per tick.
+    stall_announced: bool,
 }
 
 impl SessionApp {
@@ -1036,11 +1123,72 @@ impl SessionApp {
             last_diag_refresh: Instant::now(),
             transients: None,
             toasts: Vec::new(),
+            repaint_awaited: None,
+            stall_announced: false,
             warn_line: None,
         }
     }
 
     /// Poll the transient watcher: absorb fresh toasts and the overlay warn line.
+    /// Frames the session has actually painted, or 0 before stats are wired.
+    fn painted_frames(&self) -> u64 {
+        self.stats.as_ref().map_or(0, |s| s.snapshot().frames)
+    }
+
+    /// Drop any standing stall report. Called when a frame lands, or when the window
+    /// goes away again — the condition is over either way.
+    fn clear_stall(&mut self) {
+        if self.stall_announced {
+            self.stall_announced = false;
+            self.warn_line = None;
+        }
+    }
+
+    /// Report a reveal whose repaint never arrived.
+    ///
+    /// Runs on the same 1 Hz tick as the rest of the transient work. A reveal sends
+    /// Suppress Output's allow form plus a full-desktop Refresh Rect; if the frame count
+    /// has not moved [`REPAINT_GRACE`] later, the server owes us a desktop it never sent
+    /// and the window is showing black or a stale frame with nothing to explain it. Say
+    /// so once, in the log, on a toast, and on the overlay while it lasts.
+    fn check_repaint_stall(&mut self) {
+        let Some((asked, frames_then)) = self.repaint_awaited else {
+            return;
+        };
+        if self.painted_frames() != frames_then {
+            // The repaint arrived. Nothing to report, and nothing left to watch.
+            self.repaint_awaited = None;
+            self.clear_stall();
+            return;
+        }
+        if !repaint_stalled(asked.elapsed(), frames_then, self.painted_frames()) {
+            return;
+        }
+        let secs = asked.elapsed().as_secs();
+        // The log line and the card fire once; the overlay line is re-asserted each tick
+        // so its count stays live, and only into a free slot — an audio warning already
+        // standing there is not worth stomping for this.
+        if !self.stall_announced {
+            self.stall_announced = true;
+            eprintln!(
+                "display: asked the server to resume and repaint {secs}s ago and no frame \
+                 has arrived; the window is showing stale or black pixels (the connection \
+                 is otherwise healthy — see MDR-BUG-FLUX-00008)"
+            );
+            self.toasts.push((
+                Toast {
+                    warn: false,
+                    title: "No picture from the server".to_owned(),
+                    body: format!("repaint requested {secs}s ago, nothing arrived"),
+                },
+                Instant::now(),
+            ));
+        }
+        if self.warn_line.is_none() {
+            self.warn_line = Some(format!("display  no repaint for {secs}s after reveal"));
+        }
+    }
+
     fn poll_transients(&mut self) {
         let Some(watch) = self.transients.as_mut() else {
             return;
@@ -1511,13 +1659,13 @@ impl SessionApp {
         // The store lock is held only for the scale-and-convert pass, never across
         // `present` — presenting blocks on a copy on macOS, and the decoder thread must
         // not wait on that.
-        let generation = {
+        let (generation, blank) = {
             let store = self
                 .store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let generation = store.generation();
-            match store.output_surface() {
+            let blank = match store.output_surface() {
                 Some(session) => {
                     self.viewport =
                         Viewport::letterbox(size.width, size.height, session.width, session.height);
@@ -1528,12 +1676,27 @@ impl SessionApp {
                         &self.viewport,
                         session.pixels(),
                     );
+                    false
                 }
                 // Nothing mapped to output yet: black, not stale garbage.
-                None => buffer.fill(0),
-            }
-            generation
+                None => {
+                    buffer.fill(0);
+                    true
+                }
+            };
+            (generation, blank)
         };
+
+        // A window with no surface mapped to output is painting black because it has
+        // nothing at all, not because the desktop is dark. Say which, in place: there is
+        // no content to obscure here, and the alternative is the unexplained black
+        // rectangle that cost a day of diagnosis (MDR-BUG-FLUX-00008). Only this branch
+        // gets text drawn over it — once a surface exists its pixels are the truth, even
+        // when they are black, and a stale desktop must not be painted over.
+        if blank {
+            let waiting = self.repaint_awaited.map(|(asked, _)| asked.elapsed());
+            draw_blank_notice(&mut buffer, size.width, size.height, waiting);
+        }
 
         if self.show_stats
             && let Some(stats) = &self.stats
@@ -1650,6 +1813,9 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 // when frames do.
                 self.maybe_refresh_title();
                 self.poll_transients();
+                // Frames are moving again: this is what retires an outstanding repaint
+                // watch, and clears a stall report if one was standing.
+                self.check_repaint_stall();
             }
             SessionEvent::Cursor(update) => self.apply_remote_cursor(event_loop, update),
             SessionEvent::Close => event_loop.exit(),
@@ -1663,7 +1829,11 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
         self.service_settled_resize();
 
-        let diag_active = !self.aux.is_empty() || !self.toasts.is_empty();
+        // An outstanding repaint keeps the tick alive too: a stalled session produces no
+        // damage by definition, so without this the one condition that most needs
+        // reporting is the one nothing would ever poll for.
+        let diag_active =
+            !self.aux.is_empty() || !self.toasts.is_empty() || self.repaint_awaited.is_some();
         if diag_active
             && (matches!(cause, winit::event::StartCause::ResumeTimeReached { .. })
                 || self.last_diag_refresh.elapsed() >= DIAG_REFRESH)
@@ -1673,6 +1843,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 win.request_redraw();
             }
             self.poll_transients();
+            self.check_repaint_stall();
             if !self.toasts.is_empty()
                 && let Some(window) = &self.window
             {
@@ -1814,6 +1985,15 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                     // burned most of a core presenting invisible frames). Resuming asks
                     // for a full repaint, so nothing stale survives the reveal.
                     self.send_command(SessionCommand::SetVisibility { visible: !occluded });
+                    // The reveal owes us a repaint. Start the clock on it, so silence
+                    // where a whole desktop was asked for gets reported rather than
+                    // shown as an unexplained black window (MDR-BUG-FLUX-00008).
+                    self.repaint_awaited = if occluded {
+                        None
+                    } else {
+                        Some((Instant::now(), self.painted_frames()))
+                    };
+                    self.clear_stall();
                 }
                 // Becoming visible is the first moment anything can actually be fixed:
                 // the size may have been changed while the screen was off, and no further
@@ -2369,6 +2549,114 @@ mod tests {
 
     fn overlay_lines() -> Vec<String> {
         vec!["latency p50 3.5ms".to_string(), "cache 75% hit".to_string()]
+    }
+
+    // --- blank-window notice and the repaint stall rule --------------------------------
+
+    #[test]
+    fn a_repaint_that_arrived_is_never_a_stall_however_long_it_took() {
+        // The frame count moving is the whole proof that the server answered. Time alone
+        // must not convict it — this is the guard against reporting a healthy session.
+        assert!(!repaint_stalled(Duration::from_secs(600), 100, 101));
+    }
+
+    #[test]
+    fn a_repaint_inside_its_grace_is_not_yet_a_stall() {
+        assert!(!repaint_stalled(
+            REPAINT_GRACE - Duration::from_millis(1),
+            100,
+            100
+        ));
+    }
+
+    #[test]
+    fn a_repaint_that_never_arrives_becomes_a_stall() {
+        assert!(repaint_stalled(REPAINT_GRACE, 100, 100));
+    }
+
+    #[test]
+    fn the_blank_notice_reports_how_long_the_repaint_has_been_outstanding() {
+        let lines = blank_notice_lines(Some(Duration::from_secs(14)));
+        assert!(
+            lines.iter().any(|l| l.contains("14s")),
+            "the wait must be quantified, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_blank_notice_denies_the_thing_it_looks_like() {
+        // Every version of this failure looks like a dropped connection and is not one.
+        // If that line ever goes, the notice stops doing its job.
+        for waiting in [None, Some(Duration::from_secs(9))] {
+            let lines = blank_notice_lines(waiting);
+            assert!(
+                lines.iter().any(|l| l.contains("not a dropped session")),
+                "the notice must say the link is alive, got: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_notice_with_no_repaint_pending_says_nothing_ever_arrived() {
+        let lines = blank_notice_lines(None);
+        assert!(
+            lines.iter().any(|l| l.contains("No desktop surface")),
+            "got: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Repaint requested")),
+            "nothing was requested, so nothing is outstanding: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_sized_window_does_not_panic_drawing_the_blank_notice() {
+        let mut buf: Vec<u32> = Vec::new();
+        draw_blank_notice(&mut buf, 0, 0, Some(Duration::from_secs(3)));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn the_blank_notice_survives_awkward_window_shapes() {
+        // Centring computes a top that goes negative on a window shorter than the block,
+        // and an x that goes negative on one narrower than the text. Both must clip
+        // rather than panic or write out of bounds.
+        const SENTINEL: u32 = 0x0012_3456;
+        for (w, h) in [(60u32, 80u32), (1, 1), (2000, 3), (17, 400), (0, 0)] {
+            let mut buf = vec![SENTINEL; (w * h) as usize];
+            draw_blank_notice(&mut buf, w, h, Some(Duration::from_secs(7)));
+            assert_eq!(buf.len(), (w * h) as usize, "{w}x{h} resized the buffer");
+        }
+    }
+
+    #[test]
+    fn the_blank_notice_centres_its_block_and_spills_into_no_row_above_it() {
+        // The oracle is the untouched band above the text: it pins the vertical centring
+        // and catches a glyph row drawn at the wrong offset, which a "did anything get
+        // written" check cannot.
+        let (w, h) = (600u32, 400u32);
+        const SENTINEL: u32 = 0x0012_3456;
+        let mut buf = vec![SENTINEL; (w * h) as usize];
+        draw_blank_notice(&mut buf, w, h, None);
+
+        let top = (h as i32 - font::CHAR_H * 3) / 2;
+        assert!(
+            top > 0,
+            "this window must be tall enough to have a clear band"
+        );
+        for y in 0..top as u32 {
+            for x in 0..w {
+                assert_eq!(
+                    buf[(y * w + x) as usize],
+                    SENTINEL,
+                    "({x},{y}) is above the centred block and must be untouched"
+                );
+            }
+        }
+        // And the block itself must actually have been drawn, or the check above passes
+        // for the wrong reason.
+        let drawn = buf.iter().any(|&p| p != SENTINEL);
+        assert!(drawn, "the notice drew nothing at all");
     }
 
     // --- toasts -----------------------------------------------------------------------
