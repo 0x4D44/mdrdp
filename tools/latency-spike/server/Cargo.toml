@@ -43,6 +43,11 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Media_MediaFoundation",
+    # GetTcpTable2 — the server rung asks the OS whether anything is LISTENING on
+    # the video port. Read-only on purpose: connecting to 9500 to find out would
+    # take the capture server's single viewer slot and unpark its capture loop,
+    # so the check would disturb the very thing it measures.
+    "Win32_NetworkManagement_IpHelper",
     "Win32_System_Com",
     # OpenFileMappingW / MapViewOfFile — the IddCx shared section.
     "Win32_System_Memory",

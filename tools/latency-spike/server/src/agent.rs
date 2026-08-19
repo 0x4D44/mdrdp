@@ -107,6 +107,37 @@ pub trait AgentOps {
     /// driver as the compositor presents — none of it needing a viewer, or even
     /// a capture server, to be true.
     fn pool(&mut self) -> PoolObservation;
+    /// Whether anything is LISTENING on the capture server's video port.
+    ///
+    /// `None` when it could not be determined. Asked of the OS rather than by
+    /// connecting: a probe connect would take the server's single viewer slot
+    /// and unpark its capture loop, so the check would disturb the very thing it
+    /// measures. `Supervised::running` is set optimistically the instant a spawn
+    /// returns, so without this a server that is alive but not yet listening —
+    /// its whole 30 s wait for the pool — reports green.
+    fn server_listening(&mut self) -> Option<bool>;
+    /// Whether injected input can currently land on the desktop.
+    fn input_desktop(&mut self) -> InputDesktopObservation;
+}
+
+/// Whether the desktop that would receive injected input is the one the stack is
+/// on (HLD tranche 4 §6 rung 5).
+///
+/// This is Incident B: `SendInput` returns success, the injector thread honestly
+/// reports `WinSta0\Default`, and nothing reaches the desktop, because a locked
+/// session's *input* desktop is the secure `Winlogon` one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputDesktopObservation {
+    /// The input desktop is ours: injected input can land.
+    Matches { desktop: String },
+    /// Something else holds the input desktop — a locked console puts it on
+    /// `Winlogon`. Nothing injected will land until that clears.
+    Differs { ours: String, input: String },
+    /// Could not be judged. **Access-denied lands here, not in `Differs`**: it is
+    /// equally what a caller in another session or window station gets, so
+    /// reporting "the console is locked" on that evidence would be a confident
+    /// wrong story — the failure mode this whole tranche exists to avoid.
+    Unknown(String),
 }
 
 /// One tick's reading of the shared section.
@@ -250,6 +281,10 @@ pub struct Reconciler {
     /// Consecutive ticks the current pool fault has persisted. Reset by any
     /// healthy reading, so a rebuild race never accumulates toward an action.
     pool_fault_ticks: u32,
+    /// Whether anything is listening on the video port, as of this tick.
+    server_listening: Option<bool>,
+    /// This tick's input-desktop reading.
+    input_desktop: InputDesktopObservation,
 }
 
 impl Reconciler {
@@ -267,6 +302,8 @@ impl Reconciler {
             pool: PoolObservation::Unreadable("not sampled yet".to_owned()),
             server_generation: None,
             pool_fault_ticks: 0,
+            server_listening: None,
+            input_desktop: InputDesktopObservation::Unknown("not sampled yet".to_owned()),
         }
     }
 
@@ -362,6 +399,12 @@ impl Reconciler {
                 spawned
             });
         }
+
+        // Sampled last, so they describe the state this tick's actions produced
+        // rather than the one they replaced. Neither drives any remediation:
+        // both are report-only rungs (HLD §6).
+        self.server_listening = ops.server_listening();
+        self.input_desktop = ops.input_desktop();
     }
 
     /// What, if anything, this tick's pool reading calls for — before debouncing.
@@ -503,14 +546,64 @@ impl Reconciler {
                     .filter(|_| !self.mode_ok)
                     .map(|m| format!("{}x{} @ {} Hz", m.width, m.height, m.hz)),
             },
-            RungReport {
-                rung: Rung::Server,
-                state: ok_or_fail(self.server.running),
-                detail: None,
-            },
-            unimplemented(Rung::InputDesktop),
+            self.server_rung(),
+            self.input_desktop_rung(),
             unimplemented(Rung::Liveness),
         ]
+    }
+
+    /// The `server` rung: supervised **and** actually accepting.
+    ///
+    /// The two halves are separate facts and the second is the one that was
+    /// missing: `running` goes true the instant a spawn returns, so a server
+    /// still inside its 30 s wait for the pool reported green for that whole
+    /// window.
+    fn server_rung(&self) -> RungReport {
+        let (state, detail) = if !self.server.running {
+            (RungState::Fail, None)
+        } else {
+            match self.server_listening {
+                Some(true) => (RungState::Ok, None),
+                Some(false) => (
+                    RungState::Fail,
+                    Some(
+                        "the process is up but nothing is listening on the video port yet"
+                            .to_owned(),
+                    ),
+                ),
+                // Supervised and alive; we simply could not ask the OS. Saying
+                // "not accepting" on that would be inventing a fault.
+                None => (
+                    RungState::Unknown,
+                    Some("could not read the listening sockets".to_owned()),
+                ),
+            }
+        };
+        RungReport {
+            rung: Rung::Server,
+            state,
+            detail,
+        }
+    }
+
+    /// The `input-desktop` rung: report-only, and deliberately cautious.
+    fn input_desktop_rung(&self) -> RungReport {
+        let (state, detail) = match &self.input_desktop {
+            InputDesktopObservation::Matches { .. } => (RungState::Ok, None),
+            InputDesktopObservation::Differs { ours, input } => (
+                RungState::Fail,
+                Some(format!(
+                    "the input desktop is {input:?} but the stack is on {ours:?}: injected input \
+                     cannot land. A locked console does this; unlock it on the host."
+                )),
+            ),
+            InputDesktopObservation::Unknown(why) => (RungState::Unknown, Some(why.clone())),
+        };
+        RungReport {
+            rung: Rung::InputDesktop,
+            state,
+            detail,
+        }
     }
 
     /// Assemble the wire status. `uptime_s` comes from the runner, which owns time.
@@ -565,6 +658,10 @@ mod tests {
         /// What `pool()` reports. Defaults to a healthy generation so existing
         /// tests are unaffected by the rung's arrival.
         pool: Option<PoolObservation>,
+        /// What `server_listening()` reports. `None` here means "use the default
+        /// healthy answer"; `Some(None)` means the OS could not be asked.
+        listening: Option<Option<bool>>,
+        input_desktop: Option<InputDesktopObservation>,
     }
 
     impl AgentOps for FakeOps {
@@ -645,6 +742,16 @@ mod tests {
                 frame_seq: 100,
             })
         }
+        fn server_listening(&mut self) -> Option<bool> {
+            self.listening.unwrap_or(Some(self.server_running))
+        }
+        fn input_desktop(&mut self) -> InputDesktopObservation {
+            self.input_desktop
+                .clone()
+                .unwrap_or(InputDesktopObservation::Matches {
+                    desktop: "Default".into(),
+                })
+        }
     }
 
     /// Bring a fake to a fully green steady state, so a pool test starts from
@@ -669,6 +776,108 @@ mod tests {
             .find(|r| r.rung == rung)
             .expect("every rung is reported")
             .state
+    }
+
+    #[test]
+    fn a_live_but_not_yet_listening_server_is_not_green() {
+        // The blind spot this rung closes: `running` is set the instant a spawn
+        // returns, so a server still inside its 30 s wait for the pool used to
+        // report green for that whole window.
+        let (mut rec, mut ops) = settled();
+        assert_eq!(rung_state(&rec, Rung::Server), RungState::Ok);
+        ops.listening = Some(Some(false));
+        rec.tick(&mut ops);
+        assert_eq!(rung_state(&rec, Rung::Server), RungState::Fail);
+        assert!(ops.server_running, "the process is still alive");
+    }
+
+    #[test]
+    fn a_listening_check_that_cannot_be_answered_is_unknown_not_a_failure() {
+        let (mut rec, mut ops) = settled();
+        ops.listening = Some(None);
+        rec.tick(&mut ops);
+        assert_eq!(rung_state(&rec, Rung::Server), RungState::Unknown);
+    }
+
+    #[test]
+    fn a_dead_server_fails_the_rung_whatever_the_socket_says() {
+        // Ordering matters: a stale LISTEN entry must not outvote a dead process.
+        let (mut rec, mut ops) = settled();
+        ops.server_running = false;
+        ops.server_pending_exit = Some(1);
+        ops.listening = Some(Some(true));
+        rec.tick(&mut ops);
+        assert_eq!(rung_state(&rec, Rung::Server), RungState::Fail);
+    }
+
+    #[test]
+    fn a_foreign_input_desktop_fails_the_rung_but_never_reaches_stuck() {
+        // Incident B. It stops injected input, not pixels — so it must be loudly
+        // reported and must NOT gate the connect, or a merely-locked console
+        // would make every client on the fleet refuse to open a session.
+        let (mut rec, mut ops) = settled();
+        ops.input_desktop = Some(InputDesktopObservation::Differs {
+            ours: "Default".into(),
+            input: "Winlogon".into(),
+        });
+        rec.tick(&mut ops);
+
+        assert_eq!(rung_state(&rec, Rung::InputDesktop), RungState::Fail);
+        let status = rec.status(1);
+        assert_eq!(
+            status.stuck, None,
+            "a locked console must not gate bring-up"
+        );
+        assert!(
+            crate::control::green(&status),
+            "green() must still hold: no pixel is stopped by a locked console"
+        );
+        // Asserted through the DERIVATION too, not only through today's
+        // field-based `stuck`. Without this the check is vacuous until unit 4
+        // wires the derivation in: it would pass against a ladder that puts
+        // input-desktop into `stuck`, which is exactly the fleet-wide connect
+        // refusal this rule exists to prevent.
+        assert_eq!(
+            crate::control::stuck_from_rungs(&status.rungs),
+            None,
+            "the rung derivation must agree: input-desktop does not gate bring-up"
+        );
+    }
+
+    #[test]
+    fn an_access_denied_input_desktop_is_unknown_not_a_confident_lock_report() {
+        // Access-denied is equally what a caller in another session or window
+        // station gets. Reporting "the console is locked" on that evidence is
+        // the confident-wrong-story failure this tranche exists to avoid.
+        let (mut rec, mut ops) = settled();
+        ops.input_desktop = Some(InputDesktopObservation::Unknown(
+            "OpenInputDesktop: access denied".into(),
+        ));
+        rec.tick(&mut ops);
+        assert_eq!(rung_state(&rec, Rung::InputDesktop), RungState::Unknown);
+        assert_eq!(rec.status(1).stuck, None);
+    }
+
+    #[test]
+    fn neither_report_only_rung_ever_remediates() {
+        // Rungs above the bring-up ladder report and nothing else — the reversal
+        // the review pass forced (HLD §6).
+        let (mut rec, mut ops) = settled();
+        ops.input_desktop = Some(InputDesktopObservation::Differs {
+            ours: "Default".into(),
+            input: "Winlogon".into(),
+        });
+        ops.listening = Some(Some(false));
+        for _ in 0..POOL_FAULT_TICKS + 5 {
+            rec.tick(&mut ops);
+        }
+        assert!(
+            !ops.calls
+                .iter()
+                .any(|c| c == "kill_server" || c == "kill_creator"),
+            "report-only rungs must provoke no remediation: {:?}",
+            ops.calls
+        );
     }
 
     #[test]

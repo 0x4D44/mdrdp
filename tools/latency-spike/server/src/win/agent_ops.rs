@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use super::wide_to_string;
-use crate::agent::{AgentOps, ChildState, Mode, PoolObservation};
+use crate::agent::{AgentOps, ChildState, InputDesktopObservation, Mode, PoolObservation};
 
 /// The device string the IDD driver's INF declares — the same one the rig's
 /// scripts key on.
@@ -60,6 +60,142 @@ pub fn idd_display_origin() -> Option<(i32, i32)> {
     // ENUM_CURRENT_SETTINGS — the same union arm the rig's prep script reads.
     let position = unsafe { devmode.Anonymous1.Anonymous2.dmPosition };
     Some((position.x, position.y))
+}
+
+/// Whether anything is in LISTEN on the capture server's video port.
+///
+/// Asked of the OS's TCP table, never by connecting. A probe connect would be
+/// accepted as the server's one and only viewer (`win::send`'s `poll_accept`
+/// takes a connection only while it is free), unparking the capture loop and
+/// occupying the slot a real session needs — a health check that breaks the
+/// thing it measures.
+///
+/// `None` means the table could not be read: that is ignorance, and the rung
+/// reports it as `Unknown` rather than inventing a fault.
+fn video_port_listening() -> Option<bool> {
+    use windows::Win32::NetworkManagement::IpHelper::{GetTcpTable2, MIB_TCPTABLE2};
+
+    // Ask for the size first; the table is a variable-length trailing array, so
+    // there is no single correct fixed buffer.
+    let mut size: u32 = 0;
+    // SAFETY: a null table pointer with a zero size is the documented
+    // "tell me how big" call; it writes only through `size`.
+    let _ = unsafe { GetTcpTable2(None, &mut size, false) };
+    if size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u8; size as usize];
+    // SAFETY: `buffer` is `size` bytes and stays alive for the call; the API
+    // writes at most `size` bytes and updates `size` with what it used.
+    let rc = unsafe {
+        GetTcpTable2(
+            Some(buffer.as_mut_ptr().cast::<MIB_TCPTABLE2>()),
+            &mut size,
+            false,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: on success the buffer holds a `MIB_TCPTABLE2`: a u32 count
+    // followed by that many rows.
+    let table = unsafe { &*buffer.as_ptr().cast::<MIB_TCPTABLE2>() };
+    let count = table.dwNumEntries as usize;
+    // SAFETY: `table.table` is the first element of the trailing array the
+    // header's count describes, and the buffer was sized by the API for exactly
+    // that many rows.
+    let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) };
+
+    // The port is big-endian in the table; the state constant for LISTEN is 2.
+    const MIB_TCP_STATE_LISTEN: u32 = 2;
+    let wanted = u32::from(crate::cli::DEFAULT_VIDEO_PORT.to_be());
+    Some(
+        rows.iter()
+            .any(|row| row.dwState == MIB_TCP_STATE_LISTEN && row.dwLocalPort == wanted),
+    )
+}
+
+/// Whether the desktop that would receive injected input is the one this stack
+/// is on (HLD tranche 4 §6 rung 5).
+///
+/// Compares the **agent's own** thread desktop against `OpenInputDesktop`. It
+/// deliberately does not claim to inspect the injector: that thread lives in the
+/// *server* process and Windows offers no way to read another process's thread
+/// desktop. The agent spawns the server with an inherited station and desktop, so
+/// its own is a sound proxy — stated here rather than implied.
+fn observe_input_desktop() -> InputDesktopObservation {
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop,
+        DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
+    };
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+
+    // SAFETY: `handle` is a live desktop handle; the buffer is caller-sized and
+    // `GetUserObjectInformationW` writes at most what it is told.
+    let name_of = |handle: windows::Win32::Foundation::HANDLE| -> Option<String> {
+        let mut buf = [0u16; 256];
+        let mut needed = 0u32;
+        let ok = unsafe {
+            GetUserObjectInformationW(
+                handle,
+                UOI_NAME,
+                Some(buf.as_mut_ptr().cast()),
+                (buf.len() * 2) as u32,
+                Some(&mut needed),
+            )
+        };
+        if ok.is_err() {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
+    };
+
+    // SAFETY: a plain query for this thread's desktop; the handle is owned by
+    // the thread and must not be closed.
+    let ours = match unsafe { GetThreadDesktop(GetCurrentThreadId()) } {
+        Ok(d) => match name_of(windows::Win32::Foundation::HANDLE(d.0)) {
+            Some(n) => n,
+            None => {
+                return InputDesktopObservation::Unknown(
+                    "could not read this thread's desktop name".to_owned(),
+                )
+            }
+        },
+        Err(e) => return InputDesktopObservation::Unknown(format!("GetThreadDesktop failed: {e}")),
+    };
+
+    // SAFETY: opens a handle we close below. Access-denied is expected and
+    // handled rather than treated as evidence of anything.
+    let input = match unsafe {
+        OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(0x0001),
+        )
+    } {
+        Ok(d) => d,
+        Err(e) => {
+            // Access-denied is ALSO what a caller in a different session or
+            // window station gets, so this cannot distinguish "locked" from
+            // "looking from the wrong place". Report ignorance.
+            return InputDesktopObservation::Unknown(format!(
+                "OpenInputDesktop failed ({e}) — this may mean the secure desktop is up, or \
+                 simply that the agent is not in the console session"
+            ));
+        }
+    };
+    let input_name = name_of(windows::Win32::Foundation::HANDLE(input.0));
+    // SAFETY: `input` came from `OpenInputDesktop` and is not used again.
+    let _ = unsafe { CloseDesktop(input) };
+
+    match input_name {
+        None => {
+            InputDesktopObservation::Unknown("could not read the input desktop's name".to_owned())
+        }
+        Some(name) if name == ours => InputDesktopObservation::Matches { desktop: ours },
+        Some(name) => InputDesktopObservation::Differs { ours, input: name },
+    }
 }
 
 /// The images the agent owns on the box. Swept at start, killed at shutdown.
@@ -265,6 +401,14 @@ impl AgentOps for WinOps {
 
     fn pool(&mut self) -> PoolObservation {
         super::idd_source::observe_pool()
+    }
+
+    fn server_listening(&mut self) -> Option<bool> {
+        video_port_listening()
+    }
+
+    fn input_desktop(&mut self) -> InputDesktopObservation {
+        observe_input_desktop()
     }
 
     fn kill_all(&mut self) {
