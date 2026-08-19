@@ -31,6 +31,44 @@ use std::time::Duration;
 use crate::auxchan::{self, Slot};
 use crate::clipboard::{self, Bridge, Policy, TextClipboard};
 
+/// What one connection did, as counts. No content, by construction.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyCounts {
+    /// Payloads the clipboard actually took.
+    pub written: u64,
+    /// Payloads recognised as the host's own content coming back.
+    pub suppressed: u64,
+    /// Payloads a direction gate or the size ceiling refused.
+    ///
+    /// **Always zero on the host today**, and the reason is worth knowing
+    /// rather than reading a 0 as evidence of anything: the reader's policy
+    /// gate refuses an inbound payload *before* it is decoded, and
+    /// `decode_clipboard` refuses an oversize one, so neither ever reaches
+    /// `apply_remote`. Kept because the variants exist and a future path could
+    /// reach them — but it is not a measurement.
+    pub refused: u64,
+    /// Payloads the clipboard refused to accept — the OS-contention case.
+    pub write_failed: u64,
+}
+
+impl ApplyCounts {
+    fn note(&mut self, applied: clipboard::Applied) {
+        match applied {
+            clipboard::Applied::Written => self.written += 1,
+            clipboard::Applied::Suppressed => self.suppressed += 1,
+            clipboard::Applied::Disabled | clipboard::Applied::TooLarge => self.refused += 1,
+            clipboard::Applied::WriteFailed => self.write_failed += 1,
+        }
+    }
+}
+
+/// What [`serve_one`] returns: what the reader saw, and what came of it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionReport {
+    pub reader: auxchan::ReaderStats,
+    pub applied: ApplyCounts,
+}
+
 /// How often the host's clipboard is read.
 ///
 /// The same quarter-second the client uses. A Windows implementation is
@@ -56,13 +94,18 @@ pub fn serve(
             Ok((stream, peer)) => {
                 eprintln!("aux: connected {peer}");
                 match serve_one(stream, &mut make_clipboard, policy) {
-                    Ok(stats) => eprintln!(
-                        "aux: disconnected — {} applied, {} refused by policy, \
-                         {} malformed, {} of an unknown type",
-                        stats.decoded - stats.malformed,
-                        stats.refused_by_policy,
-                        stats.malformed,
-                        stats.unknown_type
+                    // ASCII only: this goes to server.log, which is read
+                    // through the Windows console codepage, where an em-dash
+                    // comes out as mojibake.
+                    Ok(report) => eprintln!(
+                        "aux: disconnected - written {}, echo {}, \
+                         write-failed {}, refused-by-policy {}, malformed {}, unknown-type {}",
+                        report.applied.written,
+                        report.applied.suppressed,
+                        report.applied.write_failed,
+                        report.reader.refused_by_policy,
+                        report.reader.malformed,
+                        report.reader.unknown_type
                     ),
                     Err(e) => eprintln!("aux: connection ended: {e}"),
                 }
@@ -90,7 +133,7 @@ pub fn serve_one(
     socket: TcpStream,
     make_clipboard: &mut dyn FnMut() -> Box<dyn TextClipboard>,
     policy: Policy,
-) -> Result<auxchan::ReaderStats> {
+) -> Result<ConnectionReport> {
     // Clipboard messages are small and bursty; Nagle would add up to 40 ms.
     socket.set_nodelay(true)?;
 
@@ -165,6 +208,14 @@ pub fn serve_one(
             })?,
     );
 
+    // Counted from what `apply_remote` actually did, not from what reached the
+    // decoder. Those differ exactly when it matters: a payload refused by the
+    // OS clipboard is decoded and NOT applied, and a summary that conflated
+    // them would report a refused write as a success. Found while running AC4,
+    // where the log said "2 applied" during a clipboard hold and could not tell
+    // me whether either write had landed.
+    let outcome = Arc::new(Mutex::new(ApplyCounts::default()));
+    let reader_outcome = Arc::clone(&outcome);
     let mut stats = auxchan::ReaderStats::default();
     let end = auxchan::pump_reader(
         &socket,
@@ -176,7 +227,8 @@ pub fn serve_one(
         },
         &mut |text| {
             let mut os = lock(&apply_os);
-            clipboard::apply_remote(&mut **os, &bridge, text, &mut report);
+            let applied = clipboard::apply_remote(&mut **os, &bridge, text, &mut report);
+            lock(&reader_outcome).note(applied);
         },
         &mut stats,
     );
@@ -193,7 +245,10 @@ pub fn serve_one(
     }
 
     match end {
-        auxchan::ReaderEnd::Eof => Ok(stats),
+        auxchan::ReaderEnd::Eof => Ok(ConnectionReport {
+            reader: stats,
+            applied: *lock(&outcome),
+        }),
         auxchan::ReaderEnd::Io(reason) => Err(std::io::Error::other(reason)),
     }
 }
@@ -234,6 +289,8 @@ mod tests {
         reads: Arc<std::sync::atomic::AtomicUsize>,
         /// While true, every write blocks — the OS-refusal case AC4 is about.
         writes_block: Arc<AtomicBool>,
+        /// While true, every write is refused outright, as a busy clipboard is.
+        writes_refuse: Arc<AtomicBool>,
     }
 
     impl Pasteboard {
@@ -242,6 +299,7 @@ mod tests {
                 text: Arc::new(Mutex::new(Some(text.to_owned()))),
                 reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 writes_block: Arc::new(AtomicBool::new(false)),
+                writes_refuse: Arc::new(AtomicBool::new(false)),
             }
         }
         fn empty() -> Self {
@@ -277,6 +335,11 @@ mod tests {
             while self.0.writes_block.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(5));
             }
+            // And this stands in for the ordinary case: another process holds
+            // the clipboard, so the open is refused after bounded retry.
+            if self.0.writes_refuse.load(Ordering::SeqCst) {
+                return Err("the clipboard was held by another process".to_owned());
+            }
             *lock(&self.0.text) = Some(text.to_owned());
             Ok(())
         }
@@ -291,10 +354,8 @@ mod tests {
     /// every test here would otherwise hang the whole suite on it instead of
     /// failing. A hang is not a failure: nothing reports it, nothing names the
     /// test, and CI just stops.
-    fn join_server(
-        server: std::thread::JoinHandle<Result<auxchan::ReaderStats>>,
-    ) -> auxchan::ReaderStats {
-        let done: Arc<Mutex<Option<Result<auxchan::ReaderStats>>>> = Arc::new(Mutex::new(None));
+    fn join_server(server: std::thread::JoinHandle<Result<ConnectionReport>>) -> ConnectionReport {
+        let done: Arc<Mutex<Option<Result<ConnectionReport>>>> = Arc::new(Mutex::new(None));
         let slot = Arc::clone(&done);
         std::thread::spawn(move || {
             let outcome = server.join();
@@ -320,10 +381,7 @@ mod tests {
     fn connected(
         held: Pasteboard,
         policy: Policy,
-    ) -> (
-        TcpStream,
-        std::thread::JoinHandle<Result<auxchan::ReaderStats>>,
-    ) {
+    ) -> (TcpStream, std::thread::JoinHandle<Result<ConnectionReport>>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -355,6 +413,37 @@ mod tests {
             assert_ne!(n, 0, "the host closed the channel");
             reassembler.push(&buf[..n]);
         }
+    }
+
+    #[test]
+    fn a_refused_write_is_reported_as_refused_and_never_as_applied() {
+        // The summary counted `decoded` and called it "applied". Those differ
+        // exactly when it matters — a payload the OS clipboard refuses IS
+        // decoded and is NOT applied — so a clipboard held by another process
+        // would have been logged as a success.
+        //
+        // Found running AC4: the host log said "2 applied" during a 10 s
+        // clipboard hold, and could not tell me whether either write landed.
+        let held = Pasteboard::holding("untouched");
+        held.writes_refuse.store(true, Ordering::SeqCst);
+        let (mut client, server) = connected(held.clone(), Policy::default());
+
+        let mut wire = Vec::new();
+        aux_proto::encode_clipboard_text("the clipboard will refuse this", &mut wire).unwrap();
+        client.write_all(&wire).unwrap();
+        std::thread::sleep(POLL_INTERVAL * 3);
+        assert_eq!(held.get().as_deref(), Some("untouched"));
+
+        drop(client);
+        let report = join_server(server);
+        assert_eq!(
+            report.applied.write_failed, 1,
+            "a refused write must be counted as one"
+        );
+        assert_eq!(report.applied.written, 0, "and never as written");
+        // The payload really did reach the decoder — which is why counting
+        // decodes as applications was wrong rather than merely imprecise.
+        assert_eq!(report.reader.decoded, 1);
     }
 
     #[test]
@@ -538,7 +627,7 @@ mod tests {
         // clipboard alone would also pass on an implementation that decoded the
         // content and then threw it away.
         let stats = join_server(server);
-        assert_eq!(stats.refused_by_policy, 1);
-        assert_eq!(stats.decoded, 0, "the payload reached the decoder");
+        assert_eq!(stats.reader.refused_by_policy, 1);
+        assert_eq!(stats.reader.decoded, 0, "the payload reached the decoder");
     }
 }

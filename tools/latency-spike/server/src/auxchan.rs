@@ -207,7 +207,7 @@ pub enum ReaderEnd {
 }
 
 /// Counters the reader keeps, so a test can assert what did *not* happen.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderStats {
     /// Payloads handed to the decoder. The policy gate is asserted against this
     /// rather than against delivery: "not delivered" and "not decoded" are
