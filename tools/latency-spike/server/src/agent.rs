@@ -1277,10 +1277,12 @@ mod tests {
         // written `0..POOL_FAULT_TICKS - 1` runs zero times when the constant is
         // 1, so it passes vacuously against an implementation with no debounce at
         // all — proven by mutation. The literal 2 encodes the real requirement.
-        assert!(
-            POOL_FAULT_TICKS >= 2,
-            "the debounce must span more than one tick to outlive a rebuild race"
-        );
+        const {
+            assert!(
+                POOL_FAULT_TICKS >= 2,
+                "the debounce must span more than one tick to outlive a rebuild race"
+            )
+        };
 
         let (mut rec, mut ops) = settled();
         ops.pool = Some(PoolObservation::NoPool);
