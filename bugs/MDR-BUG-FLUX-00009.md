@@ -59,6 +59,31 @@ Expected: the same summary on every exit route, including Cmd+Q and the Quit men
 
 ## Fix
 
-<unfixed — raised only>
+Extracted the block into `report_session_epilogue()` in `main.rs` and call it from the
+window's exit hook, which runs at `LoopExiting` on every close. The call site after
+`SessionWindow::run()` remains behind an `AtomicBool` guard, so the case where the hook
+did not run is still covered and neither route can produce a second report. The
+`--screenshot` capture moves with it, and now happens at `LoopExiting` while the surface
+store is still fully populated. The end dialog is unaffected — it genuinely needs the
+event loop `run()` hands back, and keeps its own cache snapshot.
+
+**Verified by a controlled red/green on the same host and the same exit route**, quench
+2026-08-19, both binaries driven identically (`--size 1280x720`, quit by clicking the
+`Quit mdrdp` menu item on that exact pid via System Events):
+
+- **Red** — installed 0.1.69, pre-fix. Log ends at `session ended: Graceful`. Nothing
+  after it.
+- **Green** — this branch's release build. Same line, then the full summary:
+  `frames 42  decode errors 0  undecoded regions 0  surface errors 0`,
+  `surfaces +2 -1  reset Some((1280, 720))  unhandled pdus 0`,
+  `codecs {"Avc444v2": 39}`, the bitmap cache line and the audio line.
+
+Reproduced green twice more on the same build, including a session driven through six
+suppress/resume cycles (`frames 75`, summary intact). Both sessions ended `Graceful`, so
+the Shutdown Request still goes out on this path — the fix does not disturb the
+disconnect the hook already owned.
+
+Not unit-tested: what broke was *where* the call lived in the winit lifecycle, which no
+in-process test can observe. The red/green above is the evidence.
 
 ## Notes
