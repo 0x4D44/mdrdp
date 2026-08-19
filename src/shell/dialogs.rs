@@ -108,6 +108,36 @@ pub const CANONICAL_STAGES: &[&str] = &[
     "post_tls_sequence",
 ];
 
+/// The native (rhydra) connect's ladder — the names `native::probe` emits.
+pub const NATIVE_CANONICAL_STAGES: &[&str] = &["ssh-spawn", "tunnel-up", "probe", "handshake"];
+
+/// An arrived stage name and a canonical entry refer to the same leg.
+fn names_match(name: &str, canon: &str) -> bool {
+    name.starts_with(canon) || canon.starts_with(name)
+}
+
+/// Which ladder the arrived events say this connect is climbing.
+///
+/// A native connect's first event is `ssh-spawn`, so the native ladder shows from
+/// the first report. An RDP stage arriving — including *after* native stages, which
+/// is exactly what an Auto probe falling back to RDP looks like — selects the RDP
+/// ladder: the native rows stay visible as done history and the pending rows show
+/// the RDP legs still to come. No events yet defaults to RDP, today's common case.
+fn canonical_for(arrived: &[(String, u64, Option<String>)]) -> &'static [&'static str] {
+    let any_match = |ladder: &[&str]| {
+        arrived
+            .iter()
+            .any(|(name, _, _)| ladder.iter().any(|canon| names_match(name, canon)))
+    };
+    if any_match(CANONICAL_STAGES) {
+        CANONICAL_STAGES
+    } else if any_match(NATIVE_CANONICAL_STAGES) {
+        NATIVE_CANONICAL_STAGES
+    } else {
+        CANONICAL_STAGES
+    }
+}
+
 /// Merge arrived stage events with the canonical expectation into display rows:
 /// everything arrived (in arrival order, ms attached), then the next canonical stage
 /// as Current, then the rest as Pending. Pure and testable.
@@ -121,13 +151,9 @@ pub fn stage_rows(arrived: &[(String, u64, Option<String>)]) -> Vec<StageRow> {
             status: StageStatus::Done,
         })
         .collect();
-    let matched = |canon: &str| {
-        arrived
-            .iter()
-            .any(|(name, _, _)| name.starts_with(canon) || canon.starts_with(name.as_str()))
-    };
+    let matched = |canon: &str| arrived.iter().any(|(name, _, _)| names_match(name, canon));
     let mut first_pending = true;
-    for canon in CANONICAL_STAGES {
+    for canon in canonical_for(arrived) {
         if !matched(canon) {
             rows.push(StageRow {
                 name: (*canon).to_owned(),
@@ -1491,6 +1517,44 @@ mod tests {
                 .iter()
                 .any(|r| r.name == "LicensingExchange" && r.status != StageStatus::Done),
             "canonical licensing must not reappear as pending: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_native_first_stage_selects_the_native_ladder() {
+        // One ssh-spawn event: the remaining pendings must be the native legs, not
+        // seven forever-pending RDP stages (review P-M4).
+        let arrived = vec![("ssh-spawn".to_owned(), 40, None)];
+        let rows = stage_rows(&arrived);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["ssh-spawn", "tunnel-up", "probe", "handshake"]);
+        assert_eq!(rows[1].status, StageStatus::Current);
+        assert!(
+            !names.contains(&"tcp_connect"),
+            "no RDP legs on a native climb: {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_auto_fallback_to_rdp_swaps_the_pending_ladder_back() {
+        // The native attempt's history stays visible as done rows, but the first
+        // RDP event means RDP is now the transport being climbed — pendings are
+        // the remaining RDP legs, and no native leg reappears as pending.
+        let arrived = vec![
+            ("ssh-spawn".to_owned(), 40, None),
+            ("tunnel-up".to_owned(), 900, None),
+            ("tcp_connect".to_owned(), 1100, None),
+        ];
+        let rows = stage_rows(&arrived);
+        assert_eq!(rows[0].name, "ssh-spawn");
+        assert_eq!(rows[0].status, StageStatus::Done);
+        assert_eq!(rows[3].name, "x224_negotiation");
+        assert_eq!(rows[3].status, StageStatus::Current);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.name == "probe" || r.name == "handshake"),
+            "unclimbed native legs must not linger as pending: {rows:?}"
         );
     }
 

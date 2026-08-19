@@ -81,7 +81,25 @@ pub struct ProbedTransport {
 
 /// Spawn the tunnel and run the probe, retrying once with fresh ports if ssh
 /// lost the local-port race (`ExitOnForwardFailure` → [`ProbeFailure::SshBind`]).
-pub fn establish(host: &str, ssh_user: Option<&str>) -> Result<ProbedTransport, ProbeFailure> {
+///
+/// `stages` mirrors the RDP connect's live stage feed: the launcher's Connecting
+/// dialog renders whatever arrives, and the first native stage name is what tells
+/// it to swap to the native ladder. Elapsed times are measured from this call.
+pub fn establish(
+    host: &str,
+    ssh_user: Option<&str>,
+    stages: Option<&std::sync::mpsc::Sender<crate::connect::LiveStage>>,
+) -> Result<ProbedTransport, ProbeFailure> {
+    let started = Instant::now();
+    let mut report = move |name: &'static str, qualifier: Option<String>| {
+        if let Some(tx) = stages {
+            let _ = tx.send(crate::connect::LiveStage {
+                name: name.to_owned(),
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                qualifier,
+            });
+        }
+    };
     let mut attempt = 0;
     loop {
         let ports =
@@ -93,8 +111,9 @@ pub fn establish(host: &str, ssh_user: Option<&str>) -> Result<ProbedTransport, 
         };
         let mut tunnel =
             Tunnel::spawn(&spec).map_err(|e| ProbeFailure::Io(format!("spawn ssh: {e}")))?;
+        report(STAGE_SSH_SPAWN, None);
         let deadline = Instant::now() + PROBE_DEADLINE;
-        match probe_over(ports, deadline, || tunnel.poll_exit()) {
+        match probe_over(ports, deadline, || tunnel.poll_exit(), &mut report) {
             Ok(conn) => {
                 return Ok(ProbedTransport {
                     conn,
@@ -111,18 +130,27 @@ pub fn establish(host: &str, ssh_user: Option<&str>) -> Result<ProbedTransport, 
     }
 }
 
+/// The stage names the native connect feeds the launcher's Connecting dialog,
+/// in order. `dialogs.rs` keys its native ladder off these exact strings.
+pub const STAGE_SSH_SPAWN: &str = "ssh-spawn";
+pub const STAGE_TUNNEL_UP: &str = "tunnel-up";
+pub const STAGE_PROBE: &str = "probe";
+pub const STAGE_HANDSHAKE: &str = "handshake";
+
 /// The four probe steps against already-decided local ports. Split from
 /// [`establish`] so tests drive it against local listeners with no ssh at all;
 /// `tunnel_exited` reports the ssh child's death (with its stderr) and is polled
-/// at every step boundary.
+/// at every step boundary. `stage` fires as each visible milestone completes.
 pub fn probe_over(
     ports: ForwardPorts,
     deadline: Instant,
     mut tunnel_exited: impl FnMut() -> Option<String>,
+    mut stage: impl FnMut(&'static str, Option<String>),
 ) -> Result<ProbeSuccess, ProbeFailure> {
     // Step 1: the control forward accepting proves ssh has bound its listeners.
     let readiness = ssh::await_forward_ready(ports.control_addr(), deadline, &mut tunnel_exited)?;
     drop(readiness);
+    stage(STAGE_TUNNEL_UP, None);
 
     // Step 2: the control pre-filter. A refused-at-the-remote-end forward shows
     // up as an accepted-then-closed local connection — query_status reads EOF and
@@ -143,6 +171,7 @@ pub fn probe_over(
     if let Some(stderr) = tunnel_exited() {
         return Err(ssh::classify_ssh_stderr(&stderr));
     }
+    stage(STAGE_PROBE, None);
 
     // Step 3: the video channel and the header gate. `green` said the server was
     // spawned; only this connect proves it is listening (the S-C1 window shows up
@@ -162,6 +191,10 @@ pub fn probe_over(
 
     // Step 4: the input channel, which the server binds moments after video.
     let input = connect_input(ports, deadline)?;
+    stage(
+        STAGE_HANDSHAKE,
+        Some(format!("wire v{}", header.wire_version)),
+    );
 
     Ok(ProbeSuccess {
         video,
@@ -358,19 +391,37 @@ mod tests {
         payload.extend_from_slice(&second[..7]); // a partial second message
         let (ports, _joins) = fake_host(Some(status_line(&green_report())), Some(payload));
 
-        let ok = probe_over(ports, far_deadline(), || None).expect("probe should succeed");
+        let mut stages: Vec<(&'static str, Option<String>)> = Vec::new();
+        let ok = probe_over(
+            ports,
+            far_deadline(),
+            || None,
+            |name, q| {
+                stages.push((name, q));
+            },
+        )
+        .expect("probe should succeed");
         assert_eq!(ok.header.wire_version, 3);
         assert_eq!((ok.header.width, ok.header.height), (1920, 1080));
         assert!(
             ok.reassembler.buffered() > 0,
             "bytes past the header must stay buffered for the session"
         );
+        // The launcher ladder climbs these in this order; handshake names the wire.
+        assert_eq!(
+            stages,
+            vec![
+                (STAGE_TUNNEL_UP, None),
+                (STAGE_PROBE, None),
+                (STAGE_HANDSHAKE, Some("wire v3".to_owned())),
+            ]
+        );
     }
 
     #[test]
     fn a_wire_v2_host_is_refused_with_the_versions_named() {
         let (ports, _joins) = fake_host(Some(status_line(&green_report())), Some(header_bytes(2)));
-        let err = probe_over(ports, far_deadline(), || None).unwrap_err();
+        let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
         assert_eq!(err, ProbeFailure::VersionMismatch { host: 2, client: 3 });
     }
 
@@ -380,7 +431,7 @@ mod tests {
         report.server.running = false;
         report.stuck = Some("server".to_owned());
         let (ports, _joins) = fake_host(Some(status_line(&report)), None);
-        let err = probe_over(ports, far_deadline(), || None).unwrap_err();
+        let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
         assert_eq!(err, ProbeFailure::NotGreen("server".to_owned()));
     }
 
@@ -389,7 +440,7 @@ mod tests {
         // The control listener accepts and closes without a reply — exactly what
         // ssh does locally when the remote end refuses the forward.
         let (ports, _joins) = fake_host(None, None);
-        let err = probe_over(ports, far_deadline(), || None).unwrap_err();
+        let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
         assert_eq!(err, ProbeFailure::NoAgent);
     }
 
@@ -420,7 +471,7 @@ mod tests {
                 }
             }
         });
-        let err = probe_over(ports, far_deadline(), || None).unwrap_err();
+        let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
         assert_eq!(err, ProbeFailure::NoServer);
     }
 
@@ -429,7 +480,7 @@ mod tests {
         let mut payload = Vec::new();
         framing::encode(framing::MSG_VIDEO_SEQ, &[0u8; 12], &mut payload);
         let (ports, _joins) = fake_host(Some(status_line(&green_report())), Some(payload));
-        let err = probe_over(ports, far_deadline(), || None).unwrap_err();
+        let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
         assert!(
             matches!(err, ProbeFailure::Io(ref m) if m.contains("expected the stats header")),
             "got {err:?}"
