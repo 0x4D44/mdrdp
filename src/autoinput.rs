@@ -50,11 +50,13 @@ enum Step {
         x: u16,
         y: u16,
     },
-    /// A vertical wheel turn at a point; positive units scroll up (away).
+    /// A vertical wheel turn at a point, counted in notches (detents), positive
+    /// scrolling up (away). One notch becomes one `InputEvent::Scroll` of
+    /// [`crate::input::WHEEL_UNITS_PER_NOTCH`] units — see [`send_scroll`].
     Scroll {
         x: u16,
         y: u16,
-        units: i16,
+        notches: i16,
     },
     /// Press at `from`, move to `to` in interpolated steps, release. A window drag.
     Drag {
@@ -138,14 +140,14 @@ impl Script {
                         },
                         "dblclick" => Step::DoubleClick { x, y },
                         _ => {
-                            let units: i16 =
+                            let notches: i16 =
                                 parts.next().and_then(|v| v.parse().ok()).ok_or_else(|| {
-                                    format!("line {}: scroll wants x y units", idx + 1)
+                                    format!("line {}: scroll wants x y notches", idx + 1)
                                 })?;
-                            if units == 0 {
-                                return Err(format!("line {}: scroll of zero units", idx + 1));
+                            if notches == 0 {
+                                return Err(format!("line {}: scroll of zero notches", idx + 1));
                             }
-                            Step::Scroll { x, y, units }
+                            Step::Scroll { x, y, notches }
                         }
                     }
                 }
@@ -215,19 +217,7 @@ impl Script {
                         send_click(input, MouseButton::Left, *x, *y)
                     }
                 }
-                Step::Scroll { x, y, units } => {
-                    input.send(InputEvent::MouseMove { x: *x, y: *y }).is_ok() && {
-                        std::thread::sleep(KEY_GAP);
-                        input
-                            .send(InputEvent::Scroll {
-                                axis: crate::input::ScrollAxis::Vertical,
-                                units: *units,
-                                x: *x,
-                                y: *y,
-                            })
-                            .is_ok()
-                    }
-                }
+                Step::Scroll { x, y, notches } => send_scroll(input, *x, *y, *notches),
                 Step::Drag { from, to, duration } => send_drag(input, *from, *to, *duration),
             };
             if !ok {
@@ -235,6 +225,36 @@ impl Script {
             }
         }
     }
+}
+
+/// Move to the point, then turn the wheel one notch at a time.
+///
+/// A script counts notches, because that is what a reader means by "scroll down
+/// three". [`InputEvent::Scroll`] does not: its `units` are wheel units, of which
+/// one notch is [`crate::input::WHEEL_UNITS_PER_NOTCH`] — real scroll input emits
+/// one event of ±120 per notch, and the native wire refuses anything that is not
+/// a multiple of 120 outright. Sending the notch count raw got the input channel
+/// closed by the host mid-run ("wheel delta -3 is not a nonzero multiple of 120").
+fn send_scroll(input: &WakingSender<InputEvent>, x: u16, y: u16, notches: i16) -> bool {
+    if input.send(InputEvent::MouseMove { x, y }).is_err() {
+        return false;
+    }
+    let step = i16::from(crate::input::WHEEL_UNITS_PER_NOTCH as i16) * notches.signum();
+    for _ in 0..notches.unsigned_abs() {
+        std::thread::sleep(KEY_GAP);
+        let sent = input
+            .send(InputEvent::Scroll {
+                axis: crate::input::ScrollAxis::Vertical,
+                units: step,
+                x,
+                y,
+            })
+            .is_ok();
+        if !sent {
+            return false;
+        }
+    }
+    true
 }
 
 /// Move to the point, press, hold briefly, release. True while the channel lives.
@@ -586,16 +606,26 @@ mod tests {
             .count();
         assert_eq!(left_downs, 2, "a double-click is two presses");
 
-        // scroll: move then one vertical wheel event carrying the signed units.
-        assert_eq!(
-            events.last(),
-            Some(&InputEvent::Scroll {
-                axis: crate::input::ScrollAxis::Vertical,
-                units: -3,
-                x: 50,
-                y: 60,
-            })
-        );
+        // scroll: move, then ONE EVENT PER NOTCH, each carrying a whole wheel
+        // notch (120 units) — not the notch count. The native wire refuses a
+        // delta that is not a nonzero multiple of 120 and closes the channel, so
+        // a `units: -3` here is a live-session failure, not a cosmetic one.
+        let scrolls: Vec<&InputEvent> = events
+            .iter()
+            .filter(|e| matches!(e, InputEvent::Scroll { .. }))
+            .collect();
+        assert_eq!(scrolls.len(), 3, "three notches are three wheel events");
+        for scroll in scrolls {
+            assert_eq!(
+                scroll,
+                &InputEvent::Scroll {
+                    axis: crate::input::ScrollAxis::Vertical,
+                    units: -crate::input::WHEEL_UNITS_PER_NOTCH as i16,
+                    x: 50,
+                    y: 60,
+                }
+            );
+        }
     }
 
     #[test]
