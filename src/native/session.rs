@@ -40,7 +40,7 @@ use crate::surface::{Rect, SurfaceStore};
 use crate::wake::{self, DoorbellReceiver};
 use crate::window::Waker;
 
-use super::clipboard::TextOnly;
+use super::clipboard::{COUNTERS, TextOnly};
 use super::probe::ProbedTransport;
 use super::ssh::Tunnel;
 use rhydra::clipboard::{self as clip, Bridge, Policy, TextClipboard};
@@ -285,7 +285,16 @@ fn spawn_aux(
                         // ordering cannot deadlock against the poll thread.
                         let mut bridge = lock(&rx_bridge);
                         let mut os = lock(&rx_os);
-                        clip::apply_remote(&mut **os, &mut bridge, text, &mut report);
+                        // Counted from what `apply_remote` reports rather than
+                        // decided again here: two places deciding the same
+                        // policy eventually disagree.
+                        match clip::apply_remote(&mut **os, &mut bridge, text, &mut report) {
+                            clip::Applied::Written => COUNTERS.note_applied(),
+                            clip::Applied::Suppressed => COUNTERS.note_echo_suppressed(),
+                            clip::Applied::Disabled
+                            | clip::Applied::TooLarge
+                            | clip::Applied::WriteFailed => COUNTERS.note_refused(),
+                        }
                     },
                     &mut stats,
                 );
@@ -321,6 +330,7 @@ fn spawn_aux(
                         let mut bridge = lock(&poll_bridge);
                         let mut os = lock(&poll_os);
                         if let Some(text) = clip::poll_local(&mut **os, &mut bridge, &mut report) {
+                            COUNTERS.note_sent();
                             poll_slot.put(text);
                         }
                     }

@@ -242,6 +242,16 @@ fn report_session_epilogue(
             "  native: frames {}  bytes in {}  decode errors {}",
             stats.frames, stats.bytes_in, stats.decode_errors
         );
+        // Counts only — no content, ever. "Exactly one message each way per
+        // copy, and none after" is a claim about the wire, and nothing else
+        // this session records can settle it.
+        let (sent, applied, echoes, refused) = mdrdp::native::clipboard::COUNTERS.snapshot();
+        if sent + applied + echoes + refused > 0 {
+            eprintln!(
+                "  native: clipboard sent {sent}  applied {applied}  \
+                 echoes suppressed {echoes}  refused {refused}"
+            );
+        }
     } else {
         eprintln!(
             "  frames {}  decode errors {}  undecoded regions {}  surface errors {}\n  \

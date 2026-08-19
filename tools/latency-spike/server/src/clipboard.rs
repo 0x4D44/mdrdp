@@ -324,6 +324,25 @@ pub fn poll_local(
     }
 }
 
+/// What [`apply_remote`] did. No payload attached, so it is safe to count and
+/// safe to print.
+///
+/// Returned rather than re-derived by the caller: deciding twice would mean two
+/// places that must agree about the policy, and they would eventually not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// Written to the clipboard.
+    Written,
+    /// Our own content coming back. The echo signal.
+    Suppressed,
+    /// The direction gate is closed.
+    Disabled,
+    /// Over the size ceiling.
+    TooLarge,
+    /// The clipboard refused the write.
+    WriteFailed,
+}
+
 /// Apply one payload that arrived from the host to the local clipboard.
 ///
 /// The read-back after the set is what closes the normalisation loop — see
@@ -338,12 +357,12 @@ pub fn apply_remote(
     bridge: &mut Bridge,
     text: &str,
     report: &mut impl FnMut(&str),
-) {
+) -> Applied {
     match bridge.on_remote_text(text) {
         Incoming::Apply(wire) => {
             if let Err(e) = os.write_text(&wire) {
                 report(&format!("clipboard write failed: {e}"));
-                return;
+                return Applied::WriteFailed;
             }
             // A failed read-back needs no `else`: deciding to apply already
             // recorded the text, which is the best guess available. What would
@@ -353,12 +372,15 @@ pub fn apply_remote(
             if let Ok(Some(read_back)) = os.read_text() {
                 bridge.note_applied(&read_back);
             }
+            Applied::Written
         }
-        Incoming::Suppressed | Incoming::Disabled => {}
+        Incoming::Suppressed => Applied::Suppressed,
+        Incoming::Disabled => Applied::Disabled,
         Incoming::TooLarge { bytes, limit } => {
             report(&format!(
                 "clipboard from the host not applied: {bytes} bytes is over the {limit}-byte limit"
             ));
+            Applied::TooLarge
         }
     }
 }
@@ -610,6 +632,51 @@ mod tests {
         // Falling back to the applied text is the best guess available, and it
         // must still stop the next poll bouncing the content back to the host.
         assert_eq!(poll_local(&mut os, &mut b, &mut r), None);
+    }
+
+    #[test]
+    fn apply_remote_reports_what_it_did_in_each_case() {
+        // The counters the acceptance criteria read are derived from this
+        // return value, so each variant has to be reachable and distinct. A
+        // caller re-deriving the decision would be a second place that has to
+        // agree with the policy, and eventually would not.
+        let mut r = |_: &str| {};
+
+        let mut os = FakeClipboard::holding("start");
+        let mut b = bridge();
+        assert_eq!(
+            apply_remote(&mut os, &mut b, "from the host", &mut r),
+            Applied::Written
+        );
+        // Straight back again: now it is our own content.
+        assert_eq!(
+            apply_remote(&mut os, &mut b, "from the host", &mut r),
+            Applied::Suppressed
+        );
+
+        let mut off = Bridge::new(Policy {
+            from_remote: false,
+            ..Policy::default()
+        });
+        assert_eq!(
+            apply_remote(&mut os, &mut off, "anything", &mut r),
+            Applied::Disabled
+        );
+
+        let mut b2 = bridge();
+        let huge = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
+        assert_eq!(
+            apply_remote(&mut os, &mut b2, &huge, &mut r),
+            Applied::TooLarge
+        );
+
+        let mut broken = FakeClipboard::holding("start");
+        broken.write_fails = true;
+        let mut b3 = bridge();
+        assert_eq!(
+            apply_remote(&mut broken, &mut b3, "will not stick", &mut r),
+            Applied::WriteFailed
+        );
     }
 
     #[test]

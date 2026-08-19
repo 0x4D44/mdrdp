@@ -15,6 +15,8 @@ pub use rhydra::clipboard::{
     Bridge, Incoming, Outgoing, Policy, TextClipboard, apply_remote, poll_local,
 };
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
 use crate::clipboard::{ClipboardContent, OsClipboard};
 
 /// Presents an [`OsClipboard`] as the text-only clipboard the shared bridge
@@ -85,5 +87,69 @@ mod tests {
     fn a_read_error_stays_an_error() {
         let mut os = TextOnly(Fake(Err("the pasteboard is busy".to_owned())));
         assert!(os.read_text().is_err());
+    }
+}
+
+/// What the clipboard did this session.
+///
+/// A process **global**, and that is not a shortcut: the architecture is one OS
+/// process per session (parent HLD), so there is exactly one of these and
+/// threading it through four call sites would buy nothing.
+///
+/// It exists because several acceptance criteria are about **counts on the
+/// wire** rather than about content — "exactly one message each way per copy,
+/// and none after" cannot be asserted by looking at a clipboard. Counts also
+/// carry no content, so this is the one clipboard telemetry that is safe to
+/// print.
+pub static COUNTERS: ClipboardCounters = ClipboardCounters::new();
+
+#[derive(Debug)]
+pub struct ClipboardCounters {
+    /// Local copies handed to the writer for the host.
+    sent: AtomicU64,
+    /// Host payloads applied to the local pasteboard.
+    applied: AtomicU64,
+    /// Host payloads recognised as our own content coming back.
+    ///
+    /// Only counted when a message actually arrived — the poll's "nothing
+    /// changed" verdict is the common case four times a second and says
+    /// nothing. This one is the echo signal.
+    echoes_suppressed: AtomicU64,
+    /// Payloads refused, in either direction, by the size ceiling or a
+    /// direction gate.
+    refused: AtomicU64,
+}
+
+impl ClipboardCounters {
+    const fn new() -> Self {
+        Self {
+            sent: AtomicU64::new(0),
+            applied: AtomicU64::new(0),
+            echoes_suppressed: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+        }
+    }
+
+    pub fn note_sent(&self) {
+        self.sent.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    pub fn note_applied(&self) {
+        self.applied.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    pub fn note_echo_suppressed(&self) {
+        self.echoes_suppressed.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    pub fn note_refused(&self) {
+        self.refused.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// `(sent, applied, echoes suppressed, refused)`.
+    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.sent.load(AtomicOrdering::Relaxed),
+            self.applied.load(AtomicOrdering::Relaxed),
+            self.echoes_suppressed.load(AtomicOrdering::Relaxed),
+            self.refused.load(AtomicOrdering::Relaxed),
+        )
     }
 }
