@@ -710,9 +710,22 @@ mod videotoolbox {
             // divergent parameter sets, and rebuilding on it would flush the decoder
             // twice per frame, destroying both reference chains until the next IDR
             // (a stall, not a glitch). Refusing without a rebuild keeps whichever
-            // sub-stream built the current session alive (Windows uses one SPS for
-            // both, so in practice this guard never fires); the caller skips and
-            // counts the refused frames.
+            // sub-stream built the current session alive; the caller skips and counts
+            // the refused frame.
+            //
+            // THIS GUARD IS LOAD-BEARING — it is not vestigial, and it fires. Measured
+            // on kiln 2026-08-19: once in a live session, recorded in the reason tally
+            // of MDR-BUG-FLUX-00008 as "avc444 luma decode failed: oscillating SPS/PPS".
+            // An earlier version of this comment claimed "Windows uses one SPS for both,
+            // so in practice this guard never fires", which is false and nearly cost a
+            // regression: a design that read the guard as dead code proposed deleting it
+            // (`wrk_docs/2026.08.19 - HLD - one H264 decode session per AVC444 view.md`,
+            // rejected). Deleting it converts one skipped frame into a double rebuild per
+            // frame, which is exactly the permanent-black-desktop failure that
+            // MDR-BUG-FLUX-00008's fix removed. The correct output Arthur observes on
+            // AVC444v2 is produced by the single decoder AND this guard together — the
+            // guard is why divergence, when it happens, costs one frame instead of the
+            // session.
             if let (Some(sps), Some(pps)) = (sps, pps) {
                 let stale = match &self.session {
                     Some(s) => s.sps != sps || s.pps != pps,
