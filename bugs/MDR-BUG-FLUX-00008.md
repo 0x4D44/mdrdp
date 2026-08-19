@@ -131,6 +131,58 @@ fault (source, timestamp, and whether it also fired during the overnight black s
 and drive the same cycling from FreeRDP or the Microsoft client to establish whether we
 are provoking a Windows fault or sending something wrong at that resolution.
 
+## Host-side evidence 2026-08-19 (via fleet SSH)
+
+The likely trigger is on the host, and the one configuration difference across the fleet
+lines up with the one host that shows the defect.
+
+**Display power-off timeout (`powercfg SUB_VIDEO VIDEOIDLE`), measured on each host:**
+
+| host | AC | battery | shows the defect |
+|---|---|---|---|
+| **kiln** | **600 s** | **600 s** | yes |
+| quench | never | never | no |
+| temper | never | 180 s | no |
+| crucible | 900 s | 600 s | no |
+
+crucible carries a timeout but is never idle — fleet agents drive it continuously, so the
+idle timer never fires. kiln sits idle and reaches 10 minutes routinely.
+
+**The timing on Arthur's black connect is exact.** kiln's System log, `Win32k`:
+`Power Manager has requested suppression of all input (INPUT_SUPPRESS_REQUEST=1)` at
+**15:22:41**, released at **15:22:53** — bracketing the connect that came up black
+(session pid 49030, 47 frames, 1 decode error). `lessons_learnt.md` already records the
+same failure shape from the capture side: a Windows monitor power-off leaves frames
+reporting success while the pixels go black.
+
+**Not proven.** kiln exposes both a `Microsoft Remote Display Adapter` and `Intel(R)
+Graphics`; it is not established that a console display power-off reaches the RDP
+session's virtual adapter. It is plausible if the RDP logon takes over the console session
+(same account), and the Win32k events are machine-wide Power Manager activity, but that is
+inference. **Test armed 2026-08-19:** kiln's `VIDEOIDLE` set to 0 on both AC and DC
+(was `0x258`/`0x258` — restore those to revert). If the black screens stop, this is it.
+
+**kiln also has an unrelated hardware fault worth tracking.** Bursts of WHEA corrected
+PCIe errors (dozens at 14:46–14:47, more at 14:14 and 15:14) against
+`PCI\VEN_8086&DEV_272B` — the Intel Wi-Fi adapter — with `Netwaw18` driver warnings
+alongside, and a measured session RTT p50 of 422 ms against 15.8 ms to anvil. Corrected
+errors do not corrupt data, but the link is unstable. Arthur flashed the BIOS and updated
+the Intel video driver the same day.
+
+**Why the official client does not show this (hypothesis, untested).** mdrdp sends
+Suppress Output on *occlusion*, which for a fullscreen session on its own macOS Space
+fires every time the user switches Space — many times an hour. The Microsoft client
+suppresses on *minimise*, which rarely happens. mdrdp therefore spends a large fraction of
+the day with the host not encoding; the official client spends almost none. That matches
+Arthur's report that sessions survived overnight before the Suppress Output change landed.
+Clean A/B: restore kiln's 600 s timeout, leave the official client connected and idle past
+it, and see whether it also goes black.
+
+**What is ours regardless of trigger.** The client can see that it asked for a repaint and
+received nothing decodable, and still shows a black window with no log line, no on-screen
+indication, and nothing but a counter in `mdrdp -S`. That silence is a client defect and is
+being fixed separately from the trigger.
+
 ## Fix
 
 <unfixed — raised only>
