@@ -95,6 +95,19 @@ pub fn spawn(
     let ProbedTransport { conn, tunnel, .. } = transport;
     let stop = Arc::new(AtomicBool::new(false));
 
+    // Name the auxiliary channel's state once, out loud. A clipboard that
+    // silently does nothing is indistinguishable from one that is broken, and
+    // the three states have three different remedies: redeploy the host, look
+    // at the host's aux listener, or nothing at all.
+    eprintln!(
+        "native: clipboard {}",
+        match (conn.header.clipboard, conn.aux.is_some()) {
+            (false, _) => "unsupported by this host",
+            (true, true) => "ready",
+            (true, false) => "advertised, but its channel did not connect",
+        }
+    );
+
     // The store's surface 0 is created at the wire size before any thread runs,
     // so the window can size itself and the first AU adopts cleanly.
     {
