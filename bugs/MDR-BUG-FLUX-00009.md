@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00009 — Exit diagnostic summary and --screenshot are skipped when the session is quit via Cmd+Q / Quit menu
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** diagnostics
 - **Raised:** 2026-08-19T07:16:05Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260819T151441Z-p23386-n706098000-c1
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00009-run-fix-20260819T151441Z-p23386-n706098000-c1
-- **Owner base:** daf875b9d1b5589bbb43538c4139237e05353522
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-19T15:14:41Z
-- **Owner until:** 2026-08-19T17:14:41Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T07:16:05Z, raised via `deltic bugs new` model=claude-opus-5@high)
+- **State history:** Open (2026-08-19T07:16:05Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-19T15:15:13Z, deltic:auto role=fix run=fix-20260819T151441Z-p23386-n706098000-c1 branch=task/bug-MDR-BUG-FLUX-00009-run-fix-20260819T151441Z-p23386-n706098000-c1 code=b26b8e7 gate=manual)
 
 ## Observation
 
