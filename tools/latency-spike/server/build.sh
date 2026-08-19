@@ -40,4 +40,5 @@ elif [ "$(uname -s 2>/dev/null || echo unknown)" != "Windows_NT" ] && [ -z "${WI
     exit 2
 fi
 
-exec cargo build --manifest-path "$HERE/Cargo.toml" --release --target "$TARGET" "$@"
+exec cargo build --manifest-path "$HERE/Cargo.toml" --release --target "$TARGET" \
+    --config 'profile.release.debug=1' "$@"

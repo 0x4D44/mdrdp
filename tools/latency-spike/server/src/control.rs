@@ -161,14 +161,29 @@ pub enum QueryError {
 }
 
 /// One blocking status query against an agent control port.
-pub fn query_status(addr: (&str, u16)) -> Result<StatusReport, QueryError> {
+///
+/// `timeout` bounds both the TCP connect and the read of the reply line — the read
+/// timeout is derived from it rather than the previous hardcoded 5 s, which could
+/// alone exceed a caller's overall budget (HLD tranche 3 §4.3/review S-M3: the
+/// native-connect probe runs its whole four-step sequence under one 8 s deadline).
+pub fn query_status(
+    addr: (&str, u16),
+    timeout: std::time::Duration,
+) -> Result<StatusReport, QueryError> {
     use std::io::{BufRead, BufReader, Write};
-    use std::time::Duration;
+    use std::net::{TcpStream, ToSocketAddrs};
 
-    let stream = std::net::TcpStream::connect(addr)
+    let sock_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| QueryError::NoAnswer(format!("resolve {}:{}: {e}", addr.0, addr.1)))?
+        .next()
+        .ok_or_else(|| {
+            QueryError::NoAnswer(format!("resolve {}:{}: no addresses", addr.0, addr.1))
+        })?;
+    let stream = TcpStream::connect_timeout(&sock_addr, timeout)
         .map_err(|e| QueryError::NoAnswer(format!("connect {}:{}: {e}", addr.0, addr.1)))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(timeout))
         .map_err(|e| QueryError::NoAnswer(e.to_string()))?;
     let mut writer = stream
         .try_clone()
@@ -209,13 +224,14 @@ pub fn wait_stable_green(
     addr: (&str, u16),
     deadline: std::time::Duration,
     spacing: std::time::Duration,
+    query_timeout: std::time::Duration,
 ) -> WaitOutcome {
     let start = std::time::Instant::now();
     loop {
-        let latest = match query_status(addr) {
+        let latest = match query_status(addr, query_timeout) {
             Ok(first) if green(&first) => {
                 std::thread::sleep(spacing);
-                match query_status(addr) {
+                match query_status(addr, query_timeout) {
                     Ok(second) => {
                         if stable_green(&first, &second) {
                             return WaitOutcome::StableGreen(Box::new(second));
@@ -411,27 +427,52 @@ mod tests {
 
     #[test]
     fn query_status_reads_a_real_socket() {
+        use std::time::Duration;
         let port = scripted_agent(vec![status_line(&distinct_report())]);
-        let report = query_status(("127.0.0.1", port)).unwrap();
+        let report = query_status(("127.0.0.1", port), Duration::from_secs(2)).unwrap();
         assert_eq!(report, distinct_report());
     }
 
     #[test]
     fn query_status_distinguishes_no_answer_from_bad_answer() {
+        use std::time::Duration;
         // Nothing listening: NoAnswer.
         let unused = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = unused.local_addr().unwrap().port();
         drop(unused);
         assert!(matches!(
-            query_status(("127.0.0.1", port)),
+            query_status(("127.0.0.1", port), Duration::from_secs(2)),
             Err(QueryError::NoAnswer(_))
         ));
         // Something answering garbage: Bad.
         let port = scripted_agent(vec!["not json".to_owned()]);
         assert!(matches!(
-            query_status(("127.0.0.1", port)),
+            query_status(("127.0.0.1", port), Duration::from_secs(2)),
             Err(QueryError::Bad(_))
         ));
+    }
+
+    #[test]
+    fn query_status_honours_its_timeout_against_a_silent_peer() {
+        use std::time::{Duration, Instant};
+        // Accepts the connection, then never writes a reply line: the read timeout,
+        // not the connect timeout, has to be the one that fires. A short timeout
+        // here proves the parameter actually reaches `set_read_timeout` — the old
+        // hardcoded-5s version would hang this test for 5 real seconds instead.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let _kept_alive = listener.accept();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let start = Instant::now();
+        let result = query_status(("127.0.0.1", port), Duration::from_millis(150));
+        assert!(matches!(result, Err(QueryError::NoAnswer(_))));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "query_status took {:?}, expected it to time out near 150ms",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -443,7 +484,8 @@ mod tests {
             wait_stable_green(
                 ("127.0.0.1", port),
                 Duration::from_secs(2),
-                Duration::from_millis(30)
+                Duration::from_millis(30),
+                Duration::from_secs(2),
             ),
             WaitOutcome::StableGreen(_)
         ));
@@ -460,7 +502,8 @@ mod tests {
             wait_stable_green(
                 ("127.0.0.1", port),
                 Duration::from_millis(300),
-                Duration::from_millis(20)
+                Duration::from_millis(20),
+                Duration::from_secs(2),
             ),
             WaitOutcome::NotGreen(_)
         ));

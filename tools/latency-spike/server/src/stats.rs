@@ -93,7 +93,11 @@ pub struct Header {
 /// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
 pub const SCHEMA: u32 = 5;
-pub const WIRE_VERSION: u32 = 2;
+/// Bumped 2 → 3 by tranche 3's input dialect (input-channel v2: scan/mouse/wheel
+/// kinds beside the original VK down/up) — the video/rects wire itself is
+/// unchanged, but the header's `wire_version` couples both dialects together so a
+/// client's video-header gate also gates which input records it may send.
+pub const WIRE_VERSION: u32 = 3;
 
 impl Header {
     pub fn new() -> Self {

@@ -342,8 +342,11 @@ mod win {
     pub fn status(wait: Option<u64>) -> ExitCode {
         use rhydra::control::{green, query_status, wait_stable_green, QueryError, WaitOutcome};
         const ADDR: (&str, u16) = ("127.0.0.1", CONTROL_PORT);
+        // This CLI path (`rhydra-agent status`) is a local diagnostic, not the
+        // §4.3 native-connect probe — it keeps the previous 5 s budget.
+        const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
         match wait {
-            None => match query_status(ADDR) {
+            None => match query_status(ADDR, QUERY_TIMEOUT) {
                 Ok(report) => {
                     println!("{}", control::status_line(&report));
                     if green(&report) {
@@ -358,7 +361,12 @@ mod win {
                 }
             },
             Some(secs) => {
-                match wait_stable_green(ADDR, Duration::from_secs(secs), Duration::from_secs(3)) {
+                match wait_stable_green(
+                    ADDR,
+                    Duration::from_secs(secs),
+                    Duration::from_secs(3),
+                    QUERY_TIMEOUT,
+                ) {
                     WaitOutcome::StableGreen(report) => {
                         println!("{}", control::status_line(&report));
                         ExitCode::SUCCESS

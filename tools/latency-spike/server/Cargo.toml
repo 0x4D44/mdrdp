@@ -1,17 +1,28 @@
 [package]
 name = "rhydra"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 description = "rhydra — mdrdp's native Windows capture/encode/send server and session agent"
 
+[features]
+# On by default: the host-only capture/encode/inject stack (win, agent,
+# idd_section) plus the two host binaries. mdrdp takes this crate as
+# `default-features = false` so its client build links only the portable half
+# — framing, rects, input records, control client, stats types — never DXGI
+# duplication, the MF encoder, or the SendInput injector (HLD tranche 3 §3).
+default = ["host"]
+host = ["dep:windows"]
+
 [[bin]]
 name = "rhydra-server"
 path = "src/main.rs"
+required-features = ["host"]
 
 [[bin]]
 name = "rhydra-agent"
 path = "src/bin/agent.rs"
+required-features = ["host"]
 
 [dependencies]
 # Same versions as the repository root Cargo.toml.
@@ -20,9 +31,11 @@ serde_json = "1"
 
 # Windows-only, and only for the Windows target: the pure-logic modules
 # (framing/annexb/input_proto/stats) build and test natively on macOS with no
-# platform dependency at all.
+# platform dependency at all. Also gated behind the `host` feature (optional +
+# `dep:windows`) so a `host`-disabled build never even considers linking it,
+# even on a Windows target.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = [
+windows = { version = "0.62", optional = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
@@ -40,8 +53,11 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
-[profile.release]
-debug = 1
+# [profile.release] intentionally absent: as a path dependency of mdrdp this
+# is a non-root profile, which cargo warns about on every mdrdp build. The
+# debug-symbol setting it carried moves to build.sh's cargo invocation
+# (`--config 'profile.release.debug=1'`), the only place that still does a
+# release build of this crate standalone.
 
 # Standalone: never a member of the mdrdp package above it.
 [workspace]

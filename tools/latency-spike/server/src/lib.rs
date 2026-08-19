@@ -3,22 +3,29 @@
 //! Grew out of the latency spike; the name is the 1997 Hydra project, in Rust.
 //!
 //! The library half is deliberately portable: framing, Annex B handling, the input
-//! record, the colour-space bit packing, the stats shapes, the agent's control
-//! protocol and its reconcile loop all build and test on macOS, because that is
-//! where they are written and because the viewer reuses them. Everything that
-//! talks to Windows lives under [`win`] behind `#[cfg(windows)]`.
+//! record, the colour-space bit packing, the stats shapes, and the agent's control
+//! *client* (`control::query_status` and friends) all build and test on macOS,
+//! because that is where they are written and because mdrdp's client build and the
+//! viewer reuse them. Everything host-only — the reconcile loop, the IddCx shared
+//! section, and everything that talks to Windows — sits behind the default-on
+//! `host` feature (composed with `#[cfg(windows)]` for [`win`], which is Windows-only
+//! regardless of the feature): a client build takes `default-features = false` and
+//! gets only the portable half (HLD tranche 3 §3).
 
-pub mod agent;
 pub mod annexb;
 pub mod cli;
 pub mod colorspace;
 pub mod control;
 pub mod diff;
 pub mod framing;
-pub mod idd_section;
 pub mod input_proto;
 pub mod rects;
 pub mod stats;
 
-#[cfg(windows)]
+#[cfg(feature = "host")]
+pub mod agent;
+#[cfg(feature = "host")]
+pub mod idd_section;
+
+#[cfg(all(feature = "host", windows))]
 pub mod win;
