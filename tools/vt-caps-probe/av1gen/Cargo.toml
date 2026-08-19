@@ -1,0 +1,12 @@
+[package]
+name = "av1gen"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+rav1e = { version = "0.8", default-features = false, features = ["threading"] }
+
+[profile.dev]
+opt-level = 2

@@ -1,0 +1,4 @@
+# Built probe and generated test streams — regenerate with gen-streams.sh
+/probe
+/streams/
+/streams5k/

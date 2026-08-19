@@ -36,6 +36,11 @@ Indented lines below the first are detail: kept for lookup, never injected.
   changing, 5/5. Any "connects but blank" report needs the desktop's activity stated before it is
   a bug in anything else. MDR-BUG-FLUX-00011.
 
+- M5 Max VideoToolbox decodes H.264 AND HEVC 4:4:4 in HARDWARE at 5K; VP9 has no VT decoder at all (`tools/vt-caps-probe`).
+  `VTIsHardwareDecodeSupported` answers per codec only; the probe feeds real 4:2:0/4:2:2/4:4:4
+  streams to a hardware-required session and counts frames. AV1 is hardware for 4:2:0 only. The
+  H.264 4096x2304 ceiling we clamp to is the Windows encoder's, not the Mac decoder's. Results in
+  `wrk_docs/2026.08.19 - SPIKE - VideoToolbox chroma and codec decode matrix on M5 Max.md`.
 - A metric must encode the failure, not the change: B-spike count ROSE after fixing the blue flash; blue-flip count hit 0 (`avcreplay`).
   Naive "pixel moved for one frame" counts the fix's deliberate flat-average softening alongside
   the overshoot it removed (2,271 -> 3,603 while the defect went to zero). The decisive metric was
