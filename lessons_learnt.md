@@ -20,6 +20,20 @@ Indented lines below the first are detail: kept for lookup, never injected.
   hosts is therefore not coverage of that class at all — MDR-BUG-FLUX-00008 was invisible to every
   test we could have written here while a real laptop sat black. MDR-BUG-FLUX-00015.
 
+- A condvar wake-up test passes with the notify deleted unless it asserts elapsed time (`native::auxchan::Slot`).
+  A taker parked on `wait_timeout` reaches the right answer anyway when the timeout fires — so
+  "assert it eventually returns Closed" is green whether or not `close()` ever notified. The only
+  oracle that separates "woken" from "timed out" is the clock. Make the park interval a constructor
+  parameter, set it far beyond the test's patience, and assert the taker returned inside a fraction
+  of it. The same trap hides any wake-up built on a polling fallback: the fallback is the bug's alibi.
+
+- Echo suppression needs the last content seen from EITHER end, never the last applied (`native::clipboard::Bridge`).
+  Keeping the last wire-applied fingerprint and refusing to send anything matching it loses a copy
+  silently and permanently: apply X, copy Y (sent), copy X again — X matches, is suppressed, and the
+  peer still holds Y. A last-*sent* slot has the identical bug. Fingerprint the canonical (LF) form,
+  not local bytes, or a Mac's `a\nb` and a Windows box's `a\r\nb` are different forever and multi-line
+  copies ping-pong at poll cadence. After applying, seed the slot from what the OS actually holds.
+
 - A health gate must treat "I could not tell" as neither health nor failure (`control::stuck_from_rungs`).
   Deriving a connect gate from "first rung that is not Ok" makes a transiently unreadable section
   refuse a session that would have worked; deriving it from "first rung that is Fail" lets a partial
