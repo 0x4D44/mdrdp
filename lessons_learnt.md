@@ -6,6 +6,36 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A locked Windows console eats injected input: SendInput succeeds, thread still reads `WinSta0\Default`, nothing lands.
+  A locked session's *input* desktop is the secure `Winlogon` one, so every diagnostic you can
+  reach from a service or SSH agrees the injector is healthy — station, desktop, integrity level,
+  session id, and the return value all look right. The tell is `tasklist /FI "IMAGENAME eq
+  LogonUI.exe"` naming your session. On quench the rig's own `mdrdp-tocon` task
+  (`tscon 2 /dest:console`) clears it. Cost a full session's diagnosis, ending on the wrong
+  hypothesis (that headless IddCx cannot accept SendInput at all).
+
+- `FrameSource::origin` defaults to (0,0); only dxgi overrode it, so IDD clicks missed by the display's offset (`win/idd_source.rs`).
+  The IDD pool header carries no desktop coordinates, so the source cannot learn its own placement
+  the way duplication learns it from `DXGI_OUTPUT_DESC::DesktopCoordinates` — GDI's `DEVMODEW::
+  dmPosition` is the only route (`agent_ops::idd_display_origin`). Latent for as long as the
+  virtual display is the only display; attaching a console pushed it to (1920,0) and every click
+  landed 1920 px to its left, silently, because SendInput succeeds either way and the keyboard
+  needs no coordinates. Typing works, the first click steals focus, everything after it vanishes.
+
+- An RDP logon to quench's console recreates the IDD display and strands the capture server on a dead pool.
+  The display renumbers (`\\.\DISPLAY12` → `15` → `16`) and the server keeps its old
+  `Global\mdrdp-idd` generation, decoding nothing while looking healthy. Recovery is three ordered
+  steps: `mdrdp-cycle-idd`; kill `mdrdp-idd-create.exe` so the agent respawns it and republishes the
+  section (the device cycle destroys it — the server then logs `waiting up to 30s for
+  Global\mdrdp-idd` and refuses connects with "the video server is not accepting yet"); restart
+  `rhydra-server.exe`.
+
+- rhydra sends a new viewer NOTHING until the desktop changes: the connect-edge keyframe request has nothing to encode (`win/pipeline.rs` capture_loop).
+  `request_keyframe()` fires, then `acquire()` times out on a static desktop, so no AU is ever
+  produced. Idle 1 s reconnects decoded 1/1/0/0/4 on a confirmed-healthy pipeline; with the desktop
+  changing, 5/5. Any "connects but blank" report needs the desktop's activity stated before it is
+  a bug in anything else. MDR-BUG-FLUX-00011.
+
 - A metric must encode the failure, not the change: B-spike count ROSE after fixing the blue flash; blue-flip count hit 0 (`avcreplay`).
   Naive "pixel moved for one frame" counts the fix's deliberate flat-average softening alongside
   the overshoot it removed (2,271 -> 3,603 while the defect went to zero). The decisive metric was
