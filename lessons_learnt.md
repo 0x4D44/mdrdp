@@ -6,6 +6,20 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Resetting the H.264 decoder on ResetGraphics fails every P-frame until the next IDR (`client::handle_reset_graphics`).
+  `H264Decoder::reset` drops the VideoToolbox session, and a session rebuilt mid-GOP holds no
+  reference frames — while the server, which never asked for this, keeps sending P-frames. The
+  decoder already rebuilds itself when SPS/PPS change, so the reset was redundant as well as
+  fatal. ResetGraphics is ROUTINE on any host with a screen attached (idle power-off, backlight,
+  lid, dock, and every window resize), so this blacked out the whole desktop until something
+  forced a keyframe — which is why resizing the window a few times "fixed" it. MDR-BUG-FLUX-00008.
+
+- Every fleet test host is headless, so display-mode transitions cannot be reproduced on any of them.
+  A physical panel produces idle power-off, backlight, lid and dock transitions that a headless box
+  never generates, and each makes the RDP server send ResetGraphics. A green sweep across all four
+  hosts is therefore not coverage of that class at all — MDR-BUG-FLUX-00008 was invisible to every
+  test we could have written here while a real laptop sat black. MDR-BUG-FLUX-00015.
+
 - A health gate must treat "I could not tell" as neither health nor failure (`control::stuck_from_rungs`).
   Deriving a connect gate from "first rung that is not Ok" makes a transiently unreadable section
   refuse a session that would have worked; deriving it from "first rung that is Fail" lets a partial

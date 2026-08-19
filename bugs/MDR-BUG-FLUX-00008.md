@@ -235,4 +235,43 @@ by restoring the reset. `on_decode_failure` was also widened from `&'static str`
 so the reason tally carries the decoder's own error — including the VideoToolbox
 OSStatus — rather than a bare label that says a decode failed and nothing about why.
 
+**The mechanism is now measured, not inferred.** With the widened reason string, a live
+kiln session reports:
+
+```
+7  Avc444v2: avc444 luma decode failed: VideoToolbox decode callback failed (status -12909)
+3  Avc444v2: avc444 chroma decode failed: VideoToolbox decode callback failed (status -12909)
+1  Avc444v2: avc444 luma decode failed: oscillating SPS/PPS (divergent AVC444 sub-streams); refusing to rebuild
+```
+
+`-12909` is exactly the status `h264.rs:235` predicted for a decoder decoding without its
+reference frames.
+
+## STILL OPEN: reference continuity is also lost across a suppress/resume
+
+**This bug is NOT fully fixed.** Removing the ResetGraphics teardown turns a permanent
+black desktop into a short burst that recovers, but decode failures remain, and three live
+runs on kiln 2026-08-19 isolate a second cause:
+
+| run | reveal in the session? | decode errors |
+|---|---|---|
+| fixed build, `--size 2560x1440`, 40 s | no | 0 |
+| pre-fix build, `--fullscreen`, 45 s | no | 0 |
+| fixed build, `--fullscreen`, 45 s | **yes** | **11, all -12909** |
+
+Errors appeared only in the run that contained a reveal. The likely mechanism: while
+output is suppressed the server keeps encoding and discarding, so its reference frames
+advance without ever reaching us; on resume its P-frames reference frames we never
+received, and the Refresh Rect we send asks for a repaint but does not oblige the server
+to emit an IDR.
+
+If that holds it is the mechanism behind the ORIGINAL overnight reports, which involved no
+resize at all — and it means Suppress Output is not safe as designed against a
+differential codec. That is an architectural question (does the client stop suppressing
+under AVC, force a keyframe some other way, or accept a transient?), explicitly for Arthur
+rather than a judgement to make inside a fix.
+
+**Do not close this bug on the ResetGraphics fix alone.** Three runs is a thin sample and
+the two paths were not otherwise matched; the correlation is suggestive, not settled.
+
 ## Notes
