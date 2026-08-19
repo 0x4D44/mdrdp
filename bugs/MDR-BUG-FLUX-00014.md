@@ -1,6 +1,6 @@
 # MDR-BUG-FLUX-00014 — Session-lost dialog shows IronRDP's raw error chain, rustc and build-machine paths included, as the user-facing explanation
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Low
 - **Area:** ui
@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T14:35:00Z, raised via `deltic bugs new` model=claude-opus-5@high)
+- **State history:** Open (2026-08-19T14:35:00Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-19T15:00:00Z, claude on flux, fix commit on task branch — regression tests proven red-then-green, both dialog states confirmed on screen)
 
 ## Observation
 
@@ -63,7 +63,68 @@ people who wrote the client.
 
 ## Fix
 
-<unfixed — raised only>
+`disconnect::LostSession` classifies a failure into the two things the two readers
+need: a `detail` sentence for the user and a `technical` chain for us. `main.rs`
+builds it (`from_connect_error` / `from_transport`) instead of calling
+`reason.to_string()`, and `EndOutcome::Lost` carries it instead of a bare `String`.
+
+**The sentence keys off the error's variant, never its wording.** Matching on text
+would break silently the next time IronRDP or the OS rephrases something, and the
+fallback has to stay honest. Each `ConnectError` variant gets its own line, and the io
+kinds that mean something different to a user (timed out / closed / refused) get theirs.
+"Reconnecting resumes it" is only said where it is true — a refused connection has no
+session to resume, and a certificate the client rejected will fail identically on the
+next attempt, so neither says it. The `Protocol` case, which is what Arthur hit, is
+honestly generic: we cannot say which layer refused without reading the chain, and the
+chain is now one click away.
+
+**The chain is shown, not deleted, and cleaned before it is.**
+`disconnect::strip_call_sites` drops the bracketed groups that carry an `@ file:line`
+— `ironrdp-error`'s call-site markers — and keeps the messages between them. Arthur's
+450-character failure becomes `RDP connection failed: PDU error: decode error: invalid
+`Type`: Unknown GFX PDU type`, with no rustc hash and no cargo-registry path. A bracket
+with no location in it is somebody's message and is left alone; a chain that stripping
+would empty falls back to the original, so an upstream format change degrades to ugly
+rather than to blank.
+
+**It sits behind a disclosure that starts closed** (`end_dialog::technical_details`),
+and the window follows it. `with_resizable(false)` blocks the *user* dragging an edge,
+not `request_inner_size` — verified live on macOS — so `EndApp::follow_content` re-sizes
+the dialog to whatever the frame laid out, under the same floor and cap `window_size`
+uses. The
+disclosure's open state is held in `EndApp`, not egui's memory, so the dialog stays a
+pure function of what it is told and a test can render both states; its animation is
+turned off, or the window would be dragged through a dozen intermediate heights.
+
+Validation: eight regression tests across `disconnect` and `ui::end_dialog`, proven red
+under three separate mutations — stripping made a no-op (two tests fail, one on the
+`/Users/` leak), the old fixed "The connection dropped" sentence restored (two fail),
+and the disclosure forced open (two fail, one naming `"Unknown GFX PDU type"` on screen).
+The third mutation's output also caught an unfaithful fixture: the test built
+`ConnectError::Protocol` from a string that already carried the `Display` prefix, so
+both tests now build the error the way the live path does. Confirmed on screen in both
+states, including a chain long enough to force the grow. Full lib suite (630), fmt,
+clippy `-D warnings`, and `check-windows.sh` all green.
+
+## Residual
+
+The chain is readable but still ours, not the user's — `invalid `Type`: Unknown GFX PDU
+type` means nothing outside this codebase. Making it mean something needs the *typed*
+failure (`ironrdp::session::SessionErrorKind` is `Pdu`/`Encode`/`Decode`/`Reason`), which
+`ConnectError::Protocol(String)` throws away at six construction sites. That is a
+plumbing change worth its own ticket, not a rider on this one.
+
+There is no copy button. Whoever reports a bug has to retype the chain or fetch it from
+the log, where `main.rs` writes it in full.
+
+This landed on top of a4f3a13, which was reworking the same two files concurrently —
+one 160 px floor and 440/420 widths replacing the mock's per-variant sizes, and
+`plain_description` dropping the spec's error-class label. That work wins on sizing:
+this branch's own floors and `window_shape` were dropped for its `MIN_HEIGHT` and
+`window_width` during the rebase, and the scale-factor slack moved back inside
+`measured_height`, where it belongs — a live frame's height needs no allowance, only
+the headless estimate does. Its test that the floor never pads a real ending passes
+unchanged.
 
 ## Notes
 

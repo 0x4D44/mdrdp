@@ -5,7 +5,7 @@
 //! egui window via [`crate::ui::egui_host::AuxWindow`]. Skipped entirely on the
 //! Cmd+Q path (the process is already gone) and for scripted runs.
 
-use crate::disconnect::ServerFarewell;
+use crate::disconnect::{LostSession, ServerFarewell};
 use crate::ui::egui_host::AuxWindow;
 use crate::ui::theme;
 use crate::window::SessionEvent;
@@ -23,11 +23,12 @@ pub enum EndChoice {
     SaveMetricsAndClose,
 }
 
-/// Aux windows are not resizable, so whatever falls past the bottom edge is simply
-/// never seen — that is how a dialog loses its own buttons. Width stays pinned by the
-/// mock; height is measured from the content each time the dialog opens
-/// ([`window_size`]), because the failure text is the server's to choose and a real
-/// IronRDP error chain wraps to a dozen lines.
+/// Aux windows cannot be dragged bigger, so whatever falls past the bottom edge is
+/// simply never seen — that is how a dialog loses its own buttons. Width stays pinned
+/// by the mock; height follows the content, measured before the window opens
+/// ([`window_size`]) and again on every frame ([`EndApp::follow_content`]), because
+/// both the failure text and the Technical details disclosure change how tall the
+/// dialog needs to be.
 const WARN_WIDTH: f32 = 440.0;
 const ENDED_WIDTH: f32 = 420.0;
 /// A floor only, so a one-line ending still looks like a dialog rather than a strip.
@@ -42,13 +43,17 @@ const MAX_HEIGHT: f32 = 640.0;
 /// Height the failure text may claim before it scrolls. Every other part of the dialog
 /// is bounded, so this is what keeps the footer on-window for any string at all.
 const REASON_MAX_HEIGHT: f32 = 260.0;
+/// Allowance added to a headless measurement: it runs at one point per pixel and the
+/// real window lays out at the display's scale factor, where glyph rounding can land a
+/// hair taller.
+const HEIGHT_SLACK: f32 = 2.0;
 
 /// How the session finished — one dialog variant per case.
 pub enum EndOutcome {
     /// Ended cleanly: the user closed the window, or we disconnected.
     Ended,
-    /// The link failed under us; the string is the failure text.
-    Lost(String),
+    /// The link failed under us, classified into a sentence plus the chain behind it.
+    Lost(LostSession),
     /// The server ended it and said why (MS-RDPBCGR Set Error Info).
     ServerEnded(ServerFarewell),
 }
@@ -79,6 +84,13 @@ struct EndApp {
     /// dialog as Done after this deadline, because nothing can click a button in an
     /// automated run. Absent in normal use.
     autoclose_at: Option<std::time::Instant>,
+    /// Height last asked of the window manager, so a content height that has not moved
+    /// does not re-request the same size on every frame.
+    requested_height: Option<f32>,
+    /// Whether the Technical details disclosure is open. Held here rather than in
+    /// egui's memory so the dialog stays a pure function of what it is told, and both
+    /// states are reachable from a test.
+    details_open: bool,
 }
 
 impl EndApp {
@@ -105,6 +117,28 @@ impl EndApp {
                 event_loop.exit();
             }
         }
+    }
+
+    /// Grow or shrink the window to the height the last frame laid out.
+    ///
+    /// Opening the Technical details disclosure adds a dozen lines under the buttons,
+    /// and an aux window has no edge to drag — so the window follows the content
+    /// instead. The clamps are [`window_size`]'s, so a disclosure cannot walk the
+    /// dialog off the screen any more than a long failure string can.
+    fn follow_content(&mut self, height: f32) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let width = window_width(&self.info.outcome);
+        let want = fit_height(height);
+        if self
+            .requested_height
+            .is_some_and(|last| (last - want).abs() < 0.5)
+        {
+            return;
+        }
+        self.requested_height = Some(want);
+        window.resize_to([width, want]);
     }
 
     fn poll_autoclose(&mut self, event_loop: &ActiveEventLoop) {
@@ -156,13 +190,17 @@ impl ApplicationHandler<SessionEvent> for EndApp {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
             WindowEvent::RedrawRequested => {
                 let info = &self.info;
-                let mut choice = None;
+                let mut details_open = self.details_open;
+                let mut drawn = Drawn::default();
                 window.redraw(|ui| {
-                    choice = draw(ui, info).choice;
+                    drawn = draw(ui, info, &mut details_open);
                 });
-                if let Some(c) = choice {
+                self.details_open = details_open;
+                if let Some(c) = drawn.choice {
                     self.choice = Some(c);
                     event_loop.exit();
+                } else {
+                    self.follow_content(drawn.height);
                 }
             }
             other => {
@@ -184,6 +222,8 @@ pub fn show(event_loop: &mut EventLoop<SessionEvent>, info: EndInfo) -> Option<E
         window: None,
         choice: None,
         autoclose_at,
+        requested_height: None,
+        details_open: false,
     };
     // Prime the pump: a freshly re-entered on-demand loop on macOS parks until an
     // external event arrives, so with nothing queued the dialog window is never even
@@ -196,26 +236,36 @@ pub fn show(event_loop: &mut EventLoop<SessionEvent>, info: EndInfo) -> Option<E
     app.choice
 }
 
-/// The size this dialog needs for the text it is about to show.
-///
-/// An aux window cannot be resized, so the size is chosen once, up front: lay the
-/// dialog out headlessly at its fixed width and take the height the content used.
-fn window_size(info: &EndInfo) -> [f32; 2] {
-    let width = if info.outcome.unexpected() {
+/// The fixed width for this dialog variant.
+fn window_width(outcome: &EndOutcome) -> f32 {
+    if outcome.unexpected() {
         WARN_WIDTH
     } else {
         ENDED_WIDTH
-    };
-    [
-        width,
-        measured_height(info, width).clamp(MIN_HEIGHT, MAX_HEIGHT),
-    ]
+    }
+}
+
+/// A content height turned into a window height: floored so a one-line ending is still
+/// a dialog, capped so nothing runs off a display.
+fn fit_height(content: f32) -> f32 {
+    content.clamp(MIN_HEIGHT, MAX_HEIGHT)
+}
+
+/// The size this dialog needs for the text it is about to show.
+///
+/// The window has to be created at some size before anything paints, so the dialog is
+/// laid out headlessly at its fixed width first and opened at the height that used —
+/// with the disclosure closed, which is how it opens. After that
+/// [`EndApp::follow_content`] keeps it honest.
+fn window_size(info: &EndInfo) -> [f32; 2] {
+    let width = window_width(&info.outcome);
+    [width, fit_height(measured_height(info, width, false))]
 }
 
 /// One headless layout pass, purely to measure — the only way to know how tall a
 /// wrapped, server-supplied string lands. Costs a font atlas per dialog opened, which
 /// is once per process.
-fn measured_height(info: &EndInfo, width: f32) -> f32 {
+fn measured_height(info: &EndInfo, width: f32, details_open: bool) -> f32 {
     let ctx = egui::Context::default();
     theme::apply(&ctx);
     let input = egui::RawInput {
@@ -228,22 +278,25 @@ fn measured_height(info: &EndInfo, width: f32) -> f32 {
         ..Default::default()
     };
     let mut height = 0.0;
-    let output = ctx.run_ui(input, |ui| height = draw(ui, info).height);
+    let mut open = details_open;
+    let output = ctx.run_ui(input, |ui| height = draw(ui, info, &mut open).height);
     // FullOutput's destructor panics on unapplied deltas; nothing paints this pass.
     output.drop_without_applying_deltas();
-    // The real window lays out at the display's scale factor, where glyph rounding can
-    // land a hair taller than this one-point-per-pixel pass.
-    height + 2.0
+    // The slack belongs to the estimate, not to the clamp: this pass runs at one point
+    // per pixel and the real window lays out at the display's scale factor, where glyph
+    // rounding can land a hair taller. A live frame's height needs no such allowance.
+    height + HEIGHT_SLACK
 }
 
 /// What one laid-out frame of the dialog produced.
+#[derive(Default)]
 struct Drawn {
     choice: Option<EndChoice>,
-    /// Height the content took, in points — what [`window_size`] measures.
+    /// Height the content took, in points — what the window is sized to.
     height: f32,
 }
 
-fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Drawn {
+fn draw(ui: &mut egui::Ui, info: &EndInfo, details_open: &mut bool) -> Drawn {
     use crate::shell::widgets;
     use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
     let mut choice = None;
@@ -289,33 +342,21 @@ fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Drawn {
                                     .color(theme::TEXT_SECONDARY),
                             );
                         }
-                        EndOutcome::Lost(reason) => {
+                        EndOutcome::Lost(lost) => {
                             ui.label(
                                 RichText::new(format!("Session to {} lost", info.session_name))
                                     .font(theme::sans_semibold(16.0))
                                     .color(theme::TEXT_PRIMARY),
                             );
+                            // One classified sentence (`disconnect::LostSession`), not
+                            // the raw chain: the reader has lost their desktop and
+                            // needs to know what happened and whether to reconnect.
                             ui.label(
-                                RichText::new(
-                                    "The connection dropped. The session is probably still \
-                                     alive on the host — reconnecting resumes it.",
-                                )
-                                .font(theme::sans(13.0))
-                                .color(theme::TEXT_SECONDARY),
+                                RichText::new(&lost.detail)
+                                    .font(theme::sans(13.0))
+                                    .color(theme::TEXT_SECONDARY),
                             );
-                            // The window grew for this text (`window_size`); past
-                            // MAX_HEIGHT it scrolls instead, so no failure string —
-                            // however long — can push the footer off the bottom.
-                            egui::ScrollArea::vertical()
-                                .max_height(REASON_MAX_HEIGHT)
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new(reason)
-                                            .font(theme::mono(11.0))
-                                            .color(theme::TEXT_MUTED),
-                                    );
-                                });
+                            technical_details(ui, &lost.technical, details_open);
                         }
                         EndOutcome::Ended => {
                             ui.label(
@@ -391,6 +432,42 @@ fn draw(ui: &mut egui::Ui, info: &EndInfo) -> Drawn {
     }
 }
 
+/// The error chain, behind a disclosure that starts closed.
+///
+/// Closed because it is written for us, not for the person reading it, and shown at
+/// all because it is what a bug report is made of. The window follows the disclosure
+/// ([`EndApp::follow_content`]); past [`REASON_MAX_HEIGHT`] the chain scrolls, so even
+/// an unbounded one cannot push the footer off the bottom.
+fn technical_details(ui: &mut egui::Ui, technical: &str, open: &mut bool) {
+    // No animation: the window is re-sized to whatever this lays out, and an animated
+    // open would drag the window through a dozen intermediate heights on its way.
+    ui.style_mut().animation_time = 0.0;
+    let header = egui::CollapsingHeader::new(
+        egui::RichText::new("Technical details")
+            .font(theme::sans(12.0))
+            .color(theme::TEXT_MUTED),
+    )
+    .id_salt("end_dialog_technical")
+    .open(Some(*open))
+    .show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(REASON_MAX_HEIGHT)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(technical)
+                        .font(theme::mono(11.0))
+                        .color(theme::TEXT_MUTED),
+                );
+            });
+    });
+    // The state is ours, not egui's (`.open(Some(..))` forces what it draws), so the
+    // click has to be applied here or the disclosure never moves.
+    if header.header_response.clicked() {
+        *open = !*open;
+    }
+}
+
 fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
@@ -446,6 +523,15 @@ mod tests {
     /// own clip rect, so text a scroll area has scrolled out of view is not counted as
     /// having overflowed the window.
     fn frame(size: [f32; 2], info: &EndInfo) -> Vec<(String, egui::Rect)> {
+        frame_with_details(size, info, false)
+    }
+
+    /// As [`frame`], with the Technical details disclosure forced open or closed.
+    fn frame_with_details(
+        size: [f32; 2],
+        info: &EndInfo,
+        details_open: bool,
+    ) -> Vec<(String, egui::Rect)> {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let input = egui::RawInput {
@@ -458,8 +544,9 @@ mod tests {
         // Seeded with a choice nothing clicked, so a body that never runs cannot pass
         // the caller's assert.
         let mut choice = Some(EndChoice::Reconnect);
+        let mut open = details_open;
         let output = ctx.run_ui(input, |ui| {
-            choice = draw(ui, info).choice;
+            choice = draw(ui, info, &mut open).choice;
         });
         let mut texts = Vec::new();
         for clipped in &output.shapes {
@@ -508,7 +595,10 @@ mod tests {
     fn no_ordinary_ending_opens_with_dead_space_below_its_buttons() {
         let cases = [
             info(EndOutcome::Ended),
-            info(EndOutcome::Lost("connection reset by peer".to_owned())),
+            lost(crate::connect::ConnectError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ))),
             info(EndOutcome::ServerEnded(
                 crate::disconnect::classify(&GracefulDisconnectReason::ErrorInfo(
                     ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::LogoffByUser),
@@ -520,7 +610,7 @@ mod tests {
             let size = window_size(info);
             assert_eq!(
                 size[1],
-                measured_height(info, size[0]),
+                measured_height(info, size[0], false),
                 "the floor padded a {size:?} window past its own content"
             );
             assert!(size[1] <= 220.0, "a short ending opened at {size:?}");
@@ -582,9 +672,17 @@ mod tests {
         assert_fits(&texts, size);
     }
 
+    /// A lost session, classified the way the live path classifies it.
+    fn lost(error: crate::connect::ConnectError) -> EndInfo {
+        info(EndOutcome::Lost(LostSession::from_connect_error(&error)))
+    }
+
     #[test]
     fn a_lost_session_still_fits_its_window() {
-        let info = info(EndOutcome::Lost("connection reset by peer".to_owned()));
+        let info = lost(crate::connect::ConnectError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        )));
         let size = window_size(&info);
         assert_eq!(size[0], WARN_WIDTH);
         let texts = frame(size, &info);
@@ -606,44 +704,78 @@ mod tests {
         assert!(drawn.contains(&"Save metrics JSON"), "{drawn:?}");
     }
 
-    /// Verbatim from a live session on 2026-08-19: IronRDP reports a failure as a
-    /// nested error chain with source locations, and this one wraps to ten lines. At
+    /// The live session's own failure (2026-08-19), classified: IronRDP reports one as
+    /// a nested error chain with source locations, and this one wraps to ten lines. At
     /// the old fixed 300 px it pushed the entire footer — Reconnect included — off the
-    /// bottom edge of a window nobody can resize.
-    const REAL_DECODE_FAILURE: &str = "RDP connection failed: [payload error @ \
-        /rustc/ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96/library/core/src/ops/function.rs:250] \
-        PDU error: [<ironrdp_egfx::client::GraphicsPipelineClient as \
-        ironrdp_dvc::DvcProcessor>::process::{{closure}} @ \
-        vendor/ironrdp-egfx/src/client.rs:1230] decode error: [<ironrdp_egfx::pdu::cmd::GfxPdu \
-        as ironrdp_core::decode::Decode<'_>>::decode @ \
-        ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ironrdp-core-0.2.1/src/error.rs:101] \
-        invalid `Type`: Unknown GFX PDU type";
+    /// bottom edge of a window nobody can resize, and every word of it was addressed to
+    /// the wrong reader.
+    fn real_decode_failure() -> EndInfo {
+        lost(crate::disconnect::tests::real_decode_failure())
+    }
 
+    /// The bug this fixes (MDR-BUG-FLUX-00014): what the user is shown is a sentence,
+    /// and no part of the chain — least of all the machine that compiled the binary —
+    /// is on screen until they ask for it.
     #[test]
-    fn a_ten_line_failure_grows_the_window_instead_of_losing_the_buttons() {
-        let one_line = window_size(&info(EndOutcome::Lost("reset by peer".to_owned())));
-        let info = info(EndOutcome::Lost(REAL_DECODE_FAILURE.to_owned()));
-        let size = window_size(&info);
-        assert!(
-            size[1] > one_line[1],
-            "the dialog did not grow for a ten-line failure: {size:?} vs {one_line:?}"
-        );
-        let texts = frame(size, &info);
+    fn a_closed_dialog_shows_a_sentence_and_no_chain() {
+        let info = real_decode_failure();
+        let texts = frame(window_size(&info), &info);
         let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            drawn.contains(
+                &"The host sent something this client could not handle. \
+                             The desktop is probably still alive on the host — \
+                             reconnecting resumes it."
+            ),
+            "{drawn:?}"
+        );
+        assert!(drawn.contains(&"Technical details"), "{drawn:?}");
+        // Nothing of the chain, by its own words rather than by the leaks the strip
+        // already removes — this is the half that proves the disclosure starts closed.
+        for hidden in ["Unknown GFX PDU type", "decode error", "PDU error"] {
+            assert!(
+                !drawn.iter().any(|t| t.contains(hidden)),
+                "{hidden:?} is on screen with the disclosure closed: {drawn:?}"
+            );
+        }
+    }
+
+    /// Opening the disclosure is what the chain is for, and it must not cost the
+    /// buttons — the window grows to carry it (MDR-BUG-FLUX-00013's rule, still).
+    #[test]
+    fn opening_the_details_grows_the_window_instead_of_losing_the_buttons() {
+        let info = real_decode_failure();
+        let width = window_width(&info.outcome);
+        let closed = measured_height(&info, width, false);
+        let open = measured_height(&info, width, true);
+        assert!(
+            open > closed,
+            "the disclosure added no height: {closed} -> {open}"
+        );
+        let size = [width, fit_height(open)];
+        let texts = frame_with_details(size, &info, true);
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            drawn.iter().any(|t| t.contains("Unknown GFX PDU type")),
+            "{drawn:?}"
+        );
         assert!(drawn.contains(&"Reconnect"), "{drawn:?}");
         assert!(drawn.contains(&"Close"), "{drawn:?}");
         assert_fits(&texts, size);
     }
 
     /// Nothing bounds the failure text, so the growth has to stop somewhere: past that
-    /// the text scrolls and the dialog still fits on a small display.
+    /// the chain scrolls and the dialog still fits on a small display.
     #[test]
-    fn a_runaway_failure_string_stops_growing_the_window() {
-        let info = info(EndOutcome::Lost("connection reset by peer. ".repeat(400)));
-        let size = window_size(&info);
+    fn a_runaway_chain_stops_growing_the_window() {
+        let info = lost(crate::connect::ConnectError::Protocol(
+            "connection reset by peer. ".repeat(400),
+        ));
+        let width = window_width(&info.outcome);
+        let size = [width, fit_height(measured_height(&info, width, true))];
         assert!(size[1] <= MAX_HEIGHT, "{size:?} exceeds the height cap");
-        let texts = frame(size, &info);
-        // The reason itself runs to thousands of characters, so the buttons are
+        let texts = frame_with_details(size, &info, true);
+        // The chain itself runs to thousands of characters, so the buttons are
         // reported by presence alone — printing `drawn` here would bury the failure.
         let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
         assert!(

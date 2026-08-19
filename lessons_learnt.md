@@ -6,6 +6,14 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- `with_resizable(false)` blocks only the USER: `request_inner_size` still resizes, so a fixed dialog can follow its content (`egui_host::resize_to`).
+  Verified live on macOS 2026-08-19 — the Session-lost dialog opens at its measured
+  closed height and grows when the Technical details disclosure opens. Two things make
+  it behave: hold the disclosure's open state yourself rather than in egui's memory (so
+  the dialog stays a pure function of what it is told, and a test can render both
+  states), and set `animation_time = 0` for it, or the window is dragged through a
+  dozen intermediate heights on the way open.
+
 - Installing the OpenSSH capability REWRITES any firewall rule sharing its name back to Private; give ours its own (`hostscripts::setup_ssh`).
   Two traps, one symptom. Windows' built-in `OpenSSH-Server-In-TCP` is Private-profile only,
   and these hosts sit on a network Windows categorises Public, so it never applies — SSH

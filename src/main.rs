@@ -1577,11 +1577,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match window_result {
         Ok(mut event_loop) => {
             if !scripted && let Some(end) = &end {
+                use mdrdp::disconnect::LostSession;
                 use mdrdp::ui::end_dialog::EndOutcome;
                 let outcome = match end {
-                    session::SessionEnd::Failed(reason) => EndOutcome::Lost(reason.to_string()),
+                    // Classified rather than printed raw: the chain is written for us
+                    // and reaches the log above either way (MDR-BUG-FLUX-00014).
+                    session::SessionEnd::Failed(reason) => {
+                        EndOutcome::Lost(LostSession::from_connect_error(reason))
+                    }
                     session::SessionEnd::TransportFailed(reason) => {
-                        EndOutcome::Lost(format!("native transport: {reason}"))
+                        EndOutcome::Lost(LostSession::from_transport(reason))
                     }
                     session::SessionEnd::ServerEnded(farewell) => {
                         EndOutcome::ServerEnded(farewell.clone())

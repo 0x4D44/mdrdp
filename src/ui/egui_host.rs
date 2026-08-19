@@ -102,6 +102,18 @@ impl AuxWindow {
         self.window.request_redraw();
     }
 
+    /// Ask for a new inner size, in points.
+    ///
+    /// `with_resizable(false)` stops the *user* dragging an edge; it does not stop the
+    /// application asking, which is what lets a fixed dialog follow content the user
+    /// expanded. The request is advisory — a window manager may answer with a
+    /// different size, and the `Resized` event carries whatever it decided.
+    pub fn resize_to(&self, size: [f32; 2]) {
+        let _ = self
+            .window
+            .request_inner_size(winit::dpi::LogicalSize::new(size[0], size[1]));
+    }
+
     /// Feed a winit event for this window. Returns whether egui wants a repaint.
     pub fn on_window_event(&mut self, event: &WindowEvent) -> bool {
         if let WindowEvent::Resized(size) = event
