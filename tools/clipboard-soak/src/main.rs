@@ -41,7 +41,21 @@ use std::time::{Duration, Instant, SystemTime};
 use report::{Attempt, Direction, Ending, MissRun, Outcome};
 
 /// How often a routine there-and-back cycle runs.
-const CYCLE: Duration = Duration::from_secs(30);
+///
+/// **Staggered against the host generator's period on purpose.** Simultaneous
+/// copies at both ends inside one poll interval leave the two clipboards
+/// disagreeing — HLD §5 states that case and does not solve it — so a soak that
+/// collided them would report known, accepted behaviour as a wedge, and someone
+/// would spend a morning on it.
+const CYCLE: Duration = Duration::from_secs(60);
+
+/// What `clipboard-cycle` must be launched with on the host.
+///
+/// The client copies at the top of its cycle and waits for the host's nonce
+/// afterwards, so the two never land together — see `CYCLE`.
+/// Longer than [`CYCLE`] on purpose: at most one host write per client cycle,
+/// so the mac->host check always has clear air in front of it.
+const DEFAULT_HOST_PERIOD: Duration = Duration::from_secs(90);
 
 /// How often the hourly stressors run.
 const STRESS_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -52,11 +66,22 @@ const STRESS_EVERY: Duration = Duration::from_secs(60 * 60);
 /// load, not at one transfer per thirty seconds.
 const BURST: u32 = 60;
 
-/// How long to wait for a payload before calling it a miss.
+/// How long to wait for a Mac→host payload before calling it a miss.
 ///
 /// Generous against a 250 ms poll on each side plus a network hop: a miss
 /// should mean *gone*, not *slow*, or the run will chase its own timeouts.
 const ARRIVAL_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Slack added to the host generator's period to get the host→Mac deadline.
+///
+/// **The deadline must exceed the generator's period, and by a clear margin.**
+/// The client cannot make the host copy anything; it waits for the generator's
+/// *next* write, so a wait that begins just after one has to sit through a full
+/// period before it can possibly succeed. A smoke run with a 20 s deadline
+/// against a 20 s period duly reported `WEDGED` — a **false wedge**, which is
+/// the one thing a soak harness must never produce, because the next person
+/// spends a morning looking for a bug that was a timeout.
+const HOST_ARRIVAL_SLACK: Duration = Duration::from_secs(15);
 
 /// How often resident memory is sampled.
 const RSS_EVERY: Duration = Duration::from_secs(60);
@@ -69,7 +94,10 @@ const RSS_GROWTH_THRESHOLD_MB: f64 = 100.0;
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(host) = args.first().filter(|a| !a.starts_with("--")).cloned() else {
-        eprintln!("usage: clipboard-soak <host> --hours 8 [--ssh-user ano] [--out report.json]");
+        eprintln!(
+            "usage: clipboard-soak <host> --hours 8 [--ssh-user ano] [--host-period 30] \
+             [--out report.json]"
+        );
         return std::process::ExitCode::from(2);
     };
     let hours = flag(&args, "--hours")
@@ -77,8 +105,18 @@ fn main() -> std::process::ExitCode {
         .unwrap_or(8.0);
     let ssh_user = flag(&args, "--ssh-user");
     let out = flag(&args, "--out");
+    let host_period = flag(&args, "--host-period")
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_HOST_PERIOD);
 
-    match run(&host, hours, ssh_user.as_deref(), out.as_deref()) {
+    match run(
+        &host,
+        hours,
+        ssh_user.as_deref(),
+        out.as_deref(),
+        host_period,
+    ) {
         Ok(verdict) => {
             println!("\n{}", verdict.summary);
             if verdict.discharges_ac8 || verdict.provisional {
@@ -106,6 +144,7 @@ fn run(
     hours: f64,
     ssh_user: Option<&str>,
     out: Option<&str>,
+    host_period: Duration,
 ) -> Result<report::Verdict, String> {
     let mdrdp = std::env::var("MDRDP").unwrap_or_else(|_| "./target/release/mdrdp".to_owned());
     let planned = Duration::from_secs_f64(hours * 3600.0);
@@ -126,11 +165,55 @@ fn run(
     let mut last_rss = Instant::now() - RSS_EVERY;
     let mut ending = Ending::Completed;
     let mut seq: u64 = 0;
+    // Highest host-generated sequence the Mac has seen. Monotonic, so a stale
+    // value cannot be counted as a fresh arrival.
+    // Set by the startup probe below, which will not let the run begin until it
+    // has seen the host generator produce one.
+    let mut host_seen: u64;
+    // Must exceed the generator's period: the client waits for its NEXT write.
+    let host_deadline = host_period + HOST_ARRIVAL_SLACK;
+    println!(
+        "soak: launch `clipboard-cycle.exe {} <minutes>` on the host's console session; \
+         host->mac deadline is {}s",
+        host_period.as_secs(),
+        host_deadline.as_secs()
+    );
 
     // Let the session connect and seed before the first transfer: content
     // already on the clipboard at connect is deliberately never sent, so a
     // transfer attempted too early would be suppressed and read as a miss.
     std::thread::sleep(Duration::from_secs(15));
+
+    // **Refuse to start if the host generator is not visibly running.**
+    //
+    // Without this the run reports host->mac misses that are nothing to do with
+    // the clipboard, and two in a row is a wedge — so a soak with no generator
+    // declares the exact failure it exists to detect. That happened three times
+    // in shakedown: twice from timing, once because the generator's launch had
+    // silently failed (its log file was still held by the previous instance,
+    // so the shell redirect could not open and the process never started).
+    //
+    // The same lesson as the clipboard holder that reported success while
+    // holding nothing: **a fixture that is not doing its job must say so, or
+    // every conclusion drawn downstream is void.**
+    let probe_deadline = host_period + HOST_ARRIVAL_SLACK;
+    println!(
+        "soak: checking the host generator is running (up to {}s)…",
+        probe_deadline.as_secs()
+    );
+    let mut probe_seen = pbpaste_soak_seq().unwrap_or(0);
+    if await_mac(&mut probe_seen, Instant::now(), probe_deadline) == Outcome::NeverArrived {
+        let _ = session.kill();
+        let _ = session.wait();
+        return Err(format!(
+            "no host clipboard nonce arrived within {}s, so `clipboard-cycle` is not running on \
+             {host}'s console session. Refusing to start: the run would report host->mac misses \
+             that mean nothing, and two in a row would be reported as a wedge.",
+            probe_deadline.as_secs()
+        ));
+    }
+    println!("soak: host generator confirmed (seq {probe_seen})");
+    host_seen = probe_seen;
 
     'outer: while began.elapsed() < planned {
         if let Some(why) = session_died(&mut session) {
@@ -155,10 +238,30 @@ fn run(
             last_rss = Instant::now();
         }
 
-        // The routine cycle. Only Mac->host is driven; see `transfer`.
-        for direction in [Direction::MacToHost, Direction::HostToMac] {
+        // **host->mac FIRST, then mac->host.** The order is the staggering.
+        //
+        // The host->mac wait returns the moment the generator writes, so doing
+        // the mac->host check immediately afterwards puts it as far from the
+        // generator's *next* write as the period allows. The other order
+        // measured one false miss in an eight-cycle smoke run: the generator
+        // overwrote the host clipboard between the copy and the check, which is
+        // exactly the value the check reads. Over eight hours that lands two in
+        // a row eventually, and two in a row is a wedge.
+        //
+        // The generator period must also exceed `CYCLE` — see the README — so
+        // there is at most one host write per cycle to be far away from.
+        for direction in [Direction::HostToMac, Direction::MacToHost] {
             seq += 1;
-            let attempt = transfer(&mdrdp, host, ssh_user, direction, seq, began);
+            let attempt = transfer(
+                &mdrdp,
+                host,
+                ssh_user,
+                direction,
+                seq,
+                began,
+                &mut host_seen,
+                host_deadline,
+            );
             if attempt.outcome.is_miss() {
                 println!(
                     "soak: MISS {} at {:.0}s (nonce {})",
@@ -179,7 +282,16 @@ fn run(
             println!("soak: hourly burst of {BURST} at 1 Hz");
             for _ in 0..BURST {
                 seq += 1;
-                let attempt = transfer(&mdrdp, host, ssh_user, Direction::MacToHost, seq, began);
+                let attempt = transfer(
+                    &mdrdp,
+                    host,
+                    ssh_user,
+                    Direction::MacToHost,
+                    seq,
+                    began,
+                    &mut host_seen,
+                    host_deadline,
+                );
                 let outcome = attempt.outcome;
                 attempts.push(attempt);
                 if let Some(wedge) = misses.note(Direction::MacToHost, outcome) {
@@ -225,6 +337,7 @@ fn run(
 }
 
 /// One transfer, timed from the copy to the confirmed arrival.
+#[allow(clippy::too_many_arguments)]
 fn transfer(
     mdrdp: &str,
     host: &str,
@@ -232,6 +345,8 @@ fn transfer(
     direction: Direction,
     seq: u64,
     began: Instant,
+    host_seen: &mut u64,
+    host_deadline: Duration,
 ) -> Attempt {
     // Synthetic by construction: a counter and a run-unique prefix, never
     // anything read from a real clipboard. That is what makes it safe to write
@@ -251,20 +366,16 @@ fn transfer(
                 }
             }
         }
-        // **Not driven, and recorded as such rather than as a miss.**
+        // Driven by `clipboard-cycle` on the host, launched once at session
+        // start — setting the host clipboard needs something in its console
+        // session, and a soak must not type on the desktop for hours.
         //
-        // Setting the host's clipboard needs something running in its console
-        // session — an ssh session is a different window station — and a soak
-        // must not type on the desktop for eight hours. The missing piece is a
-        // small host-side generator, launched once at session start, that
-        // writes a predictable nonce sequence the Mac can watch for.
-        //
-        // Until that exists this soak covers one direction, and AC8's
-        // "a transfer each way" is only half met. Saying so is the whole reason
-        // `NotExercised` is a state: the first version returned "no latency"
-        // here, which counts as a non-arrival, and the run would have declared
-        // a wedge on its second cycle.
-        Direction::HostToMac => Outcome::NotExercised,
+        // **Arrival only, no latency.** The generator deliberately stamps no
+        // wall-clock time, because the two machines' clocks are only as aligned
+        // as NTP has left them and a few hundred milliseconds of skew would sit
+        // inside the range being measured. A number that is wrong is worse than
+        // one that is absent.
+        Direction::HostToMac => await_mac(host_seen, sent, host_deadline),
     };
 
     Attempt {
@@ -273,6 +384,32 @@ fn transfer(
         outcome,
         nonce,
     }
+}
+
+/// Wait for the host's generator to land a NEW nonce on the Mac's pasteboard.
+///
+/// `host_seen` is the highest sequence number already observed; a payload must
+/// be strictly newer to count, so a value still sitting there from last cycle
+/// cannot be mistaken for a fresh arrival. That mistake would turn a wedged
+/// host->Mac direction into a run of apparent successes.
+fn await_mac(host_seen: &mut u64, sent: Instant, deadline: Duration) -> Outcome {
+    while sent.elapsed() < deadline {
+        if let Some(seq) = pbpaste_soak_seq() {
+            if seq > *host_seen {
+                *host_seen = seq;
+                return Outcome::Arrived(sent.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Outcome::NeverArrived
+}
+
+/// The sequence number on the Mac's pasteboard, if it holds one of ours.
+fn pbpaste_soak_seq() -> Option<u64> {
+    let out = Command::new("pbpaste").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim().strip_prefix("SOAKHOST-")?.parse().ok()
 }
 
 /// Poll the host until it holds `nonce`, or the deadline passes.
@@ -407,30 +544,54 @@ fn version(mdrdp: &str) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// What each direction's figures actually measure. Printed every run, because
+/// a number without its caveat is the one that gets quoted.
+fn latency_caveat(direction: Direction) -> &'static str {
+    match direction {
+        Direction::MacToHost => {
+            "(UPPER BOUND — each check spawns ssh, worth ~180 ms before it asks anything)"
+        }
+        Direction::HostToMac => {
+            "(NOT clipboard latency — dominated by the wait for the host generator's next write)"
+        }
+    }
+}
+
 fn print_summary(attempts: &[Attempt], latencies: &[f64], rss: &[f64]) {
     println!("\n--- soak summary ---");
     let exercised = attempts
         .iter()
         .filter(|a| a.outcome != Outcome::NotExercised)
         .count();
-    println!(
-        "attempted {exercised} (of {} cycle slots; host->mac is not driven — see `transfer`)",
-        attempts.len()
-    );
-    match report::latencies(latencies) {
-        Some(l) => {
-            println!(
-                "arrival latency: n={} min={:.0}ms median={:.0}ms p95={:.0}ms max={:.0}ms",
-                l.n, l.min_ms, l.median_ms, l.p95_ms, l.max_ms
-            );
-            // Said every run, not buried in a doc comment: the floor here is
-            // the polling instrument, and someone will otherwise quote it.
-            println!(
-                "  (an UPPER BOUND — each check spawns ssh, worth ~180 ms before it asks anything)"
-            );
+    let _ = latencies;
+    println!("attempted {exercised} (of {} cycle slots)", attempts.len());
+
+    // **Per direction, never pooled.** The two measure different things, and a
+    // single distribution over both describes neither: a smoke run produced a
+    // combined p95 of 19.7 s, which was the host generator's period showing up
+    // as though it were clipboard latency.
+    for direction in [Direction::MacToHost, Direction::HostToMac] {
+        let samples: Vec<f64> = attempts
+            .iter()
+            .filter(|a| a.direction == direction)
+            .filter_map(|a| a.outcome.latency_ms())
+            .collect();
+        match report::latencies(&samples) {
+            Some(l) => {
+                println!(
+                    "{}: n={} min={:.0}ms median={:.0}ms p95={:.0}ms max={:.0}ms",
+                    direction.name(),
+                    l.n,
+                    l.min_ms,
+                    l.median_ms,
+                    l.p95_ms,
+                    l.max_ms
+                );
+                println!("  {}", latency_caveat(direction));
+            }
+            // Never zeroes: an absent distribution must not look like a fast one.
+            None => println!("{}: no samples", direction.name()),
         }
-        // Never zeroes: an absent distribution must not look like a fast one.
-        None => println!("arrival latency: no samples"),
     }
     for a in attempts.iter().filter(|a| a.outcome.is_miss()) {
         println!(
@@ -476,7 +637,22 @@ fn write_report(
         "attempted": exercised,
         "recorded_but_not_driven": attempts.len() - exercised,
         "arrived": latencies.len(),
-        "latency": report::latencies(&latencies),
+        "latency_mac_to_host": report::latencies(
+            &attempts
+                .iter()
+                .filter(|a| a.direction == Direction::MacToHost)
+                .filter_map(|a| a.outcome.latency_ms())
+                .collect::<Vec<_>>(),
+        ),
+        "latency_host_to_mac": report::latencies(
+            &attempts
+                .iter()
+                .filter(|a| a.direction == Direction::HostToMac)
+                .filter_map(|a| a.outcome.latency_ms())
+                .collect::<Vec<_>>(),
+        ),
+        "latency_host_to_mac_note":
+            "NOT clipboard latency — dominated by the wait for the host generator's next write",
         "non_arrivals": attempts.iter().filter(|a| a.outcome.is_miss()).collect::<Vec<_>>(),
         "rss_mb": rss,
         "verdict": verdict,

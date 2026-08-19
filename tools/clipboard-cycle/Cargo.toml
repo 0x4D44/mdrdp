@@ -1,0 +1,19 @@
+[package]
+name = "clipboard-cycle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "clipboard-cycle — write a predictable nonce to the Windows clipboard on a fixed period, so the host->client direction can be soaked without typing"
+
+[[bin]]
+name = "clipboard-cycle"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
+
+[workspace]
