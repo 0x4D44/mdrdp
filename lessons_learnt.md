@@ -44,6 +44,13 @@ Indented lines below the first are detail: kept for lookup, never injected.
   — which rebuilds the display and drops every session on the host for no reason. The real clue sits
   under `input-desktop`, two rungs BELOW the symptom. MDR-BUG-FLUX-00017.
 
+- `check-windows.sh` checked mdrdp only, so rhydra's whole `host` half went untype-checked (`scripts/check-windows.sh`).
+  mdrdp takes rhydra with `default-features = false`, so a `cargo check` from the repo root never
+  compiles `tools/latency-spike/server/src/win/**` — DXGI duplication, the MF encoder, the SendInput
+  injector, the Win32 clipboard. A new module whose FIRST import was wrong passed the script and
+  failed a direct check of the same target. Fixed in v0.1.86 to run both; if you trusted a green run
+  after touching `win/` before that, it proved nothing about that code.
+
 - A condvar wake-up test passes with the notify deleted unless it asserts elapsed time (`native::auxchan::Slot`).
   A taker parked on `wait_timeout` reaches the right answer anyway when the timeout fires — so
   "assert it eventually returns Closed" is green whether or not `close()` ever notified. The only
