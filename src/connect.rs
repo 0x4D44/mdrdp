@@ -506,8 +506,11 @@ pub fn establish(
         // `h264::hardware_decode_available`), or AVC frames arrive with nothing to
         // decode them — the vendored client drops AVC capability sets itself when the
         // decoder is absent, so the failure mode is a silent downgrade, not a crash.
-        let decoder = crate::h264::hardware_decoder();
-        let mut graphics = ironrdp_egfx::client::GraphicsPipelineClient::new(h, decoder);
+        let decoder_factory = crate::h264::hardware_decoder_factory();
+        let mut graphics = ironrdp_egfx::client::GraphicsPipelineClient::new_with_decoder_factory(
+            h,
+            decoder_factory,
+        );
         if let Some(dir) = &opts.avc_capture {
             graphics = graphics.capturing_avc_payloads_to(dir);
         }

@@ -6,6 +6,13 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- H.264 reference state belongs to an EGFX surface incarnation, not the channel (`client::h264_decoders`).
+  A real display transition can overlap two surface lifetimes, so resetting one shared decoder
+  on every numeric-id switch destroys both chains; same-id `CreateSurface` reuse has the opposite
+  failure and retains stale references. Keep one lazy decoder per live surface, drop it on delete
+  or id reuse, and retain the last painted output while its zero-filled replacement is unpainted.
+  MDR-BUG-FLUX-00008.
+
 A lesson is **never dropped to make room** for a new one — prepend it and let the oldest
 fall out of the injected window. Soft target ~25 entries; past ~40, say it is due a prune
 rather than pruning unasked. Durable project facts and conventions belong in `CLAUDE.md`,

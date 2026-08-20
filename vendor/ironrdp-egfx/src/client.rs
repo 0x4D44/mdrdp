@@ -65,13 +65,14 @@ use tracing::{debug, trace, warn};
 use ironrdp_graphics::avc444::{Yuv420Frame, Yuv444Buffer};
 
 use crate::CHANNEL_NAME;
-use crate::decode::H264Decoder;
+use crate::decode::{DecoderResult, H264Decoder};
 use crate::pdu::{
-    Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
-    CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type,
-    DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu,
-    MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth,
-    RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
+    Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu,
+    CapabilitiesAdvertisePdu, CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags,
+    CapabilitySet, Codec1Type, DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu,
+    FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
+    MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu,
+    SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 
 /// Max capacity to keep for decompressed buffer when cleared.
@@ -414,6 +415,76 @@ enum ClientState {
     Closed,
 }
 
+/// Factory for creating independent H.264 decoders.
+///
+/// A decoder owns the reference chain for one EGFX surface. The graphics client calls
+/// [`Self::create`] only when a surface receives its first AVC update, then retains the
+/// returned decoder until that surface is deleted or its ID is reused. Keeping creation
+/// behind a factory lets hardware-backed clients create one codec session per surface
+/// without constructing unused sessions for surfaces that never carry AVC data.
+enum H264DecoderSource {
+    Creator(Box<dyn FnMut() -> Option<Box<dyn H264Decoder>> + Send>),
+    LegacySingleton(Option<Box<dyn H264Decoder>>),
+}
+
+pub struct H264DecoderFactory {
+    source: H264DecoderSource,
+    supports_yuv420: bool,
+}
+
+impl H264DecoderFactory {
+    /// Build a factory from a decoder constructor.
+    ///
+    /// `supports_yuv420` must describe the decoders returned by `create`; it controls
+    /// whether AVC444 capability sets are advertised without eagerly creating a decoder.
+    pub fn new(
+        create: impl FnMut() -> Option<Box<dyn H264Decoder>> + Send + 'static,
+        supports_yuv420: bool,
+    ) -> Self {
+        Self {
+            source: H264DecoderSource::Creator(Box::new(create)),
+            supports_yuv420,
+        }
+    }
+
+    /// Adapt the legacy single-decoder API to a factory.
+    ///
+    /// Existing `GraphicsPipelineClient::new` callers retain their API and single-decoder
+    /// behavior. The decoder is reset and recycled when its surface dies or when updates
+    /// switch to another live surface. Callers that need simultaneous independent surface
+    /// chains should use [`Self::new`].
+    pub fn from_decoder(decoder: Box<dyn H264Decoder>) -> Self {
+        let supports_yuv420 = decoder.supports_yuv420();
+        Self {
+            source: H264DecoderSource::LegacySingleton(Some(decoder)),
+            supports_yuv420,
+        }
+    }
+
+    fn create(&mut self) -> Option<Box<dyn H264Decoder>> {
+        match &mut self.source {
+            H264DecoderSource::Creator(create) => create(),
+            H264DecoderSource::LegacySingleton(decoder) => decoder.take(),
+        }
+    }
+
+    fn is_legacy_singleton(&self) -> bool {
+        matches!(self.source, H264DecoderSource::LegacySingleton(_))
+    }
+
+    fn recycle(&mut self, mut decoder: Box<dyn H264Decoder>) {
+        if let H264DecoderSource::LegacySingleton(slot) = &mut self.source {
+            decoder.reset();
+            debug_assert!(slot.is_none());
+            *slot = Some(decoder);
+        }
+    }
+
+    fn supports_yuv420(&self) -> bool {
+        self.supports_yuv420
+    }
+}
+
 // ============================================================================
 // Graphics Pipeline Client
 // ============================================================================
@@ -426,7 +497,8 @@ enum ClientState {
 /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
 pub struct GraphicsPipelineClient {
     handler: Box<dyn GraphicsPipelineHandler>,
-    h264_decoder: Option<Box<dyn H264Decoder>>,
+    /// Factory for per-surface H.264 decoder sessions.
+    h264_decoder_factory: Option<H264DecoderFactory>,
 
     decompressor: zgfx::Decompressor,
     decompressed_buffer: Vec<u8>,
@@ -447,21 +519,12 @@ pub struct GraphicsPipelineClient {
     /// dies with the surface (and on CreateSurface id reuse), survives ResetGraphics
     /// like the surfaces themselves.
     avc444_buffers: BTreeMap<u16, Yuv444Buffer>,
-    /// The surface the H.264 decoder currently holds reference frames for.
+    /// Persistent H.264 decoder sessions, keyed by their surface.
     ///
-    /// Each surface is its own H.264 sequence. We keep ONE decoder for the channel
-    /// (`wrk_docs/2026.08.16 - HLD - AVC444v2 decode.md` decision 2), so when the server
-    /// moves to a different surface that decoder's references belong to a video that is
-    /// over, and every P-frame after it fails until the new stream's next IDR. FreeRDP
-    /// does not hit this because its context is per surface (`gdi_DeleteSurface` frees
-    /// `surface->h264`); we get the same effect by resetting on the switch.
-    ///
-    /// Tracked at DECODE time, not on DeleteSurface, because the ordering is the
-    /// server's to choose: it may create and start painting the replacement before
-    /// deleting the old one, and a reset fired on that delete would destroy the
-    /// references of the surface now on screen. The first frame FOR a new surface is
-    /// the unambiguous moment the stream changed.
-    decoder_surface: Option<u16>,
+    /// Each surface is its own H.264 sequence. Keeping one decoder per live surface lets
+    /// interleaved updates continue from each surface's reference chain without resets.
+    /// Entries are removed with their surface and survive ResetGraphics.
+    h264_decoders: BTreeMap<u16, Box<dyn H264Decoder>>,
     /// Decoded-frame scratch (main, aux) — an LC=0 update needs both alive at once.
     yuv_scratch: (Yuv420Frame, Yuv420Frame),
     /// RGBA conversion scratch, recycled across updates.
@@ -479,10 +542,25 @@ impl GraphicsPipelineClient {
     /// Create a new `GraphicsPipelineClient`
     ///
     /// If `h264_decoder` is `None`, AVC420 frames are logged and skipped.
-    pub fn new(handler: Box<dyn GraphicsPipelineHandler>, h264_decoder: Option<Box<dyn H264Decoder>>) -> Self {
+    pub fn new(
+        handler: Box<dyn GraphicsPipelineHandler>,
+        h264_decoder: Option<Box<dyn H264Decoder>>,
+    ) -> Self {
+        Self::new_with_decoder_factory(handler, h264_decoder.map(H264DecoderFactory::from_decoder))
+    }
+
+    /// Create a client with a reusable H.264 decoder factory.
+    ///
+    /// A decoder is created lazily for each surface's first AVC update. The instance is
+    /// retained across updates to other surfaces, and is dropped when its surface is
+    /// deleted or its ID is reused. `ResetGraphics` does not discard decoder sessions.
+    pub fn new_with_decoder_factory(
+        handler: Box<dyn GraphicsPipelineHandler>,
+        h264_decoder_factory: Option<H264DecoderFactory>,
+    ) -> Self {
         Self {
             handler,
-            h264_decoder,
+            h264_decoder_factory,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
             state: ClientState::WaitingForConfirm,
@@ -493,7 +571,7 @@ impl GraphicsPipelineClient {
             frames_queued: 0,
             total_frames_decoded: 0,
             avc444_buffers: BTreeMap::new(),
-            decoder_surface: None,
+            h264_decoders: BTreeMap::new(),
             yuv_scratch: (Yuv420Frame::default(), Yuv420Frame::default()),
             rgba_scratch: Vec::new(),
             avc_capture: None,
@@ -573,7 +651,12 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::CreateSurface(create) => {
-                self.handle_create_surface(create.surface_id, create.width, create.height, create.pixel_format);
+                self.handle_create_surface(
+                    create.surface_id,
+                    create.width,
+                    create.height,
+                    create.pixel_format,
+                );
                 Ok(vec![])
             }
             GfxPdu::DeleteSurface(delete) => {
@@ -765,9 +848,18 @@ impl GraphicsPipelineClient {
         self.handler.on_reset_graphics(width, height);
     }
 
-    fn handle_create_surface(&mut self, surface_id: u16, width: u16, height: u16, pixel_format: PixelFormat) {
+    fn handle_create_surface(
+        &mut self,
+        surface_id: u16,
+        width: u16,
+        height: u16,
+        pixel_format: PixelFormat,
+    ) {
         if width == 0 || height == 0 {
-            warn!(surface_id, width, height, "Ignoring CreateSurface with zero dimensions");
+            warn!(
+                surface_id,
+                width, height, "Ignoring CreateSurface with zero dimensions"
+            );
             return;
         }
 
@@ -785,6 +877,7 @@ impl GraphicsPipelineClient {
         // resolution-change sequence). Any retained AVC444 state belongs to the old
         // surface and its old dimensions.
         self.avc444_buffers.remove(&surface_id);
+        self.retire_decoder(surface_id);
 
         debug!(surface_id, width, height, ?pixel_format, "Surface created");
         self.handler.on_surface_created(&surface);
@@ -793,6 +886,7 @@ impl GraphicsPipelineClient {
 
     fn handle_delete_surface(&mut self, surface_id: u16) {
         self.avc444_buffers.remove(&surface_id);
+        self.retire_decoder(surface_id);
         if self.surfaces.remove(&surface_id).is_some() {
             debug!(surface_id, "Surface deleted");
             self.handler.on_surface_deleted(surface_id);
@@ -807,7 +901,8 @@ impl GraphicsPipelineClient {
             surface.output_origin_x = origin_x;
             surface.output_origin_y = origin_y;
             debug!(surface_id, origin_x, origin_y, "Surface mapped to output");
-            self.handler.on_surface_mapped(surface_id, origin_x, origin_y);
+            self.handler
+                .on_surface_mapped(surface_id, origin_x, origin_y);
         } else {
             warn!(surface_id, "MapSurfaceToOutput for unknown surface");
         }
@@ -865,18 +960,20 @@ impl GraphicsPipelineClient {
         Ok(())
     }
 
-    fn decode_avc420(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
+    fn decode_avc420(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &ExclusiveRectangle,
+        bitmap_data: &[u8],
+    ) -> PduResult<()> {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
-        if self.h264_decoder.is_none() {
+        if self.h264_decoder_factory.is_none() {
             debug!("No H.264 decoder configured, skipping AVC420 frame");
             return Ok(());
         }
-        // AVC420 shares the one decoder with AVC444's main view, so it is subject to the
-        // same surface-switch reset (see `retarget_decoder`).
-        self.retarget_decoder(surface_id);
-        let Some(ref mut decoder) = self.h264_decoder else {
+        let Some(()) = self.ensure_decoder_for_surface(surface_id) else {
             return Ok(());
         };
 
@@ -884,11 +981,17 @@ impl GraphicsPipelineClient {
         // erroring the whole channel — the region stays stale until the next IDR heals
         // it, which beats tearing the session down over a single bad frame. (A hostile
         // or buggy server gets a dropped frame and a warning, never a stall.)
-        let frame = match decoder.decode(stream.data) {
+        let frame = match self
+            .h264_decoders
+            .get_mut(&surface_id)
+            .expect("decoder was ensured above")
+            .decode(stream.data)
+        {
             Ok(frame) => frame,
             Err(e) => {
                 warn!(error = %e, "H.264 decode failed; skipping this frame");
-                self.handler.on_decode_failure(Codec1Type::Avc420, "h264 decode failed");
+                self.handler
+                    .on_decode_failure(Codec1Type::Avc420, "h264 decode failed");
                 return Ok(());
             }
         };
@@ -914,7 +1017,13 @@ impl GraphicsPipelineClient {
             return Ok(());
         }
 
-        let cropped_data = crop_decoded_frame(frame.data(), frame.width(), frame.height(), dest_width, dest_height);
+        let cropped_data = crop_decoded_frame(
+            frame.data(),
+            frame.width(),
+            frame.height(),
+            dest_width,
+            dest_height,
+        );
 
         let update = BitmapUpdate {
             surface_id,
@@ -929,34 +1038,53 @@ impl GraphicsPipelineClient {
         Ok(())
     }
 
-    /// Point the H.264 decoder at `surface_id`, resetting it if it was holding reference
-    /// frames for a different surface.
-    ///
-    /// mdrdp patch, MDR-BUG-FLUX-00008. A surface's size is fixed at CreateSurface, so a
-    /// resolution change — or any server-side decision to rebuild the output — REPLACES
-    /// it, and the replacement is a new H.264 sequence. Carrying the old surface's
-    /// references into it makes every P-frame fail with `kVTVideoDecoderBadDataErr`
-    /// (-12909) until the new stream happens to send an IDR, which on a mostly-static
-    /// desktop can be a long time: measured on kiln 2026-08-20 as 106 such failures in a
-    /// session that logged `surfaces +3 -2` and no resolution change at all.
-    ///
-    /// Reset only on a real switch. A decoder that has never decoded has nothing to throw
-    /// away, and resetting it there would forfeit the first IDR for nothing.
-    fn retarget_decoder(&mut self, surface_id: u16) {
-        if self.decoder_surface == Some(surface_id) {
-            return;
+    /// Ensure a persistent decoder exists for `surface_id`, creating it on the first AVC
+    /// update.
+    fn ensure_decoder_for_surface(&mut self, surface_id: u16) -> Option<()> {
+        if self.h264_decoders.contains_key(&surface_id) {
+            return Some(());
         }
-        let previous = self.decoder_surface;
-        if previous.is_some()
-            && let Some(decoder) = self.h264_decoder.as_mut()
+
+        let factory = self.h264_decoder_factory.as_mut()?;
+        if factory.is_legacy_singleton()
+            && let Some((previous_surface, decoder)) = self.h264_decoders.pop_first()
         {
             debug!(
-                ?previous,
-                surface_id, "surface changed under the decoder; resetting it for the new stream"
+                previous_surface,
+                surface_id, "legacy decoder changed surface; resetting its reference chain"
             );
-            decoder.reset();
+            factory.recycle(decoder);
         }
-        self.decoder_surface = Some(surface_id);
+        let decoder = factory.create()?;
+        self.h264_decoders.insert(surface_id, decoder);
+        Some(())
+    }
+
+    /// Retire a decoder with its surface, recycling only the legacy singleton adapter.
+    fn retire_decoder(&mut self, surface_id: u16) {
+        let Some(decoder) = self.h264_decoders.remove(&surface_id) else {
+            return;
+        };
+        if let Some(factory) = self.h264_decoder_factory.as_mut() {
+            factory.recycle(decoder);
+        }
+    }
+
+    /// Decode one YUV frame through the surface's persistent decoder.
+    ///
+    /// Keeping the decoder lookup and scratch-buffer borrow in this small method avoids
+    /// holding a map entry across handler callbacks and state updates in `decode_avc444`.
+    fn decode_yuv420_for_surface(
+        &mut self,
+        surface_id: u16,
+        data: &[u8],
+        aux: bool,
+    ) -> DecoderResult<()> {
+        let (decoders, scratch) = (&mut self.h264_decoders, &mut self.yuv_scratch);
+        let decoder = decoders
+            .get_mut(&surface_id)
+            .expect("decoder was ensured above");
+        decoder.decode_yuv420(data, if aux { &mut scratch.1 } else { &mut scratch.0 })
     }
 
     /// Decode an AVC444/AVC444v2 update (MS-RDPEGFX 2.2.4.5/2.2.4.6).
@@ -989,16 +1117,19 @@ impl GraphicsPipelineClient {
             Ok(stream) => stream,
             Err(e) => {
                 warn!(error = %e, "AVC444 bitmap stream parse failed; skipping this frame");
-                self.handler.on_decode_failure(codec_id, "avc444 stream parse failed");
+                self.handler
+                    .on_decode_failure(codec_id, "avc444 stream parse failed");
                 return;
             }
         };
 
-        if self.h264_decoder.is_none() {
+        if self.h264_decoder_factory.is_none() {
             debug!("No H.264 decoder configured, skipping AVC444 frame");
             return;
         }
-        self.retarget_decoder(surface_id);
+        let Some(()) = self.ensure_decoder_for_surface(surface_id) else {
+            return;
+        };
 
         // Wire rects are RDPGFX_RECT16: EXCLUSIVE right/bottom despite the
         // `InclusiveRectangle` typing (upstream artifact — the destRect handling in
@@ -1011,8 +1142,12 @@ impl GraphicsPipelineClient {
             None => (Vec::new(), 0),
         };
         if dropped1 + dropped2 > 0 {
-            warn!(dropped = dropped1 + dropped2, "AVC444 update carried malformed region rects");
-            self.handler.on_decode_failure(codec_id, "avc444 malformed region rects");
+            warn!(
+                dropped = dropped1 + dropped2,
+                "AVC444 update carried malformed region rects"
+            );
+            self.handler
+                .on_decode_failure(codec_id, "avc444 malformed region rects");
         }
 
         // Decode the sub-streams (sequentially, one decoder). Which passes run and
@@ -1031,15 +1166,11 @@ impl GraphicsPipelineClient {
             e if e == Encoding::CHROMA => Passes::ChromaOnly,
             _ => {
                 // The parser rejects encoding values > 2 already.
-                self.handler.on_decode_failure(codec_id, "avc444 reserved LC value");
+                self.handler
+                    .on_decode_failure(codec_id, "avc444 reserved LC value");
                 return;
             }
         };
-
-        let decoder = self
-            .h264_decoder
-            .as_mut()
-            .expect("checked above that a decoder is configured");
 
         // The chroma passes index the aux frame through the geometry the encoder
         // packed against, and the two axes fail differently under SPS cropping
@@ -1067,11 +1198,14 @@ impl GraphicsPipelineClient {
             Passes::LumaAndChroma => {
                 let Some(stream2) = stream.stream2.as_ref() else {
                     // Parser guarantees stream2 for LC=0; defensive.
-                    self.handler.on_decode_failure(codec_id, "avc444 missing chroma stream");
+                    self.handler
+                        .on_decode_failure(codec_id, "avc444 missing chroma stream");
                     return;
                 };
                 let decode_started = std::time::Instant::now();
-                if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.0) {
+                if let Err(e) =
+                    self.decode_yuv420_for_surface(surface_id, stream.stream1.data, false)
+                {
                     warn!(error = %e, "AVC444 luma stream decode failed; skipping this frame");
                     self.handler
                         .on_decode_failure(codec_id, &format!("avc444 luma decode failed: {e}"));
@@ -1083,11 +1217,12 @@ impl GraphicsPipelineClient {
                 // decoder returning planes shorter than its claim. Not reachable with
                 // the in-repo decoders, but `decode_yuv420` is a public trait method.
                 if !self.yuv_scratch.0.is_well_formed() {
-                    self.handler.on_decode_failure(codec_id, "avc444 malformed decoded frame");
+                    self.handler
+                        .on_decode_failure(codec_id, "avc444 malformed decoded frame");
                     return;
                 }
                 let decode_started = std::time::Instant::now();
-                if let Err(e) = decoder.decode_yuv420(stream2.data, &mut self.yuv_scratch.1) {
+                if let Err(e) = self.decode_yuv420_for_surface(surface_id, stream2.data, true) {
                     warn!(error = %e, "AVC444 chroma stream decode failed; applying luma only");
                     chroma_skipped = Some(format!("avc444 chroma decode failed: {e}"));
                 } else if !self.yuv_scratch.1.is_well_formed() {
@@ -1134,7 +1269,9 @@ impl GraphicsPipelineClient {
             }
             Passes::LumaOnly => {
                 let decode_started = std::time::Instant::now();
-                if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.0) {
+                if let Err(e) =
+                    self.decode_yuv420_for_surface(surface_id, stream.stream1.data, false)
+                {
                     warn!(error = %e, "AVC444 luma stream decode failed; skipping this frame");
                     self.handler
                         .on_decode_failure(codec_id, &format!("avc444 luma decode failed: {e}"));
@@ -1142,7 +1279,8 @@ impl GraphicsPipelineClient {
                 }
                 decode_us += decode_started.elapsed().as_micros();
                 if !self.yuv_scratch.0.is_well_formed() {
-                    self.handler.on_decode_failure(codec_id, "avc444 malformed decoded frame");
+                    self.handler
+                        .on_decode_failure(codec_id, "avc444 malformed decoded frame");
                     return;
                 }
                 let main = &self.yuv_scratch.0;
@@ -1155,7 +1293,9 @@ impl GraphicsPipelineClient {
             Passes::ChromaOnly => {
                 // LC=2: the chroma frame travels in stream1, with stream1's rects.
                 let decode_started = std::time::Instant::now();
-                if let Err(e) = decoder.decode_yuv420(stream.stream1.data, &mut self.yuv_scratch.1) {
+                if let Err(e) =
+                    self.decode_yuv420_for_surface(surface_id, stream.stream1.data, true)
+                {
                     warn!(error = %e, "AVC444 chroma stream decode failed; skipping this frame");
                     self.handler
                         .on_decode_failure(codec_id, &format!("avc444 chroma decode failed: {e}"));
@@ -1163,7 +1303,8 @@ impl GraphicsPipelineClient {
                 }
                 decode_us += decode_started.elapsed().as_micros();
                 if !self.yuv_scratch.1.is_well_formed() {
-                    self.handler.on_decode_failure(codec_id, "avc444 malformed decoded frame");
+                    self.handler
+                        .on_decode_failure(codec_id, "avc444 malformed decoded frame");
                     return;
                 }
                 let aux = &self.yuv_scratch.1;
@@ -1185,7 +1326,8 @@ impl GraphicsPipelineClient {
                         aligned_h,
                         "AVC444 chroma-only frame geometry mismatch; skipping this frame"
                     );
-                    self.handler.on_decode_failure(codec_id, "avc444 frame geometry mismatch");
+                    self.handler
+                        .on_decode_failure(codec_id, "avc444 frame geometry mismatch");
                     return;
                 }
             }
@@ -1253,7 +1395,10 @@ impl GraphicsPipelineClient {
         self.handler.on_bitmap_updated(&update);
     }
 
-    #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
+    #[expect(
+        clippy::as_conversions,
+        reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion"
+    )]
     fn handle_end_frame(&mut self, frame_id: u32) -> PduResult<Vec<DvcMessage>> {
         self.total_frames_decoded = self.total_frames_decoded.wrapping_add(1);
         self.current_frame_id = None;
@@ -1281,11 +1426,18 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        let caps = advertised_capabilities(self.handler.capabilities(), self.h264_decoder.as_deref());
+        let decoder_supports_yuv420 = self
+            .h264_decoder_factory
+            .as_ref()
+            .map(H264DecoderFactory::supports_yuv420);
+        let caps = advertised_capabilities(self.handler.capabilities(), decoder_supports_yuv420);
 
         let pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&caps));
 
-        #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
+        #[expect(
+            clippy::as_conversions,
+            reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion"
+        )]
         Ok(vec![Box::new(pdu) as DvcMessage])
     }
 
@@ -1297,7 +1449,8 @@ impl DvcProcessor for GraphicsPipelineClient {
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
         // ZGFX decompress
         self.decompressed_buffer.clear();
-        self.decompressed_buffer.shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);
+        self.decompressed_buffer
+            .shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);
         self.decompressor
             .decompress(payload, &mut self.decompressed_buffer)
             .map_err(|e| decode_err!(e))?;
@@ -1340,15 +1493,15 @@ impl DvcClientProcessor for GraphicsPipelineClient {}
 /// If nothing survives, fall back to V8 (never AVC-bearing, always decodable).
 fn advertised_capabilities(
     handler_caps: Vec<CapabilitySet>,
-    decoder: Option<&dyn H264Decoder>,
+    decoder_supports_yuv420: Option<bool>,
 ) -> Vec<CapabilitySet> {
     let filtered: Vec<CapabilitySet> = handler_caps
         .into_iter()
         .filter(|cap| {
             let implied = CodecCapabilities::from_capability_set(cap);
-            match decoder {
-                Some(decoder) if decoder.supports_yuv420() => true,
-                Some(_) => !implied.avc444,
+            match decoder_supports_yuv420 {
+                Some(true) => true,
+                Some(false) => !implied.avc444,
                 None => !implied.avc420,
             }
         })
@@ -1371,11 +1524,19 @@ fn advertised_capabilities(
 /// reversed rects would underflow width arithmetic and oversized ones would index
 /// past the per-surface buffers, so both are dropped. Returns the surviving rects
 /// and the number dropped.
-fn valid_avc_rects(rects: &[InclusiveRectangle], surf_w: u16, surf_h: u16) -> (Vec<ExclusiveRectangle>, usize) {
+fn valid_avc_rects(
+    rects: &[InclusiveRectangle],
+    surf_w: u16,
+    surf_h: u16,
+) -> (Vec<ExclusiveRectangle>, usize) {
     let mut out = Vec::with_capacity(rects.len());
     let mut dropped = 0usize;
     for rect in rects {
-        if rect.left < rect.right && rect.top < rect.bottom && rect.right <= surf_w && rect.bottom <= surf_h {
+        if rect.left < rect.right
+            && rect.top < rect.bottom
+            && rect.right <= surf_w
+            && rect.bottom <= surf_h
+        {
             out.push(ExclusiveRectangle {
                 left: rect.left,
                 top: rect.top,
@@ -1433,11 +1594,17 @@ fn crop_decoded_frame(
     let dst_stride = tw.saturating_mul(4);
     let rows = th.min(decoded_height);
 
-    #[expect(clippy::as_conversions, reason = "product of u32 values bounded by frame dimensions")]
+    #[expect(
+        clippy::as_conversions,
+        reason = "product of u32 values bounded by frame dimensions"
+    )]
     let mut cropped = Vec::with_capacity((dst_stride as usize).saturating_mul(rows as usize));
 
     for row in 0..rows {
-        #[expect(clippy::as_conversions, reason = "row * src_stride bounded by frame size")]
+        #[expect(
+            clippy::as_conversions,
+            reason = "row * src_stride bounded by frame size"
+        )]
         let src_start = (row.saturating_mul(src_stride)) as usize;
         #[expect(clippy::as_conversions, reason = "bounded by frame dimensions")]
         let copy_len = dst_stride.min(src_stride) as usize;
@@ -1447,7 +1614,10 @@ fn crop_decoded_frame(
         }
     }
 
-    #[expect(clippy::as_conversions, reason = "dst_stride * rows bounded by frame dimensions")]
+    #[expect(
+        clippy::as_conversions,
+        reason = "dst_stride * rows bounded by frame dimensions"
+    )]
     let expected_len = (dst_stride as usize).saturating_mul(rows as usize);
     if cropped.len() < expected_len {
         tracing::warn!(
@@ -1535,40 +1705,51 @@ mod tests {
         }));
 
         assert_eq!(client.surfaces.len(), 1, "surfaces survive ResetGraphics");
-        assert!(client.current_frame_id.is_none(), "frame_id should be reset");
+        assert!(
+            client.current_frame_id.is_none(),
+            "frame_id should be reset"
+        );
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
     }
 
     #[test]
     fn reset_graphics_does_not_destroy_the_h264_decoder() {
-        // MDR-BUG-FLUX-00008. `H264Decoder::reset` is not a flush — it drops the
-        // decompression session. One rebuilt mid-GOP holds no reference frames, so every
-        // P-frame after it fails until the server's next IDR, and the server has no way
-        // to know we threw the decoder away. On any host with a real screen attached,
-        // ResetGraphics is routine — idle display power-off, backlight, lid, dock all
-        // produce one — so resetting here left the whole desktop undecodable until
-        // something forced a keyframe. Measured on kiln: 105 failures across 163 AVC444
-        // updates in a single session, and resizing the window "fixed" it precisely
-        // because that forced a fresh keyframe.
-        //
-        // It is unnecessary too: `decode_yuv420` rebuilds the session itself whenever the
-        // parameter sets first arrive or change, so a genuinely new stream heals at its
-        // first IDR.
-        struct CountingDecoder(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-        impl H264Decoder for CountingDecoder {
-            fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
-                Err(DecoderError::msg("not exercised by this test"))
-            }
-            fn reset(&mut self) {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-
+        // ResetGraphics changes the output buffer dimensions, not the surfaces or their
+        // H.264 reference chains. The decoder is created first by an AVC update so this
+        // test proves the live entry survives the reset rather than merely observing an
+        // empty map.
         let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut client = GraphicsPipelineClient::new(
-            Box::new(TestHandler),
-            Some(Box::new(CountingDecoder(std::sync::Arc::clone(&resets)))),
+        let factory_resets = std::sync::Arc::clone(&resets);
+        let (tx, _rx) = channel();
+        let mut client = GraphicsPipelineClient::new_with_decoder_factory(
+            Box::new(Recorder(tx)),
+            Some(H264DecoderFactory::new(
+                move || {
+                    Some(Box::new(CountingStubDecoder {
+                        inner: StubYuvDecoder {
+                            width: 64,
+                            height: 48,
+                        },
+                        resets: std::sync::Arc::clone(&factory_resets),
+                    }) as Box<dyn H264Decoder>)
+                },
+                true,
+            )),
         );
+
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 64,
+            height: 48,
+            pixel_format: PixelFormat::XRgb,
+        }));
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444_to(&mut client, 1, Codec1Type::Avc444v2, &stream);
+        assert_eq!(client.h264_decoders.len(), 1);
 
         let _ = client.handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
             width: 2560,
@@ -1581,6 +1762,51 @@ mod tests {
             0,
             "ResetGraphics must not tear the decode session down"
         );
+        assert!(client.h264_decoders.contains_key(&1));
+    }
+
+    #[test]
+    fn legacy_single_decoder_is_recycled_for_a_recreated_surface() {
+        // `new` is the public compatibility constructor. It owns only one decoder, but
+        // a same-id CreateSurface must reset and reuse that decoder rather than consume
+        // it once and silently skip AVC for every later surface incarnation.
+        let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = channel();
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(Recorder(tx)),
+            Some(Box::new(CountingStubDecoder {
+                inner: StubYuvDecoder {
+                    width: 64,
+                    height: 48,
+                },
+                resets: std::sync::Arc::clone(&resets),
+            })),
+        );
+        let create = || {
+            GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 64,
+                height: 48,
+                pixel_format: PixelFormat::XRgb,
+            })
+        };
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
+            stream2: None,
+        };
+
+        let _ = client.handle_pdu(create());
+        deliver_avc444_to(&mut client, 1, Codec1Type::Avc444v2, &stream);
+        assert!(client.h264_decoders.contains_key(&1));
+
+        let _ = client.handle_pdu(create());
+        deliver_avc444_to(&mut client, 1, Codec1Type::Avc444v2, &stream);
+        assert!(
+            client.h264_decoders.contains_key(&1),
+            "surface recreation must not consume the legacy decoder permanently"
+        );
+        assert_eq!(resets.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     // ------------------------------------------------------------------------
@@ -1591,7 +1817,7 @@ mod tests {
 
     use ironrdp_core::{Encode as _, WriteCursor};
 
-    use crate::decode::{DecodedFrame, DecoderError, DecoderResult};
+    use crate::decode::{DecodedFrame, DecoderError};
     use crate::pdu::QuantQuality;
 
     /// A decoder whose YUV output is scripted: every plane byte is derived from the
@@ -1608,7 +1834,9 @@ mod tests {
         }
 
         fn decode_yuv420(&mut self, data: &[u8], out: &mut Yuv420Frame) -> DecoderResult<()> {
-            let tag = *data.first().ok_or_else(|| DecoderError::msg("empty payload"))?;
+            let tag = *data
+                .first()
+                .ok_or_else(|| DecoderError::msg("empty payload"))?;
             out.width = self.width;
             out.height = self.height;
             let uv = self.width.div_ceil(2) * self.height.div_ceil(2);
@@ -1629,7 +1857,10 @@ mod tests {
 
     #[derive(Debug)]
     enum Event {
-        Update { rect: (u16, u16, u16, u16), data_len: usize },
+        Update {
+            rect: (u16, u16, u16, u16),
+            data_len: usize,
+        },
         Failure(String),
     }
 
@@ -1753,25 +1984,90 @@ mod tests {
         }
     }
 
+    struct DecoderTrace {
+        created: std::sync::atomic::AtomicUsize,
+        resets: std::sync::atomic::AtomicUsize,
+        chain_breaks: std::sync::atomic::AtomicUsize,
+        frames: std::sync::Mutex<Vec<(usize, u8)>>,
+    }
+
+    struct TracingDecoder {
+        id: usize,
+        trace: std::sync::Arc<DecoderTrace>,
+        primed: bool,
+    }
+
+    impl H264Decoder for TracingDecoder {
+        fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
+            Err(DecoderError::msg("stub is YUV-only"))
+        }
+
+        fn decode_yuv420(&mut self, data: &[u8], out: &mut Yuv420Frame) -> DecoderResult<()> {
+            let (&kind, rest) = data
+                .split_first()
+                .ok_or_else(|| DecoderError::msg("empty payload"))?;
+            let tag = *rest
+                .first()
+                .ok_or_else(|| DecoderError::msg("missing frame tag"))?;
+            if kind == 0 && !self.primed {
+                self.trace
+                    .chain_breaks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(DecoderError::msg("P frame lost its reference chain"));
+            }
+            if kind == 1 {
+                self.primed = true;
+            }
+            self.trace.frames.lock().unwrap().push((self.id, tag));
+            out.width = 64;
+            out.height = 48;
+            out.y = vec![tag; 64 * 48];
+            out.u = vec![tag.wrapping_add(1); 32 * 24];
+            out.v = vec![tag.wrapping_add(2); 32 * 24];
+            Ok(())
+        }
+
+        fn supports_yuv420(&self) -> bool {
+            true
+        }
+
+        fn reset(&mut self) {
+            self.primed = false;
+            self.trace
+                .resets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     #[test]
-    fn the_decoder_is_reset_when_the_surface_it_decodes_for_changes() {
-        // MDR-BUG-FLUX-00008. Each surface is its own H.264 sequence, and we keep one
-        // decoder for the channel. When the server replaces the surface — which it does
-        // on a resolution change, and did on kiln with no resolution change at all —
-        // carrying the previous surface's reference frames into the new stream fails
-        // every P-frame with -12909 until the new stream's next IDR. Measured there as
-        // 106 such failures alongside `surfaces +3 -2`.
-        let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    fn per_surface_decoders_survive_interleaved_updates_without_reset() {
+        // MDR-BUG-FLUX-00008. Surface 1 and surface 2 are independent H.264 sequences.
+        // Interleaving 1,2,1,2 must leave one decoder/reference chain per surface; a shared
+        // decoder would reset at each switch and lose the previous surface's references.
+        let trace = std::sync::Arc::new(DecoderTrace {
+            created: std::sync::atomic::AtomicUsize::new(0),
+            resets: std::sync::atomic::AtomicUsize::new(0),
+            chain_breaks: std::sync::atomic::AtomicUsize::new(0),
+            frames: std::sync::Mutex::new(Vec::new()),
+        });
+        let factory_trace = std::sync::Arc::clone(&trace);
         let (tx, _rx) = channel();
-        let mut client = GraphicsPipelineClient::new(
+        let mut client = GraphicsPipelineClient::new_with_decoder_factory(
             Box::new(Recorder(tx)),
-            Some(Box::new(CountingStubDecoder {
-                inner: StubYuvDecoder {
-                    width: 64,
-                    height: 48,
+            Some(H264DecoderFactory::new(
+                move || {
+                    let id = factory_trace
+                        .created
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    Some(Box::new(TracingDecoder {
+                        id,
+                        trace: std::sync::Arc::clone(&factory_trace),
+                        primed: false,
+                    }) as Box<dyn H264Decoder>)
                 },
-                resets: std::sync::Arc::clone(&resets),
-            })),
+                true,
+            )),
         );
         let create = |id: u16| {
             GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
@@ -1788,41 +2084,33 @@ mod tests {
                 stream2: None,
             }
         }
-        let (p10, p11, p20, p21) = ([10u8, 0, 0], [11u8, 0, 0], [20u8, 0, 0], [21u8, 0, 0]);
+        let (i10, p11, i20, p21) = ([1u8, 10, 0], [0u8, 11, 0], [1u8, 20, 0], [0u8, 21, 0]);
 
         let _ = client.handle_pdu(create(1));
-        deliver_avc444_to(&mut client, 1, Codec1Type::Avc444v2, &luma_frame(&p10));
-        assert_eq!(
-            resets.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "a decoder that has never decoded has nothing to throw away; resetting it \
-             here would forfeit the first IDR for nothing"
-        );
-
-        deliver_avc444_to(&mut client, 1, Codec1Type::Avc444v2, &luma_frame(&p11));
-        assert_eq!(
-            resets.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "staying on one surface is the steady state and must never reset"
-        );
-
-        // The server replaces the surface. The first frame FOR the replacement is the
-        // unambiguous moment the stream changed — not the DeleteSurface, whose ordering
-        // relative to the replacement's first frame is the server's to choose.
+        deliver_avc444_to(&mut client, 1, Codec1Type::Avc444v2, &luma_frame(&i10));
         let _ = client.handle_pdu(create(2));
-        deliver_avc444_to(&mut client, 2, Codec1Type::Avc444v2, &luma_frame(&p20));
-        assert_eq!(
-            resets.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "the switch to a new surface must reset the decoder for the new sequence"
-        );
-
+        deliver_avc444_to(&mut client, 2, Codec1Type::Avc444v2, &luma_frame(&i20));
+        deliver_avc444_to(&mut client, 1, Codec1Type::Avc444v2, &luma_frame(&p11));
         deliver_avc444_to(&mut client, 2, Codec1Type::Avc444v2, &luma_frame(&p21));
+
+        assert_eq!(trace.created.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(
-            resets.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "settled on the new surface, it must not reset again"
+            trace.resets.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "interleaving surfaces must not reset either reference chain"
         );
+        assert_eq!(
+            trace
+                .chain_breaks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            *trace.frames.lock().unwrap(),
+            vec![(1, 10), (2, 20), (1, 11), (2, 21)],
+            "each surface must retain its own decoder and reference chain"
+        );
+        assert_eq!(client.h264_decoders.len(), 2);
     }
 
     #[test]
@@ -1833,7 +2121,10 @@ mod tests {
         let stream = Avc444BitmapStream {
             encoding: Encoding::LUMA_AND_CHROMA,
             stream1: avc420_sub_stream(vec![wire_rect(0, 0, 32, 16)], &[10, 0, 0]),
-            stream2: Some(avc420_sub_stream(vec![wire_rect(32, 16, 64, 48)], &[20, 0, 0])),
+            stream2: Some(avc420_sub_stream(
+                vec![wire_rect(32, 16, 64, 48)],
+                &[20, 0, 0],
+            )),
         };
         deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
 
@@ -1885,7 +2176,10 @@ mod tests {
         let full = Avc444BitmapStream {
             encoding: Encoding::LUMA_AND_CHROMA,
             stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
-            stream2: Some(avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[20, 0, 0])),
+            stream2: Some(avc420_sub_stream(
+                vec![wire_rect(0, 0, 64, 48)],
+                &[20, 0, 0],
+            )),
         };
         deliver_avc444(&mut client, Codec1Type::Avc444v2, &full);
 
@@ -1959,7 +2253,10 @@ mod tests {
         };
         deliver_avc444(&mut client, Codec1Type::Avc444v2, &chroma_only);
 
-        let buffer = client.avc444_buffers.get(&1).expect("buffer created by LC=2");
+        let buffer = client
+            .avc444_buffers
+            .get(&1)
+            .expect("buffer created by LC=2");
         assert_eq!((buffer.width(), buffer.height()), (64, 48));
         let (y, u, _) = buffer.planes();
         assert_eq!(y[0], 0, "no luma was delivered");
@@ -1971,7 +2268,13 @@ mod tests {
 
         let events: Vec<Event> = rx.try_iter().collect();
         assert!(
-            matches!(events.as_slice(), [Event::Update { rect: (0, 0, 64, 48), .. }]),
+            matches!(
+                events.as_slice(),
+                [Event::Update {
+                    rect: (0, 0, 64, 48),
+                    ..
+                }]
+            ),
             "one update over the stream1 rects: {events:?}"
         );
     }
@@ -1986,17 +2289,25 @@ mod tests {
         let stream = Avc444BitmapStream {
             encoding: Encoding::LUMA_AND_CHROMA,
             stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
-            stream2: Some(avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[20, 0, 0])),
+            stream2: Some(avc420_sub_stream(
+                vec![wire_rect(0, 0, 64, 48)],
+                &[20, 0, 0],
+            )),
         };
         deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
 
         let buffer = client.avc444_buffers.get(&1).expect("buffer");
         let (y, u, _) = buffer.planes();
         assert_eq!(y[0], 10, "luma still applied");
-        assert_eq!(u[1 * 64 + 1], 11, "chroma stayed at the luma-replicated value");
+        assert_eq!(
+            u[1 * 64 + 1],
+            11,
+            "chroma stayed at the luma-replicated value"
+        );
         assert!(
-            rx.try_iter()
-                .any(|e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 frame geometry mismatch")),
+            rx.try_iter().any(
+                |e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 frame geometry mismatch")
+            ),
             "the degradation must be counted"
         );
     }
@@ -2011,7 +2322,10 @@ mod tests {
         let (tx, rx) = channel();
         let mut client = GraphicsPipelineClient::new(
             Box::new(Recorder(tx)),
-            Some(Box::new(StubYuvDecoder { width: 64, height: 40 })),
+            Some(Box::new(StubYuvDecoder {
+                width: 64,
+                height: 40,
+            })),
         );
         let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
             surface_id: 1,
@@ -2023,7 +2337,10 @@ mod tests {
         let stream = Avc444BitmapStream {
             encoding: Encoding::LUMA_AND_CHROMA,
             stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 40)], &[10, 0, 0]),
-            stream2: Some(avc420_sub_stream(vec![wire_rect(0, 0, 64, 40)], &[20, 0, 0])),
+            stream2: Some(avc420_sub_stream(
+                vec![wire_rect(0, 0, 64, 40)],
+                &[20, 0, 0],
+            )),
         };
         deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
 
@@ -2047,7 +2364,10 @@ mod tests {
         let (tx, rx) = channel();
         let mut client = GraphicsPipelineClient::new(
             Box::new(Recorder(tx)),
-            Some(Box::new(StubYuvDecoder { width: 60, height: 40 })),
+            Some(Box::new(StubYuvDecoder {
+                width: 60,
+                height: 40,
+            })),
         );
         let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
             surface_id: 1,
@@ -2059,16 +2379,24 @@ mod tests {
         let stream = Avc444BitmapStream {
             encoding: Encoding::LUMA_AND_CHROMA,
             stream1: avc420_sub_stream(vec![wire_rect(0, 0, 60, 40)], &[10, 0, 0]),
-            stream2: Some(avc420_sub_stream(vec![wire_rect(0, 0, 60, 40)], &[20, 0, 0])),
+            stream2: Some(avc420_sub_stream(
+                vec![wire_rect(0, 0, 60, 40)],
+                &[20, 0, 0],
+            )),
         };
         deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
 
         let buffer = client.avc444_buffers.get(&1).expect("buffer");
         let (_, u, _) = buffer.planes();
-        assert_eq!(u[3 * 60 + 5], 11, "chroma stayed at the luma-replicated value");
+        assert_eq!(
+            u[3 * 60 + 5],
+            11,
+            "chroma stayed at the luma-replicated value"
+        );
         assert!(
-            rx.try_iter()
-                .any(|e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 frame geometry mismatch")),
+            rx.try_iter().any(
+                |e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 frame geometry mismatch")
+            ),
             "the degradation must be counted"
         );
     }
@@ -2091,9 +2419,9 @@ mod tests {
 
         let events: Vec<Event> = rx.try_iter().collect();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 malformed region rects")),
+            events.iter().any(
+                |e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 malformed region rects")
+            ),
             "{events:?}"
         );
         assert!(
@@ -2104,7 +2432,28 @@ mod tests {
 
     #[test]
     fn avc444_state_dies_with_its_surface_and_on_id_reuse() {
-        let (mut client, _rx) = avc444_client(64, 48);
+        let decoders_created = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_created = std::sync::Arc::clone(&decoders_created);
+        let (tx, _rx) = channel();
+        let mut client = GraphicsPipelineClient::new_with_decoder_factory(
+            Box::new(Recorder(tx)),
+            Some(H264DecoderFactory::new(
+                move || {
+                    factory_created.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(Box::new(StubYuvDecoder {
+                        width: 64,
+                        height: 48,
+                    }) as Box<dyn H264Decoder>)
+                },
+                true,
+            )),
+        );
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 64,
+            height: 48,
+            pixel_format: PixelFormat::XRgb,
+        }));
         let stream = Avc444BitmapStream {
             encoding: Encoding::LUMA,
             stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
@@ -2112,6 +2461,10 @@ mod tests {
         };
         deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
         assert!(client.avc444_buffers.contains_key(&1));
+        assert_eq!(
+            decoders_created.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
 
         // CreateSurface may reuse the id without a DeleteSurface (resolution
         // change): the old combined state belongs to the old surface.
@@ -2125,6 +2478,10 @@ mod tests {
             !client.avc444_buffers.contains_key(&1),
             "id reuse must not inherit the old surface's YUV state"
         );
+        assert!(
+            !client.h264_decoders.contains_key(&1),
+            "id reuse must drop the old decoder"
+        );
 
         deliver_avc444(
             &mut client,
@@ -2136,11 +2493,23 @@ mod tests {
             },
         );
         assert!(client.avc444_buffers.contains_key(&1));
+        assert!(client.h264_decoders.contains_key(&1));
+        assert_eq!(
+            decoders_created.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "same-id reuse must create a fresh decoder session"
+        );
 
-        let _ = client.handle_pdu(GfxPdu::DeleteSurface(crate::pdu::DeleteSurfacePdu { surface_id: 1 }));
+        let _ = client.handle_pdu(GfxPdu::DeleteSurface(crate::pdu::DeleteSurfacePdu {
+            surface_id: 1,
+        }));
         assert!(
             !client.avc444_buffers.contains_key(&1),
             "the buffer dies with the surface"
+        );
+        assert!(
+            !client.h264_decoders.contains_key(&1),
+            "the decoder dies with the surface"
         );
     }
 
@@ -2175,13 +2544,19 @@ mod tests {
         // RGBA-only decoder: the V10.7 set implies AVC444 and is dropped; V8.1
         // (AVC420) survives.
         let rgba: Box<dyn H264Decoder> = Box::new(RgbaOnly);
-        let rgba_caps = advertised_capabilities(handler_caps(), Some(rgba.as_ref()));
+        let rgba_caps = advertised_capabilities(handler_caps(), Some(rgba.supports_yuv420()));
         assert_eq!(rgba_caps.len(), 2);
         assert!(matches!(rgba_caps[0], CapabilitySet::V8_1 { .. }));
 
         // YUV-capable decoder: everything the handler asked for.
-        let yuv: Box<dyn H264Decoder> = Box::new(StubYuvDecoder { width: 4, height: 4 });
-        assert_eq!(advertised_capabilities(handler_caps(), Some(yuv.as_ref())).len(), 3);
+        let yuv: Box<dyn H264Decoder> = Box::new(StubYuvDecoder {
+            width: 4,
+            height: 4,
+        });
+        assert_eq!(
+            advertised_capabilities(handler_caps(), Some(yuv.supports_yuv420())).len(),
+            3
+        );
     }
 
     #[test]

@@ -376,11 +376,30 @@ the fullscreen kiln session. The live, read-only `mdrdp -S` report then showed *
 decode errors in 5m21s across 941 painted frames** on kiln, while the simultaneous
 Temper and Crucible sessions on 0.1.95 showed zero errors after more than five hours.
 
-That refutes the fix's stated limitation: "if a server ever kept two surfaces live and
-alternated updates between them, this would reset on every switch and thrash. It cannot
-happen today." The error rate rose from 109 over the earlier 14h26m evidence run to 533
-in five minutes after `retarget_decoder` landed. The one-screen kiln session therefore
-does exercise overlapping surface lifetimes during its graphics restart. Resetting the
-single channel decoder on each surface switch destroys both reference chains, exactly
-the thrash the fix predicted. FreeRDP avoids it with one H.264 context per surface; that
-is the repair direction for the reopened bug.
+That refutes the fix as effective, but the aggregate counter alone does not prove which
+surface-lifecycle failure produced each error. The code has two independent holes: two
+live surfaces that alternate updates make `retarget_decoder` reset both reference chains,
+while `CreateSurface` reuse of the same numeric id makes it retain the old incarnation's
+references. Kiln's physical panel exercises display transitions that the headless boxes
+cannot, and its logs show extra surface churn, so both paths are credible. Both require
+the same repair: reference state scoped to a surface incarnation, as FreeRDP does.
+
+## Fix 2026-08-20: per-surface decoders and a last-good presentation handoff
+
+The graphics client now creates one H.264 decoder lazily for each live EGFX surface. A
+decoder survives updates to other surfaces and `ResetGraphics`, then dies on
+`DeleteSurface` or same-id `CreateSurface` reuse. This removes the channel-wide reset that
+introduced the flash, preserves both reference chains if updates overlap, and cannot carry
+references into a replacement surface incarnation.
+
+Decode correctness alone cannot prevent the flash. `CreateSurface` allocates a zero-filled
+pixel buffer, and the presenter previously displayed it as soon as the server mapped it.
+`SurfaceStore::presentation_surface` now retains the last painted desktop until the newly
+mapped surface receives its first successful paint. The protocol surface remains empty, so
+the fallback cannot contaminate codec state, cache operations, or future pixels.
+
+Two outcome tests pin the failures. Interleaved IDR/P sequences retain independent decoder
+chains, including surface deletion and same-id reuse; deliberately collapsing the decoder
+map made that test fail. A mapped zero-filled replacement retains the previous desktop
+through both different-id and same-id handoffs; the test first failed with transparent
+black, then passed with the presentation fallback.

@@ -18,6 +18,7 @@
 //! there (the vendored client filters AVC-bearing capability sets when no decoder is
 //! configured).
 
+use ironrdp_egfx::client::H264DecoderFactory;
 use ironrdp_egfx::decode::H264Decoder;
 
 /// Whether this build carries a hardware H.264 decoder.
@@ -36,6 +37,21 @@ pub fn hardware_decoder() -> Option<Box<dyn H264Decoder>> {
     #[cfg(target_os = "macos")]
     {
         Some(Box::new(videotoolbox::VideoToolboxDecoder::new()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// A reusable factory for the platform's hardware H.264 decoder, if available.
+///
+/// EGFX keeps one decoder session per live surface, so the factory must create a fresh
+/// VideoToolbox session for each surface rather than handing the client one shared decoder.
+pub fn hardware_decoder_factory() -> Option<H264DecoderFactory> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(H264DecoderFactory::new(hardware_decoder, true))
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -73,6 +73,7 @@ pub struct Surface {
     pub width: u16,
     pub height: u16,
     pixels: Vec<u8>,
+    painted: bool,
 }
 
 impl Surface {
@@ -81,11 +82,16 @@ impl Surface {
             width,
             height,
             pixels: vec![0u8; width as usize * height as usize * BPP],
+            painted: false,
         }
     }
 
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
+    }
+
+    fn is_painted(&self) -> bool {
+        self.painted
     }
 
     fn row_start(&self, y: u16) -> usize {
@@ -137,6 +143,7 @@ impl Surface {
             self.pixels[dst_off..dst_off + row_bytes]
                 .copy_from_slice(&src[src_off..src_off + row_bytes]);
         }
+        self.painted = true;
         Ok(row_bytes * clipped.height() as usize)
     }
 
@@ -152,6 +159,7 @@ impl Surface {
                 px.copy_from_slice(&rgba);
             }
         }
+        self.painted = true;
     }
 
     /// Replace the pixel buffer wholesale with a caller-produced one, returning the
@@ -171,6 +179,7 @@ impl Surface {
                 got: pixels.len(),
             });
         }
+        self.painted = true;
         Ok(std::mem::replace(&mut self.pixels, pixels))
     }
 
@@ -209,6 +218,7 @@ impl Surface {
                 d[3] = s[3];
             }
         }
+        self.painted = true;
         Ok(())
     }
 
@@ -294,6 +304,11 @@ pub struct SurfaceStore {
     surfaces: HashMap<u16, Surface>,
     cache: HashMap<u16, CacheEntry>,
     output: Option<u16>,
+    /// Last painted output retained while a newly mapped surface is still empty.
+    ///
+    /// This is presentation state only. The replacement surface remains zero-initialized,
+    /// so no stale pixels can leak into protocol operations or codec reference state.
+    presentation_fallback: Option<Surface>,
     /// Bumped on every mutation, so a presenter can tell "changed" from "unchanged"
     /// without comparing buffers.
     generation: u64,
@@ -324,12 +339,31 @@ impl SurfaceStore {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    fn retain_painted_output(&mut self) {
+        if let Some(surface) = self.output_surface().filter(|surface| surface.is_painted()) {
+            self.presentation_fallback = Some(surface.clone());
+        }
+    }
+
+    fn finish_surface_mutation(&mut self, id: u16) {
+        if self.output == Some(id) && self.surfaces.get(&id).is_some_and(Surface::is_painted) {
+            self.presentation_fallback = None;
+        }
+        self.touch();
+    }
+
     pub fn create(&mut self, id: u16, width: u16, height: u16) {
+        if self.output == Some(id) {
+            self.retain_painted_output();
+        }
         self.surfaces.insert(id, Surface::new(width, height));
         self.touch();
     }
 
     pub fn delete(&mut self, id: u16) {
+        if self.output == Some(id) {
+            self.retain_painted_output();
+        }
         self.surfaces.remove(&id);
         if self.output == Some(id) {
             self.output = None;
@@ -360,13 +394,31 @@ impl SurfaceStore {
     }
 
     pub fn map_to_output(&mut self, id: u16) {
+        if self.output != Some(id) {
+            self.retain_painted_output();
+        }
         self.output = Some(id);
+        if self.surfaces.get(&id).is_some_and(Surface::is_painted) {
+            self.presentation_fallback = None;
+        }
         self.touch();
     }
 
-    /// The surface currently mapped to output — what the window should draw.
+    /// The surface currently mapped to output in protocol state.
     pub fn output_surface(&self) -> Option<&Surface> {
         self.output.and_then(|id| self.surfaces.get(&id))
+    }
+
+    /// The surface the window should present.
+    ///
+    /// This is deliberately separate from [`Self::output_surface`]: protocol state may
+    /// already map a replacement surface before that surface has received usable pixels.
+    /// The presenter must keep the last good desktop through that handoff instead of
+    /// flashing the replacement's zero-filled allocation.
+    pub fn presentation_surface(&self) -> Option<&Surface> {
+        self.output_surface()
+            .filter(|surface| surface.is_painted())
+            .or(self.presentation_fallback.as_ref())
     }
 
     pub fn blit_rgba(
@@ -384,7 +436,7 @@ impl SurfaceStore {
         // through `Surface` directly, so cached pixels are not counted twice here.
         let written = surface.blit_rgba(dest, src, src_stride_px)?;
         self.cache_stats.bytes_from_wire += written as u64;
-        self.touch();
+        self.finish_surface_mutation(id);
         Ok(())
     }
 
@@ -397,7 +449,7 @@ impl SurfaceStore {
             .ok_or(SurfaceError::NoSuchSurface(id))?;
         let old = surface.adopt_pixels(pixels)?;
         self.cache_stats.bytes_from_wire += old.len() as u64;
-        self.touch();
+        self.finish_surface_mutation(id);
         Ok(old)
     }
 
@@ -414,7 +466,7 @@ impl SurfaceStore {
             .ok_or(SurfaceError::NoSuchSurface(id))?;
         surface.blit_bgra_strict(dest, src)?;
         self.cache_stats.bytes_from_wire += src.len() as u64;
-        self.touch();
+        self.finish_surface_mutation(id);
         Ok(())
     }
 
@@ -431,7 +483,7 @@ impl SurfaceStore {
         for rect in rects {
             surface.fill(*rect, rgba);
         }
-        self.touch();
+        self.finish_surface_mutation(id);
         Ok(())
     }
 
@@ -466,7 +518,7 @@ impl SurfaceStore {
             let rect = Rect::new(*x, *y, x.saturating_add(w), y.saturating_add(h));
             dest.blit_rgba(rect, &pixels, w)?;
         }
-        self.touch();
+        self.finish_surface_mutation(dest_id);
         Ok(())
     }
 
@@ -538,7 +590,7 @@ impl SurfaceStore {
         // cached tile in twelve places saved twelve regions' worth of wire traffic.
         self.cache_stats.hits += dest_points.len() as u64;
         self.cache_stats.bytes_served += served as u64;
-        self.touch();
+        self.finish_surface_mutation(dest_id);
         Ok(())
     }
 
@@ -829,6 +881,54 @@ mod tests {
         assert!(
             store.output_surface().is_none(),
             "deleting clears the mapping"
+        );
+    }
+
+    #[test]
+    fn an_unpainted_replacement_does_not_cover_the_last_good_desktop() {
+        // MDR-BUG-FLUX-00008. During kiln's display transition Windows replaces the
+        // mapped EGFX surface before its H.264 stream has produced a usable picture.
+        // CreateSurface allocates transparent black, so presenting protocol state
+        // immediately makes switching back to the fullscreen window flash black. Keep
+        // the last complete desktop until the replacement receives its first pixels.
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 2);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        store.map_to_output(1);
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(2, 2, RED)
+        );
+
+        // Different-id overlap: the old and replacement surfaces are both live during
+        // the handoff, and the server maps the replacement before its first paint.
+        store.create(2, 2, 2);
+        store.map_to_output(2);
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(2, 2, RED),
+            "mapping an unpainted replacement must retain the last good desktop"
+        );
+        store.solid_fill(2, &[Rect::new(0, 0, 2, 2)], BLUE).unwrap();
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(2, 2, BLUE),
+            "the replacement takes over on its first successful paint"
+        );
+
+        // Same-id replacement: CreateSurface itself swaps the mapped allocation, before
+        // a separate MapSurface PDU can provide a handoff edge.
+        store.create(2, 2, 2);
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(2, 2, BLUE),
+            "same-id recreation must retain the old incarnation until paint"
+        );
+        store.solid_fill(2, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(2, 2, RED),
+            "the recreated incarnation takes over when it is painted"
         );
     }
 

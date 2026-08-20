@@ -1812,7 +1812,7 @@ impl SessionApp {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let generation = store.generation();
-            let blank = match store.output_surface() {
+            let blank = match store.presentation_surface() {
                 Some(session) => {
                     self.viewport =
                         Viewport::letterbox(size.width, size.height, session.width, session.height);
