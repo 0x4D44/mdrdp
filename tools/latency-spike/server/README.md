@@ -221,7 +221,7 @@ the order the code follows it.
 Settings: `MFVideoFormat_NV12` in, `MFVideoFormat_HEVC` out;
 `CODECAPI_AVLowLatencyMode = TRUE`; `AVEncCommonRateControlMode = CBR` with the
 `--bitrate-kbps` value; `AVEncMPVGOPSize` from `--gop`; Main 4:2:0 8-bit profile,
-High tier, Level 4.1, studio-range BT.709. Low-latency acceptance is mandatory.
+Main tier, Level 4.1, studio-range BT.709. Low-latency acceptance is mandatory.
 The HEVC MFT may refuse the older B-picture property; low-latency mode remains the
 required no-reorder contract.
 

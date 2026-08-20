@@ -348,7 +348,10 @@ pub fn validate_config(
 ) -> Result<(), StreamContractError> {
     let fields = [
         ("profile_idc", 1, u64::from(config.profile_idc)),
-        ("high_tier", 1, u64::from(config.high_tier)),
+        // The negotiated 20 Mbit/s stream is exactly within Level 4.1 Main
+        // tier. Media Foundation has no HEVC tier control, and quench's Intel
+        // MFT emits Main tier for this configuration.
+        ("high_tier", 0, u64::from(config.high_tier)),
         ("level_idc", 123, u64::from(config.level_idc)),
         ("chroma_format_idc", 1, u64::from(config.chroma_format_idc)),
         ("bit_depth_luma", 8, u64::from(config.bit_depth_luma)),
@@ -671,10 +674,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_contract_rejects_every_wrong_field_including_tier_and_level() {
+    fn stream_contract_accepts_main_tier_and_rejects_every_wrong_field() {
         let expected = StreamConfig {
             profile_idc: 1,
-            high_tier: true,
+            high_tier: false,
             level_idc: 123,
             chroma_format_idc: 1,
             bit_depth_luma: 8,
@@ -690,7 +693,7 @@ mod tests {
                 ..expected
             },
             StreamConfig {
-                high_tier: false,
+                high_tier: true,
                 ..expected
             },
             StreamConfig {
