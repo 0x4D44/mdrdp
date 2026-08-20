@@ -291,12 +291,23 @@ pub struct AudioStats {
     /// How many formats went out in the most recent Client Audio Formats PDU, or `None`
     /// if no format exchange ever completed on either transport.
     ///
-    /// This is the only counter that separates "the server never opened an audio channel"
-    /// from "it opened one and nothing happened to be playing". `current_format` cannot:
-    /// it is set by [`RdpsndBackend::wave`], so it stays `None` through a perfectly
-    /// healthy silent session, and reading a negotiation failure out of it would attribute
-    /// a fault to a stage that was never measured.
+    /// Separates "the server started the RDPSND handshake" from "it never spoke".
+    /// `current_format` cannot: it is set by [`RdpsndBackend::wave`], so it stays `None`
+    /// through a perfectly healthy silent session, and reading a negotiation failure out
+    /// of it would attribute a fault to a stage that was never measured.
     pub negotiated_formats: Option<usize>,
+    /// Times the server opened `AUDIO_PLAYBACK_DVC`, counted the moment
+    /// [`DynamicRdpsndListener::create`] accepts the DYNVC_CREATE_REQ — before a single
+    /// audio PDU has to arrive.
+    ///
+    /// This is the counter that makes "no audio channel was opened" a *measured* claim
+    /// instead of an inference from silence. Windows opens the channel during connect and
+    /// again after desktop setup, so more than one open is normal — and it opens it on
+    /// every session, then stays silent until something on the remote desktop actually
+    /// renders audio. Without this, an idle remote desktop was reported as a server that
+    /// refused the channel, which is a different fault in a different component
+    /// (MDR-BUG-FLUX-00019).
+    pub dvc_opens: u64,
 }
 
 /// A cloneable read/write handle on a shared [`AudioStats`].
@@ -327,6 +338,37 @@ impl AudioStatsHandle {
 
     fn note<F: FnOnce(&mut AudioStats)>(&self, f: F) {
         f(&mut self.lock());
+    }
+}
+
+/// One line describing what the audio path did, for the end-of-session epilogue.
+///
+/// Every branch reports a stage that was actually **measured**. That is the whole point:
+/// the previous version inferred "the server never opened an audio channel" from an
+/// absent format exchange, and printed it on sessions where the server had opened
+/// `AUDIO_PLAYBACK_DVC` twice — sending an investigation after a server-side refusal that
+/// never happened (MDR-BUG-FLUX-00019). Windows opens that channel on every session and
+/// begins the RDPSND handshake only once something on the remote desktop actually renders
+/// audio, so "channel open, handshake not started" is the ordinary look of a quiet
+/// desktop and must not read as a fault.
+pub fn session_summary(stats: &AudioStats) -> String {
+    match (stats.current_format, stats.negotiated_formats) {
+        (Some(fmt), _) => format!(
+            "{} packets at {} Hz/{}ch, {} dropped to overrun, {} underruns",
+            stats.packets_received, fmt.sample_rate, fmt.channels, stats.overruns, stats.underruns
+        ),
+        (None, Some(0)) => {
+            "formats exchanged, but the server shared none of the formats we offer".to_owned()
+        }
+        (None, Some(n)) => {
+            format!("{n} format(s) negotiated; the server sent no audio this session")
+        }
+        (None, None) if stats.dvc_opens > 0 => format!(
+            "channel opened {} time(s), but the server never started the format exchange \
+             — nothing was playing on the remote desktop",
+            stats.dvc_opens
+        ),
+        (None, None) => "no audio channel was opened by the server this session".to_owned(),
     }
 }
 
@@ -721,6 +763,11 @@ impl DvcChannelListener for DynamicRdpsndListener {
     }
 
     fn create(&mut self, _channel_id: DynamicChannelId) -> Option<Box<dyn DvcProcessor>> {
+        // Counted here, not on the first PDU: accepting the create IS the channel
+        // opening, and it is the only evidence that survives a server which opens the
+        // channel and then never speaks. See [`AudioStats::dvc_opens`].
+        self.stats
+            .note(|s| s.dvc_opens = s.dvc_opens.saturating_add(1));
         let backend = RdpsndBackend::new(self.ring.clone(), self.stats.clone(), self.device);
         Some(Box::new(DynamicRdpsnd::new(Box::new(backend))))
     }
@@ -1143,6 +1190,86 @@ mod tests {
             stats.snapshot().negotiated_formats,
             Some(0),
             "an empty intersection is a real capability gap, not an absent exchange"
+        );
+    }
+
+    // -- session summary ---------------------------------------------------------------
+
+    #[test]
+    fn a_channel_the_server_opened_and_never_spoke_on_is_not_called_a_refusal() {
+        // MDR-BUG-FLUX-00019, exactly as measured against quench: the server opens
+        // AUDIO_PLAYBACK_DVC during connect, closes it after desktop setup, opens it
+        // again — and sends nothing at all until something on the remote desktop renders
+        // audio. The old summary read that silence as "no audio channel was opened by the
+        // server this session", which is a claim about a stage it never measured, and it
+        // sent two days of investigation after a server-side refusal that never happened.
+        let stats = AudioStatsHandle::new();
+        let ring = AudioRing::with_capacity(4096, stats.clone());
+        let mut listener = DynamicRdpsndListener::new(ring, stats.clone(), device_native());
+
+        assert_eq!(
+            stats.snapshot().dvc_opens,
+            0,
+            "nothing has opened yet, so nothing may be claimed"
+        );
+
+        // Open, close, open — the exact sequence Windows performs.
+        let mut first = listener.create(10).unwrap();
+        first.close(10);
+        let _second = listener.create(11).unwrap();
+
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.dvc_opens, 2,
+            "both opens must be counted, not just one"
+        );
+        assert_eq!(
+            snap.negotiated_formats, None,
+            "the server never started the handshake in this scenario"
+        );
+
+        let line = session_summary(&snap);
+        assert!(
+            !line.contains("no audio channel was opened"),
+            "a channel the server opened twice must not be reported as never opened: {line}"
+        );
+        assert!(
+            line.contains("opened 2 time(s)"),
+            "the summary must report the measured number of opens: {line}"
+        );
+    }
+
+    #[test]
+    fn a_server_that_never_opened_an_audio_channel_is_still_reported_as_such() {
+        // The other half of the same claim: the honest "never opened" line must survive
+        // the fix, or the report just swaps one unmeasured claim for another.
+        let line = session_summary(&AudioStats::default());
+        assert_eq!(
+            line, "no audio channel was opened by the server this session",
+            "with zero opens and zero exchanges there is nothing else to say"
+        );
+    }
+
+    #[test]
+    fn the_summary_reports_played_audio_over_the_open_count() {
+        // A session that actually played must report the packets, not the channel
+        // bookkeeping — the open count is a diagnosis for the silent case only.
+        let stats = AudioStats {
+            packets_received: 214,
+            overruns: 3,
+            underruns: 12,
+            dvc_opens: 2,
+            negotiated_formats: Some(2),
+            current_format: Some(AudioFormatSummary {
+                sample_rate: 44_100,
+                channels: 2,
+                bits_per_sample: 16,
+            }),
+            ..AudioStats::default()
+        };
+        assert_eq!(
+            session_summary(&stats),
+            "214 packets at 44100 Hz/2ch, 3 dropped to overrun, 12 underruns"
         );
     }
 

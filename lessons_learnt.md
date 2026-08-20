@@ -6,6 +6,15 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Windows opens AUDIO_PLAYBACK_DVC on every RDP session but starts RDPSND only once the desktop plays sound (`audio.rs:session_summary`).
+  So an idle remote desktop looks exactly like a server that refused audio: channel open, zero PDUs, no format
+  exchange. Testing audio negotiation against a quiet desktop measures nothing. Make the session render sound
+  first — a scheduled task registered `/ru <user> /it` runs inside the interactive session and works over ssh.
+  This cost MDR-BUG-FLUX-00019: the epilogue printed "no audio channel was opened by the server" on sessions
+  where the server had opened one twice, because it inferred channel state from an absent format exchange.
+  FreeRDP is not a counter-example — its `[dynamic] Loaded mac backend for rdpsnd` fires in `rdpsnd_on_open`,
+  at channel creation, not on receiving formats, so it proves nothing about negotiation.
+
 - H.264 reference state belongs to an EGFX surface incarnation, not the channel (`client::h264_decoders`).
   A real display transition can overlap two surface lifetimes, so resetting one shared decoder
   on every numeric-id switch destroys both chains; same-id `CreateSurface` reuse has the opposite
@@ -13,120 +22,250 @@ Indented lines below the first are detail: kept for lookup, never injected.
   or id reuse, and retain the last painted output while its zero-filled replacement is unpainted.
   MDR-BUG-FLUX-00008.
 
-A lesson is **never dropped to make room** for a new one — prepend it and let the oldest
-fall out of the injected window. Soft target ~25 entries; past ~40, say it is due a prune
-rather than pruning unasked. Durable project facts and conventions belong in `CLAUDE.md`,
-not here.
+- A headless Windows box reports healthy audio hardware while having NO active render endpoint (`tools/audio-probe`).
+  `Win32_SoundDevice` says "Realtek — Status OK" and Audiosrv is Running, but with nothing in the jack every
+  endpoint is unplugged/not-present and `GetDefaultAudioEndpoint` returns 0x80070490. WASAPI loopback capture
+  has nothing to attach to, and apps cannot render audio at all — so there is no audio to capture, not merely a
+  capture problem. Ask WASAPI, never WMI. Parked tranche 6; see the PARK doc in wrk_docs.
 
----
+- A test fixture that silently fails to run makes the harness report the failure it exists to detect (`tools/clipboard-soak/src/main.rs`).
+  Cost time twice on tranche 5. A clipboard holder reported success while holding nothing, and later
+  `clipboard-cycle`'s launch died because the previous instance still held its log file, so a shell
+  redirect could not open — the soak then ran with no generator and reported host->mac misses that had
+  nothing to do with the clipboard. Two in a row is a wedge, so the run's headline finding was an
+  artefact of its own fixture. Fix is a startup probe: the harness refuses to begin until it observes
+  the fixture actually working, rather than assuming it launched.
 
-- A healthy Windows audio device can have no active render endpoint; ask WASAPI, not WMI (`tools/audio-probe`).
-  `Win32_SoundDevice` said "Realtek — Status OK" and Audiosrv was running, but every
-  endpoint was unplugged/not-present and `GetDefaultAudioEndpoint` returned 0x80070490.
-  WASAPI loopback had nothing to attach to, so there was no audio to capture.
+- A new mdrdp dependency also needs `tools/latency-spike/viewer/Cargo.lock` refreshed, or `deltic integrate` fails.
+  The viewer is its own workspace that depends on the root library by path, so a dep added to
+  mdrdp changes the viewer's graph too. Deltic's bump step runs `cargo metadata --locked` over
+  every sub-manifest and refuses to update a lock, so the integration dies after the rebase with
+  "cannot update the lock file … because --locked was passed". Refresh it in the same commit:
+  `cargo metadata --manifest-path tools/latency-spike/viewer/Cargo.toml --offline --format-version 1`.
 
-- eframe sets the Dock icon; raw winit needs a long-lived raw-RGBA AppKit image (`dock::set_label`).
-  eframe calls `-[NSApplication setApplicationIconImage:]` through
-  `ViewportBuilder::with_icon`; the raw-winit session window did not. Compose the tile in
-  portable Rust and pass AppKit raw RGBA, not PNG: some macOS builds load an arbitrary
-  libpng for `NSImage`-from-PNG and SIGBUS (egui#7155). `NSBitmapImageRep` does not copy its
-  planes, so the buffer must outlive the call.
+- eframe sets the macOS Dock icon for you; a raw-winit window gets the generic "exec" tile (`dock::set_label`).
+  macOS gives an unbundled executable a placeholder tile unless something calls
+  `-[NSApplication setApplicationIconImage:]`. eframe makes that call from
+  `ViewportBuilder::with_icon`, so the launcher always looked right — the session window is
+  raw winit and never did. The fix composes the tile in portable Rust (icon + a hostname pill
+  rasterised with ab_glyph) and hands AppKit one RGBA buffer, so the layout and the pixels are
+  unit-testable. Build the rep from raw RGBA, never from PNG: some macOS builds load an
+  arbitrary libpng for `NSImage`-from-PNG and SIGBUS (egui#7155). `NSBitmapImageRep` does not
+  copy the planes, and the Dock re-renders whenever it likes, so the buffer must outlive the call.
 
-- A Windows clipboard lock does not persist on quench; a 30 s hold ends 0x8007058A (`tools/clipboard-hold`).
-  PowerShell P/Invoke and two native implementations all reported `opened=true`, then
-  `closed=false — thread does not have a clipboard open`, while the app wrote throughout.
-  Any clipboard holder must report `CloseClipboard`; otherwise a false hold reads as a pass.
+- Resetting the H.264 decoder on ResetGraphics fails every P-frame until the next IDR (`client::handle_reset_graphics`).
+  `H264Decoder::reset` drops the VideoToolbox session, and a session rebuilt mid-GOP holds no
+  reference frames — while the server, which never asked for this, keeps sending P-frames. The
+  decoder already rebuilds itself when SPS/PPS change, so the reset was redundant as well as
+  fatal. ResetGraphics is ROUTINE on any host with a screen attached (idle power-off, backlight,
+  lid, dock, and every window resize), so this blacked out the whole desktop until something
+  forced a keyframe — which is why resizing the window a few times "fixed" it. MDR-BUG-FLUX-00008.
 
-- Windows display/input probes need an unlocked console via `tscon` (`agent.rs:input_desktop_rung`).
-  SSH and disconnected sessions can enumerate no displays, making the agent report a healthy
-  IDD as gone. A locked console still reports `WinSta0\Default` and successful `SendInput`,
-  but the secure `Winlogon` input desktop eats the events. Run display-facing work from an
-  Interactive scheduled task after `tscon`; never cycle a healthy device for this symptom.
+- Every fleet test host is headless, so display-mode transitions cannot be reproduced on any of them.
+  A physical panel produces idle power-off, backlight, lid and dock transitions that a headless box
+  never generates, and each makes the RDP server send ResetGraphics. A green sweep across all four
+  hosts is therefore not coverage of that class at all — MDR-BUG-FLUX-00008 was invisible to every
+  test we could have written here while a real laptop sat black. MDR-BUG-FLUX-00015.
 
-- IDD input needs `dmPosition`; the default zero origin misplaces clicks (`win/idd_source.rs:IddSource::origin`).
-  The IDD pool header has no desktop coordinates, so query `DEVMODEW::dmPosition`
-  (`agent_ops::idd_display_origin`). This stayed latent while IDD was the only display;
-  attaching a console moved it to (1920,0), making every click land 1920 pixels left.
+- A disconnected Windows session enumerates NO displays, so rhydra's agent reports a healthy IDD device as gone (`agent` device rung).
+  `query session` is the check: if the console is a different session id from the one the agent runs
+  in, `EnumDisplayDevices` returns nothing and the ladder says `device FAIL` with the driver present
+  and OK in Device Manager. The remedy is `tscon` (the rig's `mdrdp-tocon` task), NOT `cycle-device`
+  — which rebuilds the display and drops every session on the host for no reason. The real clue sits
+  under `input-desktop`, two rungs BELOW the symptom. MDR-BUG-FLUX-00017.
 
-- Windows SSH setup needs PS 5.1, its own firewall rule, and the admin key file (`hostscripts::setup_ssh`).
-  PowerShell 7 failed DISM with "Class not registered" and returned silent empties from
-  `Get-Net*`; self-elevate into Windows PowerShell 5.1. Installing OpenSSH rewrites its
-  built-in firewall rule to Private, so add `mdrdp-sshd-in` after installation. Admin users
-  authenticate only through `administrators_authorized_keys`, ACLed to SYSTEM + Administrators.
+- A Windows clipboard lock does NOT persist on quench: a 30 s hold ends with 0x8007058A (`tools/clipboard-hold`).
+  Three runs, two implementations (PowerShell P/Invoke, native sleep, native with a message pump) all
+  report `opened=true`, `held_secs=30.00`, `closed=false — thread does not have a clipboard open`,
+  while the process under test writes happily throughout. Something on that host breaks the lock, so
+  a test that needs `OpenClipboard` to be refused CANNOT be staged there. Make any clipboard-holder
+  report its own `CloseClipboard` result: one that only prints "held for 30s" hides the fact that it
+  held nothing, and the run reads as a pass.
 
-- An RDP console logon rebuilds quench's IDD and strands capture (`agent.rs:request_device_cycle`).
-  The display renumbers and the server keeps its old `Global\mdrdp-idd` generation. Recover
-  in order: `mdrdp-cycle-idd`; stop `mdrdp-idd-create.exe` so the agent republishes the
-  section; restart `rhydra-server.exe`.
+- Never hold a lock across an OS clipboard call — a stuck write freezes the other direction too (`clipboard::apply_remote`).
+  `EmptyClipboard` SENDS `WM_DESTROYCLIPBOARD` to a hung previous owner, so a write can block for
+  arbitrarily long. If the reader holds the shared clipboard handle *or* the bridge mutex while it
+  does, the 250 ms poll stalls behind it and a one-direction wedge becomes both. Give each thread its
+  own clipboard handle (the OS then serialises with bounded-retry `OpenClipboard`, which fails fast),
+  and take the bridge lock only to DECIDE, never across the write.
 
-- A static desktop gives a new rhydra viewer no frame despite its keyframe request (`win/pipeline.rs:capture_loop`).
-  `request_keyframe()` fires, then `acquire()` times out, so no access unit exists to encode.
-  Idle one-second reconnects decoded 1/1/0/0/4; with the desktop changing, 5/5. State desktop
-  activity before diagnosing a blank connection. MDR-BUG-FLUX-00011.
+- Record clipboard content as applied only AFTER the write succeeds, never when deciding (`Bridge::on_remote_text`).
+  Recording at the decision means that while a write is stuck the bridge believes the clipboard holds
+  the new text while it still holds the old — so the poll reads the OLD content, calls it a change,
+  and sends it back as though the user had copied it, clobbering what they actually copied.
 
-- Intel MF accepts 4:4:4 profiles but emits 4:2:0; verify the SPS (`tools/mf-caps-probe`).
-  On quench, Intel HEVC accepted Main_444_8 + ARGB32 but emitted profile 1 /
-  `chroma_format_idc=1`; Intel VP9 ignored the profile attribute. D3D12 Video Encode does
-  expose HEVC Main_444/Main10_444 with AYUV/Y410, but not through the MFT.
+- `check-windows.sh` checked mdrdp only, so rhydra's whole `host` half went untype-checked (`scripts/check-windows.sh`).
+  mdrdp takes rhydra with `default-features = false`, so a `cargo check` from the repo root never
+  compiles `tools/latency-spike/server/src/win/**` — DXGI duplication, the MF encoder, the SendInput
+  injector, the Win32 clipboard. A new module whose FIRST import was wrong passed the script and
+  failed a direct check of the same target. Fixed in v0.1.86 to run both; if you trusted a green run
+  after touching `win/` before that, it proved nothing about that code.
 
-- M5 Max VideoToolbox decodes H.264/HEVC 4:4:4 in hardware at 5K; VP9 has no VT decoder (`tools/vt-caps-probe`).
-  The probe feeds real 4:2:0/4:2:2/4:4:4 streams to a hardware-required session. AV1 is
-  hardware for 4:2:0 only. The 4096x2304 H.264 clamp is the Windows encoder's ceiling, not
-  the Mac decoder's.
+- A condvar wake-up test passes with the notify deleted unless it asserts elapsed time (`native::auxchan::Slot`).
+  A taker parked on `wait_timeout` reaches the right answer anyway when the timeout fires — so
+  "assert it eventually returns Closed" is green whether or not `close()` ever notified. The only
+  oracle that separates "woken" from "timed out" is the clock. Make the park interval a constructor
+  parameter, set it far beyond the test's patience, and assert the taker returned inside a fraction
+  of it. The same trap hides any wake-up built on a polling fallback: the fallback is the bug's alibi.
 
-- A metric must encode the failure: B-spikes rose after the blue-flash fix, while blue-flips hit zero (`avcreplay`).
-  "Pixel moved for one frame" counted deliberate flat-average softening as failure. Hue
-  inversion—blue for one frame on yellow content—isolated the impossible rendering and
-  tracked MDR-BUG-FLUX-00010 correctly.
+- Echo suppression needs the last content seen from EITHER end, never the last applied (`native::clipboard::Bridge`).
+  Keeping the last wire-applied fingerprint and refusing to send anything matching it loses a copy
+  silently and permanently: apply X, copy Y (sent), copy X again — X matches, is suppressed, and the
+  peer still holds Y. A last-*sent* slot has the identical bug. Fingerprint the canonical (LF) form,
+  not local bytes, or a Mac's `a\nb` and a Windows box's `a\r\nb` are different forever and multi-line
+  copies ping-pong at poll cadence. After applying, seed the slot from what the OS actually holds.
 
-- softbuffer colour-converts each whole frame on CPU; IOSurface contents avoid it (`present.rs`).
-  An idle 1440p session burned 20–90% of a core in CoreAnimation's ColorSync path plus
-  softbuffer zero-allocation. `present::LayerPresenter` moves conversion to the GPU. Never
-  rewrite the surface currently displayed: CoreAnimation may ignore `setContents` naming
-  the same object, hence the three-surface pool. `MDRDP_PRESENT=soft` keeps the A/B path.
+- A health gate must treat "I could not tell" as neither health nor failure (`control::stuck_from_rungs`).
+  Deriving a connect gate from "first rung that is not Ok" makes a transiently unreadable section
+  refuse a session that would have worked; deriving it from "first rung that is Fail" lets a partial
+  report manufacture health. rhydra needs both answers, so it has two functions:
+  `stuck_from_rungs` (Fail only — may a client connect?) and `first_unsatisfied_rung` (counts
+  Unknown and absent — what should a human look at?). Conflating them costs real sessions either
+  way round.
 
-- spike-server captures nothing without a viewer; a viewer-less smoke proves nothing (`win/pipeline.rs:609`).
-  The capture loop sleeps until the video port has a client. Arm it through an SSH tunnel
-  with `nc -d 127.0.0.1 9500 > /dev/null`; without `-d`, stdin EOF closes it. Scheduled
-  tasks cannot `SetForegroundWindow`, and ending the task kills only its cmd wrapper, so use
-  `WM_CHAR` stimulus and clean orphaned server processes explicitly.
+- The IDD section's `frame_seq` is a driver-written present counter readable by ANY process, with no viewer (`idd_section.rs:184`).
+  This refuted a whole design: the wedge detector does not need to live in the client, because the
+  agent can open `Global\mdrdp-idd` read-only every tick and see whether pixels are moving. Agent-side
+  detection then survives client death, works between sessions, and lets `--doctor` answer instead of
+  reporting "untested". Generation 0 is the driver's explicit "no pool" (`SharedPool.cpp` AdvertiseNoPool).
 
-- Monitor power-off poisons DXGI duplication without an error; restart capture (`win/dxgi.rs:read_rects`).
-  Frames remain "successful" with valid dirty metadata but black pixels, so AccessLost
-  recovery never fires; GDI still sees the desktop. quench disables monitor sleep, and
-  waking it requires `SetThreadExecutionState` inside the interactive session.
+- Restarting rhydra's capture server against pool generation 0 turns a silent wedge into a 30 s crash loop.
+  A *running* server at generation 0 loops on timeout forever; a *fresh* one refuses it
+  (`idd_source.rs` wait_for_pool) and dies into doubling backoff. The remedy for "no pool" is
+  restarting the CREATOR, which owns the device's lifetime and makes the driver republish. Cause-specific
+  remediation matters here because the wrong remedy is worse than none.
 
-- Reliable glass runs need HID-source PID events plus a display-wake assertion (`probe::glass::inject`, `wakelock`).
-  A NULL-source `CGEventPostToPid` reports success but drops the event; create a
-  HIDSystemState source. Focus-routed events lose keystrokes when another app becomes
-  frontmost, so post to the target PID. ScreenCaptureKit exposes no display at the lock
-  screen, so hold an IOPM display-wake assertion between runs.
+- `with_resizable(false)` blocks only the USER: `request_inner_size` still resizes, so a fixed dialog can follow its content (`egui_host::resize_to`).
+  Verified live on macOS 2026-08-19 — the Session-lost dialog opens at its measured
+  closed height and grows when the Technical details disclosure opens. Two things make
+  it behave: hold the disclosure's open state yourself rather than in egui's memory (so
+  the dialog stays a pure function of what it is told, and a test can render both
+  states), and set `animation_time = 0` for it, or the window is dragged through a
+  dozen intermediate heights on the way open.
 
-- A trusted self-signed UMDF driver loads under Secure Boot without testsigning (`src/deploy.rs:DRIVER_INSTALL_PS1`).
-  Trust the certificate in Root + TrustedPublisher and install with pnputil. This works for
-  user-mode IddCx, not virtual audio: ACX and PortCls are kernel-mode and still meet the
-  Secure Boot code-integrity gate. The runbook lives in `src/deploy.rs:DRIVER_INSTALL_PS1`.
+- Installing the OpenSSH capability REWRITES any firewall rule sharing its name back to Private; give ours its own (`hostscripts::setup_ssh`).
+  Two traps, one symptom. Windows' built-in `OpenSSH-Server-In-TCP` is Private-profile only,
+  and these hosts sit on a network Windows categorises Public, so it never applies — SSH
+  connects time out while sshd runs and listens perfectly, which reads as a network fault.
+  Worse, adding a correct Profile-Any rule under that same built-in name is silently undone
+  the next time the capability is installed. Hence `mdrdp-sshd-in`, added AFTER the install.
+  Diagnose from the client: timeout = firewall drop, refused = sshd absent. They are opposite
+  fixes (`sshsetup::classify`).
 
-- AVC444 sends no SurfaceToCache PDUs; a quiet EGFX cache is server behaviour (`gfx::apply_surface_to_cache`).
-  Measured on quench while 117 MB of AVC444v2 painted: hits, misses and entries all stayed
-  zero. Full-frame H.264 carries the pixels, so `hit_rate()` correctly returns `None`.
+- PowerShell 7 fails DISM with "Class not registered" and returns SILENT EMPTIES from Get-Net* — self-elevate to 5.1 (`hostscripts::setup_ssh`).
+  Not a broken servicing stack, though it looks exactly like one. On temper the same
+  `Add-WindowsCapability` that failed under pwsh 7 succeeded via `DISM.exe`, and
+  `Get-NetTCPConnection -LocalPort 22` returned nothing while sshd was listening on
+  0.0.0.0:22 — so the empty output read as "sshd is dead" and cost a wrong diagnosis.
+  `Start-Process powershell -Verb RunAs` gets a 5.1 child from whatever shell was pasted
+  into, which is why every host script here self-elevates.
 
-- EGFX capability versions, not codec toggles, control AVC; Windows can strip AVC420 (`gfx::capabilities`).
-  V8.1 is the only offer that can say AVC420 without AVC444. The offer can negotiate cleanly
-  while the server keeps sending ClearCodec/Progressive until host H.264 policy is enabled.
-  Check host policy before debugging the client.
+- Windows OpenSSH ignores `~/.ssh/authorized_keys` for ANY admin; only `administrators_authorized_keys` counts (`hostscripts::setup_ssh`).
+  Machine-wide, so one key there serves every admin account on the box — `marti` and `ano`
+  both authenticate on quench from one entry. It also needs its ACL stripped to SYSTEM +
+  Administrators or sshd refuses the file outright, silently.
 
-- Windows drops EDISP layouts sent before caps; gate on `DisplayControlClient::ready` (`session::service_resize`).
-  An open Display Control channel is not enough. Sending early succeeds locally but the
-  server ignores the layout without error. A successful resize may complete through EGFX
-  ResetGraphics and new surfaces without any DeactivateAll.
+- A fixed-size dialog holding server-supplied text loses its own buttons; measure the layout headlessly first (`end_dialog::window_size`).
+  Aux windows are `with_resizable(false)`, so overflow is not a scrollbar — it is content
+  drawn past an edge nobody can move. An IronRDP failure chain wraps to ten lines and pushed
+  the whole footer off the 300 px Session-lost dialog. Two halves to the fix: run one headless
+  `egui::Context::run_ui` pass at the fixed width and open at the height the content used, and
+  cap the unbounded part so the total cannot run off a display. A fit test only proves this if
+  it clips each galley to its own clip rect — otherwise a scroll area reads as overflow.
 
-- Measure stages separately; success-only counters and blob spans hide failures (`audio::AudioStats`, `stagelog`).
-  `current_format` once meant "a wave played", not "a format negotiated". Decode failure
-  totals hid primary causes behind cascades. One span across CredSSP, MCS, licensing and
-  finalization falsely attributed most connect time to CredSSP. Instrument the actual stage
-  boundaries and preserve failure reasons.
+- A locked Windows console eats injected input: SendInput succeeds, thread still reads `WinSta0\Default`, nothing lands.
+  A locked session's *input* desktop is the secure `Winlogon` one, so every diagnostic you can
+  reach from a service or SSH agrees the injector is healthy — station, desktop, integrity level,
+  session id, and the return value all look right. The tell is `tasklist /FI "IMAGENAME eq
+  LogonUI.exe"` naming your session. On quench the rig's own `mdrdp-tocon` task
+  (`tscon 2 /dest:console`) clears it. Cost a full session's diagnosis, ending on the wrong
+  hypothesis (that headless IddCx cannot accept SendInput at all).
 
-- macOS keychain ACLs bind to a binary hash, so each unsigned rebuild re-prompts (`creds`).
-  "Always allow" expires with the next `cargo build`; `-A` is the development escape.
-  Stable code signing is functional for a launcher that starts one process per session.
+- `FrameSource::origin` defaults to (0,0); only dxgi overrode it, so IDD clicks missed by the display's offset (`win/idd_source.rs`).
+  The IDD pool header carries no desktop coordinates, so the source cannot learn its own placement
+  the way duplication learns it from `DXGI_OUTPUT_DESC::DesktopCoordinates` — GDI's `DEVMODEW::
+  dmPosition` is the only route (`agent_ops::idd_display_origin`). Latent for as long as the
+  virtual display is the only display; attaching a console pushed it to (1920,0) and every click
+  landed 1920 px to its left, silently, because SendInput succeeds either way and the keyboard
+  needs no coordinates. Typing works, the first click steals focus, everything after it vanishes.
+
+- An RDP logon to quench's console recreates the IDD display and strands the capture server on a dead pool.
+  The display renumbers (`\\.\DISPLAY12` → `15` → `16`) and the server keeps its old
+  `Global\mdrdp-idd` generation, decoding nothing while looking healthy. Recovery is three ordered
+  steps: `mdrdp-cycle-idd`; kill `mdrdp-idd-create.exe` so the agent respawns it and republishes the
+  section (the device cycle destroys it — the server then logs `waiting up to 30s for
+  Global\mdrdp-idd` and refuses connects with "the video server is not accepting yet"); restart
+  `rhydra-server.exe`.
+
+- rhydra sends a new viewer NOTHING until the desktop changes: the connect-edge keyframe request has nothing to encode (`win/pipeline.rs` capture_loop).
+  `request_keyframe()` fires, then `acquire()` times out on a static desktop, so no AU is ever
+  produced. Idle 1 s reconnects decoded 1/1/0/0/4 on a confirmed-healthy pipeline; with the desktop
+  changing, 5/5. Any "connects but blank" report needs the desktop's activity stated before it is
+  a bug in anything else. MDR-BUG-FLUX-00011.
+
+- Intel's MF encoder MFTs ACCEPT 4:4:4 profiles and silently emit 4:2:0 — read the SPS back, never trust SetOutputType (`tools/mf-caps-probe`).
+  On quench (Core Ultra 7 270K Plus) Intel HEVC takes Main_444_8 + ARGB32 and emits profile 1 /
+  chroma_format_idc 1; Intel VP9 ignores the profile attribute outright (byte-identical output).
+  The silicon can do HEVC 4:4:4 — D3D12 Video Encode reports Main_444/Main10_444 with AYUV/Y410 —
+  but not via the MFT. Also: session 0 enumerates hardware MFTs but ActivateObject fails E_FAIL;
+  D3D12 CheckFeatureSupport works there. See the quench SPIKE doc of 2026-08-19.
+- M5 Max VideoToolbox decodes H.264 AND HEVC 4:4:4 in HARDWARE at 5K; VP9 has no VT decoder at all (`tools/vt-caps-probe`).
+  `VTIsHardwareDecodeSupported` answers per codec only; the probe feeds real 4:2:0/4:2:2/4:4:4
+  streams to a hardware-required session and counts frames. AV1 is hardware for 4:2:0 only. The
+  H.264 4096x2304 ceiling we clamp to is the Windows encoder's, not the Mac decoder's. Results in
+  `wrk_docs/2026.08.19 - SPIKE - VideoToolbox chroma and codec decode matrix on M5 Max.md`.
+- A metric must encode the failure, not the change: B-spike count ROSE after fixing the blue flash; blue-flip count hit 0 (`avcreplay`).
+  Naive "pixel moved for one frame" counts the fix's deliberate flat-average softening alongside
+  the overshoot it removed (2,271 -> 3,603 while the defect went to zero). The decisive metric was
+  hue inversion — blue-dominant for one frame on yellow-dominant content — which no correct
+  rendering of the block's real colours can produce (MDR-BUG-FLUX-00010).
+- Preserved chroma goes STALE when content changes under LC=1; paint flat avg until catch-up or reconstruction overshoots (`avc444::chroma_stale`).
+  The FLUX-00007 preserve fix made gap frames worse: `4*new_avg - 3*stale` pushed U past any real
+  hue (blue flash on yellow, wrong-colour window restores, up to ~1.4 s). Average-delta detects the
+  change: re-encode noise <= 6, genuine change >= 41 (32 temper payloads) — threshold 10, no tuning.
+- Windows AVC444 alternates LC=1/LC=2; a luma pass must PRESERVE delivered odd chroma or colours pump (`avc444::apply_luma`).
+  FreeRDP replicates the luma frame's averaged chroma into all four 2x2 positions on every luma
+  pass, wiping the aux samples — on dithered content that flips 33k/48k probe pixels by up to 98
+  RGB units at every L↔C transition (measured, temper). The encoder re-sends chroma only when it
+  changed. Repro/attribution recipe: `--capture-failures` + `examples/avcreplay.rs`.
+- Suppress Output "allow" does NOT repaint: EGFX resumes only FUTURE deltas — reveal must send Refresh Rect (`session::visibility_pdus`).
+  A session that connects occluded stays black forever: the logon-black connect burst is all it
+  ever painted, the desktop appears server-side while suppressed (never sent), and a static desktop
+  produces no future deltas. Kiln showed this as a healthy connection with a permanent black
+  window, frames frozen at 80. Temper/crucible masked it because their desktops change constantly.
+  MS-RDPBCGR 2.2.11.2 Refresh Rect after the allow is what mstsc does. MDR-BUG-FLUX-00006.
+
+- softbuffer's CG backend colour-converts the WHOLE frame on CPU per present; IOSurface contents skip it (`present.rs`).
+  An idle 1440p session burned 20–90% of a core: CoreAnimation re-renders every data-provider
+  CGImage through a vImage ColorSync pass (~20 ms/frame at 2560x1440), plus softbuffer zero-allocs
+  the buffer each frame. `present::LayerPresenter` hands CA an IOSurface instead — conversion moves
+  to the GPU. Never rewrite the surface currently on glass: CA can short-circuit a `setContents`
+  naming the object it already shows, so in-place writes silently stop updating the screen (hence
+  the pool of three). `MDRDP_PRESENT=soft` forces the old path for A/B. MDR-BUG-FLUX-00005.
+
+- spike-server records ZERO frames until a viewer connects (`win/pipeline.rs:609` — by design); a viewer-less smoke proves nothing.
+  A whole afternoon's "dead capture" diagnosis on quench was this: the capture loop parks in 50 ms
+  sleeps until the video port accepts a client. Arm it headlessly with an SSH tunnel plus
+  `nc -d 127.0.0.1 9500 > /dev/null` (without `-d`, nc closes on stdin EOF and the server disarms).
+  Two more rig traps stacked on top: schtasks context cannot `SetForegroundWindow` (SendKeys stimulus
+  silently misses — post `WM_CHAR` to the hwnd instead), and `schtasks /end` kills only the cmd
+  wrapper, orphaning `spike-server-inc3.exe` on ports 9500/9501 (`taskkill /im` it). Also: the IDD
+  device lives only while `mdrdp-idd-create.exe --wait` runs — a reboot removes the device entirely;
+  quench task `mdrdp-idd-create` recreates it.
+- Windows monitor power-off silently poisons DXGI duplication: frames stay "successful", dirty metadata stays valid, pixels go black (`win/dxgi.rs:read_rects`).
+  No error is ever raised, so AccessLost recreation never fires; GDI CopyFromScreen still sees the real
+  desktop, which is the diagnostic. Restart the duplication session (i.e. the spike server) after any
+  display power transition. quench now runs `powercfg /change monitor-timeout-ac 0`, and waking a
+  blanked display needs SetThreadExecutionState from INSIDE the interactive session (task `mdrdp-wake`)
+  — injected keyboard/mouse input does not relight it. Cost: a 76%-timeout glass run and ~an hour, all
+  of which looked exactly like a latency regression.
+- A CGEvent built with a NULL source is silently dropped by CGEventPostToPid; create it from a HIDSystemState source (`glass::inject::Injector`).
+  Cost two burned quench sessions: python ctypes CGEventCreateKeyboardEvent(None, …) posted "successfully"
+  (permission preflight true, no error) yet the target app never saw a keystroke. Same call with
+  CGEventSourceCreate(kCGEventSourceStateHIDSystemState) delivered every tap.
+- winit macOS folds BOTH ISO corner keys into Backquote and never emits IntlBackslash; split on the unmodified char (`input::backquote_scancode`).
+  winit 0.30 `platform_impl/macos/event.rs` maps kVK_ISO_Section (0x0A) and kVK_ANSI_Grave (0x32) to
+  `KeyCode::Backquote`, so the 102nd key next to left Shift sent scancode 0x29 and typed ` where a UK PC
+  layout has \. `key_without_modifiers` is computed from the raw keycode before the collapse, so the two
+  keys still differ there (§/± = top-left, `/~/\/|/</> = 102nd on ISO hardware per KBGetLayoutType).
+  Validated live on quench: keycode 50 now types \, keycode 10 types `, matching Windows App 11.3.8.

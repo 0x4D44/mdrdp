@@ -299,32 +299,9 @@ fn report_session_epilogue(
     // important case — the channel was joined and the server sent nothing — which is
     // exactly what a wrong NO_AUDIO_PLAYBACK flag looks like, and it looks identical to
     // "nothing was playing" if the line is suppressed.
-    // Three outcomes, never merged: no channel was ever opened, one was opened and stayed
-    // silent, or audio actually played. Only `negotiated_formats` can tell the first two
-    // apart — `current_format` alone is `None` for both, and calling that "negotiated no
-    // format" blamed a stage that had not been measured.
+    // Every outcome names a stage that was measured — see `audio::session_summary`.
     if !is_native {
-        match (audio.current_format, audio.negotiated_formats) {
-            (Some(fmt), _) => eprintln!(
-                "  audio: {} packets at {} Hz/{}ch, {} dropped to overrun, {} underruns",
-                audio.packets_received,
-                fmt.sample_rate,
-                fmt.channels,
-                audio.overruns,
-                audio.underruns
-            ),
-            (None, None) => {
-                eprintln!("  audio: no audio channel was opened by the server this session")
-            }
-            (None, Some(0)) => eprintln!(
-                "  audio: formats exchanged, but the server shared none of the formats we offer"
-            ),
-            (None, Some(n)) => {
-                eprintln!(
-                    "  audio: {n} format(s) negotiated; the server sent no audio this session"
-                )
-            }
-        }
+        eprintln!("  audio: {}", mdrdp::audio::session_summary(&audio));
     }
     if !s.decode_error_reasons.is_empty() {
         eprintln!("  decode failures by reason:");
