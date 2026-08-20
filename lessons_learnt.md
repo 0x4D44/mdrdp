@@ -264,9 +264,14 @@ not here.
 - A UMDF driver installs under Secure Boot with cert trust alone (Root+TrustedPublisher) — no testsigning, no reboot (idd/deploy.ps1).
   `bcdedit /set testsigning on` is refused outright under Secure Boot, but that gate
   only exists for kernel code integrity: pnputil accepted the self-signed-and-trusted
-  mdrdp-idd package and WUDFHost loaded it. `tools/latency-spike/idd/install-notest.ps1`
-  on quench is the working runbook; signtool comes from the
-  `Microsoft.Windows.SDK.BuildTools` NuGet, not the WDK one.
+  mdrdp-idd package and WUDFHost loaded it. The working runbook is `DRIVER_INSTALL_PS1`
+  in `src/deploy.rs` (an earlier note here cited `idd/install-notest.ps1`, which does not
+  exist); signtool comes from the `Microsoft.Windows.SDK.BuildTools` NuGet, not the WDK one.
+  **The "only for kernel code integrity" clause is load-bearing and was missed for two days:**
+  it is exactly why a virtual AUDIO device cannot take the same route. Every audio render
+  path (ACX, PortCls) is kernel-mode — in this WDK splat ACX exists only under `km/acx`,
+  while IddCx sits under `um/x64/iddcx` — so an audio driver meets the code-integrity gate
+  this one walks around, and a self-signed one cannot load under Secure Boot at any price.
 - Windows SSH sessions see no displays: user32 enumerates empty and DXGI duplication cannot run — use tscon + an Interactive scheduled task.
   sshd sessions are non-interactive (though fully elevated for admins). The working
   pattern on quench: `tscon <id> /dest:console` to put the user's session on the
