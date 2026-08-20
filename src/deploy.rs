@@ -745,8 +745,8 @@ if ($TargetDir -and (Test-Path -LiteralPath (Join-Path $TargetDir 'audio-source'
     $audioSourceLoopback = ((Get-Content -LiteralPath (Join-Path $TargetDir 'audio-source') -Raw).Trim() -eq 'loopback')
     $audioAgent = Join-Path $TargetDir 'rhydra-agent.exe'
     if (Test-Path -LiteralPath $audioAgent) {
-        & $audioAgent check-audio *> $null
-        $audioPolicyOk = ($LASTEXITCODE -eq 0)
+        $audioCheck = Start-Process -FilePath $audioAgent -ArgumentList 'check-audio' -Wait -PassThru -WindowStyle Hidden
+        $audioPolicyOk = ($audioCheck.ExitCode -eq 0)
     }
 }
 $audioFormatsOk = [bool]($audioFormatMarker -and $audioPolicyOk -and $audioSourceLoopback -and $cableRenderActive -and $cableCaptureActive)
@@ -1895,7 +1895,8 @@ mod tests {
     #[test]
     fn audio_preflight_covers_healthy_install_configure_reboot_and_broken() {
         assert!(
-            PROBE_PS1.contains("check-audio") && PROBE_PS1.contains("$LASTEXITCODE -eq 0"),
+            PROBE_PS1.contains("Start-Process -FilePath $audioAgent")
+                && PROBE_PS1.contains("$audioCheck.ExitCode -eq 0"),
             "preflight must read back the live endpoint formats, not trust a stale marker"
         );
         let mut ev = healthy_evidence();
