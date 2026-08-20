@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00022 — rhydra HEVC rejects quench's valid Main-tier stream because the contract requires unsupported High tier
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native-transport
 - **Raised:** 2026-08-20T10:57:47Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260820T105810Z-p67382-n663796000-c1
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00022-run-fix-20260820T105810Z-p67382-n663796000-c1
-- **Owner base:** f1056c687c9c5130d802818c738ec20b6bdd8045
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-20T10:58:10Z
-- **Owner until:** 2026-08-20T12:58:10Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-20T10:57:47Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-20T10:57:47Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-20T11:02:02Z, deltic:auto role=fix run=fix-20260820T105810Z-p67382-n663796000-c1 branch=task/bug-MDR-BUG-FLUX-00022-run-fix-20260820T105810Z-p67382-n663796000-c1 code=2fdfdf2 gate=manual)
 
 ## Observation
 
