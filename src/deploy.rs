@@ -726,6 +726,10 @@ foreach ($endpoint in $audioEndpoints) {
         }
     }
 }
+# A machine-wide pending rename is not evidence that this audio install needs a
+# reboot (Edge routinely leaves one behind). Attribute it to VB-CABLE only when
+# setup ran and its verified endpoints are still unavailable.
+$audioRebootPending = [bool]($audioSetupRan -and $audioRebootPending -and (-not $cableRenderActive -or -not $cableCaptureActive))
 $audioPackageStaged = $audioSetupRan
 try {
     $audioPackageStaged = $audioPackageStaged -or ($null -ne (Get-WindowsDriver -Online -ErrorAction Stop |
@@ -1898,6 +1902,12 @@ mod tests {
             PROBE_PS1.contains("Start-Process -FilePath $audioAgent")
                 && PROBE_PS1.contains("$audioCheck.ExitCode -eq 0"),
             "preflight must read back the live endpoint formats, not trust a stale marker"
+        );
+        assert!(
+            PROBE_PS1.contains(
+                "$audioSetupRan -and $audioRebootPending -and (-not $cableRenderActive -or -not $cableCaptureActive)"
+            ),
+            "an unrelated system pending rename must not be attributed to healthy VB-CABLE"
         );
         let mut ev = healthy_evidence();
         assert_eq!(ev.audio_state(), AudioState::Healthy);
