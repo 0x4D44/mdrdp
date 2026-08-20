@@ -6,15 +6,15 @@
 - **Area:** gfx
 - **Raised:** 2026-08-19T07:15:59Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260820T101027Z-p6286-n334270000-c1
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00008-run-verify-20260820T101027Z-p6286-n334270000-c1
+- **Owner base:** 5a070a0ff49c00e81bf5dea2d50c0a437d685359
+- **Owner fingerprint:** sha256:0616f21824aed71869cf038c2f264609f33ef6eb60021a2abd6467e53b790784
+- **Owner since:** 2026-08-20T10:10:27Z
+- **Owner until:** 2026-08-20T12:10:27Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
