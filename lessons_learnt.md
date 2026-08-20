@@ -6,6 +6,11 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Visual exactness may suppress predictive pixels, never codec input (`native/session.rs:on_tile_au`).
+  Raw rects can make an encoded tile visually redundant while its P-picture remains a required
+  reference. Always decode and validate the tile AU, then suppress only its canvas blit and paint
+  accounting. Dropping it before decode breaks VideoToolbox on the next dependent P-picture.
+
 - Tiled frames need per-tile exactness; one global sequence suppresses later tiles (`native/session.rs:on_tile_au`).
   All encoders for one capture deliberately carry the same sequence. Gate each decoder chain independently,
   then advance the desktop's exact-through value to the minimum completed tile. Count the logical frame only

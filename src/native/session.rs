@@ -1145,12 +1145,10 @@ impl NativeSink {
         else {
             return Err(format!("host sent unadvertised tile {tile_id}"));
         };
-        let (header, decoded) = {
+        let (header, decoded, suppress_paint) = {
             let tile = &mut self.tile_decoders[tile_index];
-            if tile.has_base && tile.exact_through.is_some_and(|exact| seq <= exact) {
-                self.suppressed += 1;
-                return Ok(());
-            }
+            let suppress_paint =
+                tile.has_base && tile.exact_through.is_some_and(|exact| seq <= exact);
             let decoded = match tile.decoder.decode(au) {
                 Ok(decoded) => decoded,
                 Err(_) => {
@@ -1158,7 +1156,7 @@ impl NativeSink {
                     return Ok(());
                 }
             };
-            (tile.header, decoded)
+            (tile.header, decoded, suppress_paint)
         };
         if (decoded.width(), decoded.height()) != (header.width, header.height) {
             return Err(format!(
@@ -1168,6 +1166,10 @@ impl NativeSink {
                 header.width,
                 header.height
             ));
+        }
+        if suppress_paint {
+            self.suppressed += 1;
+            return Ok(());
         }
         let bytes = au.len() as u64;
         let decode_us = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
@@ -1442,6 +1444,7 @@ mod tests {
     use ironrdp_egfx::decode::{DecodedFrame, DecoderResult};
     use rhydra::input_proto::decode_record;
     use rhydra::rects::Rect as WireRect;
+    use std::sync::atomic::AtomicUsize;
 
     /// A decoder whose "AU" is one byte: the fill value of the produced frame.
     /// Distinct fills make "which frame's pixels are on the surface" checkable.
@@ -1451,6 +1454,20 @@ mod tests {
 
     impl H264Decoder for FakeDecoder {
         fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
+            let (w, h) = self.size;
+            let fill = data.first().copied().unwrap_or(0);
+            Ok(DecodedFrame::new(vec![fill; (w * h * 4) as usize], w, h))
+        }
+    }
+
+    struct CountingFakeDecoder {
+        size: (u32, u32),
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl H264Decoder for CountingFakeDecoder {
+        fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             let (w, h) = self.size;
             let fill = data.first().copied().unwrap_or(0);
             Ok(DecodedFrame::new(vec![fill; (w * h * 4) as usize], w, h))
@@ -1536,6 +1553,74 @@ mod tests {
         let pixels = guard.get(OUTPUT_SURFACE).unwrap().pixels();
         assert_eq!(pixels[0], 0x11);
         assert_eq!(pixels[(2 * 4) as usize], 0x22);
+    }
+
+    #[test]
+    fn rect_completed_tile_aus_still_advance_both_decoder_reference_chains() {
+        let size = (4, 2);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let tiles = vec![
+            super::super::probe::TileHeader {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            super::super::probe::TileHeader {
+                id: 1,
+                x: 2,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+        ];
+        let calls = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let decoders = calls
+            .iter()
+            .map(|calls| {
+                NativeDecoder::H264(Box::new(CountingFakeDecoder {
+                    size: (2, 2),
+                    calls: Arc::clone(calls),
+                }) as Box<dyn H264Decoder>)
+            })
+            .collect();
+        let stats = StatsHandle::new();
+        let mut sink = NativeSink::new_tiled(
+            decoders,
+            tiles,
+            Arc::clone(&store),
+            size,
+            Box::new(|| {}),
+            stats.clone(),
+            InputClock::default(),
+        );
+
+        sink.on_tile_au(0, &[0x11], 7).unwrap();
+        sink.on_tile_au(1, &[0x22], 7).unwrap();
+        sink.apply_update(one_rect_update(size, 8, 200)).unwrap();
+        assert_eq!(stats.snapshot().frames, 2, "tile base plus rect update");
+
+        sink.on_tile_au(0, &[0x33], 8).unwrap();
+        sink.on_tile_au(1, &[0x44], 8).unwrap();
+
+        assert_eq!(calls[0].load(Ordering::Relaxed), 2);
+        assert_eq!(calls[1].load(Ordering::Relaxed), 2);
+        assert_eq!(sink.suppressed, 2);
+        assert_eq!(stats.snapshot().frames, 2, "redundant AUs must not repaint");
+        let guard = store.lock().unwrap();
+        let pixels = guard.get(OUTPUT_SURFACE).unwrap().pixels();
+        assert_eq!(&pixels[0..4], &[0, 0, 200, 255], "rect result survives");
+        assert_eq!(
+            pixels[(2 * 4) as usize],
+            0x22,
+            "right tile was not repainted"
+        );
     }
 
     /// One 1x1 BGRA rect update at (0,0) with the given seq and blue value.
