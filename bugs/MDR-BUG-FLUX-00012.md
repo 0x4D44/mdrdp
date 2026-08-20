@@ -96,3 +96,22 @@ sample per native session, because only the AU path decodes and a session receiv
 one keyframe — a real number, but not a distribution; and the connect stage feed
 still has no first-decoded-frame event, so connect-to-first-pixel cannot be timed
 directly.
+
+## Live validation, 2026-08-20
+
+Confirmed against a real rhydra session on quench (mdrdp v0.1.99, release build,
+45 s native session with scripted typing so both input and repaints flowed):
+
+```
+before:  FPS 0   FRAMES 1     RX 7.8 MB   P50 -
+after:   FPS 8   FRAMES 116   RX 1.0 MB   P50 82.0ms
+```
+
+The row is now internally consistent — 116 frames against 1.0 MB is ~9 KB per
+frame, where the old row claimed one frame for 7.8 MB, and that inconsistency was
+what identified the defect in the first place. The session epilogue agrees
+exactly: `frames 116  bytes in 1049864`.
+
+This closes the caveat the fix was committed with (unit tests only, no live
+host). Reported by Arthur against `mdrdp -S`.
+
