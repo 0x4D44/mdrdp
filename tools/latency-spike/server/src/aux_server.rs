@@ -76,6 +76,15 @@ pub struct ConnectionReport {
     pub applied: ApplyCounts,
     /// Audio frames handed to the outbox.
     pub audio_sent: u64,
+    /// Blocks the source produced that were silence, and so were never sent.
+    ///
+    /// **This is the fixture-proof, and it is why the field exists.** "Silence
+    /// costs nothing on the wire" is satisfied by a working silent source AND by
+    /// a source that never started — and every fleet host is currently in the
+    /// second state, so on this hardware the criterion would pass for entirely
+    /// the wrong reason. A non-zero count here is the evidence that something
+    /// actually ran and chose not to send.
+    pub audio_silent: u64,
     /// Audio frames the outbox discarded because the link was behind.
     ///
     /// Reported separately from `audio_sent` because they mean different
@@ -117,7 +126,7 @@ pub fn serve(
                     Ok(report) => eprintln!(
                         "aux: disconnected - written {}, echo {}, \
                          write-failed {}, refused-by-policy {}, malformed {}, unknown-type {}, \
-                         audio-sent {}, audio-dropped {}",
+                         audio-sent {}, audio-silent {}, audio-dropped {}",
                         report.applied.written,
                         report.applied.suppressed,
                         report.applied.write_failed,
@@ -125,6 +134,7 @@ pub fn serve(
                         report.reader.malformed,
                         report.reader.unknown_type,
                         report.audio_sent,
+                        report.audio_silent,
                         report.audio_dropped
                     ),
                     Err(e) => eprintln!("aux: connection ended: {e}"),
@@ -240,6 +250,8 @@ pub fn serve_one(
     let build_source = Arc::clone(make_audio);
     let audio_sent = Arc::new(AtomicU64::new(0));
     let sent_counter = Arc::clone(&audio_sent);
+    let audio_silent = Arc::new(AtomicU64::new(0));
+    let silent_counter = Arc::clone(&audio_silent);
     joins.push(
         std::thread::Builder::new()
             .name("aux-audio".to_owned())
@@ -274,7 +286,9 @@ pub fn serve_one(
                         // Nothing on the wire, and the capture position has
                         // already advanced inside the source — which is what
                         // keeps elided silence distinguishable from loss.
-                        Captured::Silence { .. } => {}
+                        Captured::Silence { .. } => {
+                            silent_counter.fetch_add(1, Ordering::Relaxed);
+                        }
                         Captured::Unavailable => {
                             if !said_unavailable {
                                 // **Once, not every lap.** A host with no render
@@ -357,6 +371,7 @@ pub fn serve_one(
             reader: stats,
             applied: *lock(&outcome),
             audio_sent: audio_sent.load(Ordering::Relaxed),
+            audio_silent: audio_silent.load(Ordering::Relaxed),
             audio_dropped: slot.audio_dropped(),
         }),
         auxchan::ReaderEnd::Io(reason) => Err(std::io::Error::other(reason)),
@@ -540,6 +555,57 @@ mod tests {
             }
         }
         frames
+    }
+
+    #[test]
+    fn a_silent_source_costs_nothing_on_the_wire_and_is_proved_to_have_run() {
+        // **AC5, with the fixture-proof that makes it mean anything.**
+        //
+        // "Silence produces zero audio bytes" is satisfied just as well by a
+        // source that never started, and on every fleet host that is exactly the
+        // state things are in — no render endpoint, nothing to capture. So the
+        // zero is only evidence when something is known to have run and chosen
+        // not to send. `audio_silent` is that something.
+        //
+        // This repo has paid for the general lesson twice: a clipboard holder
+        // that reported success while holding nothing, and a soak generator
+        // whose launch silently failed. Same shape, third time, caught in
+        // advance rather than after a wasted run.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = Pasteboard::holding("irrelevant");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut make = || Box::new(FakeClipboard(held.clone())) as Box<dyn TextClipboard>;
+            serve_one(
+                stream,
+                &mut make,
+                &(Arc::new(|| {
+                    Box::new(crate::audio_source::SilentSource::new(48_000))
+                        as Box<dyn crate::audio_source::AudioSource>
+                }) as AudioFactory),
+                Policy::default(),
+            )
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+
+        // Ask for audio, so the source is definitely running.
+        let mut request = Vec::new();
+        aux_proto::encode_audio_control(true, &mut request);
+        client.write_all(&request).unwrap();
+
+        let frames = count_audio_for(&mut client, Duration::from_millis(600));
+        assert_eq!(frames, 0, "silence must not be framed onto the wire");
+
+        drop(client);
+        let report = join_server(server);
+        assert_eq!(report.audio_sent, 0, "nothing should have been sent");
+        assert!(
+            report.audio_silent > 0,
+            "the silent source must be PROVED to have run, or the zero above \
+             means nothing: {report:?}"
+        );
     }
 
     #[test]
