@@ -71,7 +71,7 @@ pub struct Config {
     pub gop: u32,
     pub out: Option<String>,
     pub list_outputs: bool,
-    /// Send small dirty regions as raw BGRA rects beside the H.264 stream. On by
+    /// Send small dirty regions as raw BGRA rects beside the HEVC stream. On by
     /// default; `--no-rects` turns it off to give a measurement its control arm.
     pub rects: bool,
     /// Verify a missed fast-path predicate by diffing the frame against the
@@ -132,7 +132,7 @@ pub fn usage() -> &'static str {
      rhydra-server --source idd [--video-port 9500] ...\n  \
      rhydra-server --list-outputs\n\n\
      --no-rects withholds the raw dirty-rect fast path, forcing every update down\n  \
-     the H.264-only path. That is the control arm for a measurement, not a tuning\n  \
+     the HEVC-only path. That is the control arm for a measurement, not a tuning\n  \
      knob: quote it whenever a figure is compared against the hybrid wire.\n\n\
      --no-diff withholds the Increment 3 pixel-diff fast path; metadata-driven\n  \
      rects still run. That is the control arm for the diff's own A/B, so quote it\n  \

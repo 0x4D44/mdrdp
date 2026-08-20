@@ -45,7 +45,7 @@ pub fn pack(usage: u32, rgb_range: u32, ycbcr_matrix: u32, xvycc: u32, nominal_r
 }
 
 /// The desktop side of the conversion: BGRA from Desktop Duplication is full-range
-/// sRGB, and we ask for BT.709 coefficients because that is what an H.264 decoder
+/// sRGB, and we ask for BT.709 coefficients because that is what the HEVC decoder
 /// assumes for HD content.
 pub fn desktop_bgra_input() -> u32 {
     pack(
@@ -57,7 +57,7 @@ pub fn desktop_bgra_input() -> u32 {
     )
 }
 
-/// The encoder side: studio-range NV12, BT.709. Studio range is what the MF H.264
+/// The encoder side: studio-range NV12, BT.709. Studio range is what the MF HEVC
 /// encoder expects by default, and what the mdrdp decoder's YUV→RGB path assumes.
 pub fn nv12_output() -> u32 {
     pack(

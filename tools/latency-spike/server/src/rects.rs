@@ -1,7 +1,7 @@
 //! The `MSG_RECTS` payload — raw BGRA dirty rectangles, encoded, decoded and blitted.
 //!
 //! Increment 1 of the native transport sends small screen changes as uncompressed
-//! pixels instead of pushing them through the H.264 encoder, which removes an
+//! pixels instead of pushing them through the HEVC encoder, which removes an
 //! encode plus a decode from the typing-class path. This module is the portable
 //! half of that: the macOS viewer links it to parse and paint, the Windows server
 //! links it to emit. Nothing here touches a platform API.
@@ -413,6 +413,59 @@ pub fn blit_bgra_to_rgba(
     Ok(())
 }
 
+/// Exact pixel area covered by a set of rectangles, after clipping to the frame.
+///
+/// Overlap is counted once. This is intentionally based on rectangle geometry,
+/// not `sum(w * h)`: duplication metadata can overlap, and that sum would inflate
+/// the changed-area evidence used by the HEVC live gate.
+pub fn union_area(rectangles: &[(u32, u32, u32, u32)], width: u32, height: u32) -> u64 {
+    let clipped: Vec<_> = rectangles
+        .iter()
+        .filter_map(|&(x, y, w, h)| {
+            let left = x.min(width);
+            let top = y.min(height);
+            let right = x.saturating_add(w).min(width);
+            let bottom = y.saturating_add(h).min(height);
+            (left < right && top < bottom).then_some((left, top, right, bottom))
+        })
+        .collect();
+    let mut edges: Vec<u32> = clipped
+        .iter()
+        .flat_map(|&(_, top, _, bottom)| [top, bottom])
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+
+    edges
+        .windows(2)
+        .map(|band| {
+            let (top, bottom) = (band[0], band[1]);
+            let mut spans: Vec<(u32, u32)> = clipped
+                .iter()
+                .filter(|&&(_, rect_top, _, rect_bottom)| rect_top < bottom && rect_bottom > top)
+                .map(|&(left, _, right, _)| (left, right))
+                .collect();
+            spans.sort_unstable();
+            let mut covered = 0u64;
+            let mut merged: Option<(u32, u32)> = None;
+            for (left, right) in spans {
+                match merged {
+                    Some((start, end)) if left <= end => merged = Some((start, end.max(right))),
+                    Some((start, end)) => {
+                        covered += u64::from(end - start);
+                        merged = Some((left, right));
+                    }
+                    None => merged = Some((left, right)),
+                }
+            }
+            if let Some((start, end)) = merged {
+                covered += u64::from(end - start);
+            }
+            covered * u64::from(bottom - top)
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +805,15 @@ mod tests {
         let second = update.rects[1].pixels.clone();
         let d = (2 * 8 + 5) * BPP;
         assert_eq!(&canvas[d..d + 4], &[second[2], second[1], second[0], 0xFF]);
+    }
+
+    #[test]
+    fn union_area_counts_overlaps_once_and_clips_to_the_frame() {
+        // The first two rectangles overlap by 2x2 pixels. The third extends two
+        // pixels beyond the right edge and must be clipped before it is counted.
+        let bounds = [(1, 1, 4, 3), (3, 2, 4, 3), (8, 0, 4, 2)];
+        assert_eq!(union_area(&bounds, 10, 6), 24);
+        assert_eq!(union_area(&[], 10, 6), 0);
     }
 
     #[test]

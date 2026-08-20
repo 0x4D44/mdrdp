@@ -403,35 +403,91 @@ struct EmitCtx {
     /// Cumulative microseconds spent inside those diffs — the cost side of the
     /// trade the hit count is the benefit side of.
     diff_us_total: u64,
-    /// SPS/PPS scanned out of the stream's own access units — the fallback when
+    /// VPS/SPS/PPS scanned out of the stream's own access units — the fallback when
     /// the encoder publishes no out-of-band sequence header (Quick Sync). Updated
     /// on every in-band sighting; cleared when the encoder's config epoch moves.
     stream_sets: Option<ParameterSets>,
     /// The encoder's own out-of-band sets, snapshotted before each encode call
     /// (the encoder is unborrowable from inside the sink).
     encoder_sets: Option<ParameterSets>,
+    /// Parsed bitstream contract for the current encoder configuration epoch.
+    stream_config: Option<annexb::StreamConfig>,
+    config_epoch: u64,
+    expected_width: u32,
+    expected_height: u32,
+    /// A new epoch cannot paint until its first validated IRAP arrives.
+    awaiting_epoch_irap: bool,
+    param_set_failures: u64,
+    config_wait_drops: u64,
+    clean_point_mismatches: u64,
     /// `Some(n)` while a keyframe request is outstanding: n non-keyframe AUs seen
-    /// since. Drives the §4 "verify the connect-edge IDR" retry.
+    /// since. Drives the §4 "verify the connect-edge IRAP" retry.
     awaiting_keyframe: Option<u32>,
     /// Set inside the sink; acted on by the loop (which owns the encoder).
     rerequest_keyframe: bool,
     /// A frame was dropped from the send queue; the decoder is desynced until the
-    /// next IDR, so ask for one.
+    /// next IRAP, so ask for one.
     drop_wants_keyframe: bool,
 }
 
 /// Hand one encoded access unit to the sender, with its own frame's stamps.
 fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
-    // The in-band SPS/PPS cache: update on *every* sighting (a first-sight-only
-    // cache would go stale across an encoder reconfigure), consume via
-    // `ensure_parameter_sets` below.
-    if ctx.encoder_sets.is_none() && annexb::has_parameter_sets(&au.data) {
-        if let Some(sets) = ParameterSets::from_sequence_header(&au.data) {
+    let irap = annexb::contains_irap(&au.data);
+    if irap != au.keyframe {
+        ctx.clean_point_mismatches += 1;
+    }
+
+    // Trust what the bitstream says. In-band sets win over the output-type blob,
+    // and every changed triplet starts a new local configuration boundary even if
+    // the MFT forgot to raise STREAM_CHANGE.
+    let candidate_sets =
+        ParameterSets::from_sequence_header(&au.data).or_else(|| ctx.encoder_sets.clone());
+    if let Some(sets) = candidate_sets {
+        if ctx.stream_sets.as_ref() != Some(&sets) {
+            if ctx.stream_sets.is_some() {
+                ctx.config_epoch += 1;
+            }
+            let encoded = sets.to_annex_b();
+            let config = annexb::validate_stream(&encoded, ctx.expected_width, ctx.expected_height)
+                .map_err(|error| format!("encode: refusing HEVC configuration: {error}"))?;
             ctx.stream_sets = Some(sets);
+            ctx.stream_config = Some(config);
+            ctx.awaiting_epoch_irap = true;
+            eprintln!(
+                "encode: accepted HEVC epoch {}: profile={} tier={} level={} chroma={} depth={}/{} size={}x{}",
+                ctx.config_epoch,
+                config.profile_idc,
+                if config.high_tier { "high" } else { "main" },
+                config.level_idc,
+                config.chroma_format_idc,
+                config.bit_depth_luma,
+                config.bit_depth_chroma,
+                config.width,
+                config.height
+            );
         }
     }
-    let sets = ctx.encoder_sets.as_ref().or(ctx.stream_sets.as_ref());
-    let (bytes, prepended) = annexb::ensure_parameter_sets(&au.data, sets, au.keyframe);
+
+    if ctx.awaiting_epoch_irap && !irap {
+        ctx.config_wait_drops += 1;
+        return Ok(());
+    }
+
+    let (bytes, prepended) =
+        match annexb::ensure_parameter_sets(&au.data, ctx.stream_sets.as_ref(), irap) {
+            Ok(ready) => ready,
+            Err(_) => {
+                ctx.param_set_failures += 1;
+                ctx.rerequest_keyframe = true;
+                return Ok(());
+            }
+        };
+    let config = ctx.stream_config.ok_or_else(|| {
+        "encode: refusing access unit before a validated HEVC configuration".to_owned()
+    })?;
+    if irap {
+        ctx.awaiting_epoch_irap = false;
+    }
 
     let mut record = FrameRecord::new();
     record.frame = au.meta.seq;
@@ -442,14 +498,38 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     record.encode_submit_us = ctx.clock.micros(au.submit_qpc);
     record.encode_out_us = ctx.clock.micros(au.out_qpc);
     record.au_bytes = bytes.len();
-    record.keyframe = au.keyframe;
+    record.keyframe = irap;
     record.param_sets_prepended = prepended;
+    record.config_epoch = ctx.config_epoch;
+    record.profile_idc = config.profile_idc;
+    record.high_tier = config.high_tier;
+    record.level_idc = config.level_idc;
+    record.chroma_format_idc = config.chroma_format_idc;
+    record.bit_depth_luma = config.bit_depth_luma;
+    record.bit_depth_chroma = config.bit_depth_chroma;
+    record.stream_width = config.width;
+    record.stream_height = config.height;
+    record.param_set_failures = ctx.param_set_failures;
+    record.config_wait_drops = ctx.config_wait_drops;
+    record.clean_point_mismatches = ctx.clean_point_mismatches;
     record.dropped_frames = ctx.dropped;
     record.dropped_rects = ctx.dropped_rects;
     record.diff_runs = ctx.diff_runs;
     record.diff_hits = ctx.diff_hits;
     record.diff_us_total = ctx.diff_us_total;
     record.stamp_mismatches = au.stamp_mismatches;
+    record.claimed_changed_pixels = au.meta.claimed_changed_pixels;
+    record.measured_changed_pixels = au.meta.measured_changed_pixels;
+    record.frame_pixels = au.meta.frame_pixels;
+    record.pro_rata_unchanged_au_bytes = stats::pro_rata_unchanged_bytes(
+        bytes.len(),
+        au.meta.frame_pixels,
+        au.meta
+            .measured_changed_pixels
+            .or(au.meta.claimed_changed_pixels),
+    );
+    record.raw_rect_attempted = au.meta.raw_rect_attempted;
+    record.raw_rect_sent = au.meta.raw_rect_sent;
     if au.meta.change_valid {
         record.dirty_rect_count = Some(au.meta.dirty_rect_count);
         record.dirty_bytes = Some(au.meta.dirty_bytes);
@@ -457,12 +537,12 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     }
 
     match ctx.awaiting_keyframe {
-        Some(n) if au.keyframe => {
+        Some(n) if irap => {
             record.keyframe_wait_frames = Some(n);
             ctx.awaiting_keyframe = None;
         }
         Some(n) if n + 1 >= KEYFRAME_RETRY_FRAMES => {
-            // A second's worth of frames and no IDR: the request was ignored.
+            // A second's worth of frames and no IRAP: the request was ignored.
             ctx.rerequest_keyframe = true;
             ctx.awaiting_keyframe = Some(0);
         }
@@ -478,7 +558,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
         Ok(()) => Ok(()),
         // Full means the socket is behind. Drop the newest rather than queue it: a
         // late frame is worse than a missing one here. But a dropped AU desyncs
-        // the viewer's decoder until the next IDR, so request one.
+        // the viewer's decoder until the next IRAP, so request one.
         Err(TrySendError::Full(_)) => {
             ctx.dropped += 1;
             ctx.drop_wants_keyframe = true;
@@ -547,7 +627,7 @@ fn emit_rects(
     change: &ChangeInfo,
     frame_seq: u64,
     ctx: &mut EmitCtx,
-) -> Result<()> {
+) -> Result<bool> {
     let pack_start = qpc::now();
     let rect_pixels = capture.read_rects(texture, change)?;
     send_rects(
@@ -580,7 +660,7 @@ fn send_rects(
     pack_start: i64,
     from_diff: bool,
     ctx: &mut EmitCtx,
-) -> Result<()> {
+) -> Result<bool> {
     let rect_count = rect_pixels.len() as u32;
     let rect_bytes: u64 = rect_pixels.iter().map(|r| r.pixels.len() as u64).sum();
     let update = rects::RectUpdate {
@@ -606,13 +686,13 @@ fn send_rects(
         .tx
         .try_send(send::Outbound::Rects(Box::new(record), payload))
     {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         // Full means the socket is behind. Unlike a dropped access unit this costs
         // no correctness and needs no keyframe: the same frame's AU is still on its
         // way down the ordinary path and repaints exactly this content.
         Err(TrySendError::Full(_)) => {
             ctx.dropped_rects += 1;
-            Ok(())
+            Ok(false)
         }
         Err(TrySendError::Disconnected(_)) => Err("sender thread has gone away".to_owned().into()),
     }
@@ -649,6 +729,14 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
         diff_us_total: 0,
         stream_sets: None,
         encoder_sets: None,
+        stream_config: None,
+        config_epoch: last_epoch,
+        expected_width: state.capture.width(),
+        expected_height: state.capture.height(),
+        awaiting_epoch_irap: true,
+        param_set_failures: 0,
+        config_wait_drops: 0,
+        clean_point_mismatches: 0,
         awaiting_keyframe: None,
         rerequest_keyframe: false,
         drop_wants_keyframe: false,
@@ -707,12 +795,25 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
 
         frame_seq += 1;
 
+        let claimed_changed_pixels = change.as_ref().map(|change| {
+            let bounds: Vec<_> = change
+                .rects
+                .iter()
+                .map(|rect| (rect.x, rect.y, rect.w, rect.h))
+                .collect();
+            rects::union_area(&bounds, state.capture.width(), state.capture.height())
+        });
+        let mut measured_changed_pixels = None;
+        let mut raw_rect_attempted = false;
+        let mut raw_rect_sent = false;
+
         // The fast path is an overlay, not a branch: whatever happens here, the
-        // frame still goes on to convert, encode and send as H.264 below.
+        // frame still goes on to convert, encode and send as HEVC below.
         let mut metadata_took_fast_path = false;
         if state.rects_enabled && !suppress_rects_once {
             if let Some(change) = change.as_ref().filter(|c| takes_fast_path(c)) {
-                emit_rects(state.capture, &texture, change, frame_seq, &mut ctx)?;
+                raw_rect_attempted = true;
+                raw_rect_sent = emit_rects(state.capture, &texture, change, frame_seq, &mut ctx)?;
                 metadata_took_fast_path = true;
             }
         }
@@ -784,7 +885,18 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
             if let Some(rect_pixels) = measured {
                 ctx.diff_hits += 1;
                 if !rect_pixels.is_empty() {
-                    send_rects(
+                    measured_changed_pixels = Some(rects::union_area(
+                        &rect_pixels
+                            .iter()
+                            .map(|rect| {
+                                (rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32)
+                            })
+                            .collect::<Vec<_>>(),
+                        state.capture.width(),
+                        state.capture.height(),
+                    ));
+                    raw_rect_attempted = true;
+                    raw_rect_sent = send_rects(
                         rect_pixels,
                         frame_seq,
                         state.capture.width(),
@@ -827,6 +939,11 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
             meta.dirty_bytes = change.dirty_bytes();
             meta.move_rect_count = change.move_rects;
         }
+        meta.claimed_changed_pixels = claimed_changed_pixels;
+        meta.measured_changed_pixels = measured_changed_pixels;
+        meta.frame_pixels = u64::from(state.capture.width()) * u64::from(state.capture.height());
+        meta.raw_rect_attempted = raw_rect_attempted;
+        meta.raw_rect_sent = raw_rect_sent;
 
         let time_hns = state
             .clock
@@ -854,7 +971,10 @@ fn housekeep(
         // The encoder renegotiated its output type; sets scanned from the old
         // stream would poison the new one.
         *last_epoch = epoch;
+        ctx.config_epoch += 1;
         ctx.stream_sets = None;
+        ctx.stream_config = None;
+        ctx.awaiting_epoch_irap = true;
     }
     if ctx.rerequest_keyframe {
         ctx.rerequest_keyframe = false;

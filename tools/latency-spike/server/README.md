@@ -1,7 +1,7 @@
 # `rhydra-server` — mdrdp's native capture/encode/send server, Windows
 
 The server half of the mdrdp latency spike. It captures one display with DXGI
-Desktop Duplication, converts BGRA→NV12 on the GPU, encodes H.264 with a Media
+Desktop Duplication, converts BGRA→NV12 on the GPU, encodes HEVC with a Media
 Foundation MFT in low-latency mode, and ships length-prefixed Annex B over loopback
 TCP. A second loopback socket takes keystrokes and injects them with `SendInput`.
 
@@ -126,8 +126,10 @@ smallest legal message is 1.
 
 | type | payload |
 | --- | --- |
-| 1 | one H.264 access unit, Annex B, exactly one AU per message |
+| 1 | one legacy H.264 access unit, Annex B (wire v1 only) |
 | 2 | one server stats line (JSON, no trailing newline) |
+| 3 | `[u64 frame_seq]` followed by one Annex-B access unit; HEVC in wire v4 |
+| 4 | one raw BGRA dirty-rectangle update |
 
 `TCP_NODELAY` is on. The header line is sent as a type-2 message immediately on
 connect, so an archived capture is self-describing without fetching the server's own
@@ -204,7 +206,7 @@ buffered tail lost at that moment is a measurement lost.
 
 ---
 
-## Encoder configuration, and the in-band SPS/PPS route
+## Encoder configuration, and the VPS/SPS/PPS route
 
 Hardware **async** MFTs are enumerated first
 (`MFT_ENUM_FLAG_HARDWARE | ASYNCMFT | SORTANDFILTER`) and driven by the documented
@@ -216,29 +218,29 @@ a **sync** MFT and is the fallback; it drives the plain
 is recorded in the stats header. `src/win/encode.rs` opens with the full contract in
 the order the code follows it.
 
-Settings: `MFVideoFormat_NV12` in, `MFVideoFormat_H264` out;
+Settings: `MFVideoFormat_NV12` in, `MFVideoFormat_HEVC` out;
 `CODECAPI_AVLowLatencyMode = TRUE`; `AVEncCommonRateControlMode = CBR` with the
-`--bitrate-kbps` value; `AVEncMPVDefaultBPictureCount = 0`; `AVEncMPVGOPSize` from
-`--gop`; Main profile. Zero B-frames is load-bearing beyond compression: it makes
-output order equal submission order, which is what makes the submit-stamp FIFO that
-pairs `encode_submit_us` to the right frame correct.
+`--bitrate-kbps` value; `AVEncMPVGOPSize` from `--gop`; Main 4:2:0 8-bit profile,
+High tier, Level 4.1, studio-range BT.709. Low-latency acceptance is mandatory.
+The HEVC MFT may refuse the older B-picture property; low-latency mode remains the
+required no-reorder contract.
 
 ### Which parameter-set route was taken
 
 **Both, belt and braces — in-band preferred, out-of-band as the fallback.**
 
-The receiver forces the issue: mdrdp's decoder at `src/h264.rs` (`decode_yuv420`)
-hard-errors with *"no SPS/PPS seen yet; cannot decode this access unit"* for anything
-that arrives before a parameter-set pair. MF encoders normally emit SPS/PPS in band
-ahead of each IDR, but that is not contractual — the sequence header is *also*
-published out of band on the output media type as `MF_MT_MPEG_SEQUENCE_HEADER`.
+The receiver cannot construct an HEVC format description before it has a complete
+VPS/SPS/PPS triplet. The Intel MFT used by the measured path emits these in band and
+publishes no sequence-header blob; other MFTs may also publish Annex-B sets on the
+output type as `MF_MT_MPEG_SEQUENCE_HEADER`.
 
 So the server reads and stores `MF_MT_MPEG_SEQUENCE_HEADER` at configuration time
 (and again after any `MF_E_TRANSFORM_STREAM_CHANGE` renegotiation), and for every
-**keyframe** checks whether the access unit already carries both an SPS and a PPS.
+**IRAP** checks whether the access unit already carries VPS, SPS and PPS before it.
 If it does, the AU goes out untouched and no copy is taken. If it does not, the
-stored pair is prepended as `00 00 00 01 SPS 00 00 00 01 PPS`. Non-keyframes are
-never padded. Which route fired is recorded per frame as `param_sets_prepended`, and
+stored triplet is prepended. A bare IRAP with no complete cached triplet is withheld
+and counted. Non-IRAP access units are never padded. Which route fired is recorded
+per frame as `param_sets_prepended`, and
 whether the fallback was even available is `sequence_header_available` in the header.
 
 This lives in `src/annexb.rs` and is unit-tested natively, because it is the one

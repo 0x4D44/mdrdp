@@ -78,7 +78,7 @@ pub struct Header {
     /// terms as `rect_max_count`: a measurement compared against another must be
     /// able to say which threshold each ran under.
     pub diff_idle_gap_ms: u32,
-    /// How SPS/PPS reach the wire: see `annexb`.
+    /// How VPS/SPS/PPS reach the wire: see `annexb`.
     pub parameter_set_route: &'static str,
     /// Whether the out-of-band `MF_MT_MPEG_SEQUENCE_HEADER` was available as a
     /// fallback source of parameter sets.
@@ -99,6 +99,11 @@ pub struct Header {
     pub clipboard: bool,
 }
 
+/// Schema 8: frame rows report exact claimed/measured rectangle-union area, the
+/// raw-rectangle attempt/result, and an explicitly pro-rata compressed-byte
+/// estimate for the unchanged portion of the frame.
+/// Schema 7: frame rows carry the validated HEVC stream contract at its current
+/// configuration epoch, plus cumulative fail-closed gate counters.
 /// Schema 6: the header gains `clipboard`, which says whether this host is
 /// listening on the auxiliary channel. `wire_version` deliberately does **not**
 /// move: a client that ignores the flag still speaks the same video, rects and
@@ -110,12 +115,14 @@ pub struct Header {
 /// (Schema 4: the header gained `source`, naming which capture path the run used.
 /// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
-pub const SCHEMA: u32 = 6;
-/// Bumped 2 → 3 by tranche 3's input dialect (input-channel v2: scan/mouse/wheel
+pub const SCHEMA: u32 = 8;
+/// Bumped 3 → 4 by tranche 6b's H.264 → HEVC bitstream change. `MSG_VIDEO_SEQ`
+/// and the input dialect are unchanged; its access-unit payload is not.
+/// (Bumped 2 → 3 by tranche 3's input dialect (input-channel v2: scan/mouse/wheel
 /// kinds beside the original VK down/up) — the video/rects wire itself is
 /// unchanged, but the header's `wire_version` couples both dialects together so a
 /// client's video-header gate also gates which input records it may send.
-pub const WIRE_VERSION: u32 = 3;
+pub const WIRE_VERSION: u32 = 4;
 
 impl Header {
     pub fn new() -> Self {
@@ -186,8 +193,26 @@ pub struct FrameRecord {
     pub send_done_us: i64,
     pub au_bytes: usize,
     pub keyframe: bool,
-    /// True when this server had to prepend the stored SPS/PPS itself.
+    /// True when this server had to prepend the stored VPS/SPS/PPS itself.
     pub param_sets_prepended: bool,
+    /// Encoder output-type epoch whose bitstream contract was parsed and accepted.
+    pub config_epoch: u64,
+    /// Parsed from the HEVC SPS. These fields are written on every emitted frame,
+    /// so a live run proves the stream contract was checked rather than merely set.
+    pub profile_idc: u8,
+    pub high_tier: bool,
+    pub level_idc: u8,
+    pub chroma_format_idc: u8,
+    pub bit_depth_luma: u8,
+    pub bit_depth_chroma: u8,
+    pub stream_width: u32,
+    pub stream_height: u32,
+    /// Cumulative IRAPs withheld because no complete VPS/SPS/PPS set existed.
+    pub param_set_failures: u64,
+    /// Cumulative non-IRAP outputs withheld while a new epoch awaited its IRAP.
+    pub config_wait_drops: u64,
+    /// Cumulative disagreements between MF's CleanPoint flag and the bitstream IRAP.
+    pub clean_point_mismatches: u64,
     /// Cumulative count of frames dropped because the send queue was full.
     pub dropped_frames: u64,
     /// Cumulative count of rect messages dropped for the same reason. Carried on
@@ -215,10 +240,40 @@ pub struct FrameRecord {
     pub dirty_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub move_rect_count: Option<u32>,
+    /// Exact union of source-reported dirty rectangles after clipping. This is a
+    /// coverage claim, not a pixel diff, so it can overstate the true change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_changed_pixels: Option<u64>,
+    /// Exact union of rectangles produced by the pixel-diff arm, when it ran and
+    /// found a usable delta.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_changed_pixels: Option<u64>,
+    pub frame_pixels: u64,
+    /// AU bytes multiplied by the unchanged-pixel share. HEVC compression cannot
+    /// attribute bytes spatially without parsing slices, so the name deliberately
+    /// marks this as an estimate rather than measured unchanged-region bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pro_rata_unchanged_au_bytes: Option<u64>,
+    /// Whether this frame qualified for either raw-rectangle arm, and whether the
+    /// resulting message entered the bounded send queue.
+    pub raw_rect_attempted: bool,
+    pub raw_rect_sent: bool,
     /// How many encoded frames a connect-edge keyframe request waited before the
     /// keyframe actually arrived. Present only on the keyframe that answered one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyframe_wait_frames: Option<u32>,
+}
+
+/// Proportional estimate of compressed AU bytes attributable to unchanged pixels.
+pub fn pro_rata_unchanged_bytes(
+    au_bytes: usize,
+    frame_pixels: u64,
+    changed_pixels: Option<u64>,
+) -> Option<u64> {
+    let changed = changed_pixels?.min(frame_pixels);
+    (frame_pixels != 0).then(|| {
+        (au_bytes as u128 * (frame_pixels - changed) as u128 / frame_pixels as u128) as u64
+    })
 }
 
 impl FrameRecord {
@@ -413,6 +468,18 @@ mod tests {
         r.au_bytes = 4242;
         r.keyframe = true;
         r.param_sets_prepended = true;
+        r.config_epoch = 4;
+        r.profile_idc = 1;
+        r.high_tier = true;
+        r.level_idc = 123;
+        r.chroma_format_idc = 1;
+        r.bit_depth_luma = 8;
+        r.bit_depth_chroma = 8;
+        r.stream_width = 1920;
+        r.stream_height = 1080;
+        r.param_set_failures = 2;
+        r.config_wait_drops = 7;
+        r.clean_point_mismatches = 3;
         r.dropped_frames = 3;
         r.dropped_rects = 5;
         r.stamp_mismatches = 2;
@@ -425,6 +492,12 @@ mod tests {
         r.dirty_rect_count = Some(4);
         r.dirty_bytes = Some(8192);
         r.move_rect_count = Some(1);
+        r.claimed_changed_pixels = Some(2000);
+        r.measured_changed_pixels = Some(1500);
+        r.frame_pixels = 2_073_600;
+        r.pro_rata_unchanged_au_bytes = Some(4211);
+        r.raw_rect_attempted = true;
+        r.raw_rect_sent = true;
         r.keyframe_wait_frames = Some(17);
 
         let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
@@ -440,6 +513,18 @@ mod tests {
         assert_eq!(v["au_bytes"], 4242);
         assert_eq!(v["keyframe"], true);
         assert_eq!(v["param_sets_prepended"], true);
+        assert_eq!(v["config_epoch"], 4);
+        assert_eq!(v["profile_idc"], 1);
+        assert_eq!(v["high_tier"], true);
+        assert_eq!(v["level_idc"], 123);
+        assert_eq!(v["chroma_format_idc"], 1);
+        assert_eq!(v["bit_depth_luma"], 8);
+        assert_eq!(v["bit_depth_chroma"], 8);
+        assert_eq!(v["stream_width"], 1920);
+        assert_eq!(v["stream_height"], 1080);
+        assert_eq!(v["param_set_failures"], 2);
+        assert_eq!(v["config_wait_drops"], 7);
+        assert_eq!(v["clean_point_mismatches"], 3);
         assert_eq!(v["dropped_frames"], 3);
         assert_eq!(v["dropped_rects"], 5);
         assert_eq!(v["stamp_mismatches"], 2);
@@ -449,10 +534,16 @@ mod tests {
         assert_eq!(v["dirty_rect_count"], 4);
         assert_eq!(v["dirty_bytes"], 8192);
         assert_eq!(v["move_rect_count"], 1);
+        assert_eq!(v["claimed_changed_pixels"], 2000);
+        assert_eq!(v["measured_changed_pixels"], 1500);
+        assert_eq!(v["frame_pixels"], 2_073_600);
+        assert_eq!(v["pro_rata_unchanged_au_bytes"], 4211);
+        assert_eq!(v["raw_rect_attempted"], true);
+        assert_eq!(v["raw_rect_sent"], true);
         assert_eq!(v["keyframe_wait_frames"], 17);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 22, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 40, "unexpected field count: {keys:?}");
     }
 
     #[test]
@@ -467,6 +558,17 @@ mod tests {
         assert_eq!(obj["diff_runs"], 0);
         assert_eq!(obj["diff_hits"], 0);
         assert_eq!(obj["diff_us_total"], 0);
+    }
+
+    #[test]
+    fn unchanged_byte_estimate_uses_the_best_available_pixel_ratio() {
+        assert_eq!(
+            pro_rata_unchanged_bytes(1_000, 10_000, Some(2_500)),
+            Some(750)
+        );
+        assert_eq!(pro_rata_unchanged_bytes(1_000, 10_000, None), None);
+        assert_eq!(pro_rata_unchanged_bytes(1_000, 0, Some(0)), None);
+        assert_eq!(pro_rata_unchanged_bytes(1_000, 100, Some(200)), Some(0));
     }
 
     #[test]
@@ -513,6 +615,9 @@ mod tests {
         assert!(!obj.contains_key("dirty_rect_count"));
         assert!(!obj.contains_key("dirty_bytes"));
         assert!(!obj.contains_key("move_rect_count"));
+        assert!(!obj.contains_key("claimed_changed_pixels"));
+        assert!(!obj.contains_key("measured_changed_pixels"));
+        assert!(!obj.contains_key("pro_rata_unchanged_au_bytes"));
         assert!(!obj.contains_key("keyframe_wait_frames"));
     }
 
@@ -564,7 +669,7 @@ mod tests {
     fn the_header_publishes_the_frequency_the_encoder_choice_and_the_source() {
         let mut h = Header::new();
         h.qpc_frequency = 10_000_000;
-        h.encoder = "NVIDIA H.264 Encoder MFT".into();
+        h.encoder = "Intel Hardware H265 Encoder MFT".into();
         h.encoder_kind = "async-hardware";
         h.codec_api_applied = vec!["AVLowLatencyMode".into()];
         h.codec_api_refused = vec!["AVEncMPVGOPSize".into()];
@@ -584,7 +689,7 @@ mod tests {
         assert_eq!(v["schema"], SCHEMA);
         assert_eq!(v["wire_version"], WIRE_VERSION);
         assert_eq!(v["qpc_frequency"], 10_000_000);
-        assert_eq!(v["encoder"], "NVIDIA H.264 Encoder MFT");
+        assert_eq!(v["encoder"], "Intel Hardware H265 Encoder MFT");
         assert_eq!(v["encoder_kind"], "async-hardware");
         assert_eq!(v["codec_api_applied"][0], "AVLowLatencyMode");
         assert_eq!(v["codec_api_refused"][0], "AVEncMPVGOPSize");
