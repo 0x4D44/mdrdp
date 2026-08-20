@@ -29,8 +29,47 @@ use super::ssh::{self, ForwardPorts, ProbeFailure, Tunnel, TunnelSpec};
 
 /// The wire dialects this client speaks. A range, not an equality, so the day a
 /// compatible v5 exists the gate loosens without a format break (review S-m4).
-pub const WIRE_VERSION_MIN: u32 = 4;
-pub const WIRE_VERSION_MAX: u32 = 4;
+pub const WIRE_VERSION_MIN: u32 = 5;
+pub const WIRE_VERSION_MAX: u32 = 5;
+
+/// The IDD backing-pixel mode and Windows UI scale selected by the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayRequest {
+    pub width: u32,
+    pub height: u32,
+    pub hz: u32,
+    pub scale_percent: u32,
+}
+
+impl DisplayRequest {
+    fn control_line(self) -> String {
+        serde_json::json!({
+            "cmd": "prepare-display",
+            "width": self.width,
+            "height": self.height,
+            "hz": self.hz,
+            "scale_percent": self.scale_percent,
+        })
+        .to_string()
+    }
+
+    fn mode(self) -> rhydra::control::ModeReport {
+        rhydra::control::ModeReport {
+            width: self.width,
+            height: self.height,
+            hz: self.hz,
+        }
+    }
+}
+
+fn display_ready(status: &rhydra::control::StatusReport, request: DisplayRequest) -> bool {
+    status.mode_ok
+        && status.display_mode == Some(request.mode())
+        && status.desired_display_mode == request.mode()
+        && status.desktop_scale_percent == request.scale_percent
+        && status.desired_desktop_scale_percent == request.scale_percent
+        && rhydra::control::green(status)
+}
 
 /// The whole probe's wall-clock budget, ssh spawn to input connect.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(8);
@@ -55,6 +94,8 @@ pub struct ServerHeader {
     pub wire_version: u32,
     pub width: u32,
     pub height: u32,
+    pub codec: String,
+    pub tiles: Vec<TileHeader>,
     /// Whether the host is listening on the auxiliary channel (clipboard now,
     /// audio in tranche 6).
     ///
@@ -65,6 +106,40 @@ pub struct ServerHeader {
     /// what is sent on it.
     #[serde(default)]
     pub clipboard: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct TileHeader {
+    pub id: u8,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn validate_video_contract(header: &ServerHeader) -> Result<(), String> {
+    if header.codec != "h264-420" {
+        return Err(format!("unsupported native codec {:?}", header.codec));
+    }
+    let expected: &[(u8, u32, u32, u32, u32)] = match (header.width, header.height) {
+        (5120, 2880) => &[(0, 0, 0, 2560, 2880), (1, 2560, 0, 2560, 2880)],
+        (2560, 1440) => &[(0, 0, 0, 2560, 1440)],
+        other => {
+            return Err(format!(
+                "unsupported native desktop {}x{}",
+                other.0, other.1
+            ));
+        }
+    };
+    let actual: Vec<_> = header
+        .tiles
+        .iter()
+        .map(|t| (t.id, t.x, t.y, t.width, t.height))
+        .collect();
+    if actual != expected {
+        return Err(format!("invalid native tile layout {actual:?}"));
+    }
+    Ok(())
 }
 
 /// What a successful probe hands the session: connected sockets, the parsed
@@ -108,6 +183,7 @@ pub struct ProbedTransport {
 pub fn establish(
     host: &str,
     ssh_user: Option<&str>,
+    display: DisplayRequest,
     stages: Option<&std::sync::mpsc::Sender<crate::connect::LiveStage>>,
 ) -> Result<ProbedTransport, ProbeFailure> {
     let started = Instant::now();
@@ -133,7 +209,13 @@ pub fn establish(
             Tunnel::spawn(&spec).map_err(|e| ProbeFailure::Io(format!("spawn ssh: {e}")))?;
         report(STAGE_SSH_SPAWN, None);
         let deadline = Instant::now() + PROBE_DEADLINE;
-        match probe_over(ports, deadline, || tunnel.poll_exit(), &mut report) {
+        match probe_over_with_display(
+            ports,
+            deadline,
+            Some(display),
+            || tunnel.poll_exit(),
+            &mut report,
+        ) {
             Ok(conn) => {
                 return Ok(ProbedTransport {
                     conn,
@@ -164,6 +246,16 @@ pub const STAGE_HANDSHAKE: &str = "handshake";
 pub fn probe_over(
     ports: ForwardPorts,
     deadline: Instant,
+    tunnel_exited: impl FnMut() -> Option<String>,
+    stage: impl FnMut(&'static str, Option<String>),
+) -> Result<ProbeSuccess, ProbeFailure> {
+    probe_over_with_display(ports, deadline, None, tunnel_exited, stage)
+}
+
+fn probe_over_with_display(
+    ports: ForwardPorts,
+    deadline: Instant,
+    display: Option<DisplayRequest>,
     mut tunnel_exited: impl FnMut() -> Option<String>,
     mut stage: impl FnMut(&'static str, Option<String>),
 ) -> Result<ProbeSuccess, ProbeFailure> {
@@ -176,13 +268,37 @@ pub fn probe_over(
     // up as an accepted-then-closed local connection — query_status reads EOF and
     // reports NoAnswer, which at this point means "no agent", not "ssh not ready".
     let budget = remaining(deadline, "control query")?.min(CONTROL_BUDGET);
-    let report = match rhydra::control::query_status(("127.0.0.1", ports.control), budget) {
+    let mut report = match rhydra::control::query_status(("127.0.0.1", ports.control), budget) {
         Ok(report) => report,
         Err(rhydra::control::QueryError::NoAnswer(_)) => return Err(ProbeFailure::NoAgent),
         Err(rhydra::control::QueryError::Bad(m)) => {
             return Err(ProbeFailure::Io(format!("control answered strangely: {m}")));
         }
     };
+    if let Some(request) = display {
+        rhydra::control::send_request(
+            ("127.0.0.1", ports.control),
+            &request.control_line(),
+            remaining(deadline, "display request")?.min(CONTROL_BUDGET),
+        )
+        .map_err(|e| ProbeFailure::Io(format!("display request failed: {e:?}")))?;
+
+        // The agent ticks every two seconds. It first applies the mode, then starts
+        // a fresh server whose converters and encoders inherit that geometry.
+        loop {
+            if let Some(stderr) = tunnel_exited() {
+                return Err(ssh::classify_ssh_stderr(&stderr));
+            }
+            let left = remaining(deadline, "display prepare")?;
+            std::thread::sleep(left.min(Duration::from_millis(100)));
+            let budget = remaining(deadline, "display status")?.min(CONTROL_BUDGET);
+            report = rhydra::control::query_status(("127.0.0.1", ports.control), budget)
+                .map_err(|e| ProbeFailure::Io(format!("display status failed: {e:?}")))?;
+            if display_ready(&report, request) {
+                break;
+            }
+        }
+    }
     if !rhydra::control::green(&report) {
         return Err(ProbeFailure::NotGreen(
             report.stuck.unwrap_or_else(|| "unknown".to_owned()),
@@ -207,6 +323,16 @@ pub fn probe_over(
             host: header.wire_version,
             client: WIRE_VERSION_MAX,
         });
+    }
+    validate_video_contract(&header)
+        .map_err(|message| ProbeFailure::Io(format!("video contract: {message}")))?;
+    if let Some(request) = display
+        && (header.width, header.height) != (request.width, request.height)
+    {
+        return Err(ProbeFailure::Io(format!(
+            "video header is {}x{}, but the client prepared {}x{}",
+            header.width, header.height, request.width, request.height
+        )));
     }
 
     // Step 4: the input channel, which the server binds moments after video.
@@ -354,10 +480,17 @@ mod tests {
             },
             device_present: true,
             display_mode: Some(ModeReport {
-                width: 1920,
-                height: 1080,
+                width: 2560,
+                height: 1440,
                 hz: 240,
             }),
+            desired_display_mode: ModeReport {
+                width: 2560,
+                height: 1440,
+                hz: 240,
+            },
+            desktop_scale_percent: 100,
+            desired_desktop_scale_percent: 100,
             mode_ok: true,
             server: ChildReport {
                 running: true,
@@ -384,8 +517,10 @@ mod tests {
         header_json(serde_json::json!({
             "schema": 5,
             "wire_version": wire_version,
-            "width": 1920,
-            "height": 1080,
+            "width": 2560,
+            "height": 1440,
+            "codec": "h264-420",
+            "tiles": [{"id":0,"x":0,"y":0,"width":2560,"height":1440}],
             "encoder": "quicksync-h264",
         }))
     }
@@ -396,8 +531,10 @@ mod tests {
         header_json(serde_json::json!({
             "schema": rhydra::stats::SCHEMA,
             "wire_version": wire_version,
-            "width": 1920,
-            "height": 1080,
+            "width": 2560,
+            "height": 1440,
+            "codec": "h264-420",
+            "tiles": [{"id":0,"x":0,"y":0,"width":2560,"height":1440}],
             "encoder": "quicksync-h264",
             "clipboard": clipboard,
         }))
@@ -518,7 +655,7 @@ mod tests {
     #[test]
     fn a_green_host_probes_through_to_connected_sockets_and_a_parsed_header() {
         // Extra bytes after the header must survive inside the reassembler.
-        let mut payload = header_bytes(4);
+        let mut payload = header_bytes(5);
         let mut second = Vec::new();
         framing::encode(framing::MSG_VIDEO_SEQ, &[0u8; 12], &mut second);
         payload.extend_from_slice(&second[..7]); // a partial second message
@@ -534,8 +671,8 @@ mod tests {
             },
         )
         .expect("probe should succeed");
-        assert_eq!(ok.header.wire_version, 4);
-        assert_eq!((ok.header.width, ok.header.height), (1920, 1080));
+        assert_eq!(ok.header.wire_version, 5);
+        assert_eq!((ok.header.width, ok.header.height), (2560, 1440));
         assert!(
             ok.reassembler.buffered() > 0,
             "bytes past the header must stay buffered for the session"
@@ -546,9 +683,35 @@ mod tests {
             vec![
                 (STAGE_TUNNEL_UP, None),
                 (STAGE_PROBE, None),
-                (STAGE_HANDSHAKE, Some("wire v4".to_owned())),
+                (STAGE_HANDSHAKE, Some("wire v5".to_owned())),
             ]
         );
+    }
+
+    #[test]
+    fn display_readiness_requires_the_exact_client_mode_and_scale() {
+        let request = DisplayRequest {
+            width: 5120,
+            height: 2880,
+            hz: 240,
+            scale_percent: 200,
+        };
+        let mut status = green_report();
+        status.display_mode = Some(ModeReport {
+            width: 5120,
+            height: 2880,
+            hz: 240,
+        });
+        status.desired_display_mode = status.display_mode.unwrap();
+        status.desktop_scale_percent = 200;
+        status.desired_desktop_scale_percent = 200;
+        assert!(display_ready(&status, request));
+
+        status.desktop_scale_percent = 175;
+        assert!(!display_ready(&status, request));
+        status.desktop_scale_percent = 200;
+        status.display_mode.as_mut().unwrap().width = 2560;
+        assert!(!display_ready(&status, request));
     }
 
     #[test]
@@ -556,7 +719,7 @@ mod tests {
         let (ports, _aux, _joins) =
             fake_host(Some(status_line(&green_report())), Some(header_bytes(3)));
         let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
-        assert_eq!(err, ProbeFailure::VersionMismatch { host: 3, client: 4 });
+        assert_eq!(err, ProbeFailure::VersionMismatch { host: 3, client: 5 });
     }
 
     /// Poll the counter rather than sleeping a guessed interval.
@@ -584,7 +747,7 @@ mod tests {
         // That is the shape a deployed 0.4.0 host sends: the field is missing,
         // not false.
         let (ports, aux_accepts, _joins) =
-            fake_host(Some(status_line(&green_report())), Some(header_bytes(4)));
+            fake_host(Some(status_line(&green_report())), Some(header_bytes(5)));
         let ok =
             probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
         assert!(!ok.header.clipboard, "an absent flag must read as false");
@@ -606,7 +769,7 @@ mod tests {
         // covering for a gate that only works by accident.
         let (ports, aux_accepts, _joins) = fake_host(
             Some(status_line(&green_report())),
-            Some(header_bytes_advertising(4, false)),
+            Some(header_bytes_advertising(5, false)),
         );
         let ok =
             probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
@@ -619,7 +782,7 @@ mod tests {
     fn a_host_that_advertises_the_channel_is_connected_to_exactly_once() {
         let (ports, aux_accepts, _joins) = fake_host(
             Some(status_line(&green_report())),
-            Some(header_bytes_advertising(4, true)),
+            Some(header_bytes_advertising(5, true)),
         );
         let ok =
             probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
@@ -639,7 +802,7 @@ mod tests {
         // connect would make an optional feature able to break the product.
         let (ports, _aux_accepts, _joins) = fake_host_with(
             Some(status_line(&green_report())),
-            Some(header_bytes_advertising(4, true)),
+            Some(header_bytes_advertising(5, true)),
             AuxHost::Dead,
         );
         let ok = probe_over(ports, far_deadline(), || None, |_, _| {})

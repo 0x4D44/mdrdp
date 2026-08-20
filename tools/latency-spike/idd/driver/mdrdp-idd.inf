@@ -18,7 +18,7 @@ Class=Display
 ClassVer=2.0
 Provider=%ManufacturerName%
 CatalogFile=mdrdp-idd.cat
-DriverVer=08/18/2026,0.2.0.0
+DriverVer=08/20/2026,0.3.0.0
 
 [Manufacturer]
 %ManufacturerName%=Standard,NTamd64.10.0...22000

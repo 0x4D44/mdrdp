@@ -13,10 +13,11 @@ use std::process::{Child, Command, Stdio};
 
 use windows::core::PCWSTR;
 use windows::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_UPDATEREGISTRY,
-    DEVMODEW, DISPLAY_DEVICEW, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT,
-    DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
+    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, MonitorFromPoint,
+    CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY,
+    DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, MONITOR_DEFAULTTONULL,
 };
+use windows::Win32::UI::Shell::GetScaleFactorForMonitor;
 
 use super::wide_to_string;
 use crate::agent::{AgentOps, ChildState, InputDesktopObservation, Mode, PoolObservation};
@@ -357,6 +358,43 @@ impl AgentOps for WinOps {
 
     fn display_mode(&mut self) -> Option<Mode> {
         Self::find_display().and_then(|name| Self::current_mode(&name))
+    }
+
+    fn display_scale_percent(&mut self) -> Option<u32> {
+        let name = Self::find_display()?;
+        let mode = Self::current_mode(&name)?;
+        let mut devmode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        let ok = unsafe {
+            EnumDisplaySettingsW(
+                PCWSTR::from_raw(name.as_ptr()),
+                ENUM_CURRENT_SETTINGS,
+                &mut devmode,
+            )
+        }
+        .as_bool();
+        if !ok {
+            return None;
+        }
+        // A point strictly inside this display identifies its HMONITOR without
+        // relying on the volatile \\.\DISPLAYn name outside this query.
+        let position = unsafe { devmode.Anonymous1.Anonymous2.dmPosition };
+        let point = windows::Win32::Foundation::POINT {
+            x: position
+                .x
+                .saturating_add(i32::try_from(mode.width / 2).ok()?),
+            y: position
+                .y
+                .saturating_add(i32::try_from(mode.height / 2).ok()?),
+        };
+        let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONULL) };
+        if monitor.0.is_null() {
+            return None;
+        }
+        let scale = unsafe { GetScaleFactorForMonitor(monitor) }.ok()?;
+        u32::try_from(scale.0).ok().filter(|percent| *percent != 0)
     }
 
     fn set_display_mode(&mut self, mode: Mode) -> Result<(), String> {

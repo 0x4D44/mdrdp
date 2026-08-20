@@ -240,6 +240,9 @@ pub struct Evidence {
     /// Process name owning the video port, when something listens on it.
     pub port9500_owner: Option<String>,
     pub device_present: bool,
+    /// Driver version bound to the live mdrdp display device, when present.
+    #[serde(default)]
+    pub active_driver_ver: Option<String>,
     /// Versions of every staged mdrdp-idd driver package.
     #[serde(default)]
     pub staged_driver_vers: Vec<String>,
@@ -389,13 +392,18 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
         );
     }
 
-    // Driver work needed? Device present or the artifact's DriverVer staged
-    // means current. The full install arm is gated on the signing tools.
-    let driver_current = evidence.device_present
-        || evidence
-            .staged_driver_vers
-            .iter()
-            .any(|v| v == &artifacts.driver_ver);
+    // A live device is current only when it is actually bound to this package.
+    // When no device exists yet, a staged matching package is sufficient: the
+    // creator will bind it after the agent starts.
+    let desired_staged = evidence
+        .staged_driver_vers
+        .iter()
+        .any(|v| v == &artifacts.driver_ver);
+    let driver_current = if evidence.device_present {
+        evidence.active_driver_ver.as_deref() == Some(artifacts.driver_ver.as_str())
+    } else {
+        desired_staged
+    };
     if !(driver_current || (evidence.inf2cat_present && evidence.signtool_present)) {
         return Err(format!(
             "the driver ({}) is not installed and the host lacks Inf2Cat/signtool to install \
@@ -479,6 +487,9 @@ function PortOwner([int]$port) {
 }
 $device = $null -ne (Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
     Where-Object { $_.FriendlyName -eq 'mdrdp latency-spike display' -and $_.Status -eq 'OK' })
+$activeDriver = Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
+    Where-Object { $_.DeviceName -eq 'mdrdp latency-spike display' } |
+    Select-Object -First 1 -ExpandProperty DriverVersion
 $staged = @(Get-WindowsDriver -Online -ErrorAction SilentlyContinue |
     Where-Object { $_.OriginalFileName -like '*mdrdp-idd.inf' } | ForEach-Object { "$($_.Version)" })
 $inf2cat = $null -ne (Get-Command Inf2Cat.exe -ErrorAction SilentlyContinue)
@@ -518,6 +529,7 @@ $out = @{
     port9502_owner = PortOwner 9502
     port9500_owner = PortOwner 9500
     device_present = [bool]$device
+    active_driver_ver = if ($activeDriver) { "$activeDriver" } else { $null }
     staged_driver_vers = $staged
     inf2cat_present = [bool]$inf2cat
     signtool_present = [bool]$signtool
@@ -1021,6 +1033,7 @@ mod tests {
             port9502_owner: Some("rhydra-agent".to_owned()),
             port9500_owner: Some("rhydra-server".to_owned()),
             device_present: true,
+            active_driver_ver: Some("1.0.0.1".to_owned()),
             staged_driver_vers: vec!["1.0.0.1".to_owned()],
             inf2cat_present: false,
             signtool_present: false,
@@ -1232,6 +1245,23 @@ mod tests {
         let driver_pos = labels.iter().position(|l| *l == "install driver").unwrap();
         let agent_pos = labels.iter().position(|l| *l == "install agent").unwrap();
         assert!(driver_pos < agent_pos);
+    }
+
+    #[test]
+    fn stale_active_driver_is_reinstalled_even_while_the_device_is_present() {
+        let dir = scratch_dir("stale-driver");
+        let art = test_artifacts(&dir);
+        let mut ev = healthy_evidence();
+        ev.active_driver_ver = Some("0.9.0.0".to_owned());
+        ev.inf2cat_present = true;
+        ev.signtool_present = true;
+
+        let Branch::Full(plan) = decide(&cfg(), &art, &ev).unwrap() else {
+            panic!("a stale live driver requires a full deploy");
+        };
+        assert!(plan.post.iter().any(
+            |action| matches!(action, Action::Run { label, .. } if label == "install driver")
+        ));
     }
 
     #[test]

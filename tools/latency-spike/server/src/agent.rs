@@ -32,11 +32,11 @@ const MAX_BACKOFF_TICKS: u32 = 15;
 /// 30 ticks = 60 s of continuous running resets the backoff to its floor.
 const HEALTHY_RESET_TICKS: u32 = 30;
 
-/// The mode the virtual display is held at. 1920x1080 is the wire's proven frame
-/// geometry; 240 Hz is what the driver offers and the measurements were taken at.
+/// Safe mode before the first client request. Product experiments start at 1440p;
+/// 1080p is deliberately no longer part of the native transport plan.
 pub const DESIRED_MODE: Mode = Mode {
-    width: 1920,
-    height: 1080,
+    width: 2560,
+    height: 1440,
     hz: 240,
 };
 
@@ -93,6 +93,8 @@ pub trait AgentOps {
     fn audio_endpoint(&mut self) -> Option<bool>;
     /// The display's current mode, if it can be read.
     fn display_mode(&mut self) -> Option<Mode>;
+    /// Effective Windows UI scale on that display, as a percentage.
+    fn display_scale_percent(&mut self) -> Option<u32>;
     fn set_display_mode(&mut self, mode: Mode) -> Result<(), String>;
     fn poll_server(&mut self) -> ChildState;
     fn spawn_server(&mut self) -> Result<(), String>;
@@ -294,6 +296,7 @@ pub struct Reconciler {
     creator: Supervised,
     server: Supervised,
     desired: Mode,
+    desired_scale_percent: u32,
     device_present: bool,
     /// Last answer from `audio_endpoint`; `None` until first sampled.
     audio_endpoint: Option<bool>,
@@ -301,6 +304,7 @@ pub struct Reconciler {
     /// [`AgentOps::device_id`]).
     last_device_id: Option<String>,
     actual_mode: Option<Mode>,
+    actual_scale_percent: Option<u32>,
     mode_ok: bool,
     restart_server_requested: bool,
     ticks: u64,
@@ -339,10 +343,12 @@ impl Reconciler {
             creator: Supervised::new(),
             server: Supervised::new(),
             desired: DESIRED_MODE,
+            desired_scale_percent: 100,
             device_present: false,
             audio_endpoint: None,
             last_device_id: None,
             actual_mode: None,
+            actual_scale_percent: None,
             mode_ok: false,
             restart_server_requested: false,
             ticks: 0,
@@ -377,6 +383,33 @@ impl Reconciler {
     /// Ask the next tick to kill the server; supervision then respawns it.
     pub fn request_server_restart(&mut self) {
         self.restart_server_requested = true;
+    }
+
+    /// Adopt a client-selected IDD mode. The accepted set is exactly the finite
+    /// catalogue the driver publishes, so status can never promise an impossible
+    /// mode and leave the client polling forever.
+    pub fn request_display_mode(&mut self, mode: Mode, scale_percent: u32) -> Result<(), String> {
+        let geometry_ok = matches!((mode.width, mode.height), (2560, 1440) | (5120, 2880));
+        let refresh_ok = matches!(mode.hz, 60 | 120 | 240);
+        if !geometry_ok || !refresh_ok {
+            return Err(format!(
+                "unsupported display mode {}x{} @ {} Hz (supported: 2560x1440 or 5120x2880 at 60/120/240 Hz)",
+                mode.width, mode.height, mode.hz
+            ));
+        }
+        if !(100..=500).contains(&scale_percent) {
+            return Err(format!(
+                "desktop scale {scale_percent}% is outside the supported 100..=500% range"
+            ));
+        }
+        if self.desired != mode || self.desired_scale_percent != scale_percent {
+            self.desired = mode;
+            self.desired_scale_percent = scale_percent;
+            self.mode_ok = false;
+            // Converter and encoder geometry is fixed at server construction.
+            self.restart_server_requested = true;
+        }
+        Ok(())
     }
 
     /// One reconcile pass: creator → device → mode → server.
@@ -438,18 +471,19 @@ impl Reconciler {
         self.last_device_id = device_id;
         if self.device_present {
             self.actual_mode = ops.display_mode();
-            self.mode_ok = self.actual_mode == Some(self.desired);
-            if !self.mode_ok {
+            if self.actual_mode != Some(self.desired) {
                 // Idempotent: checked every tick, so a device re-created at its
                 // default 60 Hz gets put back. A failure is degraded, not down —
                 // status shows mode_ok false and the loop moves on.
-                if ops.set_display_mode(self.desired).is_ok() {
-                    self.actual_mode = ops.display_mode();
-                    self.mode_ok = self.actual_mode == Some(self.desired);
-                }
+                let _ = ops.set_display_mode(self.desired);
+                self.actual_mode = ops.display_mode();
             }
+            self.actual_scale_percent = ops.display_scale_percent();
+            self.mode_ok = self.actual_mode == Some(self.desired)
+                && self.actual_scale_percent == Some(self.desired_scale_percent);
         } else {
             self.actual_mode = None;
+            self.actual_scale_percent = None;
             self.mode_ok = false;
         }
 
@@ -484,7 +518,9 @@ impl Reconciler {
             ops.kill_server();
         }
         let server_state = ops.poll_server();
-        if self.device_present || server_state != ChildState::NotStarted {
+        // A server created before the requested mode lands would publish a header
+        // and encoder geometry the client explicitly did not ask for.
+        if self.mode_ok || server_state != ChildState::NotStarted {
             let pool = &self.pool;
             let server_generation = &mut self.server_generation;
             self.server.tick(server_state, &mut || {
@@ -683,10 +719,23 @@ impl Reconciler {
             RungReport {
                 rung: Rung::DisplayMode,
                 state: ok_or_fail(self.mode_ok),
-                detail: self
-                    .actual_mode
-                    .filter(|_| !self.mode_ok)
-                    .map(|m| format!("{}x{} @ {} Hz", m.width, m.height, m.hz)),
+                detail: (!self.mode_ok).then(|| {
+                    let mode = self.actual_mode.map_or_else(
+                        || "unknown mode".to_owned(),
+                        |m| format!("{}x{} @ {} Hz", m.width, m.height, m.hz),
+                    );
+                    let scale = self.actual_scale_percent.map_or_else(
+                        || "unknown scale".to_owned(),
+                        |percent| format!("{percent}% scale"),
+                    );
+                    format!(
+                        "{mode}, {scale}; wanted {}x{} @ {} Hz, {}% scale",
+                        self.desired.width,
+                        self.desired.height,
+                        self.desired.hz,
+                        self.desired_scale_percent
+                    )
+                }),
             },
             self.server_rung(),
             self.input_desktop_rung(),
@@ -797,6 +846,9 @@ impl Reconciler {
             creator: self.creator.report(),
             device_present: self.device_present,
             display_mode: self.actual_mode.map(Mode::report),
+            desired_display_mode: self.desired.report(),
+            desktop_scale_percent: self.actual_scale_percent.unwrap_or(0),
+            desired_desktop_scale_percent: self.desired_scale_percent,
             mode_ok: self.mode_ok,
             server: self.server.report(),
             stuck: crate::control::stuck_from_rungs(&rungs),
@@ -831,6 +883,7 @@ mod tests {
         /// apart from one new Unknown rung that gates nothing.
         audio_endpoint: Option<bool>,
         mode: Option<Mode>,
+        scale_percent: Option<u32>,
         mode_set_fails: bool,
         server_running: bool,
         server_pending_exit: Option<i32>,
@@ -871,6 +924,9 @@ mod tests {
         }
         fn display_mode(&mut self) -> Option<Mode> {
             self.mode
+        }
+        fn display_scale_percent(&mut self) -> Option<u32> {
+            Some(self.scale_percent.unwrap_or(100))
         }
         fn set_display_mode(&mut self, mode: Mode) -> Result<(), String> {
             self.calls.push(format!("set_mode {}hz", mode.hz));
@@ -1453,6 +1509,74 @@ mod tests {
     }
 
     #[test]
+    fn a_client_mode_request_stops_the_old_server_until_the_new_mode_is_active() {
+        let mut ops = FakeOps {
+            device_id: Some("dpy-1".to_owned()),
+            mode: Some(DESIRED_MODE),
+            scale_percent: Some(200),
+            server_running: true,
+            ..FakeOps::default()
+        };
+        let mut rec = Reconciler::new();
+        rec.request_display_mode(
+            Mode {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+            },
+            200,
+        )
+        .expect("5K is a supported client request");
+
+        rec.tick(&mut ops);
+
+        assert_eq!(
+            ops.mode,
+            Some(Mode {
+                width: 5120,
+                height: 2880,
+                hz: 240
+            })
+        );
+        assert!(ops.calls.contains(&"kill_server".to_owned()));
+        let status = rec.status(0);
+        assert_eq!(
+            status.desired_display_mode,
+            ModeReport {
+                width: 5120,
+                height: 2880,
+                hz: 240
+            }
+        );
+        assert_eq!(status.desktop_scale_percent, 200);
+        assert_eq!(status.desired_desktop_scale_percent, 200);
+    }
+
+    #[test]
+    fn a_requested_scale_is_measured_not_echoed_and_gates_the_encoder() {
+        let mut ops = FakeOps {
+            device_id: Some("dpy-1".to_owned()),
+            mode: Some(Mode {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+            }),
+            scale_percent: Some(100),
+            ..FakeOps::default()
+        };
+        let mut rec = Reconciler::new();
+        rec.request_display_mode(ops.mode.unwrap(), 200).unwrap();
+
+        rec.tick(&mut ops);
+
+        let status = rec.status(0);
+        assert_eq!(status.desktop_scale_percent, 100);
+        assert_eq!(status.desired_desktop_scale_percent, 200);
+        assert!(!status.mode_ok);
+        assert!(!ops.server_running, "encoder started at the wrong UI scale");
+    }
+
+    #[test]
     fn a_device_swap_restarts_the_server() {
         let mut ops = FakeOps {
             device_id: Some("dpy-1".to_owned()),
@@ -1624,14 +1748,7 @@ mod tests {
         assert_eq!(status.creator.last_exit_code, None);
         assert!(status.server.restarts >= 1);
         assert_eq!(status.server.last_exit_code, Some(11));
-        assert_eq!(
-            status.display_mode,
-            Some(ModeReport {
-                width: 1920,
-                height: 1080,
-                hz: 240
-            })
-        );
+        assert_eq!(status.display_mode, Some(DESIRED_MODE.report()));
     }
     #[test]
     fn a_host_with_no_audio_endpoint_reports_it_red_without_blocking_anything() {

@@ -26,7 +26,8 @@ pub const CONTROL_PORT: u16 = 9502;
 /// 4: `ClipboardMatches`, the interactive-session clipboard comparison. Purely
 ///    additive — a schema-3 client never sends it, and a schema-3 agent answers
 ///    an unrecognised command with an error rather than misbehaving.
-pub const SCHEMA: u32 = 4;
+/// 5: `PrepareDisplay` plus requested mode/scale status fields.
+pub const SCHEMA: u32 = 5;
 
 /// A parsed control request: `{"cmd":"status"}` and friends.
 ///
@@ -81,6 +82,13 @@ pub enum Request {
     ClipboardMatches {
         #[serde(default)]
         expected: String,
+    },
+    /// Ask the reconcile loop to apply this IDD mode before video starts.
+    PrepareDisplay {
+        width: u32,
+        height: u32,
+        hz: u32,
+        scale_percent: u32,
     },
 }
 
@@ -258,7 +266,7 @@ pub struct ChildReport {
 
 /// A display mode, as reported. Distinct from the reconciler's internal type so
 /// the wire shape cannot drift by accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModeReport {
     pub width: u32,
     pub height: u32,
@@ -281,7 +289,17 @@ pub struct StatusReport {
     pub device_present: bool,
     /// The mode the display actually has right now, if it could be read.
     pub display_mode: Option<ModeReport>,
-    /// Whether that mode matches the desired one.
+    /// The client-selected mode the agent is reconciling toward (schema 5).
+    #[serde(default)]
+    pub desired_display_mode: ModeReport,
+    /// Windows UI scale actually in force on the IDD monitor (schema 5). Zero
+    /// means the OS would not answer; it never means 0% scaling.
+    #[serde(default = "default_scale_percent")]
+    pub desktop_scale_percent: u32,
+    /// Client-selected Windows UI scale the agent is reconciling toward.
+    #[serde(default = "default_scale_percent")]
+    pub desired_desktop_scale_percent: u32,
+    /// Whether both the backing-pixel mode and UI scale match the request.
     pub mode_ok: bool,
     pub server: ChildReport,
     /// The first unsatisfied step in bring-up order, or absent when green.
@@ -313,6 +331,10 @@ pub struct StatusReport {
     /// not know would report a healthy host as broken.
     #[serde(default)]
     pub cycling: bool,
+}
+
+const fn default_scale_percent() -> u32 {
+    100
 }
 
 /// What the IDD shared section publishes, read by the agent every tick.
@@ -649,6 +671,17 @@ mod tests {
             parse_request(r#"{"cmd":"shutdown"}"#),
             Ok(Request::Shutdown)
         );
+        assert_eq!(
+            parse_request(
+                r#"{"cmd":"prepare-display","width":5120,"height":2880,"hz":240,"scale_percent":200}"#,
+            ),
+            Ok(Request::PrepareDisplay {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+                scale_percent: 200,
+            })
+        );
     }
 
     #[test]
@@ -685,6 +718,13 @@ mod tests {
                 height: 1080,
                 hz: 240,
             }),
+            desired_display_mode: ModeReport {
+                width: 5120,
+                height: 2880,
+                hz: 120,
+            },
+            desktop_scale_percent: 175,
+            desired_desktop_scale_percent: 200,
             mode_ok: false,
             server: ChildReport {
                 running: false,
@@ -1068,6 +1108,13 @@ mod tests {
                 height: 1080,
                 hz: 240,
             }),
+            desired_display_mode: ModeReport {
+                width: 1920,
+                height: 1080,
+                hz: 240,
+            },
+            desktop_scale_percent: 100,
+            desired_desktop_scale_percent: 100,
             mode_ok: true,
             server: ChildReport {
                 running: true,

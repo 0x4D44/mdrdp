@@ -16,7 +16,7 @@
 
 use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource};
 use super::{convert, dxgi, encode, idd_source, input, pixel_diff, qpc, send, Result};
-use crate::annexb::{self, ParameterSets};
+use crate::annexb::{self, AvcParameterSets};
 use crate::cli::{Config, Source, DECLARED_FPS};
 use crate::diff;
 use crate::rects;
@@ -143,32 +143,47 @@ pub fn run(cfg: &Config) -> Result<()> {
     // thread never touches the source.
     let capture_origin = source.origin();
 
-    let mut converter = convert::Nv12Converter::new(
-        source.device(),
-        source.context(),
-        source.width(),
-        source.height(),
-        DECLARED_FPS,
-    )?;
-
     // MF must be started on the thread that drives the transform, and torn down
-    // after it — `_mf` outlives `encoder` because it is declared first.
+    // after it — `_mf` outlives every tile encoder because it is declared first.
     let _mf = encode::Session::start()?;
     let manager = encode::device_manager(source.device())?;
-    let mut encoder = encode::create(
-        source.width(),
-        source.height(),
-        DECLARED_FPS,
-        cfg.bitrate_kbps,
-        cfg.gop,
-        Some(&manager),
-    )?;
-    eprintln!("encode: {} ({})", encoder.name(), encoder.kind());
-    if !encoder.codec_api_refused().is_empty() {
+    let layout = stats::tile_layout(source.width(), source.height());
+    let tile_count = u32::try_from(layout.len()).unwrap_or(1);
+    let per_tile_bitrate = cfg.bitrate_kbps.div_ceil(tile_count).max(1);
+    let mut tiles = Vec::with_capacity(layout.len());
+    for header in layout {
+        let converter = convert::Nv12Converter::new_region(
+            source.device(),
+            source.context(),
+            source.width(),
+            source.height(),
+            header.x,
+            header.y,
+            header.width,
+            header.height,
+            DECLARED_FPS,
+        )?;
+        let encoder = encode::create(
+            header.width,
+            header.height,
+            DECLARED_FPS,
+            per_tile_bitrate,
+            cfg.gop,
+            Some(&manager),
+        )?;
         eprintln!(
-            "encode: MFT refused {} — see the stats header",
-            encoder.codec_api_refused().join(", ")
+            "encode: tile {} {}x{} — {} ({})",
+            header.id,
+            header.width,
+            header.height,
+            encoder.name(),
+            encoder.kind()
         );
+        tiles.push(TilePipeline {
+            header,
+            converter,
+            encoder,
+        });
     }
 
     // The wire's rect coordinates are u16, so a desktop wider or taller than that
@@ -195,7 +210,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         cfg,
         clock,
         source.as_ref(),
-        encoder.as_ref(),
+        tiles[0].encoder.as_ref(),
         rects_enabled,
         diff_enabled,
     );
@@ -277,28 +292,37 @@ pub fn run(cfg: &Config) -> Result<()> {
             })?;
     }
 
-    let outcome = capture_loop(capture_state(
-        source.as_mut(),
-        &mut converter,
-        encoder.as_mut(),
+    let outcome = capture_loop(CaptureState {
+        capture: source.as_mut(),
+        tiles,
         clock,
         tx,
         connected,
         rects_enabled,
         diff_enabled,
-    ));
+    });
     // Only reached when the loop fails; the happy path never returns. Draining the
     // MFT before `MFShutdown` runs (via `_mf`'s Drop) keeps the driver's own logs
     // readable for whoever diagnoses that failure.
-    encoder.shutdown();
     outcome
+}
+
+struct TilePipeline {
+    header: stats::TileHeader,
+    converter: convert::Nv12Converter,
+    encoder: Box<dyn encode::Encoder>,
+}
+
+impl Drop for TilePipeline {
+    fn drop(&mut self) {
+        self.encoder.shutdown();
+    }
 }
 
 /// Everything the capture loop needs, bundled so the signature stays readable.
 struct CaptureState<'a> {
     capture: &'a mut dyn FrameSource,
-    converter: &'a mut convert::Nv12Converter,
-    encoder: &'a mut dyn encode::Encoder,
+    tiles: Vec<TilePipeline>,
     clock: QpcClock,
     tx: SyncSender<send::Outbound>,
     connected: Arc<AtomicBool>,
@@ -308,29 +332,6 @@ struct CaptureState<'a> {
     /// Whether the Increment 3 pixel diff may run at all. Implies `rects_enabled`:
     /// the diff emits through the rect path or not at all.
     diff_enabled: bool,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn capture_state<'a>(
-    capture: &'a mut dyn FrameSource,
-    converter: &'a mut convert::Nv12Converter,
-    encoder: &'a mut dyn encode::Encoder,
-    clock: QpcClock,
-    tx: SyncSender<send::Outbound>,
-    connected: Arc<AtomicBool>,
-    rects_enabled: bool,
-    diff_enabled: bool,
-) -> CaptureState<'a> {
-    CaptureState {
-        capture,
-        converter,
-        encoder,
-        clock,
-        tx,
-        connected,
-        rects_enabled,
-        diff_enabled,
-    }
 }
 
 fn build_header(
@@ -361,6 +362,7 @@ fn build_header(
     h.output = capture.output_name().to_owned();
     h.width = capture.width();
     h.height = capture.height();
+    h.tiles = stats::tile_layout(h.width, h.height);
     h.encoder = encoder.name().to_owned();
     h.encoder_kind = encoder.kind();
     h.codec_api_applied = encoder.codec_api_applied().to_vec();
@@ -391,6 +393,7 @@ fn build_header(
 struct EmitCtx {
     clock: QpcClock,
     tx: SyncSender<send::Outbound>,
+    tile_id: u8,
     /// Cumulative frames dropped because the send queue was full.
     dropped: u64,
     /// Cumulative rect messages dropped for the same reason. Counted separately so
@@ -403,22 +406,15 @@ struct EmitCtx {
     /// Cumulative microseconds spent inside those diffs — the cost side of the
     /// trade the hit count is the benefit side of.
     diff_us_total: u64,
-    /// VPS/SPS/PPS scanned out of the stream's own access units — the fallback when
+    /// SPS/PPS scanned out of the stream's own access units — the fallback when
     /// the encoder publishes no out-of-band sequence header (Quick Sync). Updated
     /// on every in-band sighting; cleared when the encoder's config epoch moves.
-    stream_sets: Option<ParameterSets>,
+    stream_sets: Option<AvcParameterSets>,
     /// The encoder's own out-of-band sets, snapshotted before each encode call
     /// (the encoder is unborrowable from inside the sink).
-    encoder_sets: Option<ParameterSets>,
-    /// Parsed bitstream contract for the current encoder configuration epoch.
-    stream_config: Option<annexb::StreamConfig>,
+    encoder_sets: Option<AvcParameterSets>,
     config_epoch: u64,
-    expected_width: u32,
-    expected_height: u32,
-    /// A new epoch cannot paint until its first validated IRAP arrives.
-    awaiting_epoch_irap: bool,
     param_set_failures: u64,
-    config_wait_drops: u64,
     clean_point_mismatches: u64,
     /// `Some(n)` while a keyframe request is outstanding: n non-keyframe AUs seen
     /// since. Drives the §4 "verify the connect-edge IRAP" retry.
@@ -432,65 +428,29 @@ struct EmitCtx {
 
 /// Hand one encoded access unit to the sender, with its own frame's stamps.
 fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
-    let irap = annexb::contains_irap(&au.data);
-    if irap != au.keyframe {
+    let idr = annexb::avc_contains_idr(&au.data);
+    if idr != au.keyframe {
         ctx.clean_point_mismatches += 1;
     }
 
-    // Trust what the bitstream says. In-band sets win over the output-type blob,
-    // and every changed triplet starts a new local configuration boundary even if
-    // the MFT forgot to raise STREAM_CHANGE.
-    let candidate_sets =
-        ParameterSets::from_sequence_header(&au.data).or_else(|| ctx.encoder_sets.clone());
-    if let Some(sets) = candidate_sets {
-        if ctx.stream_sets.as_ref() != Some(&sets) {
-            if ctx.stream_sets.is_some() {
-                ctx.config_epoch += 1;
-            }
-            let encoded = sets.to_annex_b();
-            let config = annexb::validate_stream(&encoded, ctx.expected_width, ctx.expected_height)
-                .map_err(|error| format!("encode: refusing HEVC configuration: {error}"))?;
+    if annexb::avc_has_parameter_sets(&au.data) {
+        if let Some(sets) = AvcParameterSets::from_sequence_header(&au.data) {
             ctx.stream_sets = Some(sets);
-            ctx.stream_config = Some(config);
-            ctx.awaiting_epoch_irap = true;
-            eprintln!(
-                "encode: accepted HEVC epoch {}: profile={} tier={} level={} chroma={} depth={}/{} size={}x{}",
-                ctx.config_epoch,
-                config.profile_idc,
-                if config.high_tier { "high" } else { "main" },
-                config.level_idc,
-                config.chroma_format_idc,
-                config.bit_depth_luma,
-                config.bit_depth_chroma,
-                config.width,
-                config.height
-            );
         }
     }
-
-    if ctx.awaiting_epoch_irap && !irap {
-        ctx.config_wait_drops += 1;
+    // In-band sets describe the AU we are about to send and therefore win over
+    // a possibly stale output-type blob after an unannounced encoder reconfigure.
+    let sets = ctx.stream_sets.as_ref().or(ctx.encoder_sets.as_ref());
+    if idr && sets.is_none() {
+        ctx.param_set_failures += 1;
+        ctx.rerequest_keyframe = true;
         return Ok(());
     }
-
-    let (bytes, prepended) =
-        match annexb::ensure_parameter_sets(&au.data, ctx.stream_sets.as_ref(), irap) {
-            Ok(ready) => ready,
-            Err(_) => {
-                ctx.param_set_failures += 1;
-                ctx.rerequest_keyframe = true;
-                return Ok(());
-            }
-        };
-    let config = ctx.stream_config.ok_or_else(|| {
-        "encode: refusing access unit before a validated HEVC configuration".to_owned()
-    })?;
-    if irap {
-        ctx.awaiting_epoch_irap = false;
-    }
+    let (bytes, prepended) = annexb::ensure_avc_parameter_sets(&au.data, sets, idr);
 
     let mut record = FrameRecord::new();
     record.frame = au.meta.seq;
+    record.tile_id = ctx.tile_id;
     record.present_qpc_us = ctx.clock.micros(au.meta.present_qpc);
     record.acquire_qpc_us = ctx.clock.micros(au.meta.acquire_qpc);
     record.convert_start_us = ctx.clock.micros(au.meta.convert_start_qpc);
@@ -498,19 +458,10 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     record.encode_submit_us = ctx.clock.micros(au.submit_qpc);
     record.encode_out_us = ctx.clock.micros(au.out_qpc);
     record.au_bytes = bytes.len();
-    record.keyframe = irap;
+    record.keyframe = idr;
     record.param_sets_prepended = prepended;
     record.config_epoch = ctx.config_epoch;
-    record.profile_idc = config.profile_idc;
-    record.high_tier = config.high_tier;
-    record.level_idc = config.level_idc;
-    record.chroma_format_idc = config.chroma_format_idc;
-    record.bit_depth_luma = config.bit_depth_luma;
-    record.bit_depth_chroma = config.bit_depth_chroma;
-    record.stream_width = config.width;
-    record.stream_height = config.height;
     record.param_set_failures = ctx.param_set_failures;
-    record.config_wait_drops = ctx.config_wait_drops;
     record.clean_point_mismatches = ctx.clean_point_mismatches;
     record.dropped_frames = ctx.dropped;
     record.dropped_rects = ctx.dropped_rects;
@@ -537,7 +488,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     }
 
     match ctx.awaiting_keyframe {
-        Some(n) if irap => {
+        Some(n) if idr => {
             record.keyframe_wait_frames = Some(n);
             ctx.awaiting_keyframe = None;
         }
@@ -552,6 +503,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
 
     match ctx.tx.try_send(send::Outbound::Frame(
         Box::new(record),
+        ctx.tile_id,
         au.meta.seq,
         bytes.into_owned(),
     )) {
@@ -698,7 +650,7 @@ fn send_rects(
     }
 }
 
-fn capture_loop(state: CaptureState<'_>) -> Result<()> {
+fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
     let mut frame_seq: u64 = 0;
     let mut was_connected = false;
     let mut want_keyframe = true;
@@ -711,7 +663,11 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
     // (`Recreated` is a rebuilt duplication under `--source dxgi`, and a rebuilt
     // shared pool under `--source idd`; the reasoning is identical.)
     let mut suppress_rects_once = false;
-    let mut last_epoch = state.encoder.config_epoch();
+    let mut last_epochs: Vec<u64> = state
+        .tiles
+        .iter()
+        .map(|tile| tile.encoder.config_epoch())
+        .collect();
     // HLD §6b: the previous consumed frame, retained on the GPU, plus the stamp that
     // says how long ago it was. Both are the diff's whole state, and both reset on a
     // rebuilt source.
@@ -719,28 +675,29 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
     let mut last_acquire_qpc: Option<i64> = None;
     let frame_duration_hns = HNS_PER_SECOND / DECLARED_FPS.max(1) as i64;
     let start_qpc = qpc::now();
-    let mut ctx = EmitCtx {
-        clock: state.clock,
-        tx: state.tx.clone(),
-        dropped: 0,
-        dropped_rects: 0,
-        diff_runs: 0,
-        diff_hits: 0,
-        diff_us_total: 0,
-        stream_sets: None,
-        encoder_sets: None,
-        stream_config: None,
-        config_epoch: last_epoch,
-        expected_width: state.capture.width(),
-        expected_height: state.capture.height(),
-        awaiting_epoch_irap: true,
-        param_set_failures: 0,
-        config_wait_drops: 0,
-        clean_point_mismatches: 0,
-        awaiting_keyframe: None,
-        rerequest_keyframe: false,
-        drop_wants_keyframe: false,
-    };
+    let mut contexts: Vec<EmitCtx> = state
+        .tiles
+        .iter()
+        .zip(last_epochs.iter().copied())
+        .map(|(tile, epoch)| EmitCtx {
+            clock: state.clock,
+            tx: state.tx.clone(),
+            tile_id: tile.header.id,
+            dropped: 0,
+            dropped_rects: 0,
+            diff_runs: 0,
+            diff_hits: 0,
+            diff_us_total: 0,
+            stream_sets: None,
+            encoder_sets: None,
+            config_epoch: epoch,
+            param_set_failures: 0,
+            clean_point_mismatches: 0,
+            awaiting_keyframe: None,
+            rerequest_keyframe: false,
+            drop_wants_keyframe: false,
+        })
+        .collect();
 
     loop {
         let connected = state.connected.load(Ordering::Acquire);
@@ -757,8 +714,10 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
             want_keyframe = true;
         }
         if want_keyframe {
-            state.encoder.request_keyframe();
-            ctx.awaiting_keyframe = Some(0);
+            for (tile, ctx) in state.tiles.iter_mut().zip(&mut contexts) {
+                tile.encoder.request_keyframe();
+                ctx.awaiting_keyframe = Some(0);
+            }
             want_keyframe = false;
         }
 
@@ -774,11 +733,17 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
                 // No new frame, but the async MFT may be holding a finished AU it
                 // only delivers when pumped — on a static desktop that AU would
                 // otherwise never leave the transform.
-                state.encoder.pump(&mut |au| emit_au(au, &mut ctx))?;
-                state
-                    .encoder
-                    .release_retired_surfaces(&mut |slot| state.converter.release(slot))?;
-                housekeep(&state, &mut ctx, &mut want_keyframe, &mut last_epoch);
+                for ((tile, ctx), last_epoch) in state
+                    .tiles
+                    .iter_mut()
+                    .zip(&mut contexts)
+                    .zip(&mut last_epochs)
+                {
+                    tile.encoder.pump(&mut |au| emit_au(au, ctx))?;
+                    tile.encoder
+                        .release_retired_surfaces(&mut |slot| tile.converter.release(slot))?;
+                    housekeep(tile.encoder.as_ref(), ctx, &mut want_keyframe, last_epoch);
+                }
                 continue;
             }
             Acquired::PointerOnly => continue,
@@ -811,12 +776,13 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
         let mut raw_rect_sent = false;
 
         // The fast path is an overlay, not a branch: whatever happens here, the
-        // frame still goes on to convert, encode and send as HEVC below.
+        // frame still goes on to convert, encode and send as H.264 below.
         let mut metadata_took_fast_path = false;
         if state.rects_enabled && !suppress_rects_once {
             if let Some(change) = change.as_ref().filter(|c| takes_fast_path(c)) {
                 raw_rect_attempted = true;
-                raw_rect_sent = emit_rects(state.capture, &texture, change, frame_seq, &mut ctx)?;
+                raw_rect_sent =
+                    emit_rects(state.capture, &texture, change, frame_seq, &mut contexts[0])?;
                 metadata_took_fast_path = true;
             }
         }
@@ -837,7 +803,7 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
         //   metadata is the opposite: it claims nothing, so the diff is the only
         //   thing that can tell us anything.)
         let idle_gap_passed = match last_acquire_qpc {
-            Some(last) => ctx.clock.micros(acquire_qpc.saturating_sub(last)) >= DIFF_IDLE_GAP_US,
+            Some(last) => state.clock.micros(acquire_qpc.saturating_sub(last)) >= DIFF_IDLE_GAP_US,
             None => false,
         };
         let metadata_claims_no_change = change.as_ref().is_some_and(|c| c.rects.is_empty());
@@ -876,17 +842,17 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
                     RECT_MAX_BYTES,
                 )?
             };
-            let diff_us = ctx
+            let diff_us = state
                 .clock
                 .micros(qpc::now().saturating_sub(diff_start))
                 .max(0) as u64;
-            ctx.diff_runs += 1;
-            ctx.diff_us_total += diff_us;
+            contexts[0].diff_runs += 1;
+            contexts[0].diff_us_total += diff_us;
             // `None` is a miss — too many rects, or too many bytes — and needs no
             // action: the frame is on the codec path already, which is where a
             // large change belongs anyway.
             if let Some(rect_pixels) = measured {
-                ctx.diff_hits += 1;
+                contexts[0].diff_hits += 1;
                 if !rect_pixels.is_empty() {
                     measured_changed_pixels = Some(rects::union_area(
                         &rect_pixels
@@ -906,7 +872,7 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
                         state.capture.height(),
                         diff_start,
                         true,
-                        &mut ctx,
+                        &mut contexts[0],
                     )?;
                 }
             }
@@ -924,63 +890,88 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
         }
         last_acquire_qpc = Some(acquire_qpc);
 
-        let convert_start = qpc::now();
-        let nv12 = state.converter.convert(&texture)?;
-        let convert_end = qpc::now();
-
-        let mut meta = encode::FrameMeta {
-            seq: frame_seq,
-            present_qpc,
-            acquire_qpc,
-            convert_start_qpc: convert_start,
-            convert_end_qpc: convert_end,
-            ..Default::default()
-        };
-        if let Some(change) = &change {
-            meta.change_valid = true;
-            meta.dirty_rect_count = change.rects.len() as u32;
-            meta.dirty_bytes = change.dirty_bytes();
-            meta.move_rect_count = change.move_rects;
-        }
-        meta.claimed_changed_pixels = claimed_changed_pixels;
-        meta.measured_changed_pixels = measured_changed_pixels;
-        meta.frame_pixels = u64::from(state.capture.width()) * u64::from(state.capture.height());
-        meta.raw_rect_attempted = raw_rect_attempted;
-        meta.raw_rect_sent = raw_rect_sent;
-
         let time_hns = state
             .clock
             .micros(acquire_qpc.saturating_sub(start_qpc))
             .saturating_mul(10);
-        let sample = encode::sample_from_texture(&nv12.texture, time_hns, frame_duration_hns)?;
 
-        ctx.encoder_sets = state.encoder.parameter_sets().cloned();
-        state
-            .encoder
-            .encode(&sample, meta, nv12.slot, &mut |au| emit_au(au, &mut ctx))?;
-        state
-            .encoder
-            .release_retired_surfaces(&mut |slot| state.converter.release(slot))?;
-        housekeep(&state, &mut ctx, &mut want_keyframe, &mut last_epoch);
+        // The rect/diff counters describe the captured desktop frame and therefore
+        // belong on both tile rows, not only tile zero which owns the raw fast path.
+        let shared = (
+            contexts[0].dropped_rects,
+            contexts[0].diff_runs,
+            contexts[0].diff_hits,
+            contexts[0].diff_us_total,
+        );
+        for ctx in contexts.iter_mut().skip(1) {
+            (
+                ctx.dropped_rects,
+                ctx.diff_runs,
+                ctx.diff_hits,
+                ctx.diff_us_total,
+            ) = shared;
+        }
+
+        for (((tile, ctx), last_epoch), tile_index) in state
+            .tiles
+            .iter_mut()
+            .zip(&mut contexts)
+            .zip(&mut last_epochs)
+            .zip(0usize..)
+        {
+            let convert_start = qpc::now();
+            let nv12 = tile.converter.convert(&texture)?;
+            let convert_end = qpc::now();
+            let mut meta = encode::FrameMeta {
+                seq: frame_seq,
+                present_qpc,
+                acquire_qpc,
+                convert_start_qpc: convert_start,
+                convert_end_qpc: convert_end,
+                ..Default::default()
+            };
+            if let Some(change) = &change {
+                meta.change_valid = true;
+                meta.dirty_rect_count = change.rects.len() as u32;
+                meta.dirty_bytes = change.dirty_bytes();
+                meta.move_rect_count = change.move_rects;
+            }
+            meta.claimed_changed_pixels = claimed_changed_pixels;
+            meta.measured_changed_pixels = measured_changed_pixels;
+            // The changed-pixel counts describe the whole captured desktop. Keep the
+            // denominator in the same coordinate space; using tile pixels here would
+            // exaggerate the changed share on a two-tile 5K frame.
+            meta.frame_pixels =
+                u64::from(state.capture.width()) * u64::from(state.capture.height());
+            meta.raw_rect_attempted = raw_rect_attempted;
+            meta.raw_rect_sent = raw_rect_sent;
+
+            let sample = encode::sample_from_texture(&nv12.texture, time_hns, frame_duration_hns)?;
+            ctx.encoder_sets = tile.encoder.parameter_sets().cloned();
+            tile.encoder
+                .encode(&sample, meta, nv12.slot, &mut |au| emit_au(au, ctx))?;
+            tile.encoder
+                .release_retired_surfaces(&mut |slot| tile.converter.release(slot))?;
+            housekeep(tile.encoder.as_ref(), ctx, &mut want_keyframe, last_epoch);
+            debug_assert_eq!(usize::from(tile.header.id), tile_index);
+        }
     }
 }
 
 /// Post-emission actions that need the encoder, which the sink cannot borrow.
 fn housekeep(
-    state: &CaptureState<'_>,
+    encoder: &dyn encode::Encoder,
     ctx: &mut EmitCtx,
     want_keyframe: &mut bool,
     last_epoch: &mut u64,
 ) {
-    let epoch = state.encoder.config_epoch();
+    let epoch = encoder.config_epoch();
     if epoch != *last_epoch {
         // The encoder renegotiated its output type; sets scanned from the old
         // stream would poison the new one.
         *last_epoch = epoch;
         ctx.config_epoch += 1;
         ctx.stream_sets = None;
-        ctx.stream_config = None;
-        ctx.awaiting_epoch_irap = true;
     }
     if ctx.rerequest_keyframe {
         ctx.rerequest_keyframe = false;

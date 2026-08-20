@@ -34,7 +34,7 @@ pub enum Outbound {
     /// An encoded access unit plus the stats row it belongs to and its capture
     /// sequence number (the `MSG_VIDEO_SEQ` prefix). `send_done_us` is filled in
     /// here, because only this thread knows when the write returned.
-    Frame(Box<FrameRecord>, u64, Vec<u8>),
+    Frame(Box<FrameRecord>, u8, u64, Vec<u8>),
     /// One captured frame's raw dirty rects — a complete `MSG_RECTS` payload as
     /// `crate::rects::encode` produced it — plus its stats row. `send_done_us` is
     /// filled in here for the same reason as [`Outbound::Frame`]'s.
@@ -135,15 +135,17 @@ impl Sender {
         }
     }
 
-    /// One access unit as `MSG_VIDEO_SEQ`: the capture sequence, then the bytes.
-    fn write_video(&mut self, seq: u64, au: &[u8]) {
+    /// One H.264 tile access unit with its tile id and capture sequence.
+    fn write_video(&mut self, tile_id: u8, seq: u64, au: &[u8]) {
         let Some(client) = self.client.as_mut() else {
             return;
         };
         self.scratch.clear();
-        let length = (8 + au.len() + 1) as u32;
+        let length = (framing::TILE_AU_PREFIX + au.len() + 1) as u32;
         self.scratch.extend_from_slice(&length.to_le_bytes());
-        self.scratch.push(framing::MSG_VIDEO_SEQ);
+        self.scratch.push(framing::MSG_VIDEO_TILE);
+        self.scratch.push(tile_id);
+        self.scratch.extend_from_slice(&[0; 3]);
         self.scratch.extend_from_slice(&seq.to_le_bytes());
         self.scratch.extend_from_slice(au);
         let outcome = client
@@ -195,8 +197,8 @@ impl Sender {
     /// Write one message and its stats row.
     fn handle(&mut self, msg: Outbound) {
         match msg {
-            Outbound::Frame(mut record, seq, au) => {
-                self.write_video(seq, &au);
+            Outbound::Frame(mut record, tile_id, seq, au) => {
+                self.write_video(tile_id, seq, &au);
                 record.send_done_us = self.clock.micros(qpc::now());
                 let line = crate::stats::to_line(&*record);
                 self.write_stats(&line);

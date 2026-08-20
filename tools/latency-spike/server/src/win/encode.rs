@@ -1,4 +1,4 @@
-//! Stage 3 — HEVC via a Media Foundation MFT.
+//! Stage 3 — H.264 via a Media Foundation MFT.
 //!
 //! This is the least-known component in the spike, so the documented contract is
 //! spelled out here and cited at each step in the code. Whoever debugs the first
@@ -8,7 +8,7 @@
 //!
 //! 1. `MFStartup(MF_VERSION, MFSTARTUP_LITE)` once per process, on the thread that
 //!    will drive the transform. (Done by [`Session`].)
-//! 2. `MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, …)` with input NV12 and output HEVC.
+//! 2. `MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, …)` with input NV12 and output H.264.
 //!    Hardware **async** MFTs are asked for first
 //!    (`HARDWARE | ASYNCMFT | SORTANDFILTER`); the Microsoft software encoder, which
 //!    is a **sync** MFT, is the fallback (`SYNCMFT | SORTANDFILTER`).
@@ -21,7 +21,7 @@
 //!    what lets the encoder read the NV12 surface without a CPU copy, and it must
 //!    happen **before** the media types are set.
 //! 6. `ICodecAPI` low-latency settings, then `SetOutputType`, then `SetInputType`.
-//!    Order matters twice over: the HEVC encoder derives its input constraints from
+//!    Order matters twice over: the H.264 encoder derives its input constraints from
 //!    the output type, and several `ICodecAPI` properties are only honoured if they
 //!    are set before the output type is locked in.
 //! 7. `ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING)` then
@@ -48,13 +48,11 @@
 //!
 //! ## Output order
 //!
-//! HEVC low-latency mode is mandatory. The client assigns each decoded picture to
-//! the access unit's capture sequence, so an encoder allowed to reorder would make
-//! the wire lie. Output is still matched to submissions by MF sample timestamp,
-//! with FIFO as a counted fallback (`stamp_mismatches`).
+//! B-frames are disabled, and output is matched to submissions by MF sample
+//! timestamp with FIFO as a counted fallback (`stamp_mismatches`).
 
 use super::{qpc, Result};
-use crate::annexb::ParameterSets;
+use crate::annexb::AvcParameterSets;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use windows::core::{Interface, GUID};
@@ -115,8 +113,8 @@ pub trait Encoder {
     fn kind(&self) -> &'static str;
     fn codec_api_applied(&self) -> &[String];
     fn codec_api_refused(&self) -> &[String];
-    /// VPS/SPS/PPS from `MF_MT_MPEG_SEQUENCE_HEADER`, when published.
-    fn parameter_sets(&self) -> Option<&ParameterSets>;
+    /// SPS/PPS from `MF_MT_MPEG_SEQUENCE_HEADER`, when published.
+    fn parameter_sets(&self) -> Option<&AvcParameterSets>;
     /// Ask for an IDR on the next frame. Best-effort: an encoder that refuses
     /// `CODECAPI_AVEncVideoForceKeyFrame` will still produce one at the next GOP.
     fn request_keyframe(&mut self);
@@ -134,7 +132,7 @@ pub trait Encoder {
     /// transform until the next screen change.
     fn pump(&mut self, sink: &mut dyn FnMut(EncodedAu) -> Result<()>) -> Result<()>;
     /// Bumped whenever the encoder renegotiates its output type mid-stream. A
-    /// consumer caching stream-derived state (the in-band VPS/SPS/PPS cache) must
+    /// consumer caching stream-derived state (the in-band SPS/PPS cache) must
     /// invalidate it when this changes.
     fn config_epoch(&self) -> u64;
     /// Release every converter surface whose encoder submission is now retired.
@@ -246,7 +244,7 @@ struct Mft {
     output_size: u32,
     applied: Vec<String>,
     refused: Vec<String>,
-    parameter_sets: Option<ParameterSets>,
+    parameter_sets: Option<AvcParameterSets>,
     /// Pending submissions, keyed by the sample time each carried. Matched back to
     /// outputs by `GetSampleTime`, with front-of-queue FIFO as the counted
     /// fallback: B-frames are off, so FIFO *should* hold, but "should" is an
@@ -313,7 +311,7 @@ impl Mft {
             Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                 // The encoder renegotiated. Accept its first proposal and refresh the
                 // stored parameter sets, which may have changed with it. The epoch
-                // bump tells the pipeline to discard any stream-scanned VPS/SPS/PPS
+                // bump tells the pipeline to discard any stream-scanned SPS/PPS
                 // cache — sets from the old configuration would poison the new one.
                 // SAFETY: the transform is live.
                 let new_type = unsafe { self.transform.GetOutputAvailableType(0, 0) }?;
@@ -366,7 +364,7 @@ impl Mft {
             None => (out_qpc, FrameMeta::default()),
         };
         // `MFSampleExtension_CleanPoint` is MF's clean-point claim. The pipeline
-        // cross-checks it against the HEVC IRAP NAL types before trusting it.
+        // cross-checks keyframe claims against the H.264 bitstream.
         // SAFETY: `sample` is live; a missing attribute is an error, not a crash.
         let keyframe = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) == 1;
 
@@ -438,7 +436,7 @@ impl Mft {
     }
 }
 
-fn read_sequence_header(media_type: &IMFMediaType) -> Option<ParameterSets> {
+fn read_sequence_header(media_type: &IMFMediaType) -> Option<AvcParameterSets> {
     // SAFETY: `media_type` is live. A missing attribute returns an error rather
     // than writing anything, which is why the size is read first.
     let size = unsafe { media_type.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) }.ok()?;
@@ -448,7 +446,7 @@ fn read_sequence_header(media_type: &IMFMediaType) -> Option<ParameterSets> {
     let mut blob = vec![0u8; size as usize];
     // SAFETY: `blob` is exactly `size` bytes, which is what GetBlobSize reported.
     unsafe { media_type.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut blob, None) }.ok()?;
-    ParameterSets::from_sequence_header(&blob)
+    AvcParameterSets::from_sequence_header(&blob)
 }
 
 fn validate_output_type(media_type: &IMFMediaType, width: u32, height: u32) -> Result<()> {
@@ -457,35 +455,8 @@ fn validate_output_type(media_type: &IMFMediaType, width: u32, height: u32) -> R
     // renegotiation before its first access unit and keeps the bitstream as the
     // final authority.
     let subtype = unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }?;
-    if subtype != MFVideoFormat_HEVC {
-        return Err(format!("encoder renegotiated a non-HEVC subtype: {subtype:?}").into());
-    }
-    let checks = [
-        ("profile", eAVEncH265VProfile_Main_420_8.0 as u32, unsafe {
-            media_type.GetUINT32(&MF_MT_VIDEO_PROFILE)
-        }?),
-        ("level", eAVEncH265VLevel4_1.0 as u32, unsafe {
-            media_type.GetUINT32(&MF_MT_MPEG2_LEVEL)
-        }?),
-        ("nominal range", MFNominalRange_16_235.0 as u32, unsafe {
-            media_type.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE)
-        }?),
-        ("YUV matrix", MFVideoTransferMatrix_BT709.0 as u32, unsafe {
-            media_type.GetUINT32(&MF_MT_YUV_MATRIX)
-        }?),
-        ("primaries", MFVideoPrimaries_BT709.0 as u32, unsafe {
-            media_type.GetUINT32(&MF_MT_VIDEO_PRIMARIES)
-        }?),
-        ("transfer function", MFVideoTransFunc_709.0 as u32, unsafe {
-            media_type.GetUINT32(&MF_MT_TRANSFER_FUNCTION)
-        }?),
-    ];
-    for (name, expected, actual) in checks {
-        if actual != expected {
-            return Err(
-                format!("encoder {name} mismatch: expected {expected}, got {actual}").into(),
-            );
-        }
+    if subtype != MFVideoFormat_H264 {
+        return Err(format!("encoder renegotiated a non-H.264 subtype: {subtype:?}").into());
     }
     let frame_size = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }?;
     let actual_size = ((frame_size >> 32) as u32, frame_size as u32);
@@ -572,7 +543,7 @@ impl Encoder for AsyncEncoder {
         &self.mft.refused
     }
 
-    fn parameter_sets(&self) -> Option<&ParameterSets> {
+    fn parameter_sets(&self) -> Option<&AvcParameterSets> {
         self.mft.parameter_sets.as_ref()
     }
 
@@ -694,7 +665,7 @@ impl Encoder for SyncEncoder {
         &self.mft.refused
     }
 
-    fn parameter_sets(&self) -> Option<&ParameterSets> {
+    fn parameter_sets(&self) -> Option<&AvcParameterSets> {
         self.mft.parameter_sets.as_ref()
     }
 
@@ -772,7 +743,7 @@ fn enumerate(flags: MFT_ENUM_FLAG) -> Result<Vec<IMFActivate>> {
     };
     let output = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_HEVC,
+        guidSubtype: MFVideoFormat_H264,
     };
     let mut array: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
@@ -896,30 +867,26 @@ fn configure(
         refused: Vec::new(),
     };
     let bitrate_bps = bitrate_kbps.saturating_mul(1000);
-    let api = codec_api
-        .as_ref()
-        .ok_or("HEVC encoder exposes no ICodecAPI; cannot require AVLowLatencyMode")?;
-    let low_latency = settings.set(
-        api,
-        "AVLowLatencyMode",
-        &CODECAPI_AVLowLatencyMode,
-        &variant_bool(true),
-    );
-    if !low_latency {
-        return Err("HEVC encoder refused mandatory AVLowLatencyMode".into());
+    if let Some(api) = codec_api.as_ref() {
+        settings.set(
+            api,
+            "AVLowLatencyMode",
+            &CODECAPI_AVLowLatencyMode,
+            &variant_bool(true),
+        );
+        settings.set(
+            api,
+            "AVEncCommonRateControlMode",
+            &CODECAPI_AVEncCommonRateControlMode,
+            &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
+        );
+        settings.set(
+            api,
+            "AVEncCommonMeanBitRate",
+            &CODECAPI_AVEncCommonMeanBitRate,
+            &variant_u32(bitrate_bps),
+        );
     }
-    settings.set(
-        api,
-        "AVEncCommonRateControlMode",
-        &CODECAPI_AVEncCommonRateControlMode,
-        &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
-    );
-    settings.set(
-        api,
-        "AVEncCommonMeanBitRate",
-        &CODECAPI_AVEncCommonMeanBitRate,
-        &variant_u32(bitrate_bps),
-    );
 
     // Contract step 6b — output type first. The encoder derives its input
     // constraints from it, so setting the input type first fails on most MFTs.
@@ -927,14 +894,13 @@ fn configure(
     let output_type = unsafe { MFCreateMediaType() }?;
     unsafe {
         output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        output_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC)?;
+        output_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
         output_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps)?;
         output_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_ratio(width, height))?;
         output_type.SetUINT64(&MF_MT_FRAME_RATE, pack_ratio(fps, 1))?;
         output_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1))?;
         output_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        output_type.SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?;
-        output_type.SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH265VLevel4_1.0 as u32)?;
+        output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)?;
         output_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
         output_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
         output_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
@@ -961,9 +927,6 @@ fn configure(
     // Contract step 6c — the GOP and B-frame settings, which several encoders only
     // accept once the types are in place.
     if let Some(api) = codec_api.as_ref() {
-        // Microsoft's HEVC encoder does not promise this H.264-era property.
-        // Refusal is explicit and harmless because mandatory low-latency mode is
-        // the no-reorder contract.
         settings.set(
             api,
             "AVEncMPVDefaultBPictureCount",
@@ -1080,7 +1043,7 @@ pub fn create(
     }
 
     Err(format!(
-        "no usable HEVC encoder MFT for {width}x{height}. Candidates tried:\n  {}",
+        "no usable H.264 encoder MFT for {width}x{height}. Candidates tried:\n  {}",
         if failures.is_empty() {
             "none enumerated".to_owned()
         } else {

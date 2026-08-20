@@ -26,6 +26,41 @@ pub const MSG_RECTS: u8 = 3;
 /// codec follows the wire version: H.264 through v3, HEVC in v4. A new type rather
 /// than a changed `MSG_VIDEO` payload lets older readers skip it safely.
 pub const MSG_VIDEO_SEQ: u8 = 4;
+/// H.264 tile access unit: tile id + capture sequence + Annex B bytes.
+pub const MSG_VIDEO_TILE: u8 = 5;
+
+/// `[tile_id: u8][reserved: 3][capture_seq: u64 LE]`.
+pub const TILE_AU_PREFIX: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileAu<'a> {
+    pub tile_id: u8,
+    pub capture_seq: u64,
+    pub au: &'a [u8],
+}
+
+pub fn encode_tile_au(tile_id: u8, capture_seq: u64, au: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(TILE_AU_PREFIX + au.len());
+    payload.push(tile_id);
+    payload.extend_from_slice(&[0; 3]);
+    payload.extend_from_slice(&capture_seq.to_le_bytes());
+    payload.extend_from_slice(au);
+    payload
+}
+
+pub fn decode_tile_au(payload: &[u8]) -> Result<TileAu<'_>, &'static str> {
+    if payload.len() < TILE_AU_PREFIX {
+        return Err("tile access unit is shorter than its 12-byte prefix");
+    }
+    if payload[1..4] != [0; 3] {
+        return Err("tile access unit reserved bytes are non-zero");
+    }
+    Ok(TileAu {
+        tile_id: payload[0],
+        capture_seq: u64::from_le_bytes(payload[4..12].try_into().expect("8 bytes")),
+        au: &payload[TILE_AU_PREFIX..],
+    })
+}
 
 /// Header bytes ahead of the payload: the length field plus the type byte.
 pub const HEADER_LEN: usize = 5;
@@ -172,6 +207,16 @@ mod tests {
         let mut r = Reassembler::default();
         r.push(&wire);
         r.next_message().unwrap().unwrap()
+    }
+
+    #[test]
+    fn tile_access_unit_prefix_keeps_tile_and_capture_sequence_distinct() {
+        let payload = encode_tile_au(1, 0x0102_0304_0506_0708, &[0x65, 0xaa]);
+        let tile = decode_tile_au(&payload).expect("valid tile payload");
+        assert_eq!(tile.tile_id, 1);
+        assert_eq!(tile.capture_seq, 0x0102_0304_0506_0708);
+        assert_eq!(tile.au, &[0x65, 0xaa]);
+        assert!(decode_tile_au(&payload[..TILE_AU_PREFIX - 1]).is_err());
     }
 
     #[test]

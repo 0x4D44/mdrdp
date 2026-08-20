@@ -7,13 +7,14 @@ Derived from microsoft/Windows-driver-samples@717778a2 (MIT) for the mdrdp laten
 Abstract:
 
     An indirect display driver that exposes ONE EDID-less virtual monitor capable of
-    1920x1080 at 240/120/60 Hz. It is a measurement instrument for the mdrdp latency
-    spike, not a shipping display driver.
+    5120x2880 and 2560x1440 at 240/120/60 Hz, plus the original compatibility
+    modes. It is a measurement instrument for the mdrdp latency spike, not a
+    shipping display driver.
 
     Differences from the Microsoft sample this is derived from:
       * WPP tracing removed entirely (no Trace.h, no Driver.tmh).
       * One monitor, always EDID-less - the sample's static EDID table is gone.
-      * Monitor/target mode lists retuned for high-refresh 1080p.
+      * Monitor/target mode lists retuned for high-refresh 5K and 1440p.
       * Frame-cadence instrumentation added to SwapChainProcessor::RunCore.
       * Each acquired frame is published to a user-mode server through a named shared
         texture pool - see SharedPool.h. That is the point of the driver now; the
@@ -46,6 +47,12 @@ static constexpr DWORD MDRDP_IDD_FRAME_LOG_INTERVAL = 600;
 // Default modes reported for the EDID-less monitor. The first mode is set as preferred.
 static const struct IndirectSampleMonitor::SampleMonitorMode s_MdrdpDefaultModes[] =
 {
+    { 5120, 2880, 240 },
+    { 5120, 2880, 120 },
+    { 5120, 2880,  60 },
+    { 2560, 1440, 240 },
+    { 2560, 1440, 120 },
+    { 2560, 1440,  60 },
     { 1920, 1080, 240 },
     { 1920, 1080, 120 },
     { 1920, 1080,  60 },
@@ -740,6 +747,10 @@ NTSTATUS IddSampleMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_
     // monitor's descriptor and instead are based on the static processing capability of the device. The OS will
     // report the available set of modes for a given output as the intersection of monitor modes with target modes.
 
+    TargetModes.push_back(CreateIddCxTargetMode(5120, 2880, 240));
+    TargetModes.push_back(CreateIddCxTargetMode(5120, 2880, 120));
+    TargetModes.push_back(CreateIddCxTargetMode(5120, 2880,  60));
+    TargetModes.push_back(CreateIddCxTargetMode(2560, 1440, 240));
     TargetModes.push_back(CreateIddCxTargetMode(2560, 1440, 120));
     TargetModes.push_back(CreateIddCxTargetMode(2560, 1440,  60));
     TargetModes.push_back(CreateIddCxTargetMode(1920, 1080, 240));

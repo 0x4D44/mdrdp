@@ -18,6 +18,7 @@
 //! until the AU that closes its gap arrives; painting over a hole would lose
 //! the missing frame's content forever (transport HLD decisions 13/16).
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ironrdp_egfx::decode::H264Decoder;
 use rhydra::aux_proto::AudioFrame;
 use rhydra::auxchan::{self, Outbox};
 use rhydra::framing::{self, Reassembler};
@@ -34,7 +36,6 @@ use rhydra::rects::{self, RectUpdate};
 
 use crate::audio::{AudioFormatSummary, AudioRing};
 use crate::clipboard::ArboardClipboard;
-use crate::hevc::VideoDecoder;
 use crate::input::{InputEvent, MouseButton, ScrollAxis};
 use crate::session::{SessionCommand, SessionEnd};
 use crate::stats::StatsHandle;
@@ -43,7 +44,7 @@ use crate::wake::{self, DoorbellReceiver};
 use crate::window::Waker;
 
 use super::clipboard::{COUNTERS, TextOnly};
-use super::probe::ProbedTransport;
+use super::probe::{ProbedTransport, TileHeader};
 use super::ssh::Tunnel;
 use rhydra::clipboard::{self as clip, Bridge, Policy, TextClipboard};
 
@@ -51,7 +52,7 @@ use rhydra::clipboard::{self as clip, Bridge, Policy, TextClipboard};
 pub const OUTPUT_SURFACE: u16 = 0;
 
 /// The codec label the title bar and HUD show for native frames.
-const CODEC_LABEL: &str = "HEVC (rhydra)";
+const CODEC_LABEL: &str = "AVC (rhydra)";
 
 /// How often the local clipboard is read. Matches the RDP bridge's cadence:
 /// macOS has no change notification worth using, so this is a poll.
@@ -208,7 +209,7 @@ impl NativeHandle {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     transport: ProbedTransport,
-    decoder: Option<Box<dyn VideoDecoder>>,
+    decoders: Vec<Box<dyn H264Decoder>>,
     store: Arc<Mutex<SurfaceStore>>,
     input_rx: Receiver<InputEvent>,
     commands: Receiver<SessionCommand>,
@@ -277,8 +278,9 @@ pub fn spawn(
 
     let net_stop = Arc::clone(&stop);
     let net_input_sock = conn.input.try_clone()?;
-    let mut sink = NativeSink::new(
-        decoder,
+    let mut sink = NativeSink::new_tiled(
+        decoders,
+        conn.header.tiles.clone(),
         store,
         (conn.header.width, conn.header.height),
         Box::new(move || {
@@ -616,6 +618,10 @@ fn pump_video(
                         sink.on_au(&m.payload[8..], Some(seq))
                     }
                 }
+                framing::MSG_VIDEO_TILE => match framing::decode_tile_au(&m.payload) {
+                    Ok(tile) => sink.on_tile_au(tile.tile_id, tile.au, tile.capture_seq),
+                    Err(e) => Err(format!("MSG_VIDEO_TILE: {e}")),
+                },
                 framing::MSG_VIDEO => sink.on_au(&m.payload, None),
                 framing::MSG_STATS => Ok(()), // per-frame server stats: not consumed yet
                 _ => Ok(()),                  // unknown types skip by design
@@ -806,7 +812,9 @@ impl InputClock {
 /// The decode-and-composite state: the viewer's exactness machinery, writing
 /// into the shared store instead of a private canvas.
 pub(crate) struct NativeSink {
-    decoder: Option<Box<dyn VideoDecoder>>,
+    decoder: Option<Box<dyn H264Decoder>>,
+    tile_decoders: Vec<TileDecodeState>,
+    tile_frames: BTreeMap<u64, TileFrameProgress>,
     store: Arc<Mutex<SurfaceStore>>,
     wire_size: (u32, u32),
     /// The capture seq surface 0 is exact through. `None` until the first AU
@@ -826,9 +834,23 @@ pub(crate) struct NativeSink {
     pub(crate) held: u64,
 }
 
+struct TileDecodeState {
+    header: TileHeader,
+    decoder: Box<dyn H264Decoder>,
+    exact_through: Option<u64>,
+    has_base: bool,
+}
+
+struct TileFrameProgress {
+    seen: Vec<bool>,
+    bytes: u64,
+    decode_us: u32,
+}
+
 impl NativeSink {
+    #[cfg(test)]
     pub(crate) fn new(
-        decoder: Option<Box<dyn VideoDecoder>>,
+        decoder: Option<Box<dyn H264Decoder>>,
         store: Arc<Mutex<SurfaceStore>>,
         wire_size: (u32, u32),
         wake: Box<dyn Fn() + Send>,
@@ -837,6 +859,52 @@ impl NativeSink {
     ) -> Self {
         Self {
             decoder,
+            tile_decoders: Vec::new(),
+            tile_frames: BTreeMap::new(),
+            store,
+            wire_size,
+            exact_through: None,
+            has_base: false,
+            pending: None,
+            wake,
+            stats,
+            input_clock,
+            suppressed: 0,
+            skipped_stale: 0,
+            skipped_empty: 0,
+            skipped_before_base: 0,
+            held: 0,
+        }
+    }
+
+    pub(crate) fn new_tiled(
+        decoders: Vec<Box<dyn H264Decoder>>,
+        headers: Vec<TileHeader>,
+        store: Arc<Mutex<SurfaceStore>>,
+        wire_size: (u32, u32),
+        wake: Box<dyn Fn() + Send>,
+        stats: StatsHandle,
+        input_clock: InputClock,
+    ) -> Self {
+        assert_eq!(
+            decoders.len(),
+            headers.len(),
+            "one decoder is required per advertised tile"
+        );
+        let tile_decoders = headers
+            .into_iter()
+            .zip(decoders)
+            .map(|(header, decoder)| TileDecodeState {
+                header,
+                decoder,
+                exact_through: None,
+                has_base: false,
+            })
+            .collect();
+        Self {
+            decoder: None,
+            tile_decoders,
+            tile_frames: BTreeMap::new(),
             store,
             wire_size,
             exact_through: None,
@@ -895,7 +963,7 @@ impl NativeSink {
     pub(crate) fn on_au(&mut self, au: &[u8], seq: Option<u64>) -> Result<(), String> {
         let started = Instant::now();
         let Some(decoder) = self.decoder.as_mut() else {
-            return Err("this build has no hardware HEVC decoder".to_owned());
+            return Err("this build has no hardware H.264 decoder".to_owned());
         };
         let decoded = match decoder.decode(au) {
             Ok(d) => d,
@@ -934,6 +1002,103 @@ impl NativeSink {
         }
         self.exact_through = seq;
         self.has_base = true;
+        (self.wake)();
+        self.try_apply_pending();
+        Ok(())
+    }
+
+    pub(crate) fn on_tile_au(&mut self, tile_id: u8, au: &[u8], seq: u64) -> Result<(), String> {
+        let started = Instant::now();
+        let Some(tile_index) = self
+            .tile_decoders
+            .iter()
+            .position(|tile| tile.header.id == tile_id)
+        else {
+            return Err(format!("host sent unadvertised tile {tile_id}"));
+        };
+        let (header, decoded) = {
+            let tile = &mut self.tile_decoders[tile_index];
+            if tile.has_base && tile.exact_through.is_some_and(|exact| seq <= exact) {
+                self.suppressed += 1;
+                return Ok(());
+            }
+            let decoded = match tile.decoder.decode(au) {
+                Ok(decoded) => decoded,
+                Err(_) => {
+                    self.stats.update(|stats| stats.decode_errors += 1);
+                    return Ok(());
+                }
+            };
+            (tile.header, decoded)
+        };
+        if (decoded.width(), decoded.height()) != (header.width, header.height) {
+            return Err(format!(
+                "tile {tile_id} decoded at {}x{}, expected {}x{}",
+                decoded.width(),
+                decoded.height(),
+                header.width,
+                header.height
+            ));
+        }
+        let bytes = au.len() as u64;
+        let decode_us = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+        let generation = {
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let edge = |value: u32| {
+                u16::try_from(value)
+                    .map_err(|_| format!("tile {tile_id} edge {value} exceeds the canvas"))
+            };
+            let dest = Rect::new(
+                edge(header.x)?,
+                edge(header.y)?,
+                edge(header.x + header.width)?,
+                edge(header.y + header.height)?,
+            );
+            store
+                .blit_bgra_strict(OUTPUT_SURFACE, dest, decoded.data())
+                .map_err(|e| format!("tile blit: {e}"))?;
+            store.generation()
+        };
+        self.tile_decoders[tile_index].exact_through = Some(seq);
+        self.tile_decoders[tile_index].has_base = true;
+
+        let complete = {
+            let progress = self
+                .tile_frames
+                .entry(seq)
+                .or_insert_with(|| TileFrameProgress {
+                    seen: vec![false; self.tile_decoders.len()],
+                    bytes: 0,
+                    decode_us: 0,
+                });
+            progress.seen[tile_index] = true;
+            progress.bytes = progress.bytes.saturating_add(bytes);
+            progress.decode_us = progress.decode_us.saturating_add(decode_us);
+            progress.seen.iter().all(|seen| *seen)
+        };
+        if complete {
+            let progress = self.tile_frames.remove(&seq).expect("entry just completed");
+            self.record_paint(progress.bytes, generation, Some(progress.decode_us));
+        }
+        // A missing tile must not let an unbounded stream of newer AUs accumulate.
+        // Sixteen capture sequences cover 67 ms at 240 Hz; older incomplete rows
+        // can no longer provide useful frame or input-latency telemetry.
+        while self.tile_frames.len() > 16 {
+            let Some(oldest) = self.tile_frames.keys().next().copied() else {
+                break;
+            };
+            self.tile_frames.remove(&oldest);
+        }
+        self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
+        self.exact_through = self
+            .tile_decoders
+            .iter()
+            .map(|tile| tile.exact_through)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|seqs| seqs.into_iter().min());
         (self.wake)();
         self.try_apply_pending();
         Ok(())
@@ -1006,6 +1171,13 @@ impl NativeSink {
             self.record_paint(painted_bytes, generation, None);
         }
         self.exact_through = Some(update.frame_seq);
+        for tile in &mut self.tile_decoders {
+            tile.exact_through = Some(
+                tile.exact_through
+                    .map_or(update.frame_seq, |seq| seq.max(update.frame_seq)),
+            );
+        }
+        self.tile_frames.retain(|seq, _| *seq > update.frame_seq);
         (self.wake)();
         Ok(())
     }
@@ -1094,7 +1266,7 @@ mod tests {
         size: (u32, u32),
     }
 
-    impl VideoDecoder for FakeDecoder {
+    impl H264Decoder for FakeDecoder {
         fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
             let (w, h) = self.size;
             let fill = data.first().copied().unwrap_or(0);
@@ -1130,6 +1302,57 @@ mod tests {
     fn surface_fill(store: &Arc<Mutex<SurfaceStore>>) -> u8 {
         let guard = store.lock().unwrap();
         guard.get(OUTPUT_SURFACE).unwrap().pixels()[0]
+    }
+
+    #[test]
+    fn two_tiles_with_one_capture_sequence_both_paint() {
+        let size = (4, 2);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let tiles = vec![
+            super::super::probe::TileHeader {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            super::super::probe::TileHeader {
+                id: 1,
+                x: 2,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+        ];
+        let decoders: Vec<Box<dyn H264Decoder>> = vec![
+            Box::new(FakeDecoder { size: (2, 2) }),
+            Box::new(FakeDecoder { size: (2, 2) }),
+        ];
+        let stats = StatsHandle::new();
+        let mut sink = NativeSink::new_tiled(
+            decoders,
+            tiles,
+            Arc::clone(&store),
+            size,
+            Box::new(|| {}),
+            stats.clone(),
+            InputClock::default(),
+        );
+
+        sink.on_tile_au(0, &[0x11], 7).unwrap();
+        assert_eq!(stats.snapshot().frames, 0, "half a 5K frame is not a frame");
+        sink.on_tile_au(1, &[0x22], 7).unwrap();
+        assert_eq!(stats.snapshot().frames, 1, "both tiles are one frame");
+
+        let guard = store.lock().unwrap();
+        let pixels = guard.get(OUTPUT_SURFACE).unwrap().pixels();
+        assert_eq!(pixels[0], 0x11);
+        assert_eq!(pixels[(2 * 4) as usize], 0x22);
     }
 
     /// One 1x1 BGRA rect update at (0,0) with the given seq and blue value.

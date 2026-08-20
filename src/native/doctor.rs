@@ -276,6 +276,9 @@ mod tests {
             },
             device_present: true,
             display_mode: None,
+            desired_display_mode: Default::default(),
+            desktop_scale_percent: 100,
+            desired_desktop_scale_percent: 100,
             mode_ok: true,
             server: ChildReport {
                 running: true,

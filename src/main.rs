@@ -805,6 +805,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let fullscreen =
         force_fullscreen || (!explicit_size && remembered.unwrap_or(target.fullscreen));
 
+    // Decide the client's backing-pixel request before choosing a transport. RDP
+    // advertises it in GCC; rhydra sends the same intent to its IDD agent before
+    // opening video. Native deliberately does not pass through RDP's 4096x2304
+    // codec ceiling: 5120x2880 is the product target and is split on the host.
+    let primary_display = (fullscreen && !explicit_size)
+        .then(mdrdp::display::primary_display)
+        .flatten();
+    let native_display = match primary_display {
+        Some(d) if matches!((d.width, d.height), (5120, 2880) | (2560, 1440)) => {
+            mdrdp::native::probe::DisplayRequest {
+                width: d.width,
+                height: d.height,
+                hz: 240,
+                scale_percent: d.scale_percent,
+            }
+        }
+        _ if explicit_size
+            && matches!(
+                (u32::from(target.size.0), u32::from(target.size.1)),
+                (5120, 2880) | (2560, 1440)
+            ) =>
+        {
+            mdrdp::native::probe::DisplayRequest {
+                width: u32::from(target.size.0),
+                height: u32::from(target.size.1),
+                hz: 240,
+                scale_percent: 100,
+            }
+        }
+        _ => mdrdp::native::probe::DisplayRequest {
+            width: 2560,
+            height: 1440,
+            hz: 240,
+            scale_percent: 100,
+        },
+    };
+
     // Built before connecting so a headless machine fails here, with a clear message,
     // rather than after a connection has been established and a logon spent.
     let event_loop = SessionWindow::event_loop()?;
@@ -843,9 +880,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break 'native None;
         }
         let always = target.native == mdrdp::favourites::NativeMode::Always;
-        if !mdrdp::hevc::hardware_decode_available() {
+        if !mdrdp::h264::hardware_decode_available() {
             let why =
-                "no hardware HEVC decoder is available, and the native transport is HEVC-only";
+                "no hardware H.264 decoder is available, and the native transport is AVC-only";
             if always {
                 return Err(format!("--native: {why}").into());
             }
@@ -867,6 +904,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         match mdrdp::native::probe::establish(
             &target.host,
             target.ssh_user.as_deref(),
+            native_display,
             live_stages.as_ref(),
         ) {
             Ok(transport) => Some(transport),
@@ -922,8 +960,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let is_native = native_conn.is_some();
-    if is_native && explicit_size {
-        eprintln!("note: --size is ignored on the native transport (the host owns the resolution)");
+    if is_native {
+        eprintln!(
+            "native: requested IDD {}x{} @ {} Hz, Windows scale {}%",
+            native_display.width,
+            native_display.height,
+            native_display.hz,
+            native_display.scale_percent
+        );
     }
 
     let store = Arc::new(Mutex::new(SurfaceStore::new()));
@@ -1105,18 +1149,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // failure (headless, non-macOS) falls back to today's connect-then-renegotiate.
         // The probe reads the *primary* monitor; if the window actually opens elsewhere,
         // the start-up renegotiation still corrects it.
-        let fullscreen_plan =
-            (fullscreen && !explicit_size && settings.graphics.dynamic_resolution)
-                .then(mdrdp::display::primary_display)
-                .flatten()
-                .map(|d| {
-                    mdrdp::session::fullscreen_request(
-                        d.width,
-                        d.height,
-                        d.scale_percent,
-                        settings.graphics.integer_fullscreen_fit,
-                    )
-                });
+        let fullscreen_plan = if settings.graphics.dynamic_resolution {
+            primary_display.map(|d| {
+                mdrdp::session::fullscreen_request(
+                    d.width,
+                    d.height,
+                    d.scale_percent,
+                    settings.graphics.integer_fullscreen_fit,
+                )
+            })
+        } else {
+            None
+        };
 
         #[allow(clippy::cast_possible_truncation)]
         let opts = ConnectOptions {
@@ -1636,28 +1680,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_bell,
             session_wake_rx,
         )),
-        Connected::Native(transport) => ActiveSession::Native(
-            mdrdp::native::session::spawn(
-                *transport,
-                mdrdp::hevc::hardware_decoder(),
-                Arc::clone(&store),
-                input_rx,
-                command_rx,
-                waker,
-                session_stats.clone(),
-                session_wake_rx,
-                mdrdp::native::clipboard::Policy {
-                    to_remote: clipboard_to_remote,
-                    from_remote: clipboard_from_remote,
-                    // Text only this tranche, so the image ceiling does not
-                    // apply; the wire ceiling is the binding one and the Policy
-                    // default already carries it.
-                    ..Default::default()
-                },
-                native_audio,
+        Connected::Native(transport) => {
+            let decoder_count = transport.conn.header.tiles.len();
+            let decoders = (0..decoder_count)
+                .map(|_| {
+                    mdrdp::h264::hardware_decoder()
+                        .ok_or_else(|| "native H.264 decoder disappeared after probing".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ActiveSession::Native(
+                mdrdp::native::session::spawn(
+                    *transport,
+                    decoders,
+                    Arc::clone(&store),
+                    input_rx,
+                    command_rx,
+                    waker,
+                    session_stats.clone(),
+                    session_wake_rx,
+                    mdrdp::native::clipboard::Policy {
+                        to_remote: clipboard_to_remote,
+                        from_remote: clipboard_from_remote,
+                        // Text only this tranche, so the image ceiling does not
+                        // apply; the wire ceiling is the binding one and the Policy
+                        // default already carries it.
+                        ..Default::default()
+                    },
+                    native_audio,
+                )
+                .map_err(|e| format!("native session: {e}"))?,
             )
-            .map_err(|e| format!("native session: {e}"))?,
-        ),
+        }
     };
 
     // A scripted run must end the way a user closing the window does — through the

@@ -27,6 +27,7 @@ use super::Result;
 use crate::colorspace;
 use std::mem::ManuallyDrop;
 use windows::core::Interface;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
     ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
@@ -75,6 +76,23 @@ impl Nv12Converter {
         height: u32,
         fps: u32,
     ) -> Result<Self> {
+        Self::new_region(device, context, width, height, 0, 0, width, height, fps)
+    }
+
+    /// Convert one fixed source rectangle into a same-sized NV12 output. A 5K
+    /// desktop owns two instances, one for each 2560-pixel-wide vertical tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_region(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        source_width: u32,
+        source_height: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<Self> {
         let video_device: ID3D11VideoDevice = device.cast()?;
         let video_context: ID3D11VideoContext = context.cast()?;
 
@@ -85,8 +103,8 @@ impl Nv12Converter {
         let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputFrameRate: rate,
-            InputWidth: width,
-            InputHeight: height,
+            InputWidth: source_width,
+            InputHeight: source_height,
             OutputFrameRate: rate,
             OutputWidth: width,
             OutputHeight: height,
@@ -121,8 +139,18 @@ impl Nv12Converter {
                 false,
                 None,
             );
-            // Disable both rect overrides so the blit is a straight full-frame copy.
-            video_context.VideoProcessorSetStreamSourceRect(&processor, 0, false, None);
+            let source_rect = RECT {
+                left: i32::try_from(x)?,
+                top: i32::try_from(y)?,
+                right: i32::try_from(x.saturating_add(width))?,
+                bottom: i32::try_from(y.saturating_add(height))?,
+            };
+            video_context.VideoProcessorSetStreamSourceRect(
+                &processor,
+                0,
+                true,
+                Some(&source_rect),
+            );
             video_context.VideoProcessorSetStreamDestRect(&processor, 0, false, None);
             video_context.VideoProcessorSetOutputTargetRect(&processor, false, None);
         }

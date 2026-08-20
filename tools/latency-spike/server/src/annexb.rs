@@ -1,10 +1,10 @@
 //! Annex B access-unit utilities.
 //!
-//! The receiver cannot build an HEVC decoder before it has VPS/SPS/PPS. Media
+//! The live H.264 receiver needs SPS/PPS before it can decode an IDR. Media
 //! Foundation may publish those sets out of band in `MF_MT_MPEG_SEQUENCE_HEADER`,
-//! but quench's Intel encoder publishes none and sends them in-band instead. The
-//! server caches every in-band triplet, prepends it to a later bare IRAP, and refuses
-//! a bare IRAP when neither route produced a complete triplet.
+//! but some hardware encoders publish none and send them in-band instead. The server
+//! caches either route and prepends the sets to a later bare IDR. The retired HEVC
+//! helpers remain below so archived experiment fixtures stay readable.
 //!
 //! Start-code scanning is safe without any RBSP unescaping: emulation prevention
 //! guarantees the three-byte sequence `00 00 01` cannot occur inside a NAL payload.
@@ -59,6 +59,77 @@ pub fn nal_units(au: &[u8]) -> Vec<&[u8]> {
         i = j;
     }
     units
+}
+
+/// H.264's five-bit NAL type. Kept separate from [`nal_type`], which parses the
+/// retired HEVC experiment and remains available for archived telemetry tests.
+pub fn avc_nal_type(nal: &[u8]) -> Option<u8> {
+    nal.first().map(|byte| byte & 0x1f)
+}
+
+pub fn avc_has_parameter_sets(au: &[u8]) -> bool {
+    let (mut sps, mut pps) = (false, false);
+    for nal in nal_units(au) {
+        match avc_nal_type(nal) {
+            Some(7) => sps = true,
+            Some(8) => pps = true,
+            _ => {}
+        }
+    }
+    sps && pps
+}
+
+pub fn avc_contains_idr(au: &[u8]) -> bool {
+    nal_units(au).iter().any(|nal| avc_nal_type(nal) == Some(5))
+}
+
+/// H.264 SPS/PPS published by Media Foundation or observed in-band.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvcParameterSets {
+    pub sps: Vec<u8>,
+    pub pps: Vec<u8>,
+}
+
+impl AvcParameterSets {
+    pub fn from_sequence_header(blob: &[u8]) -> Option<Self> {
+        let (mut sps, mut pps) = (None, None);
+        for nal in nal_units(blob) {
+            match avc_nal_type(nal) {
+                Some(7) if sps.is_none() => sps = Some(nal.to_vec()),
+                Some(8) if pps.is_none() => pps = Some(nal.to_vec()),
+                _ => {}
+            }
+        }
+        Some(Self {
+            sps: sps?,
+            pps: pps?,
+        })
+    }
+
+    pub fn to_annex_b(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.sps.len() + self.pps.len() + 8);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&self.sps);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&self.pps);
+        out
+    }
+}
+
+pub fn ensure_avc_parameter_sets<'a>(
+    au: &'a [u8],
+    sets: Option<&AvcParameterSets>,
+    keyframe: bool,
+) -> (Cow<'a, [u8]>, bool) {
+    if !keyframe || avc_has_parameter_sets(au) {
+        return (Cow::Borrowed(au), false);
+    }
+    let Some(sets) = sets else {
+        return (Cow::Borrowed(au), false);
+    };
+    let mut out = sets.to_annex_b();
+    out.extend_from_slice(au);
+    (Cow::Owned(out), true)
 }
 
 /// `nal_unit_type` from HEVC's two-byte NAL header.
@@ -455,6 +526,20 @@ pub fn ensure_parameter_sets<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avc_parameter_sets_are_recognised_and_prepended_to_a_bare_idr() {
+        let sps = [0, 0, 0, 1, 0x67, 0x11];
+        let pps = [0, 0, 1, 0x68, 0x22];
+        let idr = [0, 0, 0, 1, 0x65, 0x33];
+        let sets =
+            AvcParameterSets::from_sequence_header(&[sps.as_slice(), pps.as_slice()].concat())
+                .expect("complete SPS/PPS");
+        assert!(avc_contains_idr(&idr));
+        let (ready, prepended) = ensure_avc_parameter_sets(&idr, Some(&sets), true);
+        assert!(prepended);
+        assert!(avc_has_parameter_sets(&ready));
+    }
 
     fn nal4(nal_type: u8, body: &[u8]) -> Vec<u8> {
         let mut v = vec![0, 0, 0, 1, nal_type << 1, 0x01];

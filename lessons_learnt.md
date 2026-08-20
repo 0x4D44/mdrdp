@@ -6,6 +6,11 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Tiled frames need per-tile exactness; one global sequence suppresses later tiles (`native/session.rs:on_tile_au`).
+  All encoders for one capture deliberately carry the same sequence. Gate each decoder chain independently,
+  then advance the desktop's exact-through value to the minimum completed tile. Count the logical frame only
+  when every tile for that sequence has painted, or FPS doubles and input latency closes on a half-frame.
+
 - RDP's Remote Audio endpoint is USER-mode, but only protocol-provider sessions get one; the console never can (PLAN 2026.08.20 tranche 6).
   `MMDevAPI` loads an enumerator DLL (`GetTSAudioEndpointEnumeratorForSession`) only for sessions whose
   Remote Desktop protocol provider names one via `WTS_QUERY_AUDIOENUM_DLL`. No provider, no hook — so a

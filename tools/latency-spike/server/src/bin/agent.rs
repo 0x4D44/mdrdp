@@ -77,6 +77,7 @@ mod win {
         /// guard and the status a caller read can never disagree.
         cycle_challenge: String,
         cycle_requested: bool,
+        display_request: Option<(rhydra::agent::Mode, u32)>,
     }
 
     /// Read the console session's clipboard.
@@ -151,6 +152,7 @@ mod win {
             shutdown_requested: false,
             cycle_challenge: first.cycle_challenge(),
             cycle_requested: false,
+            display_request: None,
         }));
 
         let listener = match TcpListener::bind(("127.0.0.1", CONTROL_PORT)) {
@@ -190,6 +192,11 @@ mod win {
                 if s.cycle_requested {
                     s.cycle_requested = false;
                     rec.request_device_cycle();
+                }
+                if let Some((mode, scale_percent)) = s.display_request.take() {
+                    if let Err(e) = rec.request_display_mode(mode, scale_percent) {
+                        log(&mut log_file, &format!("display request rejected: {e}"));
+                    }
                 }
             }
 
@@ -293,6 +300,25 @@ mod win {
                         Err(e) => {
                             control::error_line(&format!("could not read the clipboard: {e}"))
                         }
+                    }
+                }
+                Ok(Request::PrepareDisplay {
+                    width,
+                    height,
+                    hz,
+                    scale_percent,
+                }) => {
+                    let mode = rhydra::agent::Mode { width, height, hz };
+                    // Validate before acknowledging; the real reconciler receives
+                    // the same already-checked value on its next tick.
+                    let mut validator = Reconciler::new();
+                    match validator.request_display_mode(mode, scale_percent) {
+                        Ok(()) => {
+                            shared.lock().expect("not poisoned").display_request =
+                                Some((mode, scale_percent));
+                            control::ok_line()
+                        }
+                        Err(e) => control::error_line(&e),
                     }
                 }
             };

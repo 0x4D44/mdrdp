@@ -60,6 +60,10 @@ pub struct Header {
     pub output: String,
     pub width: u32,
     pub height: u32,
+    /// Video bitstream contract. Wire v5 is H.264 4:2:0 only.
+    pub codec: &'static str,
+    /// Non-overlapping rectangles that cover the desktop exactly.
+    pub tiles: Vec<TileHeader>,
     /// `MFT_FRIENDLY_NAME_Attribute` of the encoder that was actually selected.
     pub encoder: String,
     /// `async-hardware` or `sync-software`.
@@ -78,7 +82,7 @@ pub struct Header {
     /// terms as `rect_max_count`: a measurement compared against another must be
     /// able to say which threshold each ran under.
     pub diff_idle_gap_ms: u32,
-    /// How VPS/SPS/PPS reach the wire: see `annexb`.
+    /// How SPS/PPS reach the wire: see `annexb`.
     pub parameter_set_route: &'static str,
     /// Whether the out-of-band `MF_MT_MPEG_SEQUENCE_HEADER` was available as a
     /// fallback source of parameter sets.
@@ -99,10 +103,52 @@ pub struct Header {
     pub clipboard: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct TileHeader {
+    pub id: u8,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The experiment's only two product geometries. A 5K desktop is split because
+/// Intel's H.264 MFT cannot encode a 5120-pixel-wide picture.
+pub fn tile_layout(width: u32, height: u32) -> Vec<TileHeader> {
+    if (width, height) == (5120, 2880) {
+        vec![
+            TileHeader {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: 2560,
+                height,
+            },
+            TileHeader {
+                id: 1,
+                x: 2560,
+                y: 0,
+                width: 2560,
+                height,
+            },
+        ]
+    } else {
+        vec![TileHeader {
+            id: 0,
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }]
+    }
+}
+
+/// Schema 9: headers advertise the H.264 codec and exact tile layout, and frame
+/// rows identify the tile whose independently encoded access unit they describe.
 /// Schema 8: frame rows report exact claimed/measured rectangle-union area, the
 /// raw-rectangle attempt/result, and an explicitly pro-rata compressed-byte
 /// estimate for the unchanged portion of the frame.
-/// Schema 7: frame rows carry the validated HEVC stream contract at its current
+/// Schema 7: frame rows carried the retired HEVC stream contract at its current
 /// configuration epoch, plus cumulative fail-closed gate counters.
 /// Schema 6: the header gains `clipboard`, which says whether this host is
 /// listening on the auxiliary channel. `wire_version` deliberately does **not**
@@ -115,14 +161,14 @@ pub struct Header {
 /// (Schema 4: the header gained `source`, naming which capture path the run used.
 /// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
-pub const SCHEMA: u32 = 8;
-/// Bumped 3 → 4 by tranche 6b's H.264 → HEVC bitstream change. `MSG_VIDEO_SEQ`
-/// and the input dialect are unchanged; its access-unit payload is not.
+pub const SCHEMA: u32 = 9;
+/// Bumped 4 → 5 by the return to H.264 and the tiled `MSG_VIDEO_TILE` envelope.
+/// (Bumped 3 → 4 by tranche 6b's H.264 → HEVC bitstream change.
 /// (Bumped 2 → 3 by tranche 3's input dialect (input-channel v2: scan/mouse/wheel
 /// kinds beside the original VK down/up) — the video/rects wire itself is
 /// unchanged, but the header's `wire_version` couples both dialects together so a
 /// client's video-header gate also gates which input records it may send.
-pub const WIRE_VERSION: u32 = 4;
+pub const WIRE_VERSION: u32 = 5;
 
 impl Header {
     pub fn new() -> Self {
@@ -142,6 +188,8 @@ impl Header {
             output: String::new(),
             width: 0,
             height: 0,
+            codec: "h264-420",
+            tiles: Vec::new(),
             encoder: String::new(),
             encoder_kind: "unknown",
             codec_api_applied: Vec::new(),
@@ -184,6 +232,8 @@ pub struct FrameRecord {
     /// value the wire carries on `MSG_VIDEO_SEQ`/`MSG_RECTS`, so client and server
     /// rows join exactly. (Schema 1 counted emitted access units instead.)
     pub frame: u64,
+    /// Which independently encoded tile this row describes (wire v5).
+    pub tile_id: u8,
     pub present_qpc_us: i64,
     pub acquire_qpc_us: i64,
     pub convert_start_us: i64,
@@ -193,25 +243,13 @@ pub struct FrameRecord {
     pub send_done_us: i64,
     pub au_bytes: usize,
     pub keyframe: bool,
-    /// True when this server had to prepend the stored VPS/SPS/PPS itself.
+    /// True when this server had to prepend the stored SPS/PPS itself.
     pub param_sets_prepended: bool,
     /// Encoder output-type epoch whose bitstream contract was parsed and accepted.
     pub config_epoch: u64,
-    /// Parsed from the HEVC SPS. These fields are written on every emitted frame,
-    /// so a live run proves the stream contract was checked rather than merely set.
-    pub profile_idc: u8,
-    pub high_tier: bool,
-    pub level_idc: u8,
-    pub chroma_format_idc: u8,
-    pub bit_depth_luma: u8,
-    pub bit_depth_chroma: u8,
-    pub stream_width: u32,
-    pub stream_height: u32,
-    /// Cumulative IRAPs withheld because no complete VPS/SPS/PPS set existed.
+    /// Cumulative IDRs withheld because no complete SPS/PPS set existed.
     pub param_set_failures: u64,
-    /// Cumulative non-IRAP outputs withheld while a new epoch awaited its IRAP.
-    pub config_wait_drops: u64,
-    /// Cumulative disagreements between MF's CleanPoint flag and the bitstream IRAP.
+    /// Cumulative disagreements between MF's CleanPoint flag and the bitstream IDR.
     pub clean_point_mismatches: u64,
     /// Cumulative count of frames dropped because the send queue was full.
     pub dropped_frames: u64,
@@ -249,7 +287,7 @@ pub struct FrameRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measured_changed_pixels: Option<u64>,
     pub frame_pixels: u64,
-    /// AU bytes multiplied by the unchanged-pixel share. HEVC compression cannot
+    /// AU bytes multiplied by the unchanged-pixel share. H.264 compression cannot
     /// attribute bytes spatially without parsing slices, so the name deliberately
     /// marks this as an estimate rather than measured unchanged-region bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,6 +452,39 @@ pub fn to_line<T: Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn five_k_is_two_vertical_h264_tiles_and_1440p_is_one() {
+        assert_eq!(
+            tile_layout(5120, 2880),
+            vec![
+                TileHeader {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 2560,
+                    height: 2880
+                },
+                TileHeader {
+                    id: 1,
+                    x: 2560,
+                    y: 0,
+                    width: 2560,
+                    height: 2880
+                },
+            ]
+        );
+        assert_eq!(
+            tile_layout(2560, 1440),
+            vec![TileHeader {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440
+            }]
+        );
+    }
     use serde_json::Value;
 
     #[test]
@@ -458,6 +529,7 @@ mod tests {
         // Distinct ascending values: a fixture where all stamps were equal could
         // not tell `encode_submit_us` from `encode_out_us` if they were swapped.
         r.frame = 7;
+        r.tile_id = 1;
         r.present_qpc_us = 1000;
         r.acquire_qpc_us = 1100;
         r.convert_start_us = 1200;
@@ -469,16 +541,7 @@ mod tests {
         r.keyframe = true;
         r.param_sets_prepended = true;
         r.config_epoch = 4;
-        r.profile_idc = 1;
-        r.high_tier = true;
-        r.level_idc = 123;
-        r.chroma_format_idc = 1;
-        r.bit_depth_luma = 8;
-        r.bit_depth_chroma = 8;
-        r.stream_width = 1920;
-        r.stream_height = 1080;
         r.param_set_failures = 2;
-        r.config_wait_drops = 7;
         r.clean_point_mismatches = 3;
         r.dropped_frames = 3;
         r.dropped_rects = 5;
@@ -503,6 +566,7 @@ mod tests {
         let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
         assert_eq!(v["record"], "frame");
         assert_eq!(v["frame"], 7);
+        assert_eq!(v["tile_id"], 1);
         assert_eq!(v["present_qpc_us"], 1000);
         assert_eq!(v["acquire_qpc_us"], 1100);
         assert_eq!(v["convert_start_us"], 1200);
@@ -514,16 +578,7 @@ mod tests {
         assert_eq!(v["keyframe"], true);
         assert_eq!(v["param_sets_prepended"], true);
         assert_eq!(v["config_epoch"], 4);
-        assert_eq!(v["profile_idc"], 1);
-        assert_eq!(v["high_tier"], true);
-        assert_eq!(v["level_idc"], 123);
-        assert_eq!(v["chroma_format_idc"], 1);
-        assert_eq!(v["bit_depth_luma"], 8);
-        assert_eq!(v["bit_depth_chroma"], 8);
-        assert_eq!(v["stream_width"], 1920);
-        assert_eq!(v["stream_height"], 1080);
         assert_eq!(v["param_set_failures"], 2);
-        assert_eq!(v["config_wait_drops"], 7);
         assert_eq!(v["clean_point_mismatches"], 3);
         assert_eq!(v["dropped_frames"], 3);
         assert_eq!(v["dropped_rects"], 5);
@@ -543,7 +598,7 @@ mod tests {
         assert_eq!(v["keyframe_wait_frames"], 17);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 40, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 32, "unexpected field count: {keys:?}");
     }
 
     #[test]
@@ -669,7 +724,10 @@ mod tests {
     fn the_header_publishes_the_frequency_the_encoder_choice_and_the_source() {
         let mut h = Header::new();
         h.qpc_frequency = 10_000_000;
-        h.encoder = "Intel Hardware H265 Encoder MFT".into();
+        h.width = 5120;
+        h.height = 2880;
+        h.tiles = tile_layout(h.width, h.height);
+        h.encoder = "Intel Hardware H264 Encoder MFT".into();
         h.encoder_kind = "async-hardware";
         h.codec_api_applied = vec!["AVLowLatencyMode".into()];
         h.codec_api_refused = vec!["AVEncMPVGOPSize".into()];
@@ -689,7 +747,10 @@ mod tests {
         assert_eq!(v["schema"], SCHEMA);
         assert_eq!(v["wire_version"], WIRE_VERSION);
         assert_eq!(v["qpc_frequency"], 10_000_000);
-        assert_eq!(v["encoder"], "Intel Hardware H265 Encoder MFT");
+        assert_eq!(v["codec"], "h264-420");
+        assert_eq!(v["tiles"][0]["width"], 2560);
+        assert_eq!(v["tiles"][1]["x"], 2560);
+        assert_eq!(v["encoder"], "Intel Hardware H264 Encoder MFT");
         assert_eq!(v["encoder_kind"], "async-hardware");
         assert_eq!(v["codec_api_applied"][0], "AVLowLatencyMode");
         assert_eq!(v["codec_api_refused"][0], "AVEncMPVGOPSize");
@@ -703,6 +764,6 @@ mod tests {
         assert_eq!(v["clipboard"], true);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 25, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 27, "unexpected field count: {keys:?}");
     }
 }
