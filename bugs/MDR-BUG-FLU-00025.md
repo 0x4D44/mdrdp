@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00025 — 5K IDD publishes no frames because every full-surface GPU copy exceeds the fixed 2 ms proof deadline
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** idd/shared-pool
 - **Raised:** 2026-08-20T18:41:47Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260820T184219Z-56b84acc
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00025-run-fix-20260820T184219Z-56b84acc
-- **Owner base:** a24aac8858fda1cdf4634007a84cb6dcee3087de
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-20T18:42:19Z
-- **Owner until:** 2026-08-20T20:42:19Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-20T18:41:47Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-20T18:41:47Z, raised via `deltic bugs new`) -> Fixed (2026-08-20T18:55:53Z, deltic:auto role=fix run=fix-20260820T184219Z-56b84acc branch=task/bug-MDR-BUG-FLU-00025-run-fix-20260820T184219Z-56b84acc code=8bd484e gate=manual)
 
 ## Observation
 
