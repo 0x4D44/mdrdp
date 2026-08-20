@@ -360,9 +360,20 @@ fn transfer(
             if pbcopy(&nonce).is_err() {
                 Outcome::NeverArrived
             } else {
-                match await_host(mdrdp, host, ssh_user, &nonce, sent) {
+                let mut verdict = None;
+                match await_host(mdrdp, host, ssh_user, &nonce, sent, &mut verdict) {
                     Some(ms) => Outcome::Arrived(ms),
-                    None => Outcome::NeverArrived,
+                    None => {
+                        // The attribution, printed at the moment it is known.
+                        // Without it a miss is a mystery for the rest of the run.
+                        match verdict {
+                            Some(line) => println!("soak:   last verdict was: {line}"),
+                            None => println!(
+                                "soak:   no verdict captured — the check never produced output"
+                            ),
+                        }
+                        Outcome::NeverArrived
+                    }
                 }
             }
         }
@@ -432,6 +443,7 @@ fn await_host(
     ssh_user: Option<&str>,
     nonce: &str,
     sent: Instant,
+    last_verdict: &mut Option<String>,
 ) -> Option<f64> {
     while sent.elapsed() < ARRIVAL_DEADLINE {
         let mut cmd = Command::new(mdrdp);
@@ -439,14 +451,31 @@ fn await_host(
         if let Some(user) = ssh_user {
             cmd.arg("--ssh-user").arg(user);
         }
-        let ok = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            return Some(sent.elapsed().as_secs_f64() * 1000.0);
+        // **Capture stdout; do not discard it.**
+        //
+        // The verdict already reads "MISMATCH (host holds N bytes, expected M)",
+        // and that N is the entire difference between "the clipboard lost a
+        // payload" and "the host-side generator overwrote it between our copy
+        // and our check". The nonces differ in length by construction --
+        // `SOAK-mac2host-NNNNNN` is 20 bytes, `SOAKHOST-NNNNNN` is 15 -- so the
+        // reported length says which one the host actually held, without any
+        // content crossing the wire.
+        //
+        // The first eight-hour run reported two non-arrivals and could not
+        // attribute either, because this function threw that answer away.
+        // Having the discriminator available and not recording it cost a whole
+        // overnight run; that is the reason this capture exists.
+        match cmd.stderr(Stdio::null()).output() {
+            Ok(o) if o.status.success() => {
+                return Some(sent.elapsed().as_secs_f64() * 1000.0);
+            }
+            Ok(o) => {
+                let line = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+                if !line.is_empty() {
+                    *last_verdict = Some(line);
+                }
+            }
+            Err(e) => *last_verdict = Some(format!("check could not run: {e}")),
         }
     }
     None
