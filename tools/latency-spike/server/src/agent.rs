@@ -705,7 +705,15 @@ impl Reconciler {
     /// between a known limitation and a bug report.
     fn audio_rung(&self) -> RungReport {
         let (state, detail) = match self.audio_endpoint {
-            Some(true) => (RungState::Ok, None),
+            // Green, with the scope stated. Endpoint loopback captures the
+            // system mix rather than this session's audio, which is an accepted
+            // compromise (per-session capture is not something WASAPI offers) --
+            // and an accepted compromise that nobody can see is indistinguishable
+            // from a defect, which is the same reason this rung exists at all.
+            Some(true) => (
+                RungState::Ok,
+                Some("system mix, including system sounds — not session-scoped".to_owned()),
+            ),
             Some(false) => (
                 RungState::Fail,
                 Some(

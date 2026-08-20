@@ -247,6 +247,18 @@ impl LoopbackCapture {
             unsafe { client.GetService() }.map_err(|e| format!("no capture service: {e}"))?;
         // SAFETY: an initialised client with a capture service.
         unsafe { client.Start() }.map_err(|e| format!("cannot start capture: {e}"))?;
+        // **Say what is being captured.** Endpoint loopback takes the system mix,
+        // not this session's audio, so anything else rendering to the same
+        // endpoint — a service, a notification — is relayed to the client too.
+        // Accepted deliberately (see the HLD's review record: per-session capture
+        // is not something WASAPI offers), and stated here because a compromise
+        // nobody can see is indistinguishable from a defect.
+        eprintln!(
+            "audio: capturing the system mix at {} Hz, {} ch — this includes \
+             system sounds and any other audio on this endpoint, not only the \
+             session's own",
+            format.sample_rate, format.device_channels
+        );
         Ok(Active {
             client,
             capture,
