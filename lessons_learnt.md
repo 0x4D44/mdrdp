@@ -6,6 +6,12 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- RDP's Remote Audio endpoint is USER-mode, but only protocol-provider sessions get one; the console never can (PLAN 2026.08.20 tranche 6).
+  `MMDevAPI` loads an enumerator DLL (`GetTSAudioEndpointEnumeratorForSession`) only for sessions whose
+  Remote Desktop protocol provider names one via `WTS_QUERY_AUDIOENUM_DLL`. No provider, no hook — so a
+  console-owning host (rhydra, Sunshine) cannot borrow it and must supply a real endpoint instead: a
+  signed virtual device (VB-Cable, Steam Streaming Speakers) or an attestation-signed driver of our own.
+
 - Windows opens AUDIO_PLAYBACK_DVC on every RDP session but starts RDPSND only once the desktop plays sound (`audio.rs:session_summary`).
   So an idle remote desktop looks exactly like a server that refused audio: channel open, zero PDUs, no format
   exchange. Testing audio negotiation against a quiet desktop measures nothing. Make the session render sound
