@@ -247,7 +247,77 @@ kiln session reports:
 `-12909` is exactly the status `h264.rs:235` predicted for a decoder decoding without its
 reference frames.
 
-## STILL OPEN: reference continuity is also lost across a suppress/resume
+## REFUTED 2026-08-20: it is not the suppress/resume — it is surface replacement
+
+**The hypothesis below is wrong.** It was mine, and it was built on three unmatched runs
+in which two variables moved at once. Kept, struck through in substance, because the
+evidence that killed it is worth as much as the evidence that raised it.
+
+**What refuted it.** A kiln session on 0.1.79 ran 14h26m and logged **35 suppress / 34
+resume cycles with zero resolution changes**. If suppress/resume broke reference
+continuity, 34 reveals would have shown it. They did not — the failures arrived in a
+single burst, not per reveal, and the repaint-stall detector never fired at all (frames
+kept painting throughout).
+
+**What the epilogue then showed, and it is decisive:**
+
+```
+frames 2996  decode errors 109  undecoded regions 0  surface errors 0
+surfaces +3 -2   reset Some((2560, 1440))
+     71  avc444 luma decode failed:   VideoToolbox decode callback failed (status -12909)
+     35  avc444 chroma decode failed: VideoToolbox decode callback failed (status -12909)
+      2  avc444 chroma decode failed: oscillating SPS/PPS ...; refusing to rebuild
+      1  avc444 luma decode failed:   oscillating SPS/PPS ...; refusing to rebuild
+```
+
+`surfaces +3 -2` — one replacement beyond the +2 -1 baseline — **with no resolution change
+anywhere in the log**. The server rebuilt its output surface of its own accord. 106 of the
+109 failures are `-12909`: decoding without reference frames.
+
+Re-reading the three runs that misled me, the error run was also the only one with extra
+surface churn:
+
+| run | reveal | surfaces | errors |
+|---|---|---|---|
+| `--size`, 40 s | no | +2 -1 | 0 |
+| pre-fix `--fullscreen` | no | +2 -1 | 0 |
+| fixed `--fullscreen` | yes | **+3 -2** | **11** |
+
+Both variables moved; I attributed it to the one I was already thinking about.
+
+**Consequence:** suppress-on-occlusion is not implicated, so Arthur's decision to keep it
+carries no hidden cost, and the minimal-allow-rect and forced-resync ideas explored on the
+way here are all unnecessary.
+
+## Fix 2026-08-20: reset the decoder when the surface it decodes for changes
+
+A surface's size is fixed at `CreateSurface`, so any rebuild of the output — a resolution
+change, or the server's own decision — **replaces** it, and the replacement is a new H.264
+sequence. One decoder serves the whole channel (the August HLD's decision, unchanged), so
+it carried the previous surface's reference frames into a video they do not belong to.
+
+`retarget_decoder` in `vendor/ironrdp-egfx/src/client.rs` now resets the decoder when the
+surface it is decoding for changes, from both the AVC444 and AVC420 paths. FreeRDP gets
+the same effect structurally by freeing `surface->h264` in `gdi_DeleteSurface`; this repo's
+own lesson already said it — *codec state dies with the SURFACE, not with ResetGraphics*.
+
+**Keyed on the first frame FOR a surface, not on DeleteSurface**, because the ordering is
+the server's to choose: it may create and start painting the replacement before deleting
+the old one, and a reset fired on that delete would destroy the references of the surface
+now on screen.
+
+Note this is **not** the design rejected as
+`wrk_docs/2026.08.19 - HLD - one H264 decode session per AVC444 view.md`. That proposed
+splitting decoders per AVC444 sub-stream and its premise was refuted. This is the surface
+lifecycle, which is a different axis and was independently justified.
+
+**Known limitation, recorded rather than designed around:** if a server ever kept two
+surfaces live and alternated updates between them, this would reset on every switch and
+thrash. It cannot happen today — multi-monitor is out of scope and every measured session
+shows exactly one live surface — and the fix for it, should it ever arise, is a decoder
+per surface as FreeRDP has.
+
+## Superseded hypothesis (kept for the record): reference continuity across suppress/resume
 
 **This bug is NOT fully fixed.** Removing the ResetGraphics teardown turns a permanent
 black desktop into a short burst that recovers, but decode failures remain, and three live

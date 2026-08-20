@@ -447,6 +447,21 @@ pub struct GraphicsPipelineClient {
     /// dies with the surface (and on CreateSurface id reuse), survives ResetGraphics
     /// like the surfaces themselves.
     avc444_buffers: BTreeMap<u16, Yuv444Buffer>,
+    /// The surface the H.264 decoder currently holds reference frames for.
+    ///
+    /// Each surface is its own H.264 sequence. We keep ONE decoder for the channel
+    /// (`wrk_docs/2026.08.16 - HLD - AVC444v2 decode.md` decision 2), so when the server
+    /// moves to a different surface that decoder's references belong to a video that is
+    /// over, and every P-frame after it fails until the new stream's next IDR. FreeRDP
+    /// does not hit this because its context is per surface (`gdi_DeleteSurface` frees
+    /// `surface->h264`); we get the same effect by resetting on the switch.
+    ///
+    /// Tracked at DECODE time, not on DeleteSurface, because the ordering is the
+    /// server's to choose: it may create and start painting the replacement before
+    /// deleting the old one, and a reset fired on that delete would destroy the
+    /// references of the surface now on screen. The first frame FOR a new surface is
+    /// the unambiguous moment the stream changed.
+    decoder_surface: Option<u16>,
     /// Decoded-frame scratch (main, aux) — an LC=0 update needs both alive at once.
     yuv_scratch: (Yuv420Frame, Yuv420Frame),
     /// RGBA conversion scratch, recycled across updates.
@@ -478,6 +493,7 @@ impl GraphicsPipelineClient {
             frames_queued: 0,
             total_frames_decoded: 0,
             avc444_buffers: BTreeMap::new(),
+            decoder_surface: None,
             yuv_scratch: (Yuv420Frame::default(), Yuv420Frame::default()),
             rgba_scratch: Vec::new(),
             avc_capture: None,
@@ -853,8 +869,14 @@ impl GraphicsPipelineClient {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
-        let Some(ref mut decoder) = self.h264_decoder else {
+        if self.h264_decoder.is_none() {
             debug!("No H.264 decoder configured, skipping AVC420 frame");
+            return Ok(());
+        }
+        // AVC420 shares the one decoder with AVC444's main view, so it is subject to the
+        // same surface-switch reset (see `retarget_decoder`).
+        self.retarget_decoder(surface_id);
+        let Some(ref mut decoder) = self.h264_decoder else {
             return Ok(());
         };
 
@@ -907,6 +929,36 @@ impl GraphicsPipelineClient {
         Ok(())
     }
 
+    /// Point the H.264 decoder at `surface_id`, resetting it if it was holding reference
+    /// frames for a different surface.
+    ///
+    /// mdrdp patch, MDR-BUG-FLUX-00008. A surface's size is fixed at CreateSurface, so a
+    /// resolution change — or any server-side decision to rebuild the output — REPLACES
+    /// it, and the replacement is a new H.264 sequence. Carrying the old surface's
+    /// references into it makes every P-frame fail with `kVTVideoDecoderBadDataErr`
+    /// (-12909) until the new stream happens to send an IDR, which on a mostly-static
+    /// desktop can be a long time: measured on kiln 2026-08-20 as 106 such failures in a
+    /// session that logged `surfaces +3 -2` and no resolution change at all.
+    ///
+    /// Reset only on a real switch. A decoder that has never decoded has nothing to throw
+    /// away, and resetting it there would forfeit the first IDR for nothing.
+    fn retarget_decoder(&mut self, surface_id: u16) {
+        if self.decoder_surface == Some(surface_id) {
+            return;
+        }
+        let previous = self.decoder_surface;
+        if previous.is_some()
+            && let Some(decoder) = self.h264_decoder.as_mut()
+        {
+            debug!(
+                ?previous,
+                surface_id, "surface changed under the decoder; resetting it for the new stream"
+            );
+            decoder.reset();
+        }
+        self.decoder_surface = Some(surface_id);
+    }
+
     /// Decode an AVC444/AVC444v2 update (MS-RDPEGFX 2.2.4.5/2.2.4.6).
     ///
     /// mdrdp patch. The update carries one or two H.264 4:2:0 sub-streams (LC field):
@@ -946,6 +998,7 @@ impl GraphicsPipelineClient {
             debug!("No H.264 decoder configured, skipping AVC444 frame");
             return;
         }
+        self.retarget_decoder(surface_id);
 
         // Wire rects are RDPGFX_RECT16: EXCLUSIVE right/bottom despite the
         // `InclusiveRectangle` typing (upstream artifact — the destRect handling in
@@ -1649,13 +1702,22 @@ mod tests {
         codec_id: Codec1Type,
         stream: &Avc444BitmapStream<'_>,
     ) {
+        deliver_avc444_to(client, 1, codec_id, stream);
+    }
+
+    fn deliver_avc444_to(
+        client: &mut GraphicsPipelineClient,
+        surface_id: u16,
+        codec_id: Codec1Type,
+        stream: &Avc444BitmapStream<'_>,
+    ) {
         let mut bitmap_data = vec![0u8; stream.size()];
         stream
             .encode(&mut WriteCursor::new(&mut bitmap_data))
             .expect("encode avc444 stream");
         client
             .handle_wire_to_surface1(crate::pdu::WireToSurface1Pdu {
-                surface_id: 1,
+                surface_id,
                 codec_id,
                 pixel_format: PixelFormat::XRgb,
                 destination_rectangle: ExclusiveRectangle {
@@ -1667,6 +1729,100 @@ mod tests {
                 bitmap_data,
             })
             .expect("AVC444 must never error the channel");
+    }
+
+    /// A stub that decodes like `StubYuvDecoder` and counts how often it is reset.
+    struct CountingStubDecoder {
+        inner: StubYuvDecoder,
+        resets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl H264Decoder for CountingStubDecoder {
+        fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
+            self.inner.decode(data)
+        }
+        fn decode_yuv420(&mut self, data: &[u8], out: &mut Yuv420Frame) -> DecoderResult<()> {
+            self.inner.decode_yuv420(data, out)
+        }
+        fn supports_yuv420(&self) -> bool {
+            true
+        }
+        fn reset(&mut self) {
+            self.resets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn the_decoder_is_reset_when_the_surface_it_decodes_for_changes() {
+        // MDR-BUG-FLUX-00008. Each surface is its own H.264 sequence, and we keep one
+        // decoder for the channel. When the server replaces the surface — which it does
+        // on a resolution change, and did on kiln with no resolution change at all —
+        // carrying the previous surface's reference frames into the new stream fails
+        // every P-frame with -12909 until the new stream's next IDR. Measured there as
+        // 106 such failures alongside `surfaces +3 -2`.
+        let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = channel();
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(Recorder(tx)),
+            Some(Box::new(CountingStubDecoder {
+                inner: StubYuvDecoder {
+                    width: 64,
+                    height: 48,
+                },
+                resets: std::sync::Arc::clone(&resets),
+            })),
+        );
+        let create = |id: u16| {
+            GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: id,
+                width: 64,
+                height: 48,
+                pixel_format: PixelFormat::XRgb,
+            })
+        };
+        fn luma_frame(payload: &[u8]) -> Avc444BitmapStream<'_> {
+            Avc444BitmapStream {
+                encoding: Encoding::LUMA,
+                stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], payload),
+                stream2: None,
+            }
+        }
+        let (p10, p11, p20, p21) = ([10u8, 0, 0], [11u8, 0, 0], [20u8, 0, 0], [21u8, 0, 0]);
+
+        let _ = client.handle_pdu(create(1));
+        deliver_avc444_to(&mut client, 1, Codec1Type::Avc444v2, &luma_frame(&p10));
+        assert_eq!(
+            resets.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a decoder that has never decoded has nothing to throw away; resetting it \
+             here would forfeit the first IDR for nothing"
+        );
+
+        deliver_avc444_to(&mut client, 1, Codec1Type::Avc444v2, &luma_frame(&p11));
+        assert_eq!(
+            resets.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "staying on one surface is the steady state and must never reset"
+        );
+
+        // The server replaces the surface. The first frame FOR the replacement is the
+        // unambiguous moment the stream changed — not the DeleteSurface, whose ordering
+        // relative to the replacement's first frame is the server's to choose.
+        let _ = client.handle_pdu(create(2));
+        deliver_avc444_to(&mut client, 2, Codec1Type::Avc444v2, &luma_frame(&p20));
+        assert_eq!(
+            resets.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the switch to a new surface must reset the decoder for the new sequence"
+        );
+
+        deliver_avc444_to(&mut client, 2, Codec1Type::Avc444v2, &luma_frame(&p21));
+        assert_eq!(
+            resets.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "settled on the new surface, it must not reset again"
+        );
     }
 
     #[test]
