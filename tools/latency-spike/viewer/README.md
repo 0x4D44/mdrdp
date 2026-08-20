@@ -1,12 +1,12 @@
 # `spike-viewer` — the macOS measuring client for the latency spike
 
-Connects to `rhydra-server` over an SSH tunnel, decodes the H.264 stream it sends,
+Connects to `rhydra-server` over an SSH tunnel, decodes the HEVC stream it sends,
 presents it in a window, and forwards its own keystrokes back on the server's input
 port. It writes one JSON line per frame so the client half of the pipeline is a
 per-stage budget rather than one number.
 
-**The presenter is mdrdp's own.** Decoding is `mdrdp::h264::hardware_decoder()` called
-through `H264Decoder::decode`; presenting is `mdrdp::window::present_into` into a
+**The presenter is mdrdp's own.** Decoding is `mdrdp::hevc::hardware_decoder()` called
+through `VideoDecoder::decode`; presenting is `mdrdp::window::present_into` into a
 `softbuffer` buffer behind a `winit` window, at the crate versions the root
 `Cargo.toml` pins (winit 0.30.13, softbuffer 0.4.8). That is the requirement, not a
 convenience: the spike exists to compare *server and transport* designs, so a
@@ -147,7 +147,7 @@ minus a client `*_us` is meaningless. Differences *within* one file are the meas
 ### `client-header` — first line
 
 `schema`, `clock` (which clock the stamps are on), `connect`, `input`, and `decoder`:
-whether this build has a hardware H.264 decoder at all. `decoder: false` means every
+whether this build has a hardware HEVC decoder at all. `decoder: false` means every
 access unit will be a `decode_error` and the window will stay black.
 
 ### `frame` — one per decoded frame
@@ -155,7 +155,7 @@ access unit will be a `decode_error` and the window will stay black.
 | field | taken when |
 | --- | --- |
 | `recv_done_us` | the `read` that completed this message returned |
-| `decode_in_us` | immediately before `H264Decoder::decode` |
+| `decode_in_us` | immediately before `VideoDecoder::decode` |
 | `decode_out_us` | immediately after it returned |
 | `present_done_us` | immediately after `buffer.present()` returned |
 
@@ -218,7 +218,7 @@ required, not incidental, because a real server's first frames legitimately race
 parameter sets.
 
 Nothing above `app.rs` touches a window, which is what makes that possible. What the
-test does not prove is that a real H.264 stream decodes; that needs a real encoder and
+test does not prove is that a real HEVC stream decodes; that needs a real encoder and
 is the live run's job.
 
 ---

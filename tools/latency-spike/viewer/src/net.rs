@@ -11,6 +11,7 @@
 use std::io::Read;
 
 use rhydra::framing::{self, Reassembler};
+use serde::Deserialize;
 
 use crate::clock::Clock;
 
@@ -18,11 +19,36 @@ use crate::clock::Clock;
 /// sized to swallow a whole small frame per syscall without making the common
 /// few-KB delta frame pay for a large zeroed buffer.
 const READ_CHUNK: usize = 64 * 1024;
+const WIRE_VERSION: u32 = 4;
+
+#[derive(Deserialize)]
+struct ServerHeader<'a> {
+    record: &'a str,
+    wire_version: u32,
+}
+
+fn validate_header(payload: &[u8]) -> Result<(), String> {
+    let header: ServerHeader<'_> = serde_json::from_slice(payload)
+        .map_err(|error| format!("first stats message is not a server header: {error}"))?;
+    if header.record != "header" {
+        return Err(format!(
+            "first stats record is {:?}, expected \"header\"",
+            header.record
+        ));
+    }
+    if header.wire_version != WIRE_VERSION {
+        return Err(format!(
+            "wire version mismatch: host {}, viewer {}",
+            header.wire_version, WIRE_VERSION
+        ));
+    }
+    Ok(())
+}
 
 /// What [`pump`] hands each complete message to.
 pub trait MessageSink {
-    /// One H.264 access unit, Annex B. `seq` is the server's capture sequence
-    /// number when the stream is wire v2 (`MSG_VIDEO_SEQ`), `None` on a legacy
+    /// One HEVC access unit, Annex B. `seq` is the server's capture sequence
+    /// number when the stream is wire v4 (`MSG_VIDEO_SEQ`), `None` on a legacy
     /// `MSG_VIDEO` stream. `recv_done_us` is stamped immediately after the `read`
     /// that completed the message returned — the client's stage 1.
     fn on_video(&mut self, au: &[u8], seq: Option<u64>, recv_done_us: u64);
@@ -89,9 +115,11 @@ pub fn pump<R: Read>(reader: &mut R, clock: &Clock, sink: &mut dyn MessageSink) 
     let mut re = Reassembler::default();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut batch: Vec<framing::Message> = Vec::new();
+    let mut header_accepted = false;
     loop {
         let n = match reader.read(&mut buf) {
-            Ok(0) => return PumpEnd::Eof,
+            Ok(0) if header_accepted => return PumpEnd::Eof,
+            Ok(0) => return PumpEnd::Protocol("server closed before its header".to_owned()),
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return PumpEnd::Io(e),
@@ -105,6 +133,22 @@ pub fn pump<R: Read>(reader: &mut R, clock: &Clock, sink: &mut dyn MessageSink) 
                 Ok(None) => break,
                 Err(e) => return PumpEnd::Framing(e),
             }
+        }
+        if !header_accepted && !batch.is_empty() {
+            let first = &batch[0];
+            if first.msg_type != framing::MSG_STATS {
+                return PumpEnd::Protocol(format!(
+                    "first message type is {}, expected stats header type {}",
+                    first.msg_type,
+                    framing::MSG_STATS
+                ));
+            }
+            if let Err(error) = validate_header(&first.payload) {
+                return PumpEnd::Protocol(error);
+            }
+            sink.on_stats(&first.payload);
+            batch.remove(0);
+            header_accepted = true;
         }
         let is_video = |t: u8| t == framing::MSG_VIDEO || t == framing::MSG_VIDEO_SEQ;
         for pass in 0..2 {
@@ -180,6 +224,13 @@ mod tests {
 
     fn wire(parts: &[(u8, Vec<u8>)]) -> Vec<u8> {
         let mut out = Vec::new();
+        if parts.first().is_none_or(|(kind, _)| *kind != framing::MSG_STATS) {
+            framing::encode(
+                framing::MSG_STATS,
+                br#"{"record":"header","wire_version":4}"#,
+                &mut out,
+            );
+        }
         for (t, p) in parts {
             framing::encode(*t, p, &mut out);
         }
@@ -191,7 +242,10 @@ mod tests {
         // Distinct payloads: a fixture reusing one could not catch video and stats
         // being dispatched to the same handler.
         let bytes = wire(&[
-            (framing::MSG_STATS, br#"{"record":"header"}"#.to_vec()),
+            (
+                framing::MSG_STATS,
+                br#"{"record":"header","wire_version":4}"#.to_vec(),
+            ),
             (framing::MSG_VIDEO, vec![0, 0, 0, 1, 0x65, 0xAA]),
             (framing::MSG_VIDEO, vec![0, 0, 0, 1, 0x41, 0xBB, 0xCC]),
         ]);
@@ -199,7 +253,10 @@ mod tests {
         let end = pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
         assert!(matches!(end, PumpEnd::Eof), "{end}");
         assert_eq!(sink.stats.len(), 1);
-        assert_eq!(sink.stats[0], br#"{"record":"header"}"#);
+        assert_eq!(
+            sink.stats[0],
+            br#"{"record":"header","wire_version":4}"#
+        );
         assert_eq!(sink.video.len(), 2);
         assert_eq!(sink.video[0].0, vec![0, 0, 0, 1, 0x65, 0xAA]);
         assert_eq!(sink.video[0].1, None, "bare MSG_VIDEO carries no seq");
@@ -228,6 +285,36 @@ mod tests {
         let end = pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
         assert!(matches!(end, PumpEnd::Protocol(_)), "{end}");
         assert!(sink.video.is_empty(), "nothing decodable was delivered");
+    }
+
+    #[test]
+    fn a_wire_v3_header_is_refused_before_any_video_is_delivered() {
+        let bytes = wire(&[
+            (
+                framing::MSG_STATS,
+                br#"{"record":"header","wire_version":3}"#.to_vec(),
+            ),
+            (framing::MSG_VIDEO_SEQ, vec![0; 10]),
+        ]);
+        let mut sink = Recorder::default();
+        let end = pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
+        assert!(matches!(end, PumpEnd::Protocol(_)), "{end}");
+        assert!(sink.video.is_empty());
+    }
+
+    #[test]
+    fn video_before_the_header_is_refused_before_decode() {
+        let mut bytes = Vec::new();
+        framing::encode(framing::MSG_VIDEO_SEQ, &[0; 10], &mut bytes);
+        framing::encode(
+            framing::MSG_STATS,
+            br#"{"record":"header","wire_version":4}"#,
+            &mut bytes,
+        );
+        let mut sink = Recorder::default();
+        let end = pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
+        assert!(matches!(end, PumpEnd::Protocol(_)), "{end}");
+        assert!(sink.video.is_empty());
     }
 
     #[test]
@@ -279,7 +366,7 @@ mod tests {
         assert!(matches!(end, PumpEnd::Eof), "{end}");
         assert_eq!(
             sink.order,
-            vec!["rects", "video", "video"],
+            vec!["stats", "rects", "video", "video"],
             "the rect update paints before the batch's decodes"
         );
         assert_eq!(

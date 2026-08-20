@@ -2,7 +2,7 @@
 //!
 //! The measurement only means anything if the client side is held constant, so this
 //! viewer does not have a decoder or a presenter of its own. It calls
-//! [`mdrdp::h264::hardware_decoder`] and [`mdrdp::window::present_into`] — the same
+//! [`mdrdp::hevc::hardware_decoder`] and [`mdrdp::window::present_into`] — the same
 //! two functions an mdrdp session runs — and drives them through `winit` and
 //! `softbuffer` at the versions the client pins. What changes between a spike run and
 //! an mdrdp run is the *server* and the *transport*, which is the whole point.

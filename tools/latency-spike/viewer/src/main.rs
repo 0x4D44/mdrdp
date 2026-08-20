@@ -38,9 +38,9 @@ fn main() -> ExitCode {
     // The decoder is resolved before anything connects: without one every access unit
     // becomes a decode error and the run is worthless, so say so up front rather than
     // after ten thousand refused frames.
-    let decoder = mdrdp::h264::hardware_decoder();
+    let decoder = mdrdp::hevc::hardware_decoder();
     if decoder.is_none() {
-        eprintln!("warning: this build has no hardware H.264 decoder; nothing will be shown");
+        eprintln!("warning: this build has no hardware HEVC decoder; nothing will be shown");
     }
 
     let clock = Clock::new();

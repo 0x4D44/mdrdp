@@ -1,12 +1,8 @@
 //! Decode, and hand the newest frame to the window thread.
 //!
-//! The decoder is `mdrdp::h264::hardware_decoder()` (`src/h264.rs:35`) driven through
-//! `H264Decoder::decode` — the exact call an mdrdp session makes for an AVC420 stream
-//! (`vendor/ironrdp-egfx/src/client.rs:841`), returning RGBA8 at the coded size. Using
-//! `decode` rather than `decode_yuv420` is deliberate: the spike stream is a single
-//! 4:2:0 sub-stream, so there is no AVC444 luma/chroma pair to combine, and `decode`
-//! is the same function plus mdrdp's own YUV→RGBA conversion — the conversion the
-//! presenter downstream expects.
+//! The decoder is `mdrdp::hevc::hardware_decoder()` driven through mdrdp's own
+//! `VideoDecoder` trait, returning RGBA8 at the coded size. The spike stream is one
+//! HEVC Main 4:2:0 8-bit stream; the decoder owns its video-range BT.709 conversion.
 //!
 //! A failed decode skips one frame and keeps the connection, mirroring the mdrdp patch
 //! at that call site: the server's first access units can reach us before the parameter
@@ -18,7 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ironrdp_egfx::decode::H264Decoder;
+use mdrdp::hevc::VideoDecoder;
 use rhydra::{annexb, rects};
 
 use crate::clock::Clock;
@@ -54,7 +50,7 @@ pub struct DamageRect {
 /// use it: the window thread keeps a persistent converted canvas and re-converts just
 /// the damage (`crate::present::present_region_into`) instead of the whole surface.
 ///
-/// `Full` is the honest answer for a decoded access unit — H.264 says nothing about
+/// `Full` is the honest answer for a decoded access unit — HEVC says nothing about
 /// which pixels changed — and also the safe answer for anything this type cannot
 /// describe cheaply, because a full convert is always correct.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,7 +269,7 @@ impl FrameSlot {
 /// Decodes video messages and composites rect updates into [`FrameSlot`], and writes
 /// the client stats lines.
 pub struct DecodeSink {
-    decoder: Option<Box<dyn H264Decoder>>,
+    decoder: Option<Box<dyn VideoDecoder>>,
     slot: Arc<FrameSlot>,
     stats: Arc<StatsLog>,
     clock: Clock,
@@ -309,7 +305,7 @@ struct PendingRects {
 
 impl DecodeSink {
     pub fn new(
-        decoder: Option<Box<dyn H264Decoder>>,
+        decoder: Option<Box<dyn VideoDecoder>>,
         slot: Arc<FrameSlot>,
         stats: Arc<StatsLog>,
         wake: Box<dyn Fn() + Send>,
@@ -505,7 +501,7 @@ impl MessageSink for DecodeSink {
         // The server's own keyframe flag rides its stats line, not the video message,
         // so it is re-derived here from the access unit itself — with the server's
         // module, not a second scanner.
-        let keyframe = annexb::contains_idr(au);
+        let keyframe = annexb::contains_irap(au);
 
         let Some(decoder) = self.decoder.as_mut() else {
             self.note_decode_failure(
@@ -513,7 +509,7 @@ impl MessageSink for DecodeSink {
                 recv_done_us,
                 au,
                 keyframe,
-                "this build has no hardware H.264 decoder".to_owned(),
+                "this build has no hardware HEVC decoder".to_owned(),
             );
             return;
         };
@@ -1032,7 +1028,7 @@ mod tests {
     }
 
     /// A sink with no decoder: every test below drives the rect path only, which is
-    /// the point — the fast path must be testable without an H.264 stream.
+    /// the point — the fast path must be testable without an HEVC stream.
     fn sink_with(log: &TempLog, slot: Arc<FrameSlot>) -> DecodeSink {
         DecodeSink::new(None, slot, log.log.clone(), Box::new(|| {}))
     }

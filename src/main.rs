@@ -866,9 +866,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break 'native None;
         }
         let always = target.native == mdrdp::favourites::NativeMode::Always;
-        if !mdrdp::h264::hardware_decode_available() {
+        if !mdrdp::hevc::hardware_decode_available() {
             let why =
-                "no hardware H.264 decoder is available, and the native transport is AVC-only";
+                "no hardware HEVC decoder is available, and the native transport is HEVC-only";
             if always {
                 return Err(format!("--native: {why}").into());
             }
@@ -1662,7 +1662,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Connected::Native(transport) => ActiveSession::Native(
             mdrdp::native::session::spawn(
                 *transport,
-                mdrdp::h264::hardware_decoder(),
+                mdrdp::hevc::hardware_decoder(),
                 Arc::clone(&store),
                 input_rx,
                 command_rx,

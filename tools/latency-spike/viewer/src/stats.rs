@@ -36,7 +36,7 @@ pub struct Header {
     pub clock: &'static str,
     pub connect: String,
     pub input: String,
-    /// Whether `mdrdp::h264::hardware_decoder()` returned a decoder on this build.
+    /// Whether `mdrdp::hevc::hardware_decoder()` returned a decoder on this build.
     /// Without one, every access unit is a `decode_error` and the window stays black.
     pub decoder: bool,
 }
@@ -64,7 +64,7 @@ pub struct FrameStamps {
     pub seq: Option<u64>,
     /// When the `read` that completed this message returned.
     pub recv_done_us: u64,
-    /// Immediately before `H264Decoder::decode`.
+    /// Immediately before `VideoDecoder::decode`.
     pub decode_in_us: u64,
     /// Immediately after it returned.
     pub decode_out_us: u64,

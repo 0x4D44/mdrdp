@@ -5104,7 +5104,6 @@ dependencies = [
 name = "spike-viewer"
 version = "0.0.0"
 dependencies = [
- "ironrdp-egfx",
  "libc",
  "mdrdp",
  "rhydra",

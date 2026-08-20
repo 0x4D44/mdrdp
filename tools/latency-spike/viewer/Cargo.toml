@@ -25,11 +25,6 @@ rhydra = { path = "../server" }
 softbuffer = "0.4.8"
 winit = "0.30.13"
 
-# `H264Decoder` — the trait `mdrdp::h264::hardware_decoder()` returns. Named directly
-# because a trait must be in scope to be called; the `[patch]` table below makes it the
-# same vendored crate mdrdp itself links.
-ironrdp-egfx = "0.3.0"
-
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

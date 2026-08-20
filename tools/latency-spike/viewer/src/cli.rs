@@ -14,7 +14,7 @@ pub const DEFAULT_TITLE: &str = "spike-viewer";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// Video channel — framed H.264 access units and server stats lines.
+    /// Video channel — framed HEVC access units and server stats lines.
     pub connect: SocketAddr,
     /// Keystroke channel — 8-byte records, viewer to server.
     pub input: SocketAddr,

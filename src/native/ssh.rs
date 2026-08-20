@@ -487,9 +487,9 @@ mod tests {
 
     #[test]
     fn version_mismatch_remedy_names_the_lagging_side() {
-        let old_host = ProbeFailure::VersionMismatch { host: 2, client: 3 };
+        let old_host = ProbeFailure::VersionMismatch { host: 3, client: 4 };
         assert!(old_host.remedy("quench").contains("mdrdp deploy"));
-        let old_client = ProbeFailure::VersionMismatch { host: 4, client: 3 };
+        let old_client = ProbeFailure::VersionMismatch { host: 5, client: 4 };
         assert!(old_client.remedy("quench").contains("update mdrdp"));
     }
 }

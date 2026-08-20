@@ -22,7 +22,7 @@ use crate::sink::DamageRect;
 /// A viewport that maps one stream pixel to one window pixel, centred.
 ///
 /// `None` when the frame cannot be presented at all — a zero dimension, or one past
-/// `u16::MAX`, which `Viewport` cannot describe. Both are impossible from a real H.264
+/// `u16::MAX`, which `Viewport` cannot describe. Both are impossible from a real HEVC
 /// stream and both would otherwise be presented as garbage.
 pub fn one_to_one(
     window_width: u32,

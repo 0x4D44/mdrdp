@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ironrdp_egfx::decode::H264Decoder;
 use rhydra::aux_proto::AudioFrame;
 use rhydra::auxchan::{self, Outbox};
 use rhydra::framing::{self, Reassembler};
@@ -35,6 +34,7 @@ use rhydra::rects::{self, RectUpdate};
 
 use crate::audio::{AudioFormatSummary, AudioRing};
 use crate::clipboard::ArboardClipboard;
+use crate::hevc::VideoDecoder;
 use crate::input::{InputEvent, MouseButton, ScrollAxis};
 use crate::session::{SessionCommand, SessionEnd};
 use crate::stats::StatsHandle;
@@ -51,7 +51,7 @@ use rhydra::clipboard::{self as clip, Bridge, Policy, TextClipboard};
 pub const OUTPUT_SURFACE: u16 = 0;
 
 /// The codec label the title bar and HUD show for native frames.
-const CODEC_LABEL: &str = "AVC (rhydra)";
+const CODEC_LABEL: &str = "HEVC (rhydra)";
 
 /// How often the local clipboard is read. Matches the RDP bridge's cadence:
 /// macOS has no change notification worth using, so this is a poll.
@@ -208,7 +208,7 @@ impl NativeHandle {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     transport: ProbedTransport,
-    decoder: Option<Box<dyn H264Decoder>>,
+    decoder: Option<Box<dyn VideoDecoder>>,
     store: Arc<Mutex<SurfaceStore>>,
     input_rx: Receiver<InputEvent>,
     commands: Receiver<SessionCommand>,
@@ -806,7 +806,7 @@ impl InputClock {
 /// The decode-and-composite state: the viewer's exactness machinery, writing
 /// into the shared store instead of a private canvas.
 pub(crate) struct NativeSink {
-    decoder: Option<Box<dyn H264Decoder>>,
+    decoder: Option<Box<dyn VideoDecoder>>,
     store: Arc<Mutex<SurfaceStore>>,
     wire_size: (u32, u32),
     /// The capture seq surface 0 is exact through. `None` until the first AU
@@ -828,7 +828,7 @@ pub(crate) struct NativeSink {
 
 impl NativeSink {
     pub(crate) fn new(
-        decoder: Option<Box<dyn H264Decoder>>,
+        decoder: Option<Box<dyn VideoDecoder>>,
         store: Arc<Mutex<SurfaceStore>>,
         wire_size: (u32, u32),
         wake: Box<dyn Fn() + Send>,
@@ -895,7 +895,7 @@ impl NativeSink {
     pub(crate) fn on_au(&mut self, au: &[u8], seq: Option<u64>) -> Result<(), String> {
         let started = Instant::now();
         let Some(decoder) = self.decoder.as_mut() else {
-            return Err("this build has no hardware H.264 decoder".to_owned());
+            return Err("this build has no hardware HEVC decoder".to_owned());
         };
         let decoded = match decoder.decode(au) {
             Ok(d) => d,
@@ -1084,7 +1084,7 @@ mod tests {
     }
 
     use super::*;
-    use ironrdp_egfx::decode::{DecodedFrame, DecoderResult, H264Decoder};
+    use ironrdp_egfx::decode::{DecodedFrame, DecoderResult};
     use rhydra::input_proto::decode_record;
     use rhydra::rects::Rect as WireRect;
 
@@ -1094,7 +1094,7 @@ mod tests {
         size: (u32, u32),
     }
 
-    impl H264Decoder for FakeDecoder {
+    impl VideoDecoder for FakeDecoder {
         fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
             let (w, h) = self.size;
             let fill = data.first().copied().unwrap_or(0);

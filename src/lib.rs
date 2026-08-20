@@ -19,6 +19,7 @@ pub mod egfx;
 pub mod favourites;
 pub mod gfx;
 pub mod h264;
+pub mod hevc;
 pub mod hostscripts;
 pub mod input;
 pub mod metrics;

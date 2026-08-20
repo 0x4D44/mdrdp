@@ -6,7 +6,7 @@
 //! server's first frames can legitimately race its parameter sets, so "the stream
 //! self-heals" is a behaviour the viewer has to have, not an optimism.
 //!
-//! What it deliberately does not prove: that a real H.264 stream decodes. That needs
+//! What it deliberately does not prove: that a real HEVC stream decodes. That needs
 //! a real encoder, and it is the live run's job.
 
 use std::io::Write;
@@ -71,26 +71,37 @@ fn encoded(parts: &[(u8, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+fn header() -> (u8, Vec<u8>) {
+    (
+        framing::MSG_STATS,
+        br#"{"record":"header","schema":8,"wire_version":4,"width":1920}"#.to_vec(),
+    )
+}
+
 #[test]
 fn the_receive_path_handles_a_stats_line_and_a_garbage_access_unit() {
     let stats_file = TempStats::new("loopback");
     let stats = Arc::new(StatsLog::create(Some(stats_file.path())).expect("create stats"));
 
-    // A header-shaped server line, then two access units that are not H.264 at all,
+    // A header-shaped server line, then two access units that are not HEVC at all,
     // then another server line. If a refused access unit killed the connection, the
     // trailing line would never arrive — which is what makes it the interesting one.
     let wire = encoded(&[
+        header(),
         (
-            framing::MSG_STATS,
-            br#"{"record":"header","schema":1,"width":1920}"#.to_vec(),
+            framing::MSG_VIDEO_SEQ,
+            [1u64.to_le_bytes().as_slice(), &[0xDE, 0xAD, 0xBE, 0xEF]].concat(),
         ),
-        (framing::MSG_VIDEO, vec![0xDE, 0xAD, 0xBE, 0xEF]),
         (
-            framing::MSG_VIDEO,
-            // Annex B shaped, IDR NAL type, still meaningless to a decoder. The
+            framing::MSG_VIDEO_SEQ,
+            // Annex B shaped, HEVC IDR NAL type, still meaningless to a decoder. The
             // keyframe flag in the record must come out true, which distinguishes
             // "the AU was inspected" from "the field was defaulted".
-            vec![0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33],
+            [
+                2u64.to_le_bytes().as_slice(),
+                &[0, 0, 0, 1, 19 << 1, 0x01, 0x11, 0x22],
+            ]
+            .concat(),
         ),
         (
             framing::MSG_STATS,
@@ -102,7 +113,7 @@ fn the_receive_path_handles_a_stats_line_and_a_garbage_access_unit() {
     let wakes = Arc::new(AtomicUsize::new(0));
     let counter = wakes.clone();
     let mut sink = DecodeSink::new(
-        mdrdp::h264::hardware_decoder(),
+        mdrdp::hevc::hardware_decoder(),
         Arc::new(FrameSlot::new()),
         stats.clone(),
         Box::new(move || {
@@ -159,7 +170,7 @@ fn the_receive_path_handles_a_stats_line_and_a_garbage_access_unit() {
         "the reason is recorded, not just the fact"
     );
     assert_eq!(errors[1]["au_bytes"], 8);
-    assert_eq!(errors[1]["keyframe"], true, "an IDR NAL is a keyframe");
+    assert_eq!(errors[1]["keyframe"], true, "an IRAP NAL is a keyframe");
 }
 
 #[test]
@@ -173,6 +184,7 @@ fn a_malformed_rects_message_ends_the_connection_rather_than_being_survived() {
     let stats = Arc::new(StatsLog::create(Some(stats_file.path())).expect("create stats"));
 
     let wire = encoded(&[
+        header(),
         (framing::MSG_RECTS, vec![0xDE, 0xAD, 0xBE, 0xEF]),
         (
             framing::MSG_STATS,
@@ -182,7 +194,7 @@ fn a_malformed_rects_message_ends_the_connection_rather_than_being_survived() {
     let addr = serve_once(wire);
 
     let mut sink = DecodeSink::new(
-        mdrdp::h264::hardware_decoder(),
+        mdrdp::hevc::hardware_decoder(),
         Arc::new(FrameSlot::new()),
         stats.clone(),
         Box::new(|| {}),
@@ -196,7 +208,7 @@ fn a_malformed_rects_message_ends_the_connection_rather_than_being_survived() {
     );
     stats.flush();
     assert!(
-        stats_file.lines().is_empty(),
+        stats_file.lines().len() == 1,
         "nothing behind the malformed message was processed: {:?}",
         stats_file.lines()
     );
@@ -206,8 +218,11 @@ fn a_malformed_rects_message_ends_the_connection_rather_than_being_survived() {
 fn a_server_that_hangs_up_mid_message_ends_the_pump_without_a_panic() {
     // Half a message: the reassembler must wait for bytes that never come and then
     // report EOF. A viewer that panicked here would take a whole run with it.
-    let mut wire = encoded(&[(framing::MSG_VIDEO, vec![1, 2, 3, 4, 5, 6, 7, 8])]);
-    wire.truncate(7);
+    let mut wire = encoded(&[
+        header(),
+        (framing::MSG_VIDEO_SEQ, vec![1, 2, 3, 4, 5, 6, 7, 8]),
+    ]);
+    wire.truncate(wire.len() - 5);
     let addr = serve_once(wire);
 
     let mut sink = DecodeSink::new(
