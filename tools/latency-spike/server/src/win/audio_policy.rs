@@ -397,17 +397,29 @@ fn endpoint_info(device: &IMMDevice) -> Result<Option<EndpointInfo>, String> {
         .map_err(|error| format!("open audio endpoint properties: {error}"))?;
     let matching = property_string(&store, &PKEY_Device_MatchingDeviceId)?;
     let inf_section = property_string(&store, &PKEY_Device_DriverInfSection)?;
-    let Some(parent) = property_string(&store, &PKEY_Device_Parent)? else {
+    let id = device_id(device)?;
+    let Some(endpoint_devinst) = locate_devnode(&mmdevice_instance_id(&id)) else {
+        return Ok(None);
+    };
+    let Some(parent) = devnode_property_strings(endpoint_devinst, &PKEY_Device_Parent)
+        .into_iter()
+        .next()
+    else {
         return Ok(None);
     };
     if !parent_identity_matches(&parent) {
         return Ok(None);
     }
-    let id = device_id(device)?;
+    let Some(bus_description) =
+        devnode_property_strings(endpoint_devinst, &PKEY_Device_BusReportedDeviceDesc)
+            .into_iter()
+            .next()
+    else {
+        return Ok(None);
+    };
     Ok(Some(EndpointInfo {
         id,
-        bus_description: property_string(&store, &PKEY_Device_BusReportedDeviceDesc)?
-            .ok_or("VB-CABLE endpoint has no bus-reported role description")?,
+        bus_description,
         friendly_name: property_string(&store, &PKEY_Device_FriendlyName)?
             .unwrap_or_else(|| "<unnamed>".to_owned()),
         parent,
@@ -428,18 +440,9 @@ fn parent_identity_matches(parent: &str) -> bool {
     if !parent.to_ascii_uppercase().starts_with("ROOT\\MEDIA\\") {
         return false;
     }
-    let parent_wide = wide(parent);
-    let mut devinst = 0u32;
-    let located = unsafe {
-        CM_Locate_DevNodeW(
-            &mut devinst,
-            PCWSTR::from_raw(parent_wide.as_ptr()),
-            CM_LOCATE_DEVNODE_NORMAL,
-        )
-    };
-    if located != CR_SUCCESS {
+    let Some(devinst) = locate_devnode(parent) else {
         return false;
-    }
+    };
 
     let mut status =
         windows::Win32::Devices::DeviceAndDriverInstallation::CM_DEVNODE_STATUS_FLAGS(0);
@@ -465,6 +468,23 @@ fn parent_identity_matches(parent: &str) -> bool {
         && provider
             .iter()
             .any(|value| value.eq_ignore_ascii_case(VB_MANUFACTURER))
+}
+
+fn mmdevice_instance_id(endpoint_id: &str) -> String {
+    format!(r"SWD\MMDEVAPI\{endpoint_id}")
+}
+
+fn locate_devnode(instance_id: &str) -> Option<u32> {
+    let instance_wide = wide(instance_id);
+    let mut devinst = 0u32;
+    let result = unsafe {
+        CM_Locate_DevNodeW(
+            &mut devinst,
+            PCWSTR::from_raw(instance_wide.as_ptr()),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    };
+    (result == CR_SUCCESS).then_some(devinst)
 }
 
 fn devnode_property_strings(devinst: u32, key: &PROPERTYKEY) -> Vec<String> {
@@ -926,6 +946,14 @@ mod tests {
             Some("two".to_owned()),
             Some("three".to_owned()),
         ]));
+    }
+
+    #[test]
+    fn mmdevice_id_maps_to_its_software_device_devnode() {
+        assert_eq!(
+            mmdevice_instance_id("{0.0.0.00000000}.{511D28FA-B0DB-40F3-A17E-C08B5C8C5C24}"),
+            r"SWD\MMDEVAPI\{0.0.0.00000000}.{511D28FA-B0DB-40F3-A17E-C08B5C8C5C24}"
+        );
     }
 
     #[test]

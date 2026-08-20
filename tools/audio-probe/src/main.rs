@@ -136,6 +136,49 @@ fn stable_parent_identity(parent: &str) -> Option<String> {
 }
 
 #[cfg(windows)]
+fn software_device_facts(
+    device: &windows::Win32::Media::Audio::IMMDevice,
+) -> Option<(String, String)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS,
+    };
+    use windows::Win32::Devices::FunctionDiscovery::{
+        PKEY_Device_BusReportedDeviceDesc, PKEY_Device_Parent,
+    };
+    use windows::Win32::System::Com::CoTaskMemFree;
+
+    let id = unsafe { device.GetId() }.ok()?;
+    let endpoint_id = unsafe {
+        let mut len = 0usize;
+        while *id.0.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(id.0, len))
+    };
+    unsafe { CoTaskMemFree(Some(id.0.cast())) };
+    let instance = wide(&format!(r"SWD\MMDEVAPI\{endpoint_id}"));
+    let mut devinst = 0u32;
+    if unsafe {
+        CM_Locate_DevNodeW(
+            &mut devinst,
+            PCWSTR::from_raw(instance.as_ptr()),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    } != CR_SUCCESS
+    {
+        return None;
+    }
+    let parent = devnode_property_strings(devinst, &PKEY_Device_Parent)
+        .into_iter()
+        .next()?;
+    let bus = devnode_property_strings(devinst, &PKEY_Device_BusReportedDeviceDesc)
+        .into_iter()
+        .next()?;
+    Some((parent, bus))
+}
+
+#[cfg(windows)]
 fn property_string(
     device: &windows::Win32::Media::Audio::IMMDevice,
     key: &windows::Win32::Foundation::PROPERTYKEY,
@@ -201,11 +244,17 @@ fn print_active_endpoint_details(
             .unwrap_or_else(|| "<unnamed>".to_owned());
         let description = property_string(&device, &PKEY_Device_DeviceDesc)
             .unwrap_or_else(|| "<no PnP description>".to_owned());
-        let bus_description = property_string(&device, &PKEY_Device_BusReportedDeviceDesc)
+        let software_facts = software_device_facts(&device);
+        let bus_description = software_facts
+            .as_ref()
+            .map(|(_, bus)| bus.clone())
+            .or_else(|| property_string(&device, &PKEY_Device_BusReportedDeviceDesc))
             .unwrap_or_else(|| "<no bus role>".to_owned());
         let matching = property_string(&device, &PKEY_Device_MatchingDeviceId)
             .unwrap_or_else(|| "<no matching ID>".to_owned());
-        let parent = property_string(&device, &PKEY_Device_Parent)
+        let parent = software_facts
+            .map(|(parent, _)| parent)
+            .or_else(|| property_string(&device, &PKEY_Device_Parent))
             .unwrap_or_else(|| "<no parent>".to_owned());
         let form_factor = property_string(&device, &PKEY_AudioEndpoint_FormFactor)
             .unwrap_or_else(|| "<unknown>".to_owned());
