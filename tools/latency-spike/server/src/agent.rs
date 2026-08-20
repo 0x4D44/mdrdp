@@ -767,7 +767,8 @@ impl Reconciler {
                 RungState::Fail,
                 Some(
                     "no audio render endpoint on this host, so there is nothing to \
-                     capture — audio is unavailable, not broken"
+                     capture — audio is unavailable, not broken; fix: install VB-CABLE \
+                     with mdrdp deploy"
                         .to_owned(),
                 ),
             ),

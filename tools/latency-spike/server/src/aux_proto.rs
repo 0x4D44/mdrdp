@@ -146,6 +146,9 @@ pub struct AudioFrame {
     pub capture_pos: u64,
     /// Interleaved 16-bit LE samples, still as bytes.
     ///
+    /// Empty PCM is the one quiet-window boundary. It resets client continuity
+    /// and is never offered to the audio device; subsequent quiet stays wire-idle.
+    ///
     /// Kept as bytes rather than `Vec<i16>` so the client hands them straight to
     /// the already-tested `pcm16_le_to_f32` without an intermediate conversion.
     pub pcm: Vec<u8>,

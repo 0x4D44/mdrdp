@@ -43,8 +43,9 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ironrdp::core::{Encode, EncodeResult, WriteCursor, ensure_size, impl_as_any};
@@ -268,6 +269,21 @@ pub struct AudioFormatSummary {
 /// No sample data ever lands here — only sizes and counts, matching the clipboard/session
 /// rule that payload content never gets logged.
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct AudioDepthDistribution {
+    /// Number of once-per-second depth observations retained in this distribution.
+    pub n: u64,
+    /// Smallest observed ring depth in interleaved samples.
+    pub min_samples: u64,
+    /// Approximate median observed ring depth in interleaved samples.
+    pub median_samples: u64,
+    /// Largest observed ring depth in interleaved samples.
+    pub max_samples: u64,
+}
+
+const DEPTH_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const DEPTH_HISTOGRAM_BUCKETS: usize = 256;
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AudioStats {
     /// `Wave2` PDUs received from the server.
     pub packets_received: u64,
@@ -308,6 +324,117 @@ pub struct AudioStats {
     /// refused the channel, which is a different fault in a different component
     /// (MDR-BUG-FLUX-00019).
     pub dvc_opens: u64,
+    /// Current number of interleaved samples resident in the playback ring.
+    pub current_depth_samples: u64,
+    /// Fixed-size distribution of the once-per-second ring-depth observations.
+    pub depth_distribution: AudioDepthDistribution,
+    /// Native-only high-water trim events at the 200 ms mark. Each event evicts
+    /// oldest frame-sized data before appending the newest frame. RDPSND leaves
+    /// this at zero because its construction has no high-water policy.
+    pub high_water_trims: u64,
+}
+
+// The fixed 256-bucket array has no blanket `Default` implementation on the
+// supported compiler, so initialize its zeroed state explicitly.
+#[allow(clippy::derivable_impls)]
+impl Default for AudioStats {
+    fn default() -> Self {
+        Self {
+            packets_received: 0,
+            bytes_played: 0,
+            overruns: 0,
+            underruns: 0,
+            device_errors: 0,
+            current_format: None,
+            negotiated_formats: None,
+            dvc_opens: 0,
+            current_depth_samples: 0,
+            depth_distribution: AudioDepthDistribution::default(),
+            high_water_trims: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DepthHistogram {
+    buckets: [u64; DEPTH_HISTOGRAM_BUCKETS],
+    distribution: AudioDepthDistribution,
+}
+
+impl Default for DepthHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: [0; DEPTH_HISTOGRAM_BUCKETS],
+            distribution: AudioDepthDistribution::default(),
+        }
+    }
+}
+
+impl DepthHistogram {
+    fn record_depth_sample(&mut self, depth: usize, capacity: usize) {
+        let capacity = capacity.max(1);
+        let depth = depth.min(capacity) as u64;
+        let distribution = &mut self.distribution;
+        distribution.n = distribution.n.saturating_add(1);
+        if distribution.n == 1 {
+            distribution.min_samples = depth;
+        } else {
+            distribution.min_samples = distribution.min_samples.min(depth);
+        }
+        distribution.max_samples = distribution.max_samples.max(depth);
+
+        let bucket = ((depth * DEPTH_HISTOGRAM_BUCKETS as u64) / capacity as u64)
+            .min((DEPTH_HISTOGRAM_BUCKETS - 1) as u64) as usize;
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+
+        let target = distribution.n.div_ceil(2);
+        let mut seen = 0u64;
+        for (index, &count) in self.buckets.iter().enumerate() {
+            seen = seen.saturating_add(count);
+            if seen >= target {
+                let start = (index * capacity) / DEPTH_HISTOGRAM_BUCKETS;
+                let end = (((index + 1) * capacity) / DEPTH_HISTOGRAM_BUCKETS).min(capacity);
+                distribution.median_samples = ((start + end) / 2) as u64;
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DepthSampler {
+    next_sample_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct DepthTracker {
+    sampler: DepthSampler,
+    histogram: DepthHistogram,
+}
+
+impl Default for DepthSampler {
+    fn default() -> Self {
+        Self {
+            next_sample_at: Instant::now(),
+        }
+    }
+}
+
+impl DepthSampler {
+    fn due(&mut self, now: Instant) -> bool {
+        if now < self.next_sample_at {
+            return false;
+        }
+        self.next_sample_at = now + DEPTH_SAMPLE_INTERVAL;
+        true
+    }
+
+    #[cfg(test)]
+    fn at(now: Instant) -> Self {
+        Self {
+            next_sample_at: now,
+        }
+    }
 }
 
 /// A cloneable read/write handle on a shared [`AudioStats`].
@@ -315,29 +442,72 @@ pub struct AudioStats {
 /// Shared between [`RdpsndBackend`] (network thread), [`AudioRing`] (both threads) and
 /// [`AudioPlayback`] (device-error callback), each of which only ever holds the lock for
 /// an `O(1)` counter bump.
-#[derive(Debug, Clone, Default)]
-pub struct AudioStatsHandle(Arc<Mutex<AudioStats>>);
+#[derive(Debug, Clone)]
+pub struct AudioStatsHandle {
+    stats: Arc<Mutex<AudioStats>>,
+    current_depth_samples: Arc<AtomicU64>,
+    depth_tracker: Arc<Mutex<DepthTracker>>,
+}
+
+impl Default for AudioStatsHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl AudioStatsHandle {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            stats: Arc::new(Mutex::new(AudioStats::default())),
+            current_depth_samples: Arc::new(AtomicU64::new(0)),
+            depth_tracker: Arc::new(Mutex::new(DepthTracker::default())),
+        }
     }
 
     /// A point-in-time copy. Never aliases later mutation.
     pub fn snapshot(&self) -> AudioStats {
-        self.lock().clone()
+        let mut snapshot = self.lock().clone();
+        snapshot.current_depth_samples = self.current_depth_samples.load(Ordering::Acquire);
+        snapshot
     }
 
     fn lock(&self) -> MutexGuard<'_, AudioStats> {
         // A poisoned stats mutex means some other thread panicked while counting — not a
         // reason to bring down a running audio path, so recover the counters.
-        self.0
+        self.stats
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn note<F: FnOnce(&mut AudioStats)>(&self, f: F) {
         f(&mut self.lock());
+    }
+
+    fn note_depth(&self, depth: usize, capacity: usize) {
+        self.current_depth_samples
+            .store(depth as u64, Ordering::Release);
+
+        // This runs from the real-time output callback as well as the producer. Never wait
+        // for telemetry: the next callback can take the once-per-second observation.
+        let mut tracker = match self.depth_tracker.try_lock() {
+            Ok(tracker) => tracker,
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        if !tracker.sampler.due(Instant::now()) {
+            return;
+        }
+        tracker.histogram.record_depth_sample(depth, capacity);
+        let distribution = tracker.histogram.distribution.clone();
+        drop(tracker);
+
+        match self.stats.try_lock() {
+            Ok(mut stats) => stats.depth_distribution = distribution,
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().depth_distribution = distribution;
+            }
+        }
     }
 }
 
@@ -388,10 +558,12 @@ pub fn session_summary(stats: &AudioStats) -> String {
 /// delivery, not a jitter-buffer trying to reconstruct timing — RDPSND carries no
 /// per-sample timestamp finer than the block, so there is nothing more precise to target.
 pub const RING_BUFFER_MS: u64 = 400;
+const NATIVE_HIGH_WATER_MS: u64 = 200;
 
 struct RingBuf {
     samples: VecDeque<f32>,
     capacity: usize,
+    high_water_samples: Option<usize>,
     /// Latches to `true` the first time [`push`](Self::push) receives real samples.
     /// Distinguishes "audio has never arrived yet" from "audio arrived and then the ring
     /// ran dry" — only the latter is a real underrun. See [`pop_into`](Self::pop_into).
@@ -406,24 +578,46 @@ struct RingBuf {
 
 impl RingBuf {
     fn new(capacity: usize) -> Self {
+        Self::new_with_policy(capacity, None)
+    }
+
+    fn new_with_policy(capacity: usize, high_water_samples: Option<usize>) -> Self {
         // A zero-capacity ring can never hold anything to play; clamp to a minimum that
         // is still a real (if aggressively small) buffer rather than a permanent no-op.
         let capacity = capacity.max(1);
         Self {
             samples: VecDeque::with_capacity(capacity),
             capacity,
+            high_water_samples: high_water_samples
+                .map(|high_water| high_water.max(1).min(capacity)),
             has_flowed: false,
             in_gap: false,
         }
     }
 
-    /// Push new samples, evicting the OLDEST buffered sample per sample that would
-    /// otherwise overflow capacity. Returns the number evicted.
+    /// Push one complete incoming frame. The native high-water policy evicts oldest
+    /// buffered data in whole incoming-frame-sized units before appending it; the shared
+    /// hard-cap fallback still evicts oldest samples one at a time. Returns both outcomes.
     ///
     /// Dropping oldest-first is the deliberate policy: latency matters more than
     /// completeness for a remote desktop, so when the network is outrunning the device we
     /// want the buffer to hold what's about to be played, not what already fell behind.
-    fn push(&mut self, incoming: &[f32]) -> u64 {
+    fn push(&mut self, incoming: &[f32]) -> PushResult {
+        let mut trimmed = false;
+        if let Some(high_water) = self.high_water_samples {
+            let projected = self.samples.len().saturating_add(incoming.len());
+            if projected > high_water && !self.samples.is_empty() && !incoming.is_empty() {
+                let excess = projected - high_water;
+                let frame_units = excess.div_ceil(incoming.len());
+                let trim_samples = frame_units
+                    .saturating_mul(incoming.len())
+                    .min(self.samples.len());
+                for _ in 0..trim_samples {
+                    self.samples.pop_front();
+                }
+                trimmed = trim_samples > 0;
+            }
+        }
         if !incoming.is_empty() {
             self.has_flowed = true;
             // Fresh audio ends any dry spell; the next one is a new episode.
@@ -437,7 +631,7 @@ impl RingBuf {
             }
             self.samples.push_back(s);
         }
-        dropped
+        PushResult { dropped, trimmed }
     }
 
     /// Fill `out` from the buffer. Any samples the buffer cannot supply are left at
@@ -467,6 +661,12 @@ impl RingBuf {
         }
         starts_episode
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PushResult {
+    dropped: u64,
+    trimmed: bool,
 }
 
 /// The bounded queue between the network thread (producer) and the cpal callback thread
@@ -501,12 +701,45 @@ impl AudioRing {
         }
     }
 
+    fn with_capacity_policy(
+        capacity_samples: usize,
+        high_water_samples: Option<usize>,
+        stats: AudioStatsHandle,
+    ) -> Self {
+        Self {
+            buf: Arc::new(Mutex::new(RingBuf::new_with_policy(
+                capacity_samples,
+                high_water_samples,
+            ))),
+            stats,
+            enabled: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     /// A ring sized for [`RING_BUFFER_MS`] of audio at the given device format.
     pub fn for_device(sample_rate: u32, channels: u16, stats: AudioStatsHandle) -> Self {
         let capacity = (u64::from(sample_rate) * u64::from(channels) * RING_BUFFER_MS / 1000)
             .try_into()
             .unwrap_or(usize::MAX);
         Self::with_capacity(capacity, stats)
+    }
+
+    /// A native auxiliary ring: the same 400 ms hard capacity as RDPSND, plus a
+    /// native-only 200 ms high-water policy that discards whole incoming frames.
+    pub fn for_native_device(sample_rate: u32, channels: u16, stats: AudioStatsHandle) -> Self {
+        let capacity = (u64::from(sample_rate) * u64::from(channels) * RING_BUFFER_MS / 1000)
+            .try_into()
+            .unwrap_or(usize::MAX);
+        let high_water = (u64::from(sample_rate) * u64::from(channels) * NATIVE_HIGH_WATER_MS
+            / 1000)
+            .try_into()
+            .unwrap_or(usize::MAX);
+        Self::with_capacity_policy(capacity, Some(high_water), stats)
+    }
+
+    #[cfg(test)]
+    fn high_water_samples(&self) -> Option<usize> {
+        self.lock().high_water_samples
     }
 
     /// Producer side: push resampled, channel-mapped samples. Never blocks on the
@@ -525,10 +758,15 @@ impl AudioRing {
         if !self.is_enabled() {
             return;
         }
-        let dropped = guard.push(incoming);
-        if dropped > 0 {
+        let result = guard.push(incoming);
+        self.stats.note_depth(guard.samples.len(), guard.capacity);
+        if result.trimmed {
             self.stats
-                .note(|s| s.overruns = s.overruns.saturating_add(dropped));
+                .note(|s| s.high_water_trims = s.high_water_trims.saturating_add(1));
+        }
+        if result.dropped > 0 {
+            self.stats
+                .note(|s| s.overruns = s.overruns.saturating_add(result.dropped));
         }
     }
 
@@ -549,7 +787,12 @@ impl AudioRing {
             out.fill(0.0);
             return;
         }
-        let is_underrun = self.lock().pop_into(out);
+        let (is_underrun, depth, capacity) = {
+            let mut guard = self.lock();
+            let is_underrun = guard.pop_into(out);
+            (is_underrun, guard.samples.len(), guard.capacity)
+        };
+        self.stats.note_depth(depth, capacity);
         if is_underrun {
             self.stats
                 .note(|s| s.underruns = s.underruns.saturating_add(1));
@@ -563,6 +806,9 @@ impl AudioRing {
         let mut guard = self.lock();
         let n = guard.samples.len();
         guard.samples.clear();
+        let capacity = guard.capacity;
+        drop(guard);
+        self.stats.note_depth(0, capacity);
         n
     }
 
@@ -1007,6 +1253,7 @@ mod tests {
     use ironrdp_rdpsnd::pdu::{
         ClientAudioOutputPdu, ServerAudioFormatPdu, ServerAudioOutputPdu, Version,
     };
+    use std::time::{Duration, Instant};
 
     fn compressed_format(tag: WaveFormat) -> AudioFormat {
         AudioFormat {
@@ -1523,6 +1770,52 @@ mod tests {
     fn ring(capacity: usize) -> (AudioRing, AudioStatsHandle) {
         let stats = AudioStatsHandle::new();
         (AudioRing::with_capacity(capacity, stats.clone()), stats)
+    }
+
+    #[test]
+    fn native_ring_policy_is_enabled_only_by_native_constructor() {
+        let rdpsnd_stats = AudioStatsHandle::new();
+        let rdpsnd = AudioRing::for_device(1_000, 1, rdpsnd_stats.clone());
+        let native = AudioRing::for_native_device(1_000, 1, AudioStatsHandle::new());
+
+        assert_eq!(rdpsnd.high_water_samples(), None);
+        assert_eq!(native.high_water_samples(), Some(200));
+        rdpsnd.push(&vec![0.0; 201]);
+        assert_eq!(rdpsnd_stats.snapshot().high_water_trims, 0);
+        assert_eq!(rdpsnd_stats.snapshot().current_depth_samples, 201);
+    }
+
+    #[test]
+    fn native_ring_trims_oldest_frame_sized_data_and_counts_it() {
+        let stats = AudioStatsHandle::new();
+        let ring = AudioRing::with_capacity_policy(10, Some(4), stats.clone());
+        ring.push(&[1.0, 2.0, 3.0]);
+        ring.push(&[4.0, 5.0]);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.high_water_trims, 1);
+        assert_eq!(snapshot.current_depth_samples, 3);
+        assert_eq!(snapshot.overruns, 0);
+        let mut out = [0.0; 3];
+        ring.pop_into(&mut out);
+        assert_eq!(out, [3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn depth_sampling_is_once_per_second_and_remains_fixed_size() {
+        let start = Instant::now();
+        let mut sampler = DepthSampler::at(start);
+        assert!(sampler.due(start));
+        assert!(!sampler.due(start + Duration::from_millis(999)));
+        assert!(sampler.due(start + Duration::from_secs(1)));
+
+        let mut histogram = DepthHistogram::default();
+        histogram.record_depth_sample(10, 400);
+        histogram.record_depth_sample(30, 400);
+        assert_eq!(histogram.distribution.n, 2);
+        assert_eq!(histogram.distribution.min_samples, 10);
+        assert_eq!(histogram.distribution.max_samples, 30);
+        assert_eq!(histogram.buckets.len(), DEPTH_HISTOGRAM_BUCKETS);
     }
 
     #[test]

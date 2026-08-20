@@ -250,9 +250,27 @@ fn report_session_epilogue(
         // native audio path would have printed nothing at all — which is the
         // same failure as silence that looks like a working connection.
         let (audio_frames, left_hz, right_hz) = mdrdp::native::session::AUDIO.report();
-        if audio_frames > 0 {
-            let underruns = audio_stats.snapshot().underruns;
-            eprintln!("  native: audio frames {audio_frames}  underruns {underruns}");
+        let native_audio = mdrdp::native::session::AUDIO.metrics();
+        let audio = audio_stats.snapshot();
+        if audio_frames > 0
+            || native_audio.queue_drops > 0
+            || native_audio.capture_gaps > 0
+            || audio.high_water_trims > 0
+        {
+            eprintln!(
+                "  native: audio frames {audio_frames}  underruns {}  queue drops {}  \
+                 capture gaps {}  high-water trims {}  ring depth {} samples  \
+                 distribution n={} min={} median={} max={}",
+                audio.underruns,
+                native_audio.queue_drops,
+                native_audio.capture_gaps,
+                audio.high_water_trims,
+                audio.current_depth_samples,
+                audio.depth_distribution.n,
+                audio.depth_distribution.min_samples,
+                audio.depth_distribution.median_samples,
+                audio.depth_distribution.max_samples,
+            );
             if left_hz > 0 || right_hz > 0 {
                 // The signal check, not a frame count. Reported with both ears
                 // named because the whole point is that they differ: the host
@@ -1052,7 +1070,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // which is not known until the stream is open. That affects only how many milliseconds
     // of slack it holds; the conversion below uses the device's actual format.
     let audio_stats = AudioStatsHandle::new();
-    let audio_ring = AudioRing::for_device(48_000, 2, audio_stats.clone());
+    let audio_ring = if is_native {
+        AudioRing::for_native_device(48_000, 2, audio_stats.clone())
+    } else {
+        AudioRing::for_device(48_000, 2, audio_stats.clone())
+    };
     // Settings ▸ Audio: playback off means no device is opened and no RDPSND channel
     // is claimed — the honest form of "no sound", not a joined channel that discards.
     //

@@ -233,6 +233,9 @@ pub struct WinOps {
 
 impl WinOps {
     pub fn new(root: PathBuf) -> Self {
+        if let Err(error) = super::audio_policy::recover_stale_lease() {
+            eprintln!("audio: stale default lease recovery deferred: {error}");
+        }
         Self {
             root,
             creator: None,

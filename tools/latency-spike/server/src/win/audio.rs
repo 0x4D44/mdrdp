@@ -1,25 +1,14 @@
 //! WASAPI loopback capture — the host's real audio source.
 //!
-//! # This code has never executed. Not once.
-//!
-//! Neither fleet host has an audio render endpoint (quench 6 endpoints / 0
-//! active, temper 5 / 0 active; both return `0x80070490` from
-//! `GetDefaultAudioEndpoint` — see `wrk_docs/evidence/`). Loopback capture
-//! attaches to a render endpoint, so on those machines there is nothing to
-//! attach to, and this module type-checks and has never run a single
-//! instruction. Everything below is written from the documented contract, not
-//! from observed behaviour.
-//!
-//! It is written to be **inert until asked**: reachable only through
+//! This path is **inert until asked**: reachable only through
 //! `--audio-source loopback`, which nothing sets by default, and returning
 //! [`Captured::Unavailable`] forever if the endpoint is missing rather than
-//! failing a session. That is the safe shape for code that cannot be tested —
-//! the worst it can do on a host without audio is nothing at all.
-//!
-//! Treat any behaviour here as unverified until a host with a working endpoint
-//! exists. The first person to run it should expect to find something.
+//! failing a session. Portable conversion tests cover the pure behavior; the
+//! Windows COM and device-policy path needs live fleet-host evidence as well.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -41,6 +30,7 @@ const WAVE_FORMAT_PCM_TAG: u16 = 1;
 
 use crate::audio_source::{AudioSource, Captured};
 use crate::aux_proto::AudioFrame;
+use crate::win::audio_policy;
 
 /// The capture buffer we ask WASAPI for, in 100-nanosecond units.
 ///
@@ -64,7 +54,7 @@ thread_local! {
 /// possible failure shape: it looks like a flaky feature rather than a bug.
 /// Caught by a cross-family review; the module's own comment had asserted the
 /// per-thread property that the code did not provide.
-fn ensure_com() {
+pub(crate) fn ensure_com() {
     COM_READY.with(|ready| {
         if !ready.get() {
             // SAFETY: first COM call on this thread.
@@ -107,15 +97,51 @@ pub struct LoopbackCapture {
     /// construction and never retried: a machine does not grow a sound card
     /// mid-session, and retrying would spin.
     inner: Option<Active>,
-    /// Advances across silence as well as audio, because the client needs to
-    /// tell "the desktop was quiet" from "frames were lost".
-    capture_pos: u64,
+    /// Chunks left over after one WASAPI packet was split to the wire ceiling.
+    pending: VecDeque<AudioFrame>,
+    quiet: QuietBoundary,
+}
+
+const QUIET_BOUNDARY_AFTER: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct QuietBoundary {
+    last_audio: Option<Instant>,
+    explicit_silence: bool,
+    sent: bool,
+}
+
+impl QuietBoundary {
+    fn note_audio(&mut self, now: Instant) {
+        self.last_audio = Some(now);
+        self.sent = false;
+    }
+
+    fn note_silence(&mut self) {
+        self.explicit_silence = true;
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        let quiet_long_enough = self
+            .last_audio
+            .is_some_and(|last| now.saturating_duration_since(last) >= QUIET_BOUNDARY_AFTER);
+        if !self.sent && (self.explicit_silence || quiet_long_enough) {
+            self.explicit_silence = false;
+            self.sent = true;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct Active {
     client: IAudioClient,
     capture: IAudioCaptureClient,
     format: MixFormat,
+    /// Keeps the per-user default lease and the inter-process capture guard
+    /// alive for exactly the lifetime of this source.
+    _capture_target: Option<audio_policy::CaptureTarget>,
 }
 
 /// Read a `WAVEFORMATEX` (possibly a `WAVEFORMATEXTENSIBLE`) into what the
@@ -159,7 +185,7 @@ unsafe fn parse_mix_format(ptr: *const WAVEFORMATEX) -> Result<MixFormat, String
         other => {
             return Err(format!(
                 "unsupported mix format tag 0x{other:04x} at {bits} bits"
-            ))
+            ));
         }
     };
     let device_channels = wf.nChannels;
@@ -185,7 +211,8 @@ impl LoopbackCapture {
         match Self::open() {
             Ok(active) => Self {
                 inner: Some(active),
-                capture_pos: 0,
+                pending: VecDeque::new(),
+                quiet: QuietBoundary::default(),
             },
             Err(why) => {
                 // Once, at construction. A message per 10 ms block would turn a
@@ -193,7 +220,8 @@ impl LoopbackCapture {
                 eprintln!("audio: loopback capture unavailable ({why})");
                 Self {
                     inner: None,
-                    capture_pos: 0,
+                    pending: VecDeque::new(),
+                    quiet: QuietBoundary::default(),
                 }
             }
         }
@@ -204,9 +232,33 @@ impl LoopbackCapture {
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
                 .map_err(|e| format!("no device enumerator: {e}"))?;
-        // SAFETY: a valid enumerator.
-        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
-            .map_err(|e| format!("no default render endpoint: {e}"))?;
+        let capture_target = match audio_policy::begin_capture() {
+            Ok(target) => Some(target),
+            Err(error) => {
+                // Preserve the pre-tranche behavior on hosts without CABLE and
+                // on Windows builds where the private policy interface fails.
+                // Automatic default switching is only ever attempted for a
+                // positively identified base CABLE endpoint.
+                eprintln!("audio: VB-CABLE policy unavailable ({error}); using current default");
+                None
+            }
+        };
+        let device = if let Some(target) = capture_target.as_ref() {
+            let endpoint_id_wide: Vec<u16> = target
+                .render_id
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: the endpoint ID is a NUL-terminated string owned for this call.
+            unsafe {
+                enumerator.GetDevice(windows::core::PCWSTR::from_raw(endpoint_id_wide.as_ptr()))
+            }
+            .map_err(|e| format!("cannot open selected VB-CABLE render endpoint: {e}"))?
+        } else {
+            // SAFETY: a valid enumerator.
+            unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+                .map_err(|e| format!("no default render endpoint: {e}"))?
+        };
         // SAFETY: a valid device, no activation parameters.
         let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
             .map_err(|e| format!("cannot activate the audio client: {e}"))?;
@@ -225,6 +277,15 @@ impl LoopbackCapture {
                 return Err(why);
             }
         };
+        if capture_target.is_some() && format.sample_rate != audio_policy::SAMPLE_RATE {
+            // SAFETY: a CoTaskMem allocation returned by GetMixFormat.
+            unsafe { CoTaskMemFree(Some(format_ptr as *const _)) };
+            return Err(format!(
+                "selected VB-CABLE endpoint reports {} Hz, expected {} Hz",
+                format.sample_rate,
+                audio_policy::SAMPLE_RATE
+            ));
+        }
         // SAFETY: a valid client and the mix format it just handed us.
         let init = unsafe {
             client.Initialize(
@@ -263,6 +324,7 @@ impl LoopbackCapture {
             client,
             capture,
             format,
+            _capture_target: capture_target,
         })
     }
 }
@@ -287,28 +349,20 @@ impl Drop for LoopbackCapture {
 
 impl AudioSource for LoopbackCapture {
     fn next_block(&mut self) -> Captured {
+        if let Some(frame) = self.pending.pop_front() {
+            return Captured::Frame(frame);
+        }
         let Some(active) = self.inner.as_ref() else {
             return Captured::Unavailable;
         };
         let stride = active.format.device_channels as usize;
         let out_ch = active.format.send_channels as usize;
-        let max_frames = crate::aux_proto::MAX_AUDIO_BYTES / (out_ch * 2);
-
-        let mut pcm: Vec<u8> = Vec::new();
-        let mut start_pos: Option<u64> = None;
         let mut silent_frames = 0u64;
 
-        // **Drain, do not take one packet per tick.** WASAPI packet sizes vary
-        // and the documented contract is to consume every available packet each
-        // pass. Taking exactly one per 10 ms tick means a single scheduler delay
-        // leaves a packet queued forever after: we consume one while the endpoint
-        // produces another, so the backlog never clears and latency ratchets up to
-        // the buffer size and then starts losing samples. The pacing loop's
-        // deliberate "do not catch up" rule would have made that permanent.
+        // Drain every packet currently ready. Coalescing adjacent packets lets
+        // one lap recover from a scheduler delay instead of remaining one
+        // packet behind forever. queue_pcm still enforces the wire ceiling.
         loop {
-            if pcm.len() / (out_ch * 2) >= max_frames {
-                break;
-            }
             let mut data: *mut u8 = std::ptr::null_mut();
             let mut frames: u32 = 0;
             let mut flags: u32 = 0;
@@ -329,11 +383,7 @@ impl AudioSource for LoopbackCapture {
                 return Captured::Unavailable;
             }
             if frames == 0 {
-                // Nothing more ready. `AUDCLNT_S_BUFFER_EMPTY` is a *success*
-                // HRESULT, so it arrives here as zero frames rather than as an
-                // error — an earlier draft matched it as an error branch, which
-                // was dead code pretending to handle a case it could never see.
-                // SAFETY: paired with the GetBuffer above.
+                // `AUDCLNT_S_BUFFER_EMPTY` is a successful zero-frame poll.
                 unsafe {
                     let _ = active.capture.ReleaseBuffer(0);
                 }
@@ -342,23 +392,29 @@ impl AudioSource for LoopbackCapture {
 
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
             if silent || data.is_null() {
-                // SAFETY: paired with the GetBuffer above.
                 unsafe {
                     let _ = active.capture.ReleaseBuffer(frames);
                 }
-                silent_frames += u64::from(frames);
-                self.capture_pos = device_pos + u64::from(frames);
-                // Stop at a silence boundary so every emitted frame is
-                // contiguous in capture position. One `capture_pos` cannot
-                // describe a block with a hole in the middle.
+                silent_frames = silent_frames.saturating_add(u64::from(frames));
+                self.quiet.note_silence();
+                // Preserve the quiet boundary rather than folding audio from a
+                // later packet into the frame before it.
                 break;
             }
 
-            if start_pos.is_none() {
-                start_pos = Some(device_pos);
+            let now = Instant::now();
+            if self.quiet.take(now) {
+                self.pending.push_back(AudioFrame {
+                    sample_rate: active.format.sample_rate,
+                    channels: active.format.send_channels,
+                    capture_pos: device_pos,
+                    pcm: Vec::new(),
+                });
             }
-            // SAFETY: WASAPI guarantees `frames * device_channels` samples of the
-            // mix format's width at `data`; the format was validated at open.
+            self.quiet.note_audio(now);
+            let mut pcm = Vec::with_capacity(frames as usize * out_ch * 2);
+            // SAFETY: WASAPI guarantees `frames * stride` samples at `data` in
+            // the validated width for the lifetime of this buffer.
             unsafe {
                 append_samples(
                     &mut pcm,
@@ -368,30 +424,32 @@ impl AudioSource for LoopbackCapture {
                     out_ch,
                     active.format.kind,
                 );
-            }
-            // SAFETY: paired with the GetBuffer above, releasing exactly what it gave.
-            unsafe {
                 let _ = active.capture.ReleaseBuffer(frames);
             }
-            self.capture_pos = device_pos + u64::from(frames);
+            queue_pcm(
+                &mut self.pending,
+                active.format.sample_rate,
+                active.format.send_channels,
+                device_pos,
+                pcm,
+            );
         }
 
-        if !pcm.is_empty() {
+        if let Some(frame) = self.pending.pop_front() {
+            Captured::Frame(frame)
+        } else if self.quiet.take(Instant::now()) {
             Captured::Frame(AudioFrame {
                 sample_rate: active.format.sample_rate,
                 channels: active.format.send_channels,
-                // **WASAPI's own device position**, not a counter we maintain.
-                // A counter that only advances by frames we successfully read
-                // cannot express a buffer loss, so a discontinuity would look
-                // like continuous audio with a jump in time — which is the one
-                // thing this field exists to make visible.
-                capture_pos: start_pos.unwrap_or(self.capture_pos),
-                pcm,
+                capture_pos: 0,
+                pcm: Vec::new(),
             })
-        } else {
+        } else if silent_frames > 0 {
             Captured::Silence {
                 frames: silent_frames,
             }
+        } else {
+            Captured::Empty
         }
     }
 
@@ -401,6 +459,49 @@ impl AudioSource for LoopbackCapture {
         } else {
             "loopback (unavailable)"
         }
+    }
+}
+
+fn queue_pcm(
+    pending: &mut VecDeque<AudioFrame>,
+    sample_rate: u32,
+    channels: u8,
+    capture_pos: u64,
+    pcm: Vec<u8>,
+) {
+    let stride = usize::from(channels) * 2;
+    if stride == 0 || pcm.is_empty() || !pcm.len().is_multiple_of(stride) {
+        return;
+    }
+
+    let mut offset = 0usize;
+    while offset < pcm.len() {
+        if let Some(last) = pending.back_mut() {
+            let last_frames = last.pcm.len() / stride;
+            let contiguous = last.sample_rate == sample_rate
+                && last.channels == channels
+                && last.capture_pos.saturating_add(last_frames as u64)
+                    == capture_pos.saturating_add((offset / stride) as u64);
+            let capacity = crate::aux_proto::MAX_AUDIO_BYTES.saturating_sub(last.pcm.len());
+            let take = capacity.min(pcm.len() - offset) / stride * stride;
+            if contiguous && take > 0 {
+                last.pcm.extend_from_slice(&pcm[offset..offset + take]);
+                offset += take;
+                continue;
+            }
+        }
+
+        let take = crate::aux_proto::MAX_AUDIO_BYTES.min(pcm.len() - offset) / stride * stride;
+        if take == 0 {
+            break;
+        }
+        pending.push_back(AudioFrame {
+            sample_rate,
+            channels,
+            capture_pos: capture_pos.saturating_add((offset / stride) as u64),
+            pcm: pcm[offset..offset + take].to_vec(),
+        });
+        offset += take;
     }
 }
 
@@ -457,4 +558,53 @@ pub fn endpoint_available() -> Option<bool> {
         };
     // SAFETY: a valid enumerator.
     Some(unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_packets_split_on_frames_and_keep_device_positions() {
+        let mut pending = VecDeque::new();
+        queue_pcm(
+            &mut pending,
+            48_000,
+            2,
+            100,
+            vec![0; crate::aux_proto::MAX_AUDIO_BYTES + 8],
+        );
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].pcm.len(), crate::aux_proto::MAX_AUDIO_BYTES);
+        assert_eq!(pending[0].capture_pos, 100);
+        assert_eq!(
+            pending[1].capture_pos,
+            100 + (crate::aux_proto::MAX_AUDIO_BYTES / 4) as u64
+        );
+        assert_eq!(pending[1].pcm.len(), 8);
+    }
+
+    #[test]
+    fn contiguous_small_packets_coalesce_while_draining_wasapi() {
+        let mut pending = VecDeque::new();
+        queue_pcm(&mut pending, 48_000, 2, 10, vec![1; 8]);
+        queue_pcm(&mut pending, 48_000, 2, 12, vec![2; 8]);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].capture_pos, 10);
+        assert_eq!(pending[0].pcm, [vec![1; 8], vec![2; 8]].concat());
+    }
+
+    #[test]
+    fn quiet_boundary_is_emitted_once_until_audio_resumes() {
+        let start = Instant::now();
+        let mut quiet = QuietBoundary::default();
+        quiet.note_audio(start);
+        assert!(!quiet.take(start + Duration::from_millis(99)));
+        assert!(quiet.take(start + Duration::from_millis(100)));
+        assert!(!quiet.take(start + Duration::from_secs(1)));
+        quiet.note_audio(start + Duration::from_secs(2));
+        quiet.note_silence();
+        assert!(quiet.take(start + Duration::from_secs(2)));
+        assert!(!quiet.take(start + Duration::from_secs(3)));
+    }
 }

@@ -4,8 +4,8 @@
 //! build and test on macOS with no platform dependency. WASAPI loopback lives in
 //! `win::audio` behind this trait, so the whole pipeline above it is testable on
 //! a machine with no Windows and no sound card — which matters more than usual
-//! here, because **no fleet host can run the WASAPI half at all** (HLD tranche 6
-//! §2: neither quench nor temper has an audio render endpoint).
+//! here. The live Windows path is separately proved on provisioned fleet hosts;
+//! these portable oracles keep its conversion and wire behavior deterministic.
 //!
 //! # Why the test tone is two different frequencies
 //!
@@ -48,6 +48,10 @@ pub enum Captured {
     /// look identical, which is the failure the whole `capture_pos` field exists
     /// to prevent.
     Silence { frames: u64 },
+    /// A successful poll found no ready WASAPI frames.  Unlike synthesized
+    /// silence, this does not advance the capture clock and does not represent
+    /// rendered audio.
+    Empty,
     /// There is nothing to capture from. A **supported state**, not an error:
     /// a headless host with no render endpoint reports this forever and stays
     /// healthy.

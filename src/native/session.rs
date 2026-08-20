@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -106,6 +106,14 @@ pub struct AudioCounters {
     /// diagnostic, not a measurement anyone will do arithmetic on.
     left_hz: AtomicU64,
     right_hz: AtomicU64,
+    queue_drops: AtomicU64,
+    capture_gaps: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeAudioMetrics {
+    pub queue_drops: u64,
+    pub capture_gaps: u64,
 }
 
 impl AudioCounters {
@@ -114,11 +122,21 @@ impl AudioCounters {
             frames: AtomicU64::new(0),
             left_hz: AtomicU64::new(0),
             right_hz: AtomicU64::new(0),
+            queue_drops: AtomicU64::new(0),
+            capture_gaps: AtomicU64::new(0),
         }
     }
 
     fn note_frame(&self) {
         self.frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_queue_drop(&self) {
+        self.queue_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_capture_gap(&self) {
+        self.capture_gaps.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Measure the dominant frequency in each channel, once.
@@ -153,6 +171,59 @@ impl AudioCounters {
             self.frames.load(Ordering::Relaxed),
             self.left_hz.load(Ordering::Relaxed),
             self.right_hz.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn metrics(&self) -> NativeAudioMetrics {
+        NativeAudioMetrics {
+            queue_drops: self.queue_drops.load(Ordering::Relaxed),
+            capture_gaps: self.capture_gaps.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn enqueue_audio(tx: &SyncSender<AudioFrame>, frame: AudioFrame, counters: &AudioCounters) {
+    match tx.try_send(frame) {
+        Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+        Err(TrySendError::Full(_)) => counters.note_queue_drop(),
+    }
+}
+
+#[derive(Debug, Default)]
+struct CaptureContinuity {
+    next_capture_pos: Option<u64>,
+    sample_rate: Option<u32>,
+}
+
+impl CaptureContinuity {
+    fn observe(&mut self, capture_pos: u64, frame_count: usize, sample_rate: u32) -> bool {
+        let gap = self
+            .next_capture_pos
+            .zip(self.sample_rate)
+            .is_some_and(|(expected, rate)| rate == sample_rate && capture_pos != expected);
+        self.next_capture_pos = Some(capture_pos.saturating_add(frame_count as u64));
+        self.sample_rate = Some(sample_rate);
+        gap
+    }
+
+    fn observe_frame(&mut self, frame: &AudioFrame) -> bool {
+        // The host emits exactly one zero-PCM frame on entry to a quiet window.
+        // It is a boundary in the existing wire shape, never playable audio.
+        if frame.pcm.is_empty() {
+            self.next_capture_pos = None;
+            self.sample_rate = None;
+            return false;
+        }
+        let stride = usize::from(frame.channels).saturating_mul(2);
+        if stride == 0 || !frame.pcm.len().is_multiple_of(stride) {
+            self.next_capture_pos = None;
+            self.sample_rate = None;
+            return false;
+        }
+        self.observe(
+            frame.capture_pos,
+            frame.pcm.len() / stride,
+            frame.sample_rate,
         )
     }
 }
@@ -486,6 +557,7 @@ fn spawn_aux(
             .name("native-aux-rx".to_owned())
             .spawn(move || {
                 let mut stats = auxchan::ReaderStats::default();
+                let mut audio_continuity = CaptureContinuity::default();
                 let end = auxchan::pump_reader(
                     rx_socket,
                     &mut auxchan::ReaderSinks {
@@ -519,8 +591,13 @@ fn spawn_aux(
                         // trade: the alternative is wedging both directions to
                         // preserve audio nobody can hear.
                         on_audio: &mut |frame| {
-                            if let Some(tx) = audio_tx.as_ref() {
-                                let _ = tx.try_send(frame);
+                            if audio_continuity.observe_frame(&frame) {
+                                AUDIO.note_capture_gap();
+                            }
+                            if !frame.pcm.is_empty()
+                                && let Some(tx) = audio_tx.as_ref()
+                            {
+                                enqueue_audio(tx, frame, &AUDIO);
                             }
                         },
                         // Client -> host only; the client never receives it.
@@ -540,9 +617,8 @@ fn spawn_aux(
         std::thread::Builder::new()
             .name("native-aux-tx".to_owned())
             .spawn(move || {
-                if let auxchan::WriterEnd::Io(reason) =
-                    auxchan::pump_writer(tx_socket, &tx_slot, &mut report)
-                {
+                let writer = auxchan::pump_writer(tx_socket, &tx_slot, &mut report);
+                if let auxchan::WriterEnd::Io(reason) = writer.end {
                     report(&format!("clipboard channel write failed: {reason}"));
                 }
             })?,
@@ -1225,6 +1301,43 @@ impl NativeSink {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, TcpListener};
+
+    #[test]
+    fn capture_gaps_reset_only_on_an_explicit_quiet_boundary() {
+        let mut continuity = CaptureContinuity::default();
+        let frame = |capture_pos, pcm| AudioFrame {
+            sample_rate: 48_000,
+            channels: 2,
+            capture_pos,
+            pcm,
+        };
+        assert!(!continuity.observe_frame(&frame(100, vec![0; 40])));
+        assert!(!continuity.observe_frame(&frame(110, vec![0; 40])));
+        assert!(continuity.observe_frame(&frame(130, vec![0; 40])));
+        assert!(!continuity.observe_frame(&frame(0, Vec::new())));
+        assert!(!continuity.observe_frame(&frame(1_000, vec![0; 40])));
+        assert!(!continuity.observe_frame(&frame(1_010, vec![0; 40])));
+    }
+
+    #[test]
+    fn native_audio_counters_report_queue_drops_and_capture_gaps() {
+        let counters = AudioCounters::new();
+        counters.note_capture_gap();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(0);
+        enqueue_audio(
+            &tx,
+            AudioFrame {
+                sample_rate: 48_000,
+                channels: 1,
+                capture_pos: 0,
+                pcm: vec![0; 20],
+            },
+            &counters,
+        );
+        let report = counters.metrics();
+        assert_eq!(report.queue_drops, 1);
+        assert_eq!(report.capture_gaps, 1);
+    }
 
     /// A pasteboard that holds nothing and never changes, so the poll thread
     /// runs its real loop without touching the developer's own clipboard.

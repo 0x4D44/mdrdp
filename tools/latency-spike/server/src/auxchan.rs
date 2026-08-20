@@ -168,10 +168,10 @@ impl Outbox {
     }
 
     /// Queue one audio frame, dropping the oldest if the queue is full.
-    pub fn put_audio(&self, frame: AudioFrame) {
+    pub fn put_audio(&self, frame: AudioFrame) -> bool {
         let mut state = self.lock();
         if state.closed {
-            return;
+            return false;
         }
         while state.audio.len() >= AUDIO_FIFO_FRAMES {
             state.audio.pop_front();
@@ -180,6 +180,7 @@ impl Outbox {
         state.audio.push_back(frame);
         drop(state);
         self.ready.notify_one();
+        true
     }
 
     /// Wait up to the poll interval for something to send.
@@ -272,6 +273,13 @@ pub enum WriterEnd {
     Io(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct WriterReport {
+    pub end: WriterEnd,
+    /// Audio frames fully written and flushed to the socket.
+    pub audio_written: u64,
+}
+
 /// Drain the slot onto the wire until it closes or the socket fails.
 ///
 /// An over-ceiling payload is **reported and dropped, never written**. That is
@@ -282,26 +290,34 @@ pub fn pump_writer(
     mut out: impl Write,
     outbox: &Outbox,
     report: &mut impl FnMut(&str),
-) -> WriterEnd {
+) -> WriterReport {
     let mut buf = Vec::new();
+    let mut audio_written = 0u64;
     loop {
-        let encoded = match outbox.take() {
-            Take::Closed => return WriterEnd::Closed,
+        let (encoded, is_audio) = match outbox.take() {
+            Take::Closed => {
+                return WriterReport {
+                    end: WriterEnd::Closed,
+                    audio_written,
+                };
+            }
             Take::Idle => continue,
             Take::Clipboard(text) => {
                 buf.clear();
-                match aux_proto::encode_clipboard_text(&text, &mut buf) {
+                let result = match aux_proto::encode_clipboard_text(&text, &mut buf) {
                     Ok(()) => Ok(()),
                     // Names sizes only; `AuxProtoError` carries no content.
                     Err(e) => Err(format!("clipboard not sent: {e}")),
-                }
+                };
+                (result, false)
             }
             Take::Audio(frame) => {
                 buf.clear();
-                match aux_proto::encode_audio(&frame, &mut buf) {
+                let result = match aux_proto::encode_audio(&frame, &mut buf) {
                     Ok(()) => Ok(()),
                     Err(e) => Err(format!("audio frame not sent: {e}")),
-                }
+                };
+                (result, true)
             }
         };
         if let Err(why) = encoded {
@@ -312,10 +328,19 @@ pub fn pump_writer(
             continue;
         }
         if let Err(e) = out.write_all(&buf) {
-            return WriterEnd::Io(e.to_string());
+            return WriterReport {
+                end: WriterEnd::Io(e.to_string()),
+                audio_written,
+            };
         }
         if let Err(e) = out.flush() {
-            return WriterEnd::Io(e.to_string());
+            return WriterReport {
+                end: WriterEnd::Io(e.to_string()),
+                audio_written,
+            };
+        }
+        if is_audio {
+            audio_written = audio_written.saturating_add(1);
         }
     }
 }
@@ -651,8 +676,8 @@ mod tests {
         slot.close();
         let mut wire = Vec::new();
         let mut reports = Vec::new();
-        let end = pump_writer(&mut wire, &slot, &mut |m| reports.push(m.to_owned()));
-        assert_eq!(end, WriterEnd::Closed);
+        let report = pump_writer(&mut wire, &slot, &mut |m| reports.push(m.to_owned()));
+        assert_eq!(report.end, WriterEnd::Closed);
         assert_eq!(wire, framed_clipboard("hello\nworld"));
         assert!(reports.is_empty());
     }
@@ -694,7 +719,7 @@ mod tests {
         slot.put_clipboard("small".to_owned());
         wait_until(|| !wire.lock().unwrap().is_empty());
         slot.close();
-        assert_eq!(writer.join().unwrap(), WriterEnd::Closed);
+        assert_eq!(writer.join().unwrap().end, WriterEnd::Closed);
 
         // Only the payload under the ceiling reached the wire, and the loop
         // carried on to send it rather than ending on the refusal.
@@ -723,8 +748,8 @@ mod tests {
         let slot = Outbox::new();
         slot.put_clipboard("anything".to_owned());
         slot.close();
-        let end = pump_writer(Broken, &slot, &mut |_| {});
-        assert!(matches!(end, WriterEnd::Io(m) if m.contains("gone")));
+        let report = pump_writer(Broken, &slot, &mut |_| {});
+        assert!(matches!(report.end, WriterEnd::Io(m) if m.contains("gone")));
     }
 
     #[test]
@@ -998,8 +1023,9 @@ mod tests {
 
         let mut sink = Vec::new();
         let mut said = Vec::new();
-        let end = pump_writer(&mut sink, &outbox, &mut |m| said.push(m.to_owned()));
-        assert_eq!(end, WriterEnd::Closed);
+        let report = pump_writer(&mut sink, &outbox, &mut |m| said.push(m.to_owned()));
+        assert_eq!(report.end, WriterEnd::Closed);
+        assert_eq!(report.audio_written, 1);
 
         let mut reassembler = Reassembler::new(framing::DEFAULT_MAX_PAYLOAD);
         reassembler.push(&sink);

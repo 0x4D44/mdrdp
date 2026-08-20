@@ -20,6 +20,8 @@ fn main() -> ExitCode {
         Some("run") => win::run(),
         Some("install") => win::install(),
         Some("uninstall") => win::uninstall(),
+        Some("configure-audio") => win::configure_audio(),
+        Some("check-audio") => win::check_audio(),
         Some("status") => match parse_wait(&args[1..]) {
             Ok(wait) => win::status(wait),
             Err(e) => {
@@ -28,7 +30,9 @@ fn main() -> ExitCode {
             }
         },
         _ => {
-            eprintln!("usage: rhydra-agent run|install|uninstall|status [--wait <secs>]");
+            eprintln!(
+                "usage: rhydra-agent run|install|uninstall|configure-audio|check-audio|status [--wait <secs>]"
+            );
             ExitCode::from(2)
         }
     }
@@ -321,6 +325,20 @@ mod win {
                         Err(e) => control::error_line(&e),
                     }
                 }
+                Ok(Request::ConfigureAudio) => match rhydra::win::audio_policy::configure_audio() {
+                    Ok(detail) => {
+                        eprintln!("control: {detail}");
+                        control::ok_line()
+                    }
+                    Err(error) => control::error_line(&error),
+                },
+                Ok(Request::CheckAudio) => match rhydra::win::audio_policy::check_audio() {
+                    Ok(detail) => {
+                        eprintln!("control: {detail}");
+                        control::ok_line()
+                    }
+                    Err(error) => control::error_line(&error),
+                },
             };
             writeln!(writer, "{reply}")?;
         }
@@ -369,6 +387,88 @@ mod win {
                 eprintln!("agent: task registered but /run failed: {other:?}");
                 ExitCode::FAILURE
             }
+        }
+    }
+
+    /// Forward the request to the already-running interactive agent.  This
+    /// executable may be invoked from an SSH service session, but it never
+    /// performs per-user Core Audio mutation in that session.
+    pub fn configure_audio() -> ExitCode {
+        match audio_control_request("configure-audio", true) {
+            Ok(reply) => {
+                let source_path = match std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(|parent| parent.join("audio-source")))
+                {
+                    Some(path) => path,
+                    None => {
+                        eprintln!("agent: cannot resolve the deployed audio-source path");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if let Err(error) = std::fs::write(&source_path, "loopback\n") {
+                    eprintln!(
+                        "agent: enable loopback source {} failed: {error}",
+                        source_path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+                if let Err(error) = rhydra::win::audio_policy::write_format_marker(reply.trim()) {
+                    eprintln!("agent: configure-audio marker failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+                println!("{}", reply.trim());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("agent: configure-audio failed: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    pub fn check_audio() -> ExitCode {
+        match audio_control_request("check-audio", false) {
+            Ok(reply) => {
+                println!("{}", reply.trim());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("agent: check-audio failed: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    fn audio_control_request(command: &str, wait_for_agent: bool) -> Result<String, String> {
+        let deadline = Instant::now()
+            + if wait_for_agent {
+                Duration::from_secs(15)
+            } else {
+                Duration::ZERO
+            };
+        let mut stream = loop {
+            match TcpStream::connect(("127.0.0.1", CONTROL_PORT)) {
+                Ok(stream) => break stream,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(error) => return Err(format!("needs the interactive agent: {error}")),
+            }
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        writeln!(stream, "{{\"cmd\":\"{command}\"}}")
+            .map_err(|error| format!("request failed: {error}"))?;
+        let mut reply = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut reply)
+            .map_err(|error| format!("response failed: {error}"))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reply).map_err(|error| format!("invalid response: {error}"))?;
+        if parsed.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            Ok(reply)
+        } else {
+            Err(format!("refused: {}", reply.trim()))
         }
     }
 

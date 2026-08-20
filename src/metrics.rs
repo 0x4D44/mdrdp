@@ -366,6 +366,35 @@ mod tests {
     }
 
     #[test]
+    fn report_exposes_bounded_audio_depth_and_trim_counters() {
+        let audio = AudioStats {
+            current_depth_samples: 96,
+            depth_distribution: crate::audio::AudioDepthDistribution {
+                n: 42,
+                min_samples: 8,
+                median_samples: 88,
+                max_samples: 120,
+            },
+            high_water_trims: 3,
+            ..AudioStats::default()
+        };
+        let report = SessionMetricsReport::new(
+            1,
+            "graceful_shutdown",
+            &SessionStats::new(),
+            &GfxStats::default(),
+            &audio,
+            ["native"],
+            None,
+        );
+        let json = serde_json::to_value(report).expect("report serialises");
+        assert_eq!(json["audio"]["current_depth_samples"], 96);
+        assert_eq!(json["audio"]["depth_distribution"]["n"], 42);
+        assert_eq!(json["audio"]["depth_distribution"]["median_samples"], 88);
+        assert_eq!(json["audio"]["high_water_trims"], 3);
+    }
+
+    #[test]
     fn report_carries_per_slot_detail_and_still_carries_nothing_sensitive() {
         // Every field a different value, so a swapped width/height or a
         // bytes_served/bytes_stored mix-up cannot pass.

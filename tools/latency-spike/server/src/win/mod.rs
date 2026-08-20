@@ -10,6 +10,7 @@
 
 pub mod agent_ops;
 pub mod audio;
+pub mod audio_policy;
 pub mod clipboard;
 pub mod convert;
 pub mod dxgi;

@@ -74,8 +74,12 @@ impl ApplyCounts {
 pub struct ConnectionReport {
     pub reader: auxchan::ReaderStats,
     pub applied: ApplyCounts,
-    /// Audio frames handed to the outbox.
-    pub audio_sent: u64,
+    /// Non-silent audio frames returned by the source.
+    pub audio_produced: u64,
+    /// Produced audio frames accepted by the bounded outbox.
+    pub audio_queued: u64,
+    /// Audio frames fully written and flushed to the socket.
+    pub audio_written: u64,
     /// Blocks the source produced that were silence, and so were never sent.
     ///
     /// **This is the fixture-proof, and it is why the field exists.** "Silence
@@ -87,7 +91,7 @@ pub struct ConnectionReport {
     pub audio_silent: u64,
     /// Audio frames the outbox discarded because the link was behind.
     ///
-    /// Reported separately from `audio_sent` because they mean different
+    /// Reported separately from produced/queued/written because they mean different
     /// things to whoever is diagnosing: frames sent is "the source is working",
     /// frames dropped is "the link cannot keep up". A single number would
     /// conflate a healthy quiet session with a congested one.
@@ -126,14 +130,17 @@ pub fn serve(
                     Ok(report) => eprintln!(
                         "aux: disconnected - written {}, echo {}, \
                          write-failed {}, refused-by-policy {}, malformed {}, unknown-type {}, \
-                         audio-sent {}, audio-silent {}, audio-dropped {}",
+                         audio-produced {}, audio-queued {}, audio-written {}, \
+                         audio-silent {}, audio-dropped {}",
                         report.applied.written,
                         report.applied.suppressed,
                         report.applied.write_failed,
                         report.reader.refused_by_policy,
                         report.reader.malformed,
                         report.reader.unknown_type,
-                        report.audio_sent,
+                        report.audio_produced,
+                        report.audio_queued,
+                        report.audio_written,
                         report.audio_silent,
                         report.audio_dropped
                     ),
@@ -203,13 +210,15 @@ pub fn serve_one(
 
     let tx_socket = socket.try_clone()?;
     let tx_slot = Arc::clone(&slot);
+    let audio_written = Arc::new(AtomicU64::new(0));
+    let written_counter = Arc::clone(&audio_written);
     joins.push(
         std::thread::Builder::new()
             .name("aux-tx".to_owned())
             .spawn(move || {
-                if let auxchan::WriterEnd::Io(reason) =
-                    auxchan::pump_writer(tx_socket, &tx_slot, &mut report)
-                {
+                let writer = auxchan::pump_writer(tx_socket, &tx_slot, &mut report);
+                written_counter.store(writer.audio_written, Ordering::Relaxed);
+                if let auxchan::WriterEnd::Io(reason) = writer.end {
                     report(&format!("channel write failed: {reason}"));
                 }
             })?,
@@ -248,17 +257,22 @@ pub fn serve_one(
     let audio_stop = Arc::clone(&stop);
     let audio_enabled = Arc::clone(&audio_on);
     let build_source = Arc::clone(make_audio);
-    let audio_sent = Arc::new(AtomicU64::new(0));
-    let sent_counter = Arc::clone(&audio_sent);
+    let audio_produced = Arc::new(AtomicU64::new(0));
+    let produced_counter = Arc::clone(&audio_produced);
+    let audio_queued = Arc::new(AtomicU64::new(0));
+    let queued_counter = Arc::clone(&audio_queued);
     let audio_silent = Arc::new(AtomicU64::new(0));
     let silent_counter = Arc::clone(&audio_silent);
     joins.push(
         std::thread::Builder::new()
             .name("aux-audio".to_owned())
             .spawn(move || {
-                // Built HERE, on the thread that will use it: a WASAPI client is
-                // COM and must not be shuffled between threads.
-                let mut source = build_source();
+                // Built lazily HERE, on the thread that will use it: a WASAPI
+                // client is COM and must not be shuffled between threads. The
+                // drop on disable is intentional; the next enable edge builds a
+                // fresh source so a lost endpoint is re-enumerated.
+                let mut source: Option<Box<dyn AudioSource>> = None;
+                let mut was_enabled = false;
                 let block = Duration::from_millis(audio_source::FRAME_MS as u64);
                 let mut said_unavailable = false;
                 // **Paced against a deadline, not by sleeping a fixed amount.**
@@ -272,16 +286,41 @@ pub fn serve_one(
                 // timing was not, which is a failure a frame counter cannot see.
                 let mut due = std::time::Instant::now();
                 while !audio_stop.load(Ordering::Relaxed) {
-                    if !audio_enabled.load(Ordering::Relaxed) {
+                    let enabled = audio_enabled.load(Ordering::Relaxed);
+                    if enabled && !was_enabled {
+                        source = Some(build_source());
+                        was_enabled = true;
+                        said_unavailable = false;
+                        due = std::time::Instant::now();
+                    } else if !enabled && was_enabled {
+                        source = None;
+                        was_enabled = false;
+                        due = std::time::Instant::now();
+                    }
+                    if !enabled {
                         std::thread::sleep(block);
                         // Nothing is owed for time spent disabled.
                         due = std::time::Instant::now();
                         continue;
                     }
+                    let Some(source) = source.as_mut() else {
+                        std::thread::sleep(block);
+                        continue;
+                    };
                     match source.next_block() {
                         Captured::Frame(frame) => {
-                            audio_slot.put_audio(frame);
-                            sent_counter.fetch_add(1, Ordering::Relaxed);
+                            if frame.pcm.is_empty() {
+                                // One existing-shape boundary frame tells the
+                                // client that a quiet window began. It is queued
+                                // on the wire, but is neither produced nor
+                                // playable audio.
+                                silent_counter.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                produced_counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if audio_slot.put_audio(frame) {
+                                queued_counter.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         // Nothing on the wire, and the capture position has
                         // already advanced inside the source — which is what
@@ -289,6 +328,7 @@ pub fn serve_one(
                         Captured::Silence { .. } => {
                             silent_counter.fetch_add(1, Ordering::Relaxed);
                         }
+                        Captured::Empty => {}
                         Captured::Unavailable => {
                             if !said_unavailable {
                                 // **Once, not every lap.** A host with no render
@@ -370,7 +410,9 @@ pub fn serve_one(
         auxchan::ReaderEnd::Eof => Ok(ConnectionReport {
             reader: stats,
             applied: *lock(&outcome),
-            audio_sent: audio_sent.load(Ordering::Relaxed),
+            audio_produced: audio_produced.load(Ordering::Relaxed),
+            audio_queued: audio_queued.load(Ordering::Relaxed),
+            audio_written: audio_written.load(Ordering::Relaxed),
             audio_silent: audio_silent.load(Ordering::Relaxed),
             audio_dropped: slot.audio_dropped(),
         }),
@@ -398,6 +440,7 @@ mod tests {
     use super::*;
     use crate::aux_proto;
     use std::io::{Read, Write};
+    use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
     /// A fake host pasteboard the test can change underneath the poll thread
@@ -467,6 +510,26 @@ mod tests {
             }
             *lock(&self.0.text) = Some(text.to_owned());
             Ok(())
+        }
+    }
+
+    struct LifecycleSource {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl AudioSource for LifecycleSource {
+        fn next_block(&mut self) -> Captured {
+            Captured::Empty
+        }
+
+        fn describe(&self) -> &'static str {
+            "lifecycle-test"
+        }
+    }
+
+    impl Drop for LifecycleSource {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -600,12 +663,66 @@ mod tests {
 
         drop(client);
         let report = join_server(server);
-        assert_eq!(report.audio_sent, 0, "nothing should have been sent");
+        assert_eq!(
+            report.audio_produced, 0,
+            "nothing should have been produced"
+        );
+        assert_eq!(report.audio_queued, 0, "nothing should have been queued");
+        assert_eq!(
+            report.audio_written, 0,
+            "nothing should have reached the socket"
+        );
         assert!(
             report.audio_silent > 0,
             "the silent source must be PROVED to have run, or the zero above \
              means nothing: {report:?}"
         );
+    }
+
+    #[test]
+    fn audio_source_is_created_on_enable_and_dropped_on_disable() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let constructed = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let server_constructed = Arc::clone(&constructed);
+        let server_dropped = Arc::clone(&dropped);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let held = Pasteboard::holding("irrelevant");
+            let mut make = || Box::new(FakeClipboard(held.clone())) as Box<dyn TextClipboard>;
+            let factory = Arc::new(move || {
+                server_constructed.fetch_add(1, Ordering::SeqCst);
+                Box::new(LifecycleSource {
+                    dropped: Arc::clone(&server_dropped),
+                }) as Box<dyn AudioSource>
+            }) as AudioFactory;
+            serve_one(stream, &mut make, &factory, Policy::default())
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(constructed.load(Ordering::SeqCst), 0);
+
+        let mut request = Vec::new();
+        aux_proto::encode_audio_control(true, &mut request);
+        client.write_all(&request).unwrap();
+        wait_until(
+            || constructed.load(Ordering::SeqCst) == 1,
+            "audio source construction after enable",
+        );
+
+        request.clear();
+        aux_proto::encode_audio_control(false, &mut request);
+        client.write_all(&request).unwrap();
+        wait_until(
+            || dropped.load(Ordering::SeqCst) == 1,
+            "audio source drop after disable",
+        );
+
+        drop(client);
+        let _ = join_server(server);
     }
 
     #[test]
@@ -633,8 +750,8 @@ mod tests {
         drop(client);
         let report = join_server(server);
         assert!(
-            report.audio_sent > 0,
-            "the host should report what it sent: {report:?}"
+            report.audio_produced > 0 && report.audio_queued > 0 && report.audio_written > 0,
+            "the host should distinguish production, queueing, and socket writes: {report:?}"
         );
     }
 

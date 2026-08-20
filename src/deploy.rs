@@ -24,6 +24,17 @@ pub const REMOTE_SCRIPTS: &str = r"C:\mdrdp\scripts";
 /// fidelity through Windows OpenSSH is assumption-labelled in the HLD.
 pub const SENTINEL: &str = "RHYDRA-OK";
 
+/// The only package deploy will fetch for the VB-CABLE base device. Keep these
+/// values in the Rust contract as well as in `VB_CABLE_INSTALL_PS1`: changing
+/// the URL without changing the expected bytes must be a review-visible diff.
+pub const VB_CABLE_DOWNLOAD_URL: &str =
+    "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip";
+pub const VB_CABLE_ARCHIVE_SHA256: &str =
+    "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb";
+pub const VB_CABLE_ARCHIVE_BYTES: u64 = 1_318_877;
+
+const VB_CABLE_MARKER: &str = r"C:\mdrdp\vb-cable-pack45.ok";
+
 const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 
 pub struct Config {
@@ -257,6 +268,33 @@ pub struct Evidence {
     /// The running agent's status, when the control port answered a status query:
     /// (version, green, server_running).
     pub agent: Option<AgentProbe>,
+    /// The official VB-CABLE package is staged in the Windows driver store.
+    #[serde(default)]
+    pub audio_package_staged: bool,
+    /// The official package installer has completed on this host. This marker
+    /// distinguishes an endpoint that predates deploy from a failed install.
+    #[serde(default)]
+    pub audio_setup_ran: bool,
+    /// Windows reports that a reboot is pending after audio provisioning.
+    #[serde(default)]
+    pub audio_reboot_pending: bool,
+    /// The endpoint's stable root/provider identity, not its friendly name,
+    /// matched VB-Audio's base device (`VBAudioVACWDM`).
+    #[serde(default)]
+    pub cable_identity_ok: bool,
+    /// At least one active VB-CABLE render endpoint was found.
+    #[serde(default)]
+    pub cable_render_active: bool,
+    /// The active VB-CABLE capture endpoint was found.
+    #[serde(default)]
+    pub cable_capture_active: bool,
+    /// The endpoint format/loopback preflight passed. The probe is deliberately
+    /// conservative: absence of this fact requests configure-audio.
+    #[serde(default)]
+    pub cable_formats_ok: bool,
+    /// A Windows default render endpoint is active.
+    #[serde(default)]
+    pub audio_default_render_active: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -271,8 +309,21 @@ pub struct AgentProbe {
 /// branches (review finding: a `Step` language grows until it is a bad shell).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Run { label: String, command: String },
-    Copy { local: PathBuf, remote: String },
+    Run {
+        label: String,
+        command: String,
+    },
+    /// Run an uploaded PowerShell script through `Ssh::run_script`, retaining
+    /// its sentinel-validated stdout as deploy evidence.
+    Script {
+        label: String,
+        script: String,
+        args: String,
+    },
+    Copy {
+        local: PathBuf,
+        remote: String,
+    },
 }
 
 /// The decided shape of this deploy.
@@ -280,6 +331,8 @@ pub enum Action {
 pub enum Branch {
     /// Everything already matches: no quiesce, no copy — verify only.
     FastPath,
+    /// The runtime stack is exact and healthy; repair/configure only audio.
+    AudioOnly(Plan),
     Full(Plan),
 }
 
@@ -309,6 +362,52 @@ fn quiesce_actions(evidence: &Evidence) -> Vec<Action> {
             }]
         })
         .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioState {
+    Healthy,
+    NeedsInstall,
+    NeedsConfigure,
+    RebootRequired,
+    Broken,
+}
+
+impl Evidence {
+    fn audio_state(&self) -> AudioState {
+        if self.audio_reboot_pending {
+            return AudioState::RebootRequired;
+        }
+        if !self.audio_package_staged {
+            return AudioState::NeedsInstall;
+        }
+        if !self.cable_render_active || !self.cable_capture_active || !self.cable_identity_ok {
+            return if self.audio_setup_ran {
+                AudioState::Broken
+            } else {
+                AudioState::NeedsInstall
+            };
+        }
+        if !self.cable_formats_ok || !self.audio_default_render_active {
+            return AudioState::NeedsConfigure;
+        }
+        AudioState::Healthy
+    }
+}
+
+fn vb_cable_install_action() -> Action {
+    Action::Script {
+        label: "install VB-CABLE Pack45".to_owned(),
+        script: "vbcable-install.ps1".to_owned(),
+        args: format!("-MarkerPath \"{VB_CABLE_MARKER}\""),
+    }
+}
+
+fn configure_audio_action(remote_dir: &str) -> Action {
+    Action::Run {
+        label: "configure audio".to_owned(),
+        command: format!("\"{remote_dir}\\rhydra-agent.exe\" configure-audio"),
+    }
 }
 
 /// The pure heart: evidence in, plan or stop out. Every stop happens here,
@@ -354,6 +453,24 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
             }
         }
     }
+    let audio_state = evidence.audio_state();
+    match audio_state {
+        AudioState::RebootRequired => {
+            return Err(
+                "VB-CABLE provisioning requires a reboot; reboot the host and re-run deploy"
+                    .to_owned(),
+            );
+        }
+        AudioState::Broken => {
+            return Err(
+                "VB-CABLE setup completed but no stable active endpoints were found; host is \
+                 broken and deploy will not retry in a loop"
+                    .to_owned(),
+            );
+        }
+        AudioState::Healthy | AudioState::NeedsInstall | AudioState::NeedsConfigure => {}
+    }
+
     // Fast path: the exact version is already deployed, byte-sizes match, and
     // the running agent reports that version healthy. (Same-version different
     // bytes falls through to a full deploy: sizes are the tell.) Checked BEFORE
@@ -371,14 +488,31 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
             _ => false,
         }
     });
-    if evidence.version_dirs.iter().any(|d| d == &vdir)
+    let exact_stack = evidence.version_dirs.iter().any(|d| d == &vdir)
         && sizes_match
         && evidence
             .agent
             .as_ref()
-            .is_some_and(|a| a.green && a.version == artifacts.version)
-    {
-        return Ok(Branch::FastPath);
+            .is_some_and(|a| a.green && a.version == artifacts.version);
+    let remote_dir = artifacts.remote_dir();
+    if exact_stack {
+        match audio_state {
+            AudioState::Healthy => return Ok(Branch::FastPath),
+            AudioState::NeedsInstall | AudioState::NeedsConfigure => {
+                let mut plan = Plan::default();
+                if audio_state == AudioState::NeedsInstall {
+                    plan.pre.push(vb_cable_install_action());
+                }
+                plan.post.push(configure_audio_action(&remote_dir));
+                plan.notes.push(
+                    "exact runtime stack: repairing audio only; no agent quiesce, copy, or driver \
+                     replacement"
+                        .to_owned(),
+                );
+                return Ok(Branch::AudioOnly(plan));
+            }
+            AudioState::RebootRequired | AudioState::Broken => unreachable!(),
+        }
     }
 
     if let Some(agent) = &evidence.agent
@@ -413,8 +547,14 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
         ));
     }
 
-    let remote_dir = artifacts.remote_dir();
     let mut plan = Plan::default();
+
+    // The VB-CABLE package is independently verified before any action that can
+    // quiesce the old agent or replace its artifacts. Script actions retain the
+    // sentinel-validated output for the deploy evidence report.
+    if audio_state == AudioState::NeedsInstall {
+        plan.pre.push(vb_cable_install_action());
+    }
 
     // Copy-collision: replacing the same version dir the running agent lives in
     // means quiescing first; a fresh version dir keeps copy-first atomicity.
@@ -460,6 +600,10 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
         label: "install agent".to_owned(),
         command: format!("\"{remote_dir}\\rhydra-agent.exe\" install"),
     });
+    // A fresh version directory never inherits the one-word source selector.
+    // Re-run the verified configure operation after every full deploy so the
+    // new agent starts loopback; the exact-stack fast path remains a true no-op.
+    plan.post.push(configure_audio_action(&remote_dir));
     Ok(Branch::Full(plan))
 }
 
@@ -521,6 +665,91 @@ try {
     }
     $client.Close()
 } catch { $agent = $null }
+$audioSetupRan = Test-Path 'C:\mdrdp\vb-cable-pack45.ok'
+$audioRebootPending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+try {
+    $rename = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction Stop
+    if ($rename.PendingFileRenameOperations) { $audioRebootPending = $true }
+} catch {}
+function Device-Properties([string]$InstanceId) {
+    $props = @{}
+    Get-PnpDeviceProperty -InstanceId $InstanceId -ErrorAction SilentlyContinue |
+        ForEach-Object { $props[$_.KeyName] = "$($_.Data)" }
+    $props
+}
+function Cable-Endpoint-Identity($endpoint) {
+    if ($endpoint.Status -ne 'OK') { return $null }
+    $endpointProps = Device-Properties $endpoint.InstanceId
+    $parentId = "$($endpointProps['DEVPKEY_Device_Parent'])"
+    if (-not $parentId) { return $null }
+    $root = Get-PnpDevice -InstanceId $parentId -ErrorAction SilentlyContinue
+    if (-not $root -or $root.Status -ne 'OK') { return $null }
+    $rootProps = Device-Properties $parentId
+    $hardwareIds = "$($rootProps['DEVPKEY_Device_HardwareIds'])"
+    $service = "$($rootProps['DEVPKEY_Device_Service'])"
+    $manufacturer = "$($rootProps['DEVPKEY_Device_Manufacturer'])"
+    $provider = "$($rootProps['DEVPKEY_Device_DriverProvider'])"
+    if ($hardwareIds -notmatch 'VBAudioVACWDM' -or $service -notmatch 'VBAudioVACMME') { return $null }
+    if ($manufacturer -notmatch 'VB-Audio Software' -or $provider -notmatch 'VB-Audio Software') { return $null }
+    $flow = if ($endpoint.InstanceId -match '\{0\.0\.0\.') { 'render' } elseif ($endpoint.InstanceId -match '\{0\.0\.1\.') { 'capture' } else { 'other' }
+    if ($flow -eq 'other') { return $null }
+    [pscustomobject]@{
+        name = "$($endpoint.FriendlyName)"
+        instance = "$($endpoint.InstanceId)"
+        parent = $parentId
+        flow = $flow
+        root_hardware_ids = $hardwareIds
+        root_service = $service
+        root_manufacturer = $manufacturer
+        root_provider = $provider
+    }
+}
+$audioEndpoints = @(Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction SilentlyContinue |
+    Where-Object { $_.Status -eq 'OK' })
+$cableRenderActive = $false
+$cableCaptureActive = $false
+$cableIdentityOk = $false
+$cableNames = @()
+$cableEndpointFacts = @()
+foreach ($endpoint in $audioEndpoints) {
+    $identity = Cable-Endpoint-Identity $endpoint
+    if ($identity) {
+        $cableIdentityOk = $true
+        $cableNames += $identity.name
+        $cableEndpointFacts += $identity
+        if ($identity.flow -eq 'render') {
+            $cableRenderActive = $true
+        }
+        if ($identity.flow -eq 'capture') {
+            $cableCaptureActive = $true
+        }
+    }
+}
+$audioPackageStaged = $audioSetupRan
+try {
+    $audioPackageStaged = $audioPackageStaged -or ($null -ne (Get-WindowsDriver -Online -ErrorAction Stop |
+        Where-Object { $_.OriginalFileName -match 'vbMmeCable64|VBAudio' } | Select-Object -First 1))
+} catch {}
+$audioDefaultRenderActive = [bool]($null -ne ($s.rungs |
+    Where-Object { $_.rung -eq 'audio' -and $_.state -eq 'ok' } |
+    Select-Object -First 1))
+# Endpoint activity and stable identity are the deploy-time facts. The native
+# audio probe records format/loopback viability after configure-audio; retaining
+# this fact explicitly prevents an active but unusable endpoint from being called
+# healthy by the planner.
+$audioFormatMarker = Test-Path 'C:\mdrdp\vb-cable-format.ok'
+$audioSourceLoopback = $false
+$audioPolicyOk = $false
+if ($TargetDir -and (Test-Path -LiteralPath (Join-Path $TargetDir 'audio-source'))) {
+    $audioSourceLoopback = ((Get-Content -LiteralPath (Join-Path $TargetDir 'audio-source') -Raw).Trim() -eq 'loopback')
+    $audioAgent = Join-Path $TargetDir 'rhydra-agent.exe'
+    if (Test-Path -LiteralPath $audioAgent) {
+        & $audioAgent check-audio *> $null
+        $audioPolicyOk = ($LASTEXITCODE -eq 0)
+    }
+}
+$audioFormatsOk = [bool]($audioFormatMarker -and $audioPolicyOk -and $audioSourceLoopback -and $cableRenderActive -and $cableCaptureActive)
 $out = @{
     elevated = [bool]$elevated
     console_user = $consoleUser
@@ -536,8 +765,197 @@ $out = @{
     version_dirs = $versionDirs
     target_dir_sizes = $sizes
     agent = $agent
+    audio_package_staged = [bool]$audioPackageStaged
+    audio_setup_ran = [bool]$audioSetupRan
+    audio_reboot_pending = [bool]$audioRebootPending
+    cable_identity_ok = [bool]$cableIdentityOk
+    cable_render_active = [bool]$cableRenderActive
+    cable_capture_active = [bool]$cableCaptureActive
+    cable_formats_ok = [bool]$audioFormatsOk
+    audio_default_render_active = [bool]$audioDefaultRenderActive
+    cable_endpoint_names = $cableNames
+    cable_endpoint_facts = $cableEndpointFacts
 }
 Write-Output ($out | ConvertTo-Json -Compress -Depth 4)
+Write-Output 'RHYDRA-OK'
+"#;
+
+/// Downloads, verifies, and installs the official VB-CABLE Pack45 package.
+/// This script is intentionally self-contained: it runs before quiesce or
+/// artifact replacement and emits the signature and endpoint facts that made
+/// the install safe to audit after the fact.
+pub const VB_CABLE_INSTALL_PS1: &str = r#"
+param([string]$MarkerPath = 'C:\mdrdp\vb-cable-pack45.ok')
+$ErrorActionPreference = 'Stop'
+$url = 'https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip'
+$expectedHash = 'b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb'
+$expectedBytes = [uint64]1318877
+$stageRoot = Join-Path $env:TEMP ('mdrdp-vbcable-' + [Guid]::NewGuid().ToString('N'))
+$archive = Join-Path $stageRoot 'VBCABLE_Driver_Pack45.zip'
+$signatureFacts = @()
+
+function Require-Signature([string]$Path, [string]$SubjectPrefix, [string]$IssuerContains) {
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($sig.Status -ne 'Valid' -or $null -eq $sig.SignerCertificate) {
+        throw "invalid Authenticode signature for $Path ($($sig.Status))"
+    }
+    $subject = "$($sig.SignerCertificate.Subject)"
+    $issuer = "$($sig.SignerCertificate.Issuer)"
+    if (-not $subject.StartsWith($SubjectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "unexpected signer for $Path ($subject)"
+    }
+    if ($IssuerContains -and $issuer -notlike "*$IssuerContains*") {
+        throw "unexpected issuer for $Path ($issuer)"
+    }
+    [pscustomobject]@{ path = $Path; status = "$($sig.Status)"; subject = $subject; issuer = $issuer }
+}
+
+function Device-Properties([string]$InstanceId) {
+    $props = @{}
+    Get-PnpDeviceProperty -InstanceId $InstanceId -ErrorAction SilentlyContinue |
+        ForEach-Object { $props[$_.KeyName] = "$($_.Data)" }
+    $props
+}
+
+function Cable-Endpoint-Identity($endpoint) {
+    if ($endpoint.Status -ne 'OK') { return $null }
+    $endpointProps = Device-Properties $endpoint.InstanceId
+    $parentId = "$($endpointProps['DEVPKEY_Device_Parent'])"
+    if (-not $parentId) { return $null }
+    $root = Get-PnpDevice -InstanceId $parentId -ErrorAction SilentlyContinue
+    if (-not $root -or $root.Status -ne 'OK') { return $null }
+    $rootProps = Device-Properties $parentId
+    $hardwareIds = "$($rootProps['DEVPKEY_Device_HardwareIds'])"
+    $service = "$($rootProps['DEVPKEY_Device_Service'])"
+    $manufacturer = "$($rootProps['DEVPKEY_Device_Manufacturer'])"
+    $provider = "$($rootProps['DEVPKEY_Device_DriverProvider'])"
+    if ($hardwareIds -notmatch 'VBAudioVACWDM' -or $service -notmatch 'VBAudioVACMME') { return $null }
+    if ($manufacturer -notmatch 'VB-Audio Software' -or $provider -notmatch 'VB-Audio Software') { return $null }
+    $flow = if ($endpoint.InstanceId -match '\{0\.0\.0\.') { 'render' } elseif ($endpoint.InstanceId -match '\{0\.0\.1\.') { 'capture' } else { 'other' }
+    if ($flow -eq 'other') { return $null }
+    [pscustomobject]@{
+        name = "$($endpoint.FriendlyName)"
+        instance = "$($endpoint.InstanceId)"
+        parent = $parentId
+        flow = $flow
+        root_hardware_ids = $hardwareIds
+        root_service = $service
+        root_manufacturer = $manufacturer
+        root_provider = $provider
+    }
+}
+
+function Cable-Endpoints {
+    $found = @()
+    $devices = @(Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.Status -eq 'OK' })
+    foreach ($device in $devices) {
+        $identity = Cable-Endpoint-Identity $device
+        if ($identity) { $found += $identity }
+    }
+    $found
+}
+
+function Reboot-Pending {
+    $pending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+        (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+    try {
+        $rename = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction Stop
+        if ($rename.PendingFileRenameOperations) { $pending = $true }
+    } catch {}
+    [bool]$pending
+}
+
+try {
+    New-Item -ItemType Directory -Force -Path $stageRoot | Out-Null
+    Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+    $actualBytes = (Get-Item -LiteralPath $archive).Length
+    if ([uint64]$actualBytes -ne $expectedBytes) {
+        throw "VB-CABLE archive size mismatch: $actualBytes, expected $expectedBytes"
+    }
+    $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash) {
+        throw "VB-CABLE archive hash mismatch: $actualHash, expected $expectedHash"
+    }
+    $extractRoot = Join-Path $stageRoot 'extract'
+    Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot -Force
+    $setup = Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter 'VBCABLE_Setup_x64.exe' |
+        Select-Object -First 1
+    $inf = Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter 'vbMmeCable64_win10.inf' |
+        Select-Object -First 1
+    $payloadDir = if ($inf) { $inf.DirectoryName } else { $null }
+    $catalog = if ($payloadDir) {
+        Get-ChildItem -LiteralPath $payloadDir -File -Filter '*.cat' | Select-Object -First 1
+    }
+    $sys = if ($payloadDir) {
+        Get-ChildItem -LiteralPath $payloadDir -File -Filter '*.sys' | Select-Object -First 1
+    }
+    if (-not $setup -or -not $inf -or -not $catalog -or -not $sys) {
+        throw 'VB-CABLE archive is missing its x64 setup, INF, catalog, or SYS payload'
+    }
+    $infText = Get-Content -LiteralPath $inf.FullName -Raw
+    $vbAudioProvider = $infText -match '(?im)^\s*Provider\s*=\s*%VBAudio%\s*$' -and
+        $infText -match '(?im)^\s*VBAudio\s*=\s*"VB-Audio Software"\s*$'
+    $manufacturerProvider = $infText -match '(?im)^\s*Provider\s*=\s*%ManufacturerName%\s*$' -and
+        $infText -match '(?im)^\s*ManufacturerName\s*=\s*"VB-Audio Software"\s*$'
+    if (-not $vbAudioProvider -and -not $manufacturerProvider) {
+        throw 'VB-CABLE INF provider identity check failed (expected VBAudio or ManufacturerName = VB-Audio Software)'
+    }
+    if ($infText -notmatch 'VBAudioVACWDM') { throw 'VB-CABLE INF hardware identity check failed' }
+    $providerIdentity = if ($vbAudioProvider) { 'Provider=%VBAudio%; VBAudio="VB-Audio Software"' } else { 'Provider=%ManufacturerName%; ManufacturerName="VB-Audio Software"' }
+    $signatureFacts += Require-Signature $setup.FullName 'CN=BUREL VINCENT Entrepreneur individuel' ''
+    $signatureFacts += Require-Signature $sys.FullName 'CN=BUREL VINCENT Entrepreneur individuel' ''
+    $signatureFacts += Require-Signature $catalog.FullName 'CN=Microsoft Windows Hardware Compatibility Publisher' 'Microsoft Windows Third Party Component CA 2014'
+
+    # Official command: VBCABLE_Setup_x64.exe -i -h
+    $process = Start-Process -FilePath $setup.FullName -ArgumentList @('-i', '-h') -Wait -PassThru
+    if ($process.ExitCode -ne 0) { throw "VBCABLE_Setup_x64.exe -i -h failed ($($process.ExitCode))" }
+    $markerDir = Split-Path -Parent $MarkerPath
+    if ($markerDir) { New-Item -ItemType Directory -Force -Path $markerDir | Out-Null }
+    # Persist setup completion before the endpoint postcheck. A failed postcheck
+    # must not be mistaken for a package that was never installed.
+    Set-Content -LiteralPath $MarkerPath -Value 'VB-CABLE Pack45 setup completed; endpoint postcheck pending' -Encoding ASCII
+    # One device rescan is enough to surface a package that installed without a
+    # reboot. Repeating the scan would hide a failed install behind a loop.
+    & pnputil.exe /scan-devices | Out-Null
+    $scanExit = $LASTEXITCODE
+    $deadline = (Get-Date).AddSeconds(30)
+    $endpoints = @()
+    do {
+        $endpoints = @(Cable-Endpoints)
+        $hasRender = $endpoints | Where-Object flow -eq 'render'
+        $hasCapture = $endpoints | Where-Object flow -eq 'capture'
+        if ($hasRender -and $hasCapture) { break }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    if (-not $hasRender -or -not $hasCapture) {
+        if (Reboot-Pending) {
+            throw 'VB-CABLE install requires a reboot before active endpoints appear'
+        }
+        throw "VB-CABLE install produced no active render/capture endpoints (pnputil exit $scanExit)"
+    }
+    Set-Content -LiteralPath $MarkerPath -Value 'VB-CABLE Pack45 setup completed; endpoint postcheck passed' -Encoding ASCII
+    $evidence = [pscustomobject]@{
+        archive_url = $url
+        archive_bytes = $actualBytes
+        archive_sha256 = $actualHash
+        package = 'VBCABLE_Driver_Pack45.zip'
+        setup = 'VBCABLE_Setup_x64.exe'
+        signatures = $signatureFacts
+        inf_identity = @($providerIdentity, 'VBAudioVACWDM')
+        inf_authenticode = 'UnknownError (INF is catalog-signed; no INF Authenticode signature is required)'
+        endpoints = $endpoints
+        installer_exit = $process.ExitCode
+        rescan_exit = $scanExit
+        donationware = 'VB-CABLE by VB-Audio (www.vb-cable.com) is donationware; all participations are welcome.'
+    }
+    Write-Output ($evidence | ConvertTo-Json -Compress -Depth 6)
+    Write-Output $evidence.donationware
+} finally {
+    if (Test-Path -LiteralPath $stageRoot) {
+        Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 Write-Output 'RHYDRA-OK'
 "#;
 
@@ -692,6 +1110,7 @@ fn upload_scripts(ssh: &Ssh) -> Result<(), String> {
         ("probe.ps1", PROBE_PS1),
         ("sizes.ps1", SIZES_PS1),
         ("driver-install.ps1", DRIVER_INSTALL_PS1),
+        ("vbcable-install.ps1", VB_CABLE_INSTALL_PS1),
     ] {
         let local = dir.join(name);
         std::fs::write(&local, body).map_err(|e| e.to_string())?;
@@ -705,12 +1124,36 @@ fn parse_evidence(json: &str) -> Result<Evidence, String> {
         .map_err(|e| format!("probe output did not parse: {e}\n{json}"))
 }
 
-fn execute(ssh: &Ssh, actions: &[Action]) -> Result<(), String> {
+#[derive(Debug, Clone)]
+struct ScriptEvidence {
+    label: String,
+    stdout: String,
+}
+
+fn execute(
+    ssh: &Ssh,
+    actions: &[Action],
+    evidence: &mut Vec<ScriptEvidence>,
+) -> Result<(), String> {
     for action in actions {
         match action {
             Action::Run { label, command } => {
                 eprintln!("  run   {label}");
                 ssh.run(command).map_err(|e| format!("{label}: {e}"))?;
+            }
+            Action::Script {
+                label,
+                script,
+                args,
+            } => {
+                eprintln!("  script [{label}]");
+                let stdout = ssh
+                    .run_script(script, args)
+                    .map_err(|e| format!("{label}: {e}"))?;
+                evidence.push(ScriptEvidence {
+                    label: label.clone(),
+                    stdout,
+                });
             }
             Action::Copy { local, remote } => {
                 eprintln!("  copy  {} -> {remote}", local.display());
@@ -719,6 +1162,14 @@ fn execute(ssh: &Ssh, actions: &[Action]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn report_script_evidence(evidence: &[ScriptEvidence]) {
+    for item in evidence {
+        if !item.stdout.is_empty() {
+            eprintln!("deploy: evidence [{}]:\n{}", item.label, item.stdout);
+        }
+    }
 }
 
 fn check_sizes(ssh: &Ssh, artifacts: &Artifacts) -> Result<(), String> {
@@ -846,6 +1297,43 @@ pub fn run(args: &[String]) -> i32 {
                 return 0;
             }
         }
+        Branch::AudioOnly(plan) => {
+            for note in &plan.notes {
+                eprintln!("deploy: note: {note}");
+            }
+            if cfg.dry_run {
+                eprintln!("deploy: --dry-run audio-only plan:");
+                for a in plan.pre.iter().chain(&plan.post) {
+                    match a {
+                        Action::Run { label, command } => eprintln!("  run   [{label}] {command}"),
+                        Action::Script {
+                            label,
+                            script,
+                            args,
+                        } => eprintln!("  script [{label}] {script} {args}"),
+                        Action::Copy { local, remote } => {
+                            eprintln!("  copy  {} -> {remote}", local.display());
+                        }
+                    }
+                }
+                eprintln!("  then: agent verify (status --wait 30, stable green)");
+                return 0;
+            }
+            let mut script_evidence = Vec::new();
+            let steps: Result<(), String> = (|| {
+                execute(&ssh, &plan.pre, &mut script_evidence)?;
+                execute(&ssh, &plan.post, &mut script_evidence)?;
+                Ok(())
+            })();
+            report_script_evidence(&script_evidence);
+            match steps {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("deploy: {e}");
+                    return 1;
+                }
+            }
+        }
         Branch::Full(plan) => {
             for note in &plan.notes {
                 eprintln!("deploy: note: {note}");
@@ -855,6 +1343,11 @@ pub fn run(args: &[String]) -> i32 {
                 for a in plan.pre.iter().chain(&plan.copies).chain(&plan.post) {
                     match a {
                         Action::Run { label, command } => eprintln!("  run   [{label}] {command}"),
+                        Action::Script {
+                            label,
+                            script,
+                            args,
+                        } => eprintln!("  script [{label}] {script} {args}"),
                         Action::Copy { local, remote } => {
                             eprintln!("  copy  {} -> {remote}", local.display());
                         }
@@ -863,16 +1356,21 @@ pub fn run(args: &[String]) -> i32 {
                 eprintln!("  then: size check, agent verify (status --wait 30, stable green)");
                 return 0;
             }
+            let mut script_evidence = Vec::new();
             let steps: Result<(), String> = (|| {
-                execute(&ssh, &plan.pre)?;
-                execute(&ssh, &plan.copies)?;
+                execute(&ssh, &plan.pre, &mut script_evidence)?;
+                execute(&ssh, &plan.copies, &mut script_evidence)?;
                 check_sizes(&ssh, &artifacts)?;
-                execute(&ssh, &plan.post)?;
+                execute(&ssh, &plan.post, &mut script_evidence)?;
                 Ok(())
             })();
-            if let Err(e) = steps {
-                eprintln!("deploy: {e}");
-                return 1;
+            report_script_evidence(&script_evidence);
+            match steps {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("deploy: {e}");
+                    return 1;
+                }
             }
         }
     }
@@ -934,7 +1432,9 @@ pub fn run(args: &[String]) -> i32 {
 
 fn report_evidence(ev: &Evidence) {
     eprintln!(
-        "deploy: host evidence: elevated={} console={} agent={} device={} staged_driver={:?}",
+        "deploy: host evidence: elevated={} console={} agent={} device={} staged_driver={:?} \
+         audio={{package={} setup={} reboot={} identity={} render={} capture={} formats={} \
+         default_active={}}}",
         ev.elevated,
         ev.console_user.as_deref().unwrap_or("<nobody>"),
         ev.agent
@@ -943,6 +1443,14 @@ fn report_evidence(ev: &Evidence) {
             .unwrap_or_else(|| "none".to_owned()),
         ev.device_present,
         ev.staged_driver_vers,
+        ev.audio_package_staged,
+        ev.audio_setup_ran,
+        ev.audio_reboot_pending,
+        ev.cable_identity_ok,
+        ev.cable_render_active,
+        ev.cable_capture_active,
+        ev.cable_formats_ok,
+        ev.audio_default_render_active,
     );
 }
 
@@ -1044,6 +1552,14 @@ mod tests {
                 green: true,
                 server_running: false,
             }),
+            audio_package_staged: true,
+            audio_setup_ran: true,
+            audio_reboot_pending: false,
+            cable_identity_ok: true,
+            cable_render_active: true,
+            cable_capture_active: true,
+            cable_formats_ok: true,
+            audio_default_render_active: true,
         }
     }
 
@@ -1077,10 +1593,15 @@ mod tests {
             .iter()
             .map(|a| match a {
                 Action::Run { label, .. } => label.as_str(),
+                Action::Script { label, .. } => label.as_str(),
                 Action::Copy { .. } => "copy",
             })
             .collect();
-        assert_eq!(labels, ["quiesce existing agent", "install agent"]);
+        assert_eq!(
+            labels,
+            ["quiesce existing agent", "install agent", "configure audio"],
+            "the new version directory must receive its own loopback source selector"
+        );
         assert_eq!(plan.copies.len(), 5);
     }
 
@@ -1239,6 +1760,7 @@ mod tests {
             .iter()
             .filter_map(|a| match a {
                 Action::Run { label, .. } => Some(label.as_str()),
+                Action::Script { label, .. } => Some(label.as_str()),
                 Action::Copy { .. } => None,
             })
             .collect();
@@ -1307,6 +1829,7 @@ mod tests {
             ("probe", PROBE_PS1),
             ("sizes", SIZES_PS1),
             ("driver-install", DRIVER_INSTALL_PS1),
+            ("vbcable-install", VB_CABLE_INSTALL_PS1),
         ] {
             let last = body.trim_end().lines().last().unwrap();
             assert!(
@@ -1314,5 +1837,176 @@ mod tests {
                 "{name}.ps1 must end by printing the sentinel, ends with {last:?}"
             );
         }
+    }
+
+    #[test]
+    fn vbcable_script_is_pinned_and_verifies_before_install() {
+        assert_eq!(VB_CABLE_ARCHIVE_BYTES, 1_318_877);
+        assert_eq!(
+            VB_CABLE_ARCHIVE_SHA256,
+            "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb"
+        );
+        assert_eq!(
+            VB_CABLE_DOWNLOAD_URL,
+            "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip"
+        );
+        let script = VB_CABLE_INSTALL_PS1;
+        for required in [
+            "VBCABLE_Driver_Pack45.zip",
+            "VBCABLE_Setup_x64.exe",
+            "Get-FileHash",
+            "Get-AuthenticodeSignature",
+            "CN=BUREL VINCENT Entrepreneur individuel",
+            "Microsoft Windows Hardware Compatibility Publisher",
+            "Microsoft Windows Third Party Component CA 2014",
+            "UnknownError",
+            "ManufacturerName",
+            "Provider=%VBAudio%",
+            "Provider=%ManufacturerName%",
+            "VBAudioVACWDM",
+            "VBAudioVACMME",
+            "VB-Audio Software",
+            "Start-Process",
+            "-i",
+            "-h",
+            "[Guid]::NewGuid",
+            "finally",
+            "RHYDRA-OK",
+            "donationware",
+        ] {
+            assert!(script.contains(required), "script is missing {required:?}");
+        }
+        assert!(
+            script.find("Get-FileHash").unwrap() < script.find("Start-Process").unwrap(),
+            "package verification must precede installer execution"
+        );
+        assert!(
+            script.find("Get-AuthenticodeSignature").unwrap()
+                < script.find("Start-Process").unwrap(),
+            "signature verification must precede installer execution"
+        );
+        assert!(
+            script.contains("Where-Object flow -eq 'render'")
+                && script.contains("Where-Object flow -eq 'capture'"),
+            "the postcheck must filter the `flow` field emitted by Cable-Endpoint-Identity"
+        );
+    }
+
+    #[test]
+    fn audio_preflight_covers_healthy_install_configure_reboot_and_broken() {
+        assert!(
+            PROBE_PS1.contains("check-audio") && PROBE_PS1.contains("$LASTEXITCODE -eq 0"),
+            "preflight must read back the live endpoint formats, not trust a stale marker"
+        );
+        let mut ev = healthy_evidence();
+        assert_eq!(ev.audio_state(), AudioState::Healthy);
+
+        ev.audio_package_staged = false;
+        assert_eq!(ev.audio_state(), AudioState::NeedsInstall);
+
+        ev.audio_package_staged = true;
+        ev.cable_formats_ok = false;
+        assert_eq!(ev.audio_state(), AudioState::NeedsConfigure);
+
+        ev.audio_reboot_pending = true;
+        assert_eq!(ev.audio_state(), AudioState::RebootRequired);
+
+        ev.audio_reboot_pending = false;
+        ev.cable_formats_ok = true;
+        ev.audio_setup_ran = true;
+        ev.cable_render_active = false;
+        assert_eq!(ev.audio_state(), AudioState::Broken);
+    }
+
+    #[test]
+    fn audio_only_repair_does_not_quiesce_or_replace_a_healthy_stack() {
+        let dir = scratch_dir("audio-only");
+        let art = test_artifacts(&dir);
+        let mut ev = healthy_evidence();
+        ev.version_dirs.push("v0.2.0".to_owned());
+        for (name, len) in [
+            ("rhydra-server.exe", 10u64),
+            ("rhydra-agent.exe", 20),
+            ("mdrdp-idd-create.exe", 30),
+            ("mdrdp_idd.dll", 40),
+            ("mdrdp-idd.inf", 50),
+        ] {
+            ev.target_dir_sizes.insert(name.to_owned(), len);
+        }
+        ev.cable_render_active = false;
+        ev.cable_capture_active = false;
+        ev.audio_package_staged = false;
+        ev.audio_setup_ran = false;
+        ev.agent = Some(AgentProbe {
+            version: "0.2.0".to_owned(),
+            green: true,
+            server_running: true,
+        });
+
+        let Branch::AudioOnly(plan) = decide(&cfg(), &art, &ev).unwrap() else {
+            panic!("a broken cable on an exact healthy stack is audio-only repair");
+        };
+        assert!(plan.copies.is_empty());
+        assert!(
+            plan.pre
+                .iter()
+                .chain(&plan.post)
+                .all(|a| !matches!(a, Action::Run { label, .. } if label.contains("quiesce")))
+        );
+        assert!(matches!(
+            plan.pre.first(),
+            Some(Action::Script { label, .. }) if label.contains("VB-CABLE")
+        ));
+    }
+
+    #[test]
+    fn cable_install_is_first_before_any_full_deploy_mutation() {
+        let dir = scratch_dir("audio-order");
+        let art = test_artifacts(&dir);
+        let mut ev = healthy_evidence();
+        ev.audio_package_staged = false;
+        ev.audio_setup_ran = false;
+        ev.cable_render_active = false;
+        ev.cable_capture_active = false;
+        let Branch::Full(plan) = decide(&cfg(), &art, &ev).unwrap() else {
+            panic!("expected a full plan");
+        };
+        assert!(matches!(
+            plan.pre.first(),
+            Some(Action::Script { label, .. }) if label.contains("VB-CABLE")
+        ));
+        let all: Vec<&Action> = plan
+            .pre
+            .iter()
+            .chain(&plan.copies)
+            .chain(&plan.post)
+            .collect();
+        let audio = all
+            .iter()
+            .position(|a| matches!(a, Action::Script { label, .. } if label.contains("VB-CABLE")))
+            .unwrap();
+        let quiesce = all
+            .iter()
+            .position(|a| matches!(a, Action::Run { label, .. } if label.contains("quiesce")));
+        let copy = all.iter().position(|a| matches!(a, Action::Copy { .. }));
+        assert!(quiesce.is_none_or(|i| audio < i));
+        assert!(copy.is_none_or(|i| audio < i));
+    }
+
+    #[test]
+    fn staged_cable_without_endpoint_after_setup_stops_without_a_loop() {
+        let dir = scratch_dir("audio-broken");
+        let art = test_artifacts(&dir);
+        let mut ev = healthy_evidence();
+        ev.audio_package_staged = true;
+        ev.audio_setup_ran = true;
+        ev.cable_render_active = false;
+        ev.cable_capture_active = false;
+        ev.audio_reboot_pending = false;
+        let error = decide(&cfg(), &art, &ev).unwrap_err();
+        assert!(error.contains("broken") || error.contains("reboot"));
+
+        ev.audio_reboot_pending = true;
+        assert!(decide(&cfg(), &art, &ev).unwrap_err().contains("reboot"));
     }
 }

@@ -27,7 +27,10 @@ pub const CONTROL_PORT: u16 = 9502;
 ///    additive — a schema-3 client never sends it, and a schema-3 agent answers
 ///    an unrecognised command with an error rather than misbehaving.
 /// 5: `PrepareDisplay` plus requested mode/scale status fields.
-pub const SCHEMA: u32 = 5;
+/// 6: `ConfigureAudio`, which is handled by the interactive agent and refuses
+///    while the capture process owns its named lease.
+/// 7: `CheckAudio`, the read-only live-format check used by deploy preflight.
+pub const SCHEMA: u32 = 7;
 
 /// A parsed control request: `{"cmd":"status"}` and friends.
 ///
@@ -90,6 +93,12 @@ pub enum Request {
         hz: u32,
         scale_percent: u32,
     },
+    /// Pin the discovered VB-CABLE endpoints from the interactive session.
+    /// The agent owns this operation because an SSH service session has a
+    /// different per-user Core Audio policy context.
+    ConfigureAudio,
+    /// Read back both VB-CABLE formats in the interactive user's policy store.
+    CheckAudio,
 }
 
 /// Parse one request line. The error string is sent back to the client verbatim,
@@ -681,6 +690,14 @@ mod tests {
                 hz: 240,
                 scale_percent: 200,
             })
+        );
+        assert_eq!(
+            parse_request(r#"{"cmd":"configure-audio"}"#),
+            Ok(Request::ConfigureAudio)
+        );
+        assert_eq!(
+            parse_request(r#"{"cmd":"check-audio"}"#),
+            Ok(Request::CheckAudio)
         );
     }
 
