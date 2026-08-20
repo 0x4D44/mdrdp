@@ -480,7 +480,17 @@ pub fn exe_root() -> Result<PathBuf, String> {
 /// session; a value that falls back to silence is merely unhelpful.
 fn audio_source_arg(root: &std::path::Path) -> String {
     match std::fs::read_to_string(root.join("audio-source")) {
+        // **`loopback` was missing here, and its absence made the design's
+        // central promise false.** The HLD says capture starts working the
+        // moment a host grows an endpoint, "with no other change" — but the
+        // supervised agent mapped every value except `tone` to `off`, so the
+        // deployed path could never select real capture at all. Only a manual
+        // server invocation could, which is not how any fleet host runs.
         Ok(s) if s.trim() == "tone" => "tone".to_owned(),
+        Ok(s) if s.trim() == "loopback" => "loopback".to_owned(),
+        // Anything unrecognised, including a typo, reads as off. A value that
+        // silently fell back to a *working* source would be worse: a typo would
+        // start streaming audio nobody asked for.
         _ => "off".to_owned(),
     }
 }

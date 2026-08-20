@@ -57,6 +57,11 @@ windows = { version = "0.62", optional = true, features = [
     # StructuredStorage + Variant pair for its PROPVARIANT parameter, which is
     # why they are here rather than only Win32_Media_Audio.
     "Win32_Media_Audio",
+    # KSDATAFORMAT_SUBTYPE_PCM / _IEEE_FLOAT: the SubFormat GUIDs that say what a
+    # WAVEFORMATEXTENSIBLE mix format actually contains. Using the crate's own
+    # constants rather than hardcoding the GUIDs.
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     # OpenFileMappingW / MapViewOfFile — the IddCx shared section.

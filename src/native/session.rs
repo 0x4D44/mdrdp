@@ -376,9 +376,17 @@ fn spawn_aux(
     // would land on the latency of every clipboard message sharing the thread,
     // and the whole point of this channel is that lower-priority traffic never
     // delays higher-priority traffic.
+    //
+    // **Bounded.** An unbounded queue here would sit in front of a bounded ring
+    // and quietly defeat it: if decode or playback fell behind, stale audio would
+    // accumulate without limit, adding exactly the latency the host's drop-oldest
+    // FIFO exists to prevent, and teardown would then have to chew through the
+    // whole backlog before this thread could exit. Depth matches the host's
+    // outbox so the two bounds agree.
     let (audio_tx, audio_rx) = match audio {
         Some(_) => {
-            let (tx, rx) = std::sync::mpsc::channel::<AudioFrame>();
+            let (tx, rx) =
+                std::sync::mpsc::sync_channel::<AudioFrame>(rhydra::auxchan::AUDIO_FIFO_FRAMES);
             (Some(tx), Some(rx))
         }
         None => (None, None),
@@ -463,12 +471,18 @@ fn spawn_aux(
                         // **Handed off, never processed here.** Decode, channel
                         // remap and resample are the expensive part, and doing them
                         // on the reader would add their cost to the latency of every
-                        // clipboard message sharing this thread. The send never
-                        // blocks; if nothing is playing, the frame is dropped, which
-                        // is the right answer for audio nobody can hear.
+                        // clipboard message sharing this thread.
+                        //
+                        // `try_send`, never `send`. The queue is bounded, and
+                        // `SyncSender::send` BLOCKS when a bounded queue is full —
+                        // on this thread that would stall the reader, which is what
+                        // keeps the clipboard moving, so a stalled audio device
+                        // would wedge the clipboard. Dropping a frame is the right
+                        // trade: the alternative is wedging both directions to
+                        // preserve audio nobody can hear.
                         on_audio: &mut |frame| {
                             if let Some(tx) = audio_tx.as_ref() {
-                                let _ = tx.send(frame);
+                                let _ = tx.try_send(frame);
                             }
                         },
                         // Client -> host only; the client never receives it.
