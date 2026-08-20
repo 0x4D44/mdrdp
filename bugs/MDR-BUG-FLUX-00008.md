@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00008 — Reveal after Suppress Output paints black: the resumed AVC444 stream fails to decode in a burst
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** gfx
 - **Raised:** 2026-08-19T07:15:59Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260820T094820Z-p79668-n341034000-c1
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T094820Z-p79668-n341034000-c1
-- **Owner base:** c3f6590b0a1be54362119cfc00ea72c83cbc7496
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-20T09:48:20Z
-- **Owner until:** 2026-08-20T11:48:20Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T07:15:59Z, raised via `deltic bugs new` model=claude-opus-5@high)
+- **State history:** Open (2026-08-19T07:15:59Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-20T09:48:39Z, deltic:auto role=fix run=fix-20260820T094820Z-p79668-n341034000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T094820Z-p79668-n341034000-c1 code=dc30a1e gate=manual)
 
 ## Observation
 
