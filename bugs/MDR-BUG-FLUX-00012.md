@@ -34,3 +34,65 @@ Related gap in the same area: the connect stage feed stops at 'handshake'. There
 <unfixed — raised only>
 
 ## Notes
+
+### 2026-08-20 — Root cause, and the same defect on a second surface
+
+Arthur reported `mdrdp -S` showing a native session with FRAMES 1 and a blank P50
+beside RX 7.8 MB. Same defect as this ticket, seen through `--sessions` instead of
+`--metrics-json`: only the RDP path feeds the shared collectors.
+
+Evidence, from the live presence file of a 5h42m native session
+(`~/Library/Application Support/mdrdp/sessions/46248.json`, mdrdp 0.1.95):
+
+```
+"frames": 1, "bytes_in": 8295888, "latency_p50_us": null,
+"frame_gap_p50_us": 60011134, "codecs": {}
+```
+
+**Two causes, not three.**
+
+1. **FRAMES 1 — the rects path painted without counting.** `NativeSink::on_au` and
+   `NativeSink::paint` each kept their own stats block, and `paint`'s omitted
+   `s.frames += 1` (it did update `bytes_in`, `codec_painted` and `mark_painted`).
+   A native session receives one AU keyframe and then rect deltas forever, so the
+   count froze at 1 while 8.3 MB of rects arrived — ~346 updates at ~24 KB each.
+   Neither path fed `s.codecs` either, so the HUD's codec line read
+   "no surface updates yet" for the life of every native session.
+
+2. **Blank P50 — nothing on the native path ever recorded `s.latency`.** The
+   input→paint round-trip proxy existed only in the RDP loop (`src/session.rs:295`
+   stamps on send, `:525` records on the next paint). The native session sends input
+   on `native-input` and paints on `native-net`, so a thread-local stamp could not
+   work and none was written.
+
+**FPS 0 is not a defect.** `frame_gap_p50_us` was 60,011,134 µs — the host's idle
+cadence really is one update per minute, so 1e6/gap rounds to 0. The arithmetic is
+honest; the column grades an unfiltered median and so paints an idle session red.
+Logged separately in `scratchpad.md` (2026-08-20) as a presentation question, not a
+counter that is wrong.
+
+The presence writer and the sink share one `StatsHandle` (`src/main.rs:1637`), and
+the file refreshes normally — the earlier suspicion of a stale file or a second
+handle is disproved by the recorded frame gaps, which only `mark_painted` can write.
+
+### Fix, landed on this branch
+
+`src/native/session.rs`:
+
+- One `NativeSink::record_paint(bytes, generation, decode_us)` now folds a painted
+  frame into the collectors — frame count, bytes, codec tally, codec bytes, decode
+  sample (AU path only), the input round trip, and `mark_painted`. Both paint paths
+  call it. The duplication that let the two blocks drift is gone.
+- New `InputClock` (`Arc<Mutex<Option<Instant>>>`), stamped by `pump_input` after any
+  lap that put records on the wire and taken by the next paint. Only the first
+  unanswered input starts it, matching the RDP loop's `get_or_insert_with`.
+
+Not affected, and verified working on the native path: `frame_gap` and `present`.
+`mark_painted` already ran on both paint paths, and `mark_presented` is called from
+the shared renderer (`src/window.rs:1887`), which is transport-agnostic.
+
+Still open in this ticket after this change: the `decode` block carries roughly one
+sample per native session, because only the AU path decodes and a session receives
+one keyframe — a real number, but not a distribution; and the connect stage feed
+still has no first-decoded-frame event, so connect-to-first-pixel cannot be timed
+directly.

@@ -271,6 +271,10 @@ pub fn spawn(
     let video = conn.video.try_clone()?;
     let input = conn.input.try_clone()?;
 
+    // One clock, both threads: `native-input` stamps it, `native-net` closes it
+    // on the next paint. That is the session's input round trip.
+    let input_clock = InputClock::default();
+
     let net_stop = Arc::clone(&stop);
     let net_input_sock = conn.input.try_clone()?;
     let mut sink = NativeSink::new(
@@ -281,6 +285,7 @@ pub fn spawn(
             let _ = waker.damaged();
         }),
         stats,
+        input_clock.clone(),
     );
     let mut video_sock = conn.video;
     let mut reassembler = conn.reassembler;
@@ -300,7 +305,14 @@ pub fn spawn(
     let input_join = std::thread::Builder::new()
         .name("native-input".to_owned())
         .spawn(move || {
-            let failure = pump_input(input_sock, input_rx, commands, wake_rx, &input_stop);
+            let failure = pump_input(
+                input_sock,
+                input_rx,
+                commands,
+                wake_rx,
+                &input_stop,
+                input_clock,
+            );
             input_stop.store(true, Ordering::Relaxed);
             let _ = input_video_sock.shutdown(Shutdown::Both);
             failure
@@ -623,6 +635,7 @@ fn pump_input(
     commands: Receiver<SessionCommand>,
     wake_rx: DoorbellReceiver,
     stop: &AtomicBool,
+    input_clock: InputClock,
 ) -> Option<String> {
     let mut writer = match sock.try_clone() {
         Ok(w) => w,
@@ -661,6 +674,7 @@ fn pump_input(
         if ready.bell {
             wake_rx.drain();
         }
+        let written_before = written.0;
         loop {
             match input_rx.try_recv() {
                 Ok(event) => {
@@ -679,6 +693,11 @@ fn pump_input(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return None,
             }
+        }
+        if written.0 > written_before {
+            // Something reached the host: start the round-trip clock the next
+            // paint on `native-net` will close.
+            input_clock.stamp();
         }
         loop {
             match commands.try_recv() {
@@ -750,6 +769,40 @@ struct PendingRects {
     update: RectUpdate,
 }
 
+/// The first input still waiting for a paint, shared across the session's two
+/// threads.
+///
+/// The RDP loop measures the same input→paint proxy inside a single thread
+/// ([`crate::session::notify_if_painted`]); a native session sends input on
+/// `native-input` and paints on `native-net`, so the stamp has to be shared
+/// state rather than a local. Only the FIRST unanswered input starts the clock:
+/// overwriting it with each later keystroke would measure the gap to the *last*
+/// one and make a slow link look fast.
+#[derive(Clone, Default)]
+pub(crate) struct InputClock(Arc<Mutex<Option<Instant>>>);
+
+impl InputClock {
+    /// Input just went on the wire. A no-op while an earlier one is still
+    /// unanswered.
+    fn stamp(&self) {
+        let mut held = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.get_or_insert_with(Instant::now);
+    }
+
+    /// A paint just landed: close the outstanding round trip, in microseconds.
+    fn take_us(&self) -> Option<u32> {
+        let sent = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?;
+        Some(u32::try_from(sent.elapsed().as_micros()).unwrap_or(u32::MAX))
+    }
+}
+
 /// The decode-and-composite state: the viewer's exactness machinery, writing
 /// into the shared store instead of a private canvas.
 pub(crate) struct NativeSink {
@@ -763,6 +816,8 @@ pub(crate) struct NativeSink {
     pending: Option<PendingRects>,
     wake: Box<dyn Fn() + Send>,
     stats: StatsHandle,
+    /// Shared with `native-input`; a paint closes whatever it holds.
+    input_clock: InputClock,
     // Visible-behaviour counters (tests and debugging; not user-facing yet).
     pub(crate) suppressed: u64,
     pub(crate) skipped_stale: u64,
@@ -778,6 +833,7 @@ impl NativeSink {
         wire_size: (u32, u32),
         wake: Box<dyn Fn() + Send>,
         stats: StatsHandle,
+        input_clock: InputClock,
     ) -> Self {
         Self {
             decoder,
@@ -788,12 +844,42 @@ impl NativeSink {
             pending: None,
             wake,
             stats,
+            input_clock,
             suppressed: 0,
             skipped_stale: 0,
             skipped_empty: 0,
             skipped_before_base: 0,
             held: 0,
         }
+    }
+
+    /// Fold one painted frame into the session stats.
+    ///
+    /// Both paint paths come through here on purpose. They used to keep their
+    /// own stats blocks, and the rects path — which carries almost every frame
+    /// of a native session — silently omitted the frame count, so `--sessions`
+    /// reported FRAMES 1 beside megabytes of RX (MDR-BUG-FLUX-00012). One
+    /// place now decides what a painted frame costs the collectors.
+    ///
+    /// `decode_us` is `Some` only for the AU path; a rect blit decodes nothing.
+    fn record_paint(&self, bytes: u64, generation: u64, decode_us: Option<u32>) {
+        let input_us = self.input_clock.take_us();
+        self.stats.update(|s| {
+            s.frames += 1;
+            s.bytes_in += bytes;
+            *s.codecs.entry(CODEC_LABEL.to_owned()).or_insert(0) += 1;
+            *s.codec_painted.entry(CODEC_LABEL.to_owned()).or_insert(0) += bytes;
+            if let Some(us) = decode_us {
+                s.decode.record(us);
+            }
+            // A paint following input is the closest thing to a round trip the
+            // client can observe alone — the same proxy, and the same caveats,
+            // as the RDP path's.
+            if let Some(us) = input_us {
+                s.latency.record(us);
+            }
+            s.mark_painted(generation);
+        });
     }
 
     /// May a decoded AU with this seq replace the surface? (The viewer's rule:
@@ -844,13 +930,7 @@ impl NativeSink {
                 .adopt_pixels(OUTPUT_SURFACE, decoded.into_data())
                 .map_err(|e| format!("surface adopt: {e}"))?;
             let generation = store.generation();
-            self.stats.update(|s| {
-                s.frames += 1;
-                s.bytes_in += bytes;
-                s.decode.record(decode_us);
-                *s.codec_painted.entry(CODEC_LABEL.to_owned()).or_insert(0) += bytes;
-                s.mark_painted(generation);
-            });
+            self.record_paint(bytes, generation, Some(decode_us));
         }
         self.exact_through = seq;
         self.has_base = true;
@@ -923,11 +1003,7 @@ impl NativeSink {
                 painted_bytes += r.pixels.len() as u64;
             }
             let generation = store.generation();
-            self.stats.update(|s| {
-                s.bytes_in += painted_bytes;
-                *s.codec_painted.entry(CODEC_LABEL.to_owned()).or_insert(0) += painted_bytes;
-                s.mark_painted(generation);
-            });
+            self.record_paint(painted_bytes, generation, None);
         }
         self.exact_through = Some(update.frame_seq);
         (self.wake)();
@@ -1027,6 +1103,13 @@ mod tests {
     }
 
     fn sink_with_store(size: (u32, u32)) -> (NativeSink, Arc<Mutex<SurfaceStore>>) {
+        sink_with_clock(size, InputClock::default())
+    }
+
+    fn sink_with_clock(
+        size: (u32, u32),
+        clock: InputClock,
+    ) -> (NativeSink, Arc<Mutex<SurfaceStore>>) {
         let store = Arc::new(Mutex::new(SurfaceStore::new()));
         {
             let mut s = store.lock().unwrap();
@@ -1039,6 +1122,7 @@ mod tests {
             size,
             Box::new(|| {}),
             StatsHandle::new(),
+            clock,
         );
         (sink, store)
     }
@@ -1142,6 +1226,136 @@ mod tests {
         sink.apply_update(one_rect_update((4, 2), 1, 200)).unwrap();
         assert_eq!(sink.skipped_before_base, 1);
         assert_eq!(surface_fill(&store), 0, "nothing to composite onto yet");
+    }
+
+    /// MDR-BUG-FLUX-00012: the rects path carries almost every frame of a live
+    /// native session, and it used to paint without counting. `--sessions` then
+    /// showed FRAMES 1 next to megabytes of RX, and FPS graded from a stat no
+    /// rect update ever fed.
+    #[test]
+    fn every_painted_frame_is_counted_not_just_the_keyframe() {
+        let (mut sink, _store) = sink_with_store((4, 2));
+        sink.on_au(&[7], Some(10)).unwrap();
+        sink.apply_update(one_rect_update((4, 2), 11, 200)).unwrap();
+        sink.apply_update(one_rect_update((4, 2), 12, 201)).unwrap();
+        let s = sink.stats.snapshot();
+        assert_eq!(s.frames, 3, "the AU and both rect updates each painted");
+        assert_eq!(
+            s.codecs.get(CODEC_LABEL),
+            Some(&3),
+            "the codec tally must count every painted frame, not just the AU"
+        );
+        // 4 bytes of BGRA per rect update, plus the one-byte fake AU.
+        assert_eq!(s.bytes_in, 9);
+
+        // An update that paints nothing must not inflate the count.
+        sink.apply_update(one_rect_update((4, 2), 9, 202)).unwrap(); // stale
+        sink.apply_update(one_rect_update((4, 2), 99, 203)).unwrap(); // held: a gap
+        let s = sink.stats.snapshot();
+        assert_eq!(s.frames, 3, "a skipped or held update painted nothing");
+        assert_eq!(s.codecs.get(CODEC_LABEL), Some(&3));
+    }
+
+    /// The blank P50 column: nothing on the native path ever recorded the
+    /// input round trip, so `latency` stayed empty for the life of a session.
+    #[test]
+    fn a_paint_closes_the_outstanding_input_round_trip_on_both_paths() {
+        let clock = InputClock::default();
+        let (mut sink, _store) = sink_with_clock((4, 2), clock.clone());
+
+        clock.stamp();
+        sink.on_au(&[7], Some(10)).unwrap();
+        assert_eq!(
+            sink.stats.snapshot().latency.count(),
+            1,
+            "the AU path must close an outstanding round trip"
+        );
+
+        // Nothing outstanding: a paint the user did not ask for records nothing.
+        sink.apply_update(one_rect_update((4, 2), 11, 200)).unwrap();
+        assert_eq!(sink.stats.snapshot().latency.count(), 1);
+
+        clock.stamp();
+        sink.apply_update(one_rect_update((4, 2), 12, 201)).unwrap();
+        assert_eq!(
+            sink.stats.snapshot().latency.count(),
+            2,
+            "the rects path must close one too"
+        );
+
+        // An update that paints nothing must leave the clock running, or a
+        // stale frame would answer the keystroke instead of the real one.
+        clock.stamp();
+        sink.apply_update(one_rect_update((4, 2), 9, 202)).unwrap();
+        assert_eq!(sink.stats.snapshot().latency.count(), 2);
+        assert!(clock.take_us().is_some(), "the stamp must still be pending");
+    }
+
+    #[test]
+    fn only_the_first_unanswered_input_starts_the_round_trip_clock() {
+        let clock = InputClock::default();
+        clock.stamp();
+        std::thread::sleep(Duration::from_millis(25));
+        clock.stamp(); // a later keystroke must not restart the clock
+        let us = clock.take_us().expect("a stamp is outstanding");
+        assert!(
+            us >= 25_000,
+            "the clock must run from the FIRST input, got {us}us"
+        );
+        assert!(
+            clock.take_us().is_none(),
+            "taking the stamp must clear it: one paint answers one round trip"
+        );
+    }
+
+    /// The wiring the two tests above cannot see: `native-input` is what stamps
+    /// the clock, and a clock nobody stamps measures nothing.
+    #[test]
+    fn the_input_thread_stamps_the_clock_when_a_record_reaches_the_wire() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sock = TcpStream::connect(addr).unwrap();
+        // Hold the peer open: a readable input socket means EOF, which ends the pump.
+        let _peer = listener.accept().unwrap().0;
+
+        let (bell, wake_rx) = crate::wake::doorbell().unwrap();
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let (_commands_tx, commands) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let clock = InputClock::default();
+
+        let thread_clock = clock.clone();
+        let thread_stop = Arc::clone(&stop);
+        let join = std::thread::spawn(move || {
+            pump_input(
+                sock,
+                input_rx,
+                commands,
+                wake_rx,
+                &thread_stop,
+                thread_clock,
+            )
+        });
+
+        input_tx.send(InputEvent::MouseMove { x: 1, y: 2 }).unwrap();
+        bell.ring();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stamped = loop {
+            if let Some(us) = clock.take_us() {
+                break Some(us);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the input thread never stamped the round-trip clock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(stamped.is_some());
+
+        stop.store(true, Ordering::Relaxed);
+        bell.ring();
+        let _ = join.join();
     }
 
     #[test]
