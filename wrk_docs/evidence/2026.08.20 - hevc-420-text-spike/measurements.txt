@@ -1,0 +1,50 @@
+HEVC 4:2:0 vs 4:4:4 at 5120x2880 -- raw measurement log
+generated 2026-08-20T05:00:05Z on macOS 26.5.2 arm64
+ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers
+libx265 4.2+1-e444744, build 8bit+10bit+12bit
+
+All encodes: -preset medium, keyint=1 (single IDR), bframes=0, full-range BT.709,
+one frame in, one frame out. Bytes are the whole IDR.
+
+GATE: a 4:4:4 lossless encode must round-trip bit-exact (PSNR inf on all three planes).
+      a 4:2:0 lossless encode must be inf on Y -- its U/V figure IS the subsampling floor.
+      Both gates pass in sections 1 and 2. An earlier run of this pipeline did NOT pass
+      them (swscale was inserting a tv->pc range expansion ahead of the encoder, which
+      capped every luma PSNR at ~28 dB); the gate is what caught it.
+
+=== 1. SYNTHETIC 5K test card, psy-rd=0 on BOTH formats (matched comparison) ===
+variant                 bytes  PSNR
+yuv420p-20M            283674  y:42.947342 u:35.138456 v:33.182529
+yuv444p-20M            335739  y:42.863080 u:45.764122 v:45.870293
+yuv420p-lossless      1025706  y:inf u:35.827100 v:33.610488
+yuv444p-lossless      1282659  y:inf u:inf v:inf
+
+=== 2. REAL Windows 5K screenshot (baseline/freerdp-reference/ref2-full.png), psy-rd=0 ===
+variant                 bytes  PSNR
+yuv420p-20M             39901  y:51.437556 u:50.851904 v:52.902507
+yuv444p-20M             55314  y:51.441108 u:53.989358 v:54.292720
+yuv420p-lossless      2298055  y:inf u:54.232610 v:58.586115
+yuv444p-lossless      3730222  y:inf u:inf v:inf
+
+=== 3. Rate sweep, synthetic card, x265 DEFAULTS (psy-rd on) ===
+    NOTE: with psy-rd on, x265 forces cbQpOffset=crQpOffset=+6 for 4:4:4 input and
+    IGNORES an explicit cbQpOffset=0 (verified: identical byte counts). Only psy-rd=0
+    clears it. Every 4:4:4 row below therefore carries a +6 chroma-QP handicap;
+    the 4:2:0 rows are unaffected, so the 4:2:0 chroma plateau is a clean reading.
+variant                 bytes  PSNR
+yuv420p-5M             244002  y:40.537368 u:34.974405 v:33.072293
+yuv444p-5M             237034  y:40.375176 u:39.359481 v:39.230421
+yuv420p-20M            286227  y:43.054494 u:35.157532 v:33.196372
+yuv444p-20M            289206  y:42.975202 u:41.226314 v:41.189346
+yuv420p-50M            450749  y:50.403625 u:35.605741 v:33.485983
+yuv444p-50M            483454  y:50.365287 u:47.423102 v:47.564573
+yuv420p-qp16           804728  y:62.786063 u:35.807511 v:33.597527
+yuv444p-qp16           920214  y:62.722981 u:58.715118 v:58.752606
+yuv420p-lossless      1025706  y:inf u:35.827100 v:33.610488
+yuv444p-lossless      1282659  y:inf u:inf v:inf
+
+=== 4. No-codec control: swscale 4:4:4 -> 4:2:0 -> 4:4:4, synthetic card ===
+PSNR y:inf u:35.827100 v:33.610488 average:36.339797 min:36.339797 max:36.339797
+SSIM Y:1.000000 (inf) U:0.984238 (18.023954) V:0.983547 (17.837546) All:0.989262 (19.690663)
+  Agrees with the 4:2:0 lossless encode in section 1 to 6 significant figures
+  (u 35.827100 / v 33.610488): x265's chroma downsampler and swscale's are the same.
