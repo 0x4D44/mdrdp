@@ -95,10 +95,9 @@ const SEQLOCK_ATTEMPTS: u32 = 32;
 /// release with it.
 const MUTEX_KEY: u64 = 0;
 
-/// How long to wait for a slot's keyed mutex. Small on purpose — the driver holds
-/// it only for its own copy, and a slot we cannot get in this long is one the
-/// driver is actively writing, which the next-newest slot or the next wakeup
-/// covers.
+/// How long to wait for a slot's keyed mutex. Small on purpose: a large surface copy
+/// may outlive this wait, but a busy slot is safely skipped in favour of the next-newest
+/// slot or the next wakeup.
 const MUTEX_TIMEOUT_MS: u32 = 4;
 
 /// `AcquireSync` succeeded but the previous owner died holding the mutex. A

@@ -265,7 +265,7 @@ namespace Microsoft
             void AppendCoverageRect(const RECT& Rect);
             void MarkAllOverflowed();
             void MarkAllAbsent();
-            bool WaitForCopy();
+            bool WaitForCopy(const LARGE_INTEGER& Start);
             void PublishSlot(UINT32 Index, UINT64 FrameSeq, INT64 PresentQpc);
 
             SharedSection* m_pSection;
@@ -280,6 +280,7 @@ namespace Microsoft
             IDDCX_MOVEREGION m_ScratchMoves[MDRDP_IDD_MAX_COVERAGE_RECTS];
 
             LARGE_INTEGER m_PerfFrequency;
+            LONGLONG m_CopyWaitLimitUs;
             UINT64 m_FrameSeq;
             UINT32 m_Generation;
             bool m_Started;

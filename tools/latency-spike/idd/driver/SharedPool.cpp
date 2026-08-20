@@ -29,13 +29,38 @@ using namespace Microsoft::WRL;
 
 #pragma region helpers
 
-// How long the swap-chain thread will wait for the GPU to finish a slot copy before giving
-// up on it. The wait holds the slot's keyed mutex, so it must sit UNDER the consumer's own
-// 4 ms mutex timeout as well as under the 4.17 ms frame interval of the 240 Hz mode this
-// driver advertises - a 1080p CopyResource is ~0.2 ms, so 2 ms is already ten times the
-// common case. If we ever hit it, the log says so and the frame is not published (a copy
-// that never provably finished would publish torn pixels as a complete frame).
-static constexpr LONGLONG MDRDP_IDD_COPY_WAIT_LIMIT_US = 2000;
+// Bound the event-query polling by surface size. A 1080p CopyResource is ~0.2 ms, so the
+// 2 ms floor leaves ample scheduling margin there. Quench measured 5K copies at 2.001 ms
+// minimum and 6.848 ms maximum under encoder load, so linear pixel scaling gives 14.223 ms.
+// The 16 ms ceiling limits a stuck GPU's damage. Direct3D calls themselves cannot be
+// pre-empted, but the elapsed sample begins before submission so they cannot consume this
+// budget and then receive a fresh polling budget.
+static constexpr LONGLONG CopyWaitLimitUs(UINT32 Width, UINT32 Height)
+{
+    constexpr UINT64 BaselinePixels = 1920ULL * 1080ULL;
+    constexpr LONGLONG MinimumUs = 2000;
+    constexpr LONGLONG MaximumUs = 16000;
+    constexpr UINT64 MaximumScaledPixels = BaselinePixels * (MaximumUs / MinimumUs);
+
+    const UINT64 Pixels = static_cast<UINT64>(Width) * static_cast<UINT64>(Height);
+    if (Pixels <= BaselinePixels)
+    {
+        return MinimumUs;
+    }
+    if (Pixels >= MaximumScaledPixels)
+    {
+        return MaximumUs;
+    }
+
+    return static_cast<LONGLONG>((Pixels * MinimumUs + BaselinePixels - 1) / BaselinePixels);
+}
+
+static_assert(CopyWaitLimitUs(0, 0) == 2000, "zero dimensions keep the lower bound");
+static_assert(CopyWaitLimitUs(1280, 720) == 2000, "small surfaces keep the lower bound");
+static_assert(CopyWaitLimitUs(1920, 1080) == 2000, "1080p keeps the existing budget");
+static_assert(CopyWaitLimitUs(2560, 1440) == 3556, "1440p scales and rounds up");
+static_assert(CopyWaitLimitUs(5120, 2880) == 14223, "5K covers the measured copy tail");
+static_assert(CopyWaitLimitUs(UINT32_MAX, UINT32_MAX) == 16000, "extreme dimensions cap safely");
 
 // Seqlock, writer side. The sequence is odd while a write is in flight and even when the
 // record is stable, so a reader that samples the same even value either side of its read
@@ -266,6 +291,7 @@ MdrdpSharedSlot* SharedSection::Slot(UINT32 Index) const
 
 SharedFramePool::SharedFramePool() :
     m_pSection(nullptr),
+    m_CopyWaitLimitUs(2000),
     m_FrameSeq(0),
     m_Started(false)
 {
@@ -311,6 +337,7 @@ HRESULT SharedFramePool::Start(
     m_pSection = pSection;
     m_Device = pDevice;
     m_Context = pContext;
+    m_CopyWaitLimitUs = CopyWaitLimitUs(SourceDesc.Width, SourceDesc.Height);
     m_Stats = {};
 
     // The generation the consumer watches for invalidation. It only ever goes up, and it
@@ -498,6 +525,7 @@ void SharedFramePool::Stop()
     m_Device.Reset();
 
     m_pSection = nullptr;
+    m_CopyWaitLimitUs = 2000;
     m_FrameSeq = 0;
     m_Started = false;
 }
@@ -541,6 +569,8 @@ void SharedFramePool::ProcessFrame(
         return;
     }
 
+    LARGE_INTEGER CopyStart = {};
+    QueryPerformanceCounter(&CopyStart);
     m_Context->CopyResource(Target.Texture.Get(), pSource);
 
     // The keyed mutex protects the destination; NOTHING protects the source, which goes
@@ -548,7 +578,7 @@ void SharedFramePool::ProcessFrame(
     // composites into a surface the GPU is still reading. A copy that never provably
     // finished is NOT published - torn pixels under a record that calls them complete
     // would defeat the whole contract; the frame is simply lost and counted.
-    const bool CopyProven = WaitForCopy();
+    const bool CopyProven = WaitForCopy(CopyStart);
 
     if (CopyProven)
     {
@@ -705,16 +735,13 @@ void SharedFramePool::MarkAllAbsent()
     }
 }
 
-bool SharedFramePool::WaitForCopy()
+bool SharedFramePool::WaitForCopy(const LARGE_INTEGER& Start)
 {
     m_Context->End(m_CopyFence.Get());
     m_Context->Flush();
 
-    LARGE_INTEGER Start = {};
-    QueryPerformanceCounter(&Start);
-
     const LONGLONG Limit = (m_PerfFrequency.QuadPart != 0)
-        ? (m_PerfFrequency.QuadPart * MDRDP_IDD_COPY_WAIT_LIMIT_US) / 1000000
+        ? (m_PerfFrequency.QuadPart * m_CopyWaitLimitUs) / 1000000
         : 0;
 
     bool Signalled = false;
