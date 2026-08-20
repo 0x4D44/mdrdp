@@ -377,7 +377,7 @@ mod win {
         match TcpStream::connect(("127.0.0.1", CONTROL_PORT)) {
             Ok(mut stream) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let _ = writeln!(stream, "{}", r#"{"cmd":"shutdown"}"#);
+                let _ = writeln!(stream, "{{\"cmd\":\"shutdown\"}}");
                 let mut reply = String::new();
                 let _ = BufReader::new(&stream).read_line(&mut reply);
                 println!("agent shutdown acknowledged: {}", reply.trim());

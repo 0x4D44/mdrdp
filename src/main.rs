@@ -881,8 +881,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let always = target.native == mdrdp::favourites::NativeMode::Always;
         if !mdrdp::h264::hardware_decode_available() {
-            let why =
-                "no hardware H.264 decoder is available, and the native transport is AVC-only";
+            let why = "no hardware H.264 decoder is available for the preferred native path";
             if always {
                 return Err(format!("--native: {why}").into());
             }
@@ -1682,10 +1681,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )),
         Connected::Native(transport) => {
             let decoder_count = transport.conn.header.tiles.len();
+            let codec = transport.conn.header.codec.as_str();
             let decoders = (0..decoder_count)
-                .map(|_| {
-                    mdrdp::h264::hardware_decoder()
-                        .ok_or_else(|| "native H.264 decoder disappeared after probing".to_owned())
+                .map(|_| match codec {
+                    "h264-420" => mdrdp::h264::hardware_decoder()
+                        .map(mdrdp::native::session::NativeDecoder::H264)
+                        .ok_or_else(|| "native H.264 decoder disappeared after probing".to_owned()),
+                    "hevc-420" => mdrdp::hevc::hardware_decoder()
+                        .map(mdrdp::native::session::NativeDecoder::Hevc)
+                        .ok_or_else(|| "native HEVC fallback decoder is unavailable".to_owned()),
+                    other => Err(format!(
+                        "native server selected unsupported codec {other:?}"
+                    )),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             ActiveSession::Native(

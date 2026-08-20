@@ -118,18 +118,18 @@ pub struct TileHeader {
 }
 
 fn validate_video_contract(header: &ServerHeader) -> Result<(), String> {
-    if header.codec != "h264-420" {
-        return Err(format!("unsupported native codec {:?}", header.codec));
+    let geometry = (header.width, header.height);
+    if !matches!(geometry, (5120, 2880) | (2560, 1440)) {
+        return Err(format!(
+            "unsupported native desktop {}x{}",
+            geometry.0, geometry.1
+        ));
     }
-    let expected: &[(u8, u32, u32, u32, u32)] = match (header.width, header.height) {
-        (5120, 2880) => &[(0, 0, 0, 2560, 2880), (1, 2560, 0, 2560, 2880)],
-        (2560, 1440) => &[(0, 0, 0, 2560, 1440)],
-        other => {
-            return Err(format!(
-                "unsupported native desktop {}x{}",
-                other.0, other.1
-            ));
-        }
+    let expected: &[(u8, u32, u32, u32, u32)] = match (header.codec.as_str(), geometry) {
+        ("h264-420", (5120, 2880)) => &[(0, 0, 0, 2560, 2880), (1, 2560, 0, 2560, 2880)],
+        ("h264-420", (2560, 1440)) | ("hevc-420", (2560, 1440)) => &[(0, 0, 0, 2560, 1440)],
+        ("hevc-420", (5120, 2880)) => &[(0, 0, 0, 5120, 2880)],
+        (codec, _) => return Err(format!("unsupported native codec {codec:?}")),
     };
     let actual: Vec<_> = header
         .tiles
@@ -712,6 +712,21 @@ mod tests {
         status.desktop_scale_percent = 200;
         status.display_mode.as_mut().unwrap().width = 2560;
         assert!(!display_ready(&status, request));
+    }
+
+    #[test]
+    fn a_single_full_frame_hevc_stream_is_an_explicitly_supported_fallback() {
+        let header: ServerHeader = serde_json::from_value(serde_json::json!({
+            "schema": rhydra::stats::SCHEMA,
+            "wire_version": 5,
+            "width": 5120,
+            "height": 2880,
+            "codec": "hevc-420",
+            "tiles": [{"id":0,"x":0,"y":0,"width":5120,"height":2880}],
+            "encoder": "quicksync-hevc"
+        }))
+        .unwrap();
+        validate_video_contract(&header).expect("HEVC remains the 5K fallback");
     }
 
     #[test]

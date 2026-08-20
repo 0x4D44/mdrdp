@@ -60,7 +60,8 @@ pub struct Header {
     pub output: String,
     pub width: u32,
     pub height: u32,
-    /// Video bitstream contract. Wire v5 is H.264 4:2:0 only.
+    /// Video bitstream contract. Wire v5 prefers H.264 4:2:0 and retains HEVC 4:2:0
+    /// as an explicitly advertised startup fallback.
     pub codec: &'static str,
     /// Non-overlapping rectangles that cover the desktop exactly.
     pub tiles: Vec<TileHeader>,
@@ -82,7 +83,7 @@ pub struct Header {
     /// terms as `rect_max_count`: a measurement compared against another must be
     /// able to say which threshold each ran under.
     pub diff_idle_gap_ms: u32,
-    /// How SPS/PPS reach the wire: see `annexb`.
+    /// How SPS/PPS (or VPS/SPS/PPS for HEVC fallback) reach the wire: see `annexb`.
     pub parameter_set_route: &'static str,
     /// Whether the out-of-band `MF_MT_MPEG_SEQUENCE_HEADER` was available as a
     /// fallback source of parameter sets.
@@ -143,12 +144,23 @@ pub fn tile_layout(width: u32, height: u32) -> Vec<TileHeader> {
     }
 }
 
-/// Schema 9: headers advertise the H.264 codec and exact tile layout, and frame
+/// The retained HEVC fallback uses one full-desktop stream at either supported size.
+pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
+    vec![TileHeader {
+        id: 0,
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }]
+}
+
+/// Schema 9: headers advertise the selected codec and exact tile layout, and frame
 /// rows identify the tile whose independently encoded access unit they describe.
 /// Schema 8: frame rows report exact claimed/measured rectangle-union area, the
 /// raw-rectangle attempt/result, and an explicitly pro-rata compressed-byte
 /// estimate for the unchanged portion of the frame.
-/// Schema 7: frame rows carried the retired HEVC stream contract at its current
+/// Schema 7: frame rows first carried the HEVC stream contract at its current
 /// configuration epoch, plus cumulative fail-closed gate counters.
 /// Schema 6: the header gains `clipboard`, which says whether this host is
 /// listening on the auxiliary channel. `wire_version` deliberately does **not**
@@ -287,7 +299,7 @@ pub struct FrameRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measured_changed_pixels: Option<u64>,
     pub frame_pixels: u64,
-    /// AU bytes multiplied by the unchanged-pixel share. H.264 compression cannot
+    /// AU bytes multiplied by the unchanged-pixel share. Inter-frame compression cannot
     /// attribute bytes spatially without parsing slices, so the name deliberately
     /// marks this as an estimate rather than measured unchanged-region bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -482,6 +494,20 @@ mod tests {
                 y: 0,
                 width: 2560,
                 height: 1440
+            }]
+        );
+    }
+
+    #[test]
+    fn five_k_hevc_fallback_is_one_full_desktop_stream() {
+        assert_eq!(
+            hevc_fallback_layout(5120, 2880),
+            vec![TileHeader {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: 5120,
+                height: 2880,
             }]
         );
     }

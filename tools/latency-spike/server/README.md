@@ -1,9 +1,11 @@
 # `rhydra-server` — mdrdp's native capture/encode/send server, Windows
 
-The server half of the mdrdp latency spike. It captures one display with DXGI
-Desktop Duplication, converts BGRA→NV12 on the GPU, encodes HEVC with a Media
-Foundation MFT in low-latency mode, and ships length-prefixed Annex B over loopback
-TCP. A second loopback socket takes keystrokes and injects them with `SendInput`.
+The server half of the mdrdp native transport. It captures the client-requested IDD
+display, converts BGRA→NV12 on the GPU, and encodes with a low-latency Media Foundation
+MFT. H.264 is preferred: 5K uses two 2560x2880 tiles and 2560x1440 uses one tile. If
+that complete path cannot be constructed at startup, the server retains one full-frame
+HEVC stream as a compatibility fallback. The selected codec and exact tile layout are
+advertised before any video. A second loopback socket takes input records.
 
 The point is **decomposition**, not throughput. Every stage stamps
 `QueryPerformanceCounter` on entry and exit, so the output is a per-stage latency
@@ -128,8 +130,9 @@ smallest legal message is 1.
 | --- | --- |
 | 1 | one legacy H.264 access unit, Annex B (wire v1 only) |
 | 2 | one server stats line (JSON, no trailing newline) |
-| 3 | `[u64 frame_seq]` followed by one Annex-B access unit; HEVC in wire v4 |
-| 4 | one raw BGRA dirty-rectangle update |
+| 3 | one raw BGRA dirty-rectangle update |
+| 4 | legacy `[u64 frame_seq]` plus one Annex-B access unit (through wire v4) |
+| 5 | `[u8 tile_id][3 reserved][u64 frame_seq]` plus one Annex-B access unit; codec and tile rectangle come from the wire-v5 header |
 
 `TCP_NODELAY` is on. The header line is sent as a type-2 message immediately on
 connect, so an archived capture is self-describing without fetching the server's own
@@ -206,7 +209,7 @@ buffered tail lost at that moment is a measurement lost.
 
 ---
 
-## Encoder configuration, and the VPS/SPS/PPS route
+## Encoder configuration and parameter-set routing
 
 Hardware **async** MFTs are enumerated first
 (`MFT_ENUM_FLAG_HARDWARE | ASYNCMFT | SORTANDFILTER`) and driven by the documented
@@ -218,29 +221,30 @@ a **sync** MFT and is the fallback; it drives the plain
 is recorded in the stats header. `src/win/encode.rs` opens with the full contract in
 the order the code follows it.
 
-Settings: `MFVideoFormat_NV12` in, `MFVideoFormat_HEVC` out;
+Settings: `MFVideoFormat_NV12` in; H.264 or HEVC out; best-effort
 `CODECAPI_AVLowLatencyMode = TRUE`; `AVEncCommonRateControlMode = CBR` with the
-`--bitrate-kbps` value; `AVEncMPVGOPSize` from `--gop`; Main 4:2:0 8-bit profile,
-Main tier, Level 4.1, studio-range BT.709. Low-latency acceptance is mandatory.
-The HEVC MFT may refuse the older B-picture property; low-latency mode remains the
-required no-reorder contract.
+`--bitrate-kbps` value; zero B-pictures; `AVEncMPVGOPSize` from `--gop`; Main 4:2:0
+8-bit and studio-range BT.709. The HEVC fallback additionally requires
+`ICodecAPI`, accepted low-latency mode, Main tier and Level 4.1. Failure to construct
+any H.264 tile drops the partial path before one full-frame HEVC encoder is attempted.
+The codec never changes during a session.
 
 ### Which parameter-set route was taken
 
 **Both, belt and braces — in-band preferred, out-of-band as the fallback.**
 
-The receiver cannot construct an HEVC format description before it has a complete
-VPS/SPS/PPS triplet. The Intel MFT used by the measured path emits these in band and
-publishes no sequence-header blob; other MFTs may also publish Annex-B sets on the
-output type as `MF_MT_MPEG_SEQUENCE_HEADER`.
+The receiver cannot construct a decoder format before it has complete parameter sets:
+SPS/PPS for H.264 or VPS/SPS/PPS for HEVC. An MFT may emit these in band, publish them
+on the output type as `MF_MT_MPEG_SEQUENCE_HEADER`, or do both.
 
 So the server reads and stores `MF_MT_MPEG_SEQUENCE_HEADER` at configuration time
 (and again after any `MF_E_TRANSFORM_STREAM_CHANGE` renegotiation), and for every
-**IRAP** checks whether the access unit already carries VPS, SPS and PPS before it.
-If it does, the AU goes out untouched and no copy is taken. If it does not, the
-stored triplet is prepended. A bare IRAP with no complete cached triplet is withheld
-and counted. Non-IRAP access units are never padded. Which route fired is recorded
-per frame as `param_sets_prepended`, and
+keyframe checks whether the access unit already carries its codec's required sets.
+If it does, the AU goes out untouched. Otherwise the stored sets are prepended. A
+bare keyframe with no complete cached set is withheld and counted. Non-keyframes are
+never padded. HEVC also validates its parsed stream contract and waits for an IRAP
+after every configuration epoch. Which route fired is recorded per frame as
+`param_sets_prepended`, and
 whether the fallback was even available is `sequence_header_available` in the header.
 
 This lives in `src/annexb.rs` and is unit-tested natively, because it is the one
@@ -249,13 +253,12 @@ error.
 
 ---
 
-## Known-unvalidated areas
+## Remaining live-validation areas
 
-Everything below compiles, links, and has been reasoned against the documented
-contract. **None of it has executed.** The first live run happens on the host.
+The original full-frame HEVC path has completed a soak. The tiled H.264 primary path
+and automatic startup fallback selection still need a live host/client run.
 
-* **The async MFT event pump is the biggest unknown.** The HLD flagged it and it is
-  still the least-exercised code here. Specifics to watch on the first run: whether
+* **The H.264 async MFT event pump is the biggest unknown.** Specifics to watch on its first run: whether
   `METransformNeedInput` credits arrive before the first frame is offered; whether
   the non-blocking drain after each submit actually keeps up, or output lags a frame;
   and whether the shutdown drain ever sees `METransformDrainComplete` (the wait is
@@ -289,7 +292,8 @@ contract. **None of it has executed.** The first live run happens on the host.
 ## `rhydra-agent` — the session agent
 
 The second binary in this crate: the logon-task supervisor that keeps the whole
-capture stack up (IDD creator → device → 1920x1080@240 → `rhydra-server`), with a
+capture stack up (IDD creator → client-requested 2560x1440 or 5120x2880 at 240 Hz →
+`rhydra-server`), with a
 loopback JSON control port on 9502 (`{"cmd":"status"}`, `{"cmd":"restart-server"}`,
 `{"cmd":"shutdown"}` — one object per line, same shape back). `rhydra-agent install`
 registers the onlogon scheduled task and starts it; `rhydra-agent uninstall` shuts

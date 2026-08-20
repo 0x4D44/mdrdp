@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ironrdp_egfx::decode::H264Decoder;
+use ironrdp_egfx::decode::{DecodedFrame, DecoderResult, H264Decoder};
 use rhydra::aux_proto::AudioFrame;
 use rhydra::auxchan::{self, Outbox};
 use rhydra::framing::{self, Reassembler};
@@ -36,6 +36,7 @@ use rhydra::rects::{self, RectUpdate};
 
 use crate::audio::{AudioFormatSummary, AudioRing};
 use crate::clipboard::ArboardClipboard;
+use crate::hevc::VideoDecoder;
 use crate::input::{InputEvent, MouseButton, ScrollAxis};
 use crate::session::{SessionCommand, SessionEnd};
 use crate::stats::StatsHandle;
@@ -50,6 +51,29 @@ use rhydra::clipboard::{self as clip, Bridge, Policy, TextClipboard};
 
 /// The surface id the native session paints. There is only ever one.
 pub const OUTPUT_SURFACE: u16 = 0;
+
+/// Decoder selected by the server header. H.264 remains primary; HEVC is kept
+/// as a full-frame fallback when the host cannot construct the tiled AVC path.
+pub enum NativeDecoder {
+    H264(Box<dyn H264Decoder>),
+    Hevc(Box<dyn VideoDecoder>),
+}
+
+impl NativeDecoder {
+    fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
+        match self {
+            Self::H264(decoder) => decoder.decode(data),
+            Self::Hevc(decoder) => decoder.decode(data),
+        }
+    }
+
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::H264(_) => "AVC (rhydra)",
+            Self::Hevc(_) => "HEVC (rhydra fallback)",
+        }
+    }
+}
 
 /// The codec label the title bar and HUD show for native frames.
 const CODEC_LABEL: &str = "AVC (rhydra)";
@@ -209,7 +233,7 @@ impl NativeHandle {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     transport: ProbedTransport,
-    decoders: Vec<Box<dyn H264Decoder>>,
+    decoders: Vec<NativeDecoder>,
     store: Arc<Mutex<SurfaceStore>>,
     input_rx: Receiver<InputEvent>,
     commands: Receiver<SessionCommand>,
@@ -815,6 +839,7 @@ pub(crate) struct NativeSink {
     decoder: Option<Box<dyn H264Decoder>>,
     tile_decoders: Vec<TileDecodeState>,
     tile_frames: BTreeMap<u64, TileFrameProgress>,
+    codec_label: String,
     store: Arc<Mutex<SurfaceStore>>,
     wire_size: (u32, u32),
     /// The capture seq surface 0 is exact through. `None` until the first AU
@@ -836,7 +861,7 @@ pub(crate) struct NativeSink {
 
 struct TileDecodeState {
     header: TileHeader,
-    decoder: Box<dyn H264Decoder>,
+    decoder: NativeDecoder,
     exact_through: Option<u64>,
     has_base: bool,
 }
@@ -861,6 +886,7 @@ impl NativeSink {
             decoder,
             tile_decoders: Vec::new(),
             tile_frames: BTreeMap::new(),
+            codec_label: CODEC_LABEL.to_owned(),
             store,
             wire_size,
             exact_through: None,
@@ -878,7 +904,7 @@ impl NativeSink {
     }
 
     pub(crate) fn new_tiled(
-        decoders: Vec<Box<dyn H264Decoder>>,
+        decoders: Vec<NativeDecoder>,
         headers: Vec<TileHeader>,
         store: Arc<Mutex<SurfaceStore>>,
         wire_size: (u32, u32),
@@ -891,6 +917,10 @@ impl NativeSink {
             headers.len(),
             "one decoder is required per advertised tile"
         );
+        let codec_label = decoders
+            .first()
+            .map_or(CODEC_LABEL, NativeDecoder::label)
+            .to_owned();
         let tile_decoders = headers
             .into_iter()
             .zip(decoders)
@@ -905,6 +935,7 @@ impl NativeSink {
             decoder: None,
             tile_decoders,
             tile_frames: BTreeMap::new(),
+            codec_label,
             store,
             wire_size,
             exact_through: None,
@@ -935,8 +966,8 @@ impl NativeSink {
         self.stats.update(|s| {
             s.frames += 1;
             s.bytes_in += bytes;
-            *s.codecs.entry(CODEC_LABEL.to_owned()).or_insert(0) += 1;
-            *s.codec_painted.entry(CODEC_LABEL.to_owned()).or_insert(0) += bytes;
+            *s.codecs.entry(self.codec_label.clone()).or_insert(0) += 1;
+            *s.codec_painted.entry(self.codec_label.clone()).or_insert(0) += bytes;
             if let Some(us) = decode_us {
                 s.decode.record(us);
             }
@@ -1329,9 +1360,9 @@ mod tests {
                 height: 2,
             },
         ];
-        let decoders: Vec<Box<dyn H264Decoder>> = vec![
-            Box::new(FakeDecoder { size: (2, 2) }),
-            Box::new(FakeDecoder { size: (2, 2) }),
+        let decoders = vec![
+            NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+            NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
         ];
         let stats = StatsHandle::new();
         let mut sink = NativeSink::new_tiled(

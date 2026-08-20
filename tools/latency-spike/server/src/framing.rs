@@ -26,7 +26,8 @@ pub const MSG_RECTS: u8 = 3;
 /// codec follows the wire version: H.264 through v3, HEVC in v4. A new type rather
 /// than a changed `MSG_VIDEO` payload lets older readers skip it safely.
 pub const MSG_VIDEO_SEQ: u8 = 4;
-/// H.264 tile access unit: tile id + capture sequence + Annex B bytes.
+/// Header-selected codec access unit: tile id + capture sequence + Annex B bytes.
+/// H.264 may advertise multiple tiles; the HEVC fallback advertises one full-frame tile.
 pub const MSG_VIDEO_TILE: u8 = 5;
 
 /// `[tile_id: u8][reserved: 3][capture_seq: u64 LE]`.

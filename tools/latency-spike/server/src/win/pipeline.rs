@@ -16,7 +16,7 @@
 
 use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource};
 use super::{convert, dxgi, encode, idd_source, input, pixel_diff, qpc, send, Result};
-use crate::annexb::{self, AvcParameterSets};
+use crate::annexb::{self, AvcParameterSets, ParameterSets};
 use crate::cli::{Config, Source, DECLARED_FPS};
 use crate::diff;
 use crate::rects;
@@ -147,44 +147,21 @@ pub fn run(cfg: &Config) -> Result<()> {
     // after it — `_mf` outlives every tile encoder because it is declared first.
     let _mf = encode::Session::start()?;
     let manager = encode::device_manager(source.device())?;
-    let layout = stats::tile_layout(source.width(), source.height());
-    let tile_count = u32::try_from(layout.len()).unwrap_or(1);
-    let per_tile_bitrate = cfg.bitrate_kbps.div_ceil(tile_count).max(1);
-    let mut tiles = Vec::with_capacity(layout.len());
-    for header in layout {
-        let converter = convert::Nv12Converter::new_region(
-            source.device(),
-            source.context(),
-            source.width(),
-            source.height(),
-            header.x,
-            header.y,
-            header.width,
-            header.height,
-            DECLARED_FPS,
-        )?;
-        let encoder = encode::create(
-            header.width,
-            header.height,
-            DECLARED_FPS,
-            per_tile_bitrate,
-            cfg.gop,
-            Some(&manager),
-        )?;
-        eprintln!(
-            "encode: tile {} {}x{} — {} ({})",
-            header.id,
-            header.width,
-            header.height,
-            encoder.name(),
-            encoder.kind()
-        );
-        tiles.push(TilePipeline {
-            header,
-            converter,
-            encoder,
-        });
-    }
+    let (codec, tiles) = match build_tiles(encode::Codec::H264, cfg, source.as_ref(), &manager) {
+        Ok(tiles) => (encode::Codec::H264, tiles),
+        Err(h264_error) => {
+            eprintln!(
+                "encode: tiled H.264 unavailable; falling back explicitly to HEVC: {h264_error}"
+            );
+            let tiles = build_tiles(encode::Codec::Hevc, cfg, source.as_ref(), &manager)
+                .map_err(|hevc_error| {
+                    format!(
+                        "no native encoder path: H.264 failed ({h264_error}); HEVC fallback failed ({hevc_error})"
+                    )
+                })?;
+            (encode::Codec::Hevc, tiles)
+        }
+    };
 
     // The wire's rect coordinates are u16, so a desktop wider or taller than that
     // cannot be addressed by the fast path at all. Decided once here rather than
@@ -210,7 +187,8 @@ pub fn run(cfg: &Config) -> Result<()> {
         cfg,
         clock,
         source.as_ref(),
-        tiles[0].encoder.as_ref(),
+        codec,
+        &tiles,
         rects_enabled,
         diff_enabled,
     );
@@ -294,6 +272,7 @@ pub fn run(cfg: &Config) -> Result<()> {
 
     let outcome = capture_loop(CaptureState {
         capture: source.as_mut(),
+        codec,
         tiles,
         clock,
         tx,
@@ -313,6 +292,58 @@ struct TilePipeline {
     encoder: Box<dyn encode::Encoder>,
 }
 
+fn build_tiles(
+    codec: encode::Codec,
+    cfg: &Config,
+    source: &dyn FrameSource,
+    manager: &windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager,
+) -> Result<Vec<TilePipeline>> {
+    let layout = match codec {
+        encode::Codec::H264 => stats::tile_layout(source.width(), source.height()),
+        encode::Codec::Hevc => stats::hevc_fallback_layout(source.width(), source.height()),
+    };
+    let tile_count = u32::try_from(layout.len()).unwrap_or(1);
+    let per_tile_bitrate = cfg.bitrate_kbps.div_ceil(tile_count).max(1);
+    let mut tiles = Vec::with_capacity(layout.len());
+    for header in layout {
+        let converter = convert::Nv12Converter::new_region(
+            source.device(),
+            source.context(),
+            source.width(),
+            source.height(),
+            header.x,
+            header.y,
+            header.width,
+            header.height,
+            DECLARED_FPS,
+        )?;
+        let encoder = encode::create(
+            codec,
+            header.width,
+            header.height,
+            DECLARED_FPS,
+            per_tile_bitrate,
+            cfg.gop,
+            Some(manager),
+        )?;
+        eprintln!(
+            "encode: {} tile {} {}x{} — {} ({})",
+            codec.wire_name(),
+            header.id,
+            header.width,
+            header.height,
+            encoder.name(),
+            encoder.kind()
+        );
+        tiles.push(TilePipeline {
+            header,
+            converter,
+            encoder,
+        });
+    }
+    Ok(tiles)
+}
+
 impl Drop for TilePipeline {
     fn drop(&mut self) {
         self.encoder.shutdown();
@@ -322,6 +353,7 @@ impl Drop for TilePipeline {
 /// Everything the capture loop needs, bundled so the signature stays readable.
 struct CaptureState<'a> {
     capture: &'a mut dyn FrameSource,
+    codec: encode::Codec,
     tiles: Vec<TilePipeline>,
     clock: QpcClock,
     tx: SyncSender<send::Outbound>,
@@ -338,7 +370,8 @@ fn build_header(
     cfg: &Config,
     clock: QpcClock,
     capture: &dyn FrameSource,
-    encoder: &dyn encode::Encoder,
+    codec: encode::Codec,
+    tiles: &[TilePipeline],
     rects_enabled: bool,
     diff_enabled: bool,
 ) -> Header {
@@ -362,7 +395,9 @@ fn build_header(
     h.output = capture.output_name().to_owned();
     h.width = capture.width();
     h.height = capture.height();
-    h.tiles = stats::tile_layout(h.width, h.height);
+    h.codec = codec.wire_name();
+    h.tiles = tiles.iter().map(|tile| tile.header).collect();
+    let encoder = tiles[0].encoder.as_ref();
     h.encoder = encoder.name().to_owned();
     h.encoder_kind = encoder.kind();
     h.codec_api_applied = encoder.codec_api_applied().to_vec();
@@ -406,13 +441,7 @@ struct EmitCtx {
     /// Cumulative microseconds spent inside those diffs — the cost side of the
     /// trade the hit count is the benefit side of.
     diff_us_total: u64,
-    /// SPS/PPS scanned out of the stream's own access units — the fallback when
-    /// the encoder publishes no out-of-band sequence header (Quick Sync). Updated
-    /// on every in-band sighting; cleared when the encoder's config epoch moves.
-    stream_sets: Option<AvcParameterSets>,
-    /// The encoder's own out-of-band sets, snapshotted before each encode call
-    /// (the encoder is unborrowable from inside the sink).
-    encoder_sets: Option<AvcParameterSets>,
+    codec: CodecEmitState,
     config_epoch: u64,
     param_set_failures: u64,
     clean_point_mismatches: u64,
@@ -426,27 +455,112 @@ struct EmitCtx {
     drop_wants_keyframe: bool,
 }
 
+enum CodecEmitState {
+    H264 {
+        stream_sets: Option<AvcParameterSets>,
+        encoder_sets: Option<AvcParameterSets>,
+    },
+    Hevc {
+        stream_sets: Option<ParameterSets>,
+        encoder_sets: Option<ParameterSets>,
+        stream_config: Option<annexb::StreamConfig>,
+        expected_width: u32,
+        expected_height: u32,
+        awaiting_epoch_irap: bool,
+        config_wait_drops: u64,
+    },
+}
+
 /// Hand one encoded access unit to the sender, with its own frame's stamps.
 fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
-    let idr = annexb::avc_contains_idr(&au.data);
-    if idr != au.keyframe {
-        ctx.clean_point_mismatches += 1;
-    }
-
-    if annexb::avc_has_parameter_sets(&au.data) {
-        if let Some(sets) = AvcParameterSets::from_sequence_header(&au.data) {
-            ctx.stream_sets = Some(sets);
+    let (keyframe, bytes, prepended) = match &mut ctx.codec {
+        CodecEmitState::H264 {
+            stream_sets,
+            encoder_sets,
+        } => {
+            let idr = annexb::avc_contains_idr(&au.data);
+            if idr != au.keyframe {
+                ctx.clean_point_mismatches += 1;
+            }
+            if annexb::avc_has_parameter_sets(&au.data) {
+                if let Some(sets) = AvcParameterSets::from_sequence_header(&au.data) {
+                    *stream_sets = Some(sets);
+                }
+            }
+            let sets = stream_sets.as_ref().or(encoder_sets.as_ref());
+            if idr && sets.is_none() {
+                ctx.param_set_failures += 1;
+                ctx.rerequest_keyframe = true;
+                return Ok(());
+            }
+            let (bytes, prepended) = annexb::ensure_avc_parameter_sets(&au.data, sets, idr);
+            (idr, bytes, prepended)
         }
-    }
-    // In-band sets describe the AU we are about to send and therefore win over
-    // a possibly stale output-type blob after an unannounced encoder reconfigure.
-    let sets = ctx.stream_sets.as_ref().or(ctx.encoder_sets.as_ref());
-    if idr && sets.is_none() {
-        ctx.param_set_failures += 1;
-        ctx.rerequest_keyframe = true;
-        return Ok(());
-    }
-    let (bytes, prepended) = annexb::ensure_avc_parameter_sets(&au.data, sets, idr);
+        CodecEmitState::Hevc {
+            stream_sets,
+            encoder_sets,
+            stream_config,
+            expected_width,
+            expected_height,
+            awaiting_epoch_irap,
+            config_wait_drops,
+        } => {
+            let irap = annexb::contains_irap(&au.data);
+            if irap != au.keyframe {
+                ctx.clean_point_mismatches += 1;
+            }
+            let candidate =
+                ParameterSets::from_sequence_header(&au.data).or_else(|| encoder_sets.clone());
+            if let Some(sets) = candidate {
+                if stream_sets.as_ref() != Some(&sets) {
+                    if stream_sets.is_some() {
+                        ctx.config_epoch += 1;
+                    }
+                    let config = annexb::validate_stream(
+                        &sets.to_annex_b(),
+                        *expected_width,
+                        *expected_height,
+                    )
+                    .map_err(|error| format!("encode: refusing HEVC configuration: {error}"))?;
+                    *stream_sets = Some(sets);
+                    *stream_config = Some(config);
+                    *awaiting_epoch_irap = true;
+                    eprintln!(
+                        "encode: accepted HEVC fallback epoch {}: profile={} tier={} level={} chroma={} depth={}/{} size={}x{}",
+                        ctx.config_epoch,
+                        config.profile_idc,
+                        if config.high_tier { "high" } else { "main" },
+                        config.level_idc,
+                        config.chroma_format_idc,
+                        config.bit_depth_luma,
+                        config.bit_depth_chroma,
+                        config.width,
+                        config.height
+                    );
+                }
+            }
+            if *awaiting_epoch_irap && !irap {
+                *config_wait_drops += 1;
+                return Ok(());
+            }
+            let (bytes, prepended) =
+                match annexb::ensure_parameter_sets(&au.data, stream_sets.as_ref(), irap) {
+                    Ok(ready) => ready,
+                    Err(_) => {
+                        ctx.param_set_failures += 1;
+                        ctx.rerequest_keyframe = true;
+                        return Ok(());
+                    }
+                };
+            if stream_config.is_none() {
+                return Err("encode: refusing HEVC AU before a validated configuration".into());
+            }
+            if irap {
+                *awaiting_epoch_irap = false;
+            }
+            (irap, bytes, prepended)
+        }
+    };
 
     let mut record = FrameRecord::new();
     record.frame = au.meta.seq;
@@ -458,7 +572,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     record.encode_submit_us = ctx.clock.micros(au.submit_qpc);
     record.encode_out_us = ctx.clock.micros(au.out_qpc);
     record.au_bytes = bytes.len();
-    record.keyframe = idr;
+    record.keyframe = keyframe;
     record.param_sets_prepended = prepended;
     record.config_epoch = ctx.config_epoch;
     record.param_set_failures = ctx.param_set_failures;
@@ -488,7 +602,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     }
 
     match ctx.awaiting_keyframe {
-        Some(n) if idr => {
+        Some(n) if keyframe => {
             record.keyframe_wait_frames = Some(n);
             ctx.awaiting_keyframe = None;
         }
@@ -688,8 +802,21 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             diff_runs: 0,
             diff_hits: 0,
             diff_us_total: 0,
-            stream_sets: None,
-            encoder_sets: None,
+            codec: match state.codec {
+                encode::Codec::H264 => CodecEmitState::H264 {
+                    stream_sets: None,
+                    encoder_sets: None,
+                },
+                encode::Codec::Hevc => CodecEmitState::Hevc {
+                    stream_sets: None,
+                    encoder_sets: None,
+                    stream_config: None,
+                    expected_width: tile.header.width,
+                    expected_height: tile.header.height,
+                    awaiting_epoch_irap: true,
+                    config_wait_drops: 0,
+                },
+            },
             config_epoch: epoch,
             param_set_failures: 0,
             clean_point_mismatches: 0,
@@ -947,7 +1074,18 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             meta.raw_rect_sent = raw_rect_sent;
 
             let sample = encode::sample_from_texture(&nv12.texture, time_hns, frame_duration_hns)?;
-            ctx.encoder_sets = tile.encoder.parameter_sets().cloned();
+            match (&mut ctx.codec, tile.encoder.parameter_sets()) {
+                (
+                    CodecEmitState::H264 { encoder_sets, .. },
+                    Some(encode::CodecParameterSets::H264(sets)),
+                ) => *encoder_sets = Some(sets.clone()),
+                (
+                    CodecEmitState::Hevc { encoder_sets, .. },
+                    Some(encode::CodecParameterSets::Hevc(sets)),
+                ) => *encoder_sets = Some(sets.clone()),
+                (_, None) => {}
+                _ => return Err("encoder parameter-set codec changed mid-stream".into()),
+            }
             tile.encoder
                 .encode(&sample, meta, nv12.slot, &mut |au| emit_au(au, ctx))?;
             tile.encoder
@@ -971,7 +1109,19 @@ fn housekeep(
         // stream would poison the new one.
         *last_epoch = epoch;
         ctx.config_epoch += 1;
-        ctx.stream_sets = None;
+        match &mut ctx.codec {
+            CodecEmitState::H264 { stream_sets, .. } => *stream_sets = None,
+            CodecEmitState::Hevc {
+                stream_sets,
+                stream_config,
+                awaiting_epoch_irap,
+                ..
+            } => {
+                *stream_sets = None;
+                *stream_config = None;
+                *awaiting_epoch_irap = true;
+            }
+        }
     }
     if ctx.rerequest_keyframe {
         ctx.rerequest_keyframe = false;
