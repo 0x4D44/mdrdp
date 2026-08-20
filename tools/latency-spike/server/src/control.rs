@@ -115,13 +115,23 @@ pub enum Rung {
     InputDesktop,
     /// Frames are actually being presented to the virtual display.
     Liveness,
+    /// Whether this host can capture audio at all.
+    ///
+    /// **Deliberately not a bring-up rung**: a host with no audio is a working
+    /// host, and gating a session on sound would refuse a perfectly good remote
+    /// desktop over a missing speaker. It exists because the alternative is worse
+    /// than a red rung — audio that is *silently* absent is indistinguishable
+    /// from audio that is broken, which is product requirement 4 (no visibility)
+    /// reproduced inside the newest feature. Both fleet hosts report this red
+    /// today, and that is the honest answer rather than a defect.
+    Audio,
 }
 
 impl Rung {
     /// Every rung, in ladder order. The client renders from this list, so a rung
     /// an older agent omits shows as [`RungState::Unknown`] rather than vanishing
     /// — an absent rung must never read as a green one.
-    pub const ALL: [Rung; 7] = [
+    pub const ALL: [Rung; 8] = [
         Rung::Creator,
         Rung::Device,
         Rung::Pool,
@@ -129,6 +139,7 @@ impl Rung {
         Rung::Server,
         Rung::InputDesktop,
         Rung::Liveness,
+        Rung::Audio,
     ];
 
     /// Whether this rung may appear in [`StatusReport::stuck`].
@@ -141,7 +152,7 @@ impl Rung {
     pub fn gates_bring_up(self) -> bool {
         match self {
             Rung::Creator | Rung::Device | Rung::Pool | Rung::DisplayMode | Rung::Server => true,
-            Rung::InputDesktop | Rung::Liveness => false,
+            Rung::InputDesktop | Rung::Liveness | Rung::Audio => false,
         }
     }
 
@@ -155,6 +166,7 @@ impl Rung {
             Rung::Server => "server",
             Rung::InputDesktop => "input-desktop",
             Rung::Liveness => "liveness",
+            Rung::Audio => "audio",
         }
     }
 }
@@ -879,12 +891,44 @@ mod tests {
     fn rung_all_covers_every_variant_and_keeps_ladder_order() {
         // ALL is what the client renders from, so a rung missing here would be
         // invisible in the doctor rather than reported as unknown.
-        assert_eq!(Rung::ALL.len(), 7);
+        assert_eq!(Rung::ALL.len(), 8);
         let mut sorted = Rung::ALL;
         sorted.sort();
         assert_eq!(sorted, Rung::ALL, "ALL must already be in ladder order");
         assert_eq!(Rung::ALL[0], Rung::Creator);
-        assert_eq!(Rung::ALL[Rung::ALL.len() - 1], Rung::Liveness);
+        assert_eq!(Rung::ALL[Rung::ALL.len() - 1], Rung::Audio);
+    }
+
+    #[test]
+    fn a_red_audio_rung_never_refuses_a_session() {
+        // Both fleet hosts report audio red today, and a remote desktop without
+        // sound is a working remote desktop. If this rung gated bring-up, every
+        // client on the fleet would refuse to open a session over a missing
+        // speaker — which is exactly the class of mistake `gates_bring_up`
+        // exists to prevent, and why the rule is asserted rather than trusted.
+        assert!(
+            !Rung::Audio.gates_bring_up(),
+            "audio must never gate a connect"
+        );
+        // Every rung green except audio, which is red — the state both fleet
+        // hosts are actually in.
+        let rungs: Vec<RungReport> = Rung::ALL
+            .iter()
+            .map(|&rung| RungReport {
+                rung,
+                state: if rung == Rung::Audio {
+                    RungState::Fail
+                } else {
+                    RungState::Ok
+                },
+                detail: None,
+            })
+            .collect();
+        assert_eq!(
+            stuck_from_rungs(&rungs),
+            None,
+            "a red audio rung must not read as stuck"
+        );
     }
 
     #[test]

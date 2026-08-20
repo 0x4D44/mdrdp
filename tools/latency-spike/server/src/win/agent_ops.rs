@@ -385,6 +385,10 @@ impl AgentOps for WinOps {
         }
     }
 
+    fn audio_endpoint(&mut self) -> Option<bool> {
+        super::audio::endpoint_available()
+    }
+
     fn poll_server(&mut self) -> ChildState {
         Self::poll(&mut self.server)
     }

@@ -84,6 +84,13 @@ pub trait AgentOps {
     /// 2026-08-18: the agent's first server attached to the dying section and
     /// captured nothing, with no error, forever).
     fn device_id(&mut self) -> Option<String>;
+    /// Whether this host has an audio render endpoint to capture from.
+    ///
+    /// `Some(true)` an endpoint exists, `Some(false)` there is none, `None` the
+    /// question could not be answered. Three-valued because "I could not ask"
+    /// and "the answer is no" want different diagnoses, and reporting the first
+    /// as the second is how a health ladder tells a confident wrong story.
+    fn audio_endpoint(&mut self) -> Option<bool>;
     /// The display's current mode, if it can be read.
     fn display_mode(&mut self) -> Option<Mode>;
     fn set_display_mode(&mut self, mode: Mode) -> Result<(), String>;
@@ -288,6 +295,8 @@ pub struct Reconciler {
     server: Supervised,
     desired: Mode,
     device_present: bool,
+    /// Last answer from `audio_endpoint`; `None` until first sampled.
+    audio_endpoint: Option<bool>,
     /// The identity last observed, for spotting swaps and blinks (see
     /// [`AgentOps::device_id`]).
     last_device_id: Option<String>,
@@ -331,6 +340,7 @@ impl Reconciler {
             server: Supervised::new(),
             desired: DESIRED_MODE,
             device_present: false,
+            audio_endpoint: None,
             last_device_id: None,
             actual_mode: None,
             mode_ok: false,
@@ -413,6 +423,7 @@ impl Reconciler {
 
         let device_id = ops.device_id();
         self.device_present = device_id.is_some();
+        self.audio_endpoint = ops.audio_endpoint();
         // A server that attached to one device instance's section captures nothing
         // once that instance dies — silently, forever. Restart it whenever the
         // device swaps identity or blinks away and back after the server started.
@@ -680,7 +691,36 @@ impl Reconciler {
             self.server_rung(),
             self.input_desktop_rung(),
             self.liveness_rung(),
+            self.audio_rung(),
         ]
+    }
+
+    /// The `audio` rung: can this host capture audio at all?
+    ///
+    /// Red on both fleet hosts today, and that is the honest answer rather than
+    /// a defect: neither has a render endpoint, so there is nothing to capture.
+    /// It never gates a connect — see `Rung::gates_bring_up` — because a remote
+    /// desktop without sound is a working remote desktop. It exists so that
+    /// missing audio is *visible* instead of silent, which is the difference
+    /// between a known limitation and a bug report.
+    fn audio_rung(&self) -> RungReport {
+        let (state, detail) = match self.audio_endpoint {
+            Some(true) => (RungState::Ok, None),
+            Some(false) => (
+                RungState::Fail,
+                Some(
+                    "no audio render endpoint on this host, so there is nothing to \
+                     capture — audio is unavailable, not broken"
+                        .to_owned(),
+                ),
+            ),
+            None => (RungState::Unknown, None),
+        };
+        RungReport {
+            rung: Rung::Audio,
+            state,
+            detail,
+        }
     }
 
     /// The `server` rung: supervised **and** actually accepting.
@@ -778,6 +818,10 @@ mod tests {
         creator_running: bool,
         creator_pending_exit: Option<i32>,
         device_id: Option<String>,
+        /// What `audio_endpoint()` reports. `None` (the Default) means "could
+        /// not judge", which keeps every pre-existing test's ladder unchanged
+        /// apart from one new Unknown rung that gates nothing.
+        audio_endpoint: Option<bool>,
         mode: Option<Mode>,
         mode_set_fails: bool,
         server_running: bool,
@@ -813,6 +857,9 @@ mod tests {
         }
         fn device_id(&mut self) -> Option<String> {
             self.device_id.clone()
+        }
+        fn audio_endpoint(&mut self) -> Option<bool> {
+            self.audio_endpoint
         }
         fn display_mode(&mut self) -> Option<Mode> {
             self.mode
@@ -1577,5 +1624,32 @@ mod tests {
                 hz: 240
             })
         );
+    }
+    #[test]
+    fn a_host_with_no_audio_endpoint_reports_it_red_without_blocking_anything() {
+        // Both fleet hosts are in exactly this state. The rung must be RED --
+        // silence that is never reported is indistinguishable from a broken
+        // feature -- and must gate nothing, because a remote desktop without
+        // sound is a working remote desktop.
+        let (mut rec, mut ops) = settled();
+        ops.audio_endpoint = Some(false);
+        rec.tick(&mut ops);
+        assert_eq!(rung_state(&rec, Rung::Audio), RungState::Fail);
+        assert_eq!(
+            crate::control::stuck_from_rungs(&rec.rungs()),
+            None,
+            "a red audio rung must never make the host stuck"
+        );
+
+        // And with an endpoint it goes green, so the red above is a measurement
+        // rather than a constant this test would report either way.
+        ops.audio_endpoint = Some(true);
+        rec.tick(&mut ops);
+        assert_eq!(rung_state(&rec, Rung::Audio), RungState::Ok);
+
+        // Unknown stays distinct from both: "could not ask" is not "no".
+        ops.audio_endpoint = None;
+        rec.tick(&mut ops);
+        assert_eq!(rung_state(&rec, Rung::Audio), RungState::Unknown);
     }
 }

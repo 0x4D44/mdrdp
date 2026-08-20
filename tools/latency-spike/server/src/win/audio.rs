@@ -264,3 +264,24 @@ impl AudioSource for LoopbackCapture {
         }
     }
 }
+
+/// Whether this host has a default audio render endpoint.
+///
+/// The question the health ladder's `audio` rung asks, and the same one
+/// `tools/audio-probe` answers standalone. Three-valued: `None` means the
+/// enumerator itself could not be created, which is a different problem from
+/// having no endpoint and deserves a different answer.
+///
+/// Read-only and cheap — it enumerates, it does not open a capture stream — so
+/// it is safe to call on every status poll.
+pub fn endpoint_available() -> Option<bool> {
+    ensure_com();
+    // SAFETY: standard COM activation of the endpoint enumerator.
+    let enumerator: IMMDeviceEnumerator =
+        match unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) } {
+            Ok(e) => e,
+            Err(_) => return None,
+        };
+    // SAFETY: a valid enumerator.
+    Some(unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.is_ok())
+}

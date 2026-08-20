@@ -353,7 +353,15 @@ mod tests {
         // Order follows Rung::ALL, not the order the agent sent.
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names[0], "creator");
-        assert_eq!(names[names.len() - 1], "liveness");
+        assert_eq!(
+            names[names.len() - 1],
+            "audio",
+            "the ladder ends with the audio rung as of tranche 6"
+        );
+        // An agent that does not send the audio rung must show it as Unknown
+        // rather than omitting it: an absent rung must never read as a green one,
+        // and on this fleet the audio answer is the interesting one.
+        assert_eq!(by_name("audio"), RowState::Unknown);
         assert!(any_failure(&rows), "a Fail rung is a failure");
     }
 
