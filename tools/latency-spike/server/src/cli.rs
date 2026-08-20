@@ -5,7 +5,8 @@
 
 /// Where the host's audio comes from.
 ///
-/// `loopback` is deliberately absent until the WASAPI capture behind it exists.
+/// `loopback` is the real source. It reports "unavailable" and stays healthy on a
+/// host with no render endpoint, which is every fleet host today.
 /// A flag value that silently produced nothing would be worse than no flag: it
 /// would look like a working configuration and sound like a broken product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +207,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                 cfg.audio_source = match value.as_str() {
                     "off" => AudioKind::Off,
                     "tone" => AudioKind::Tone,
-                    other => return Err(format!("--audio-source {other:?}: expected off or tone")),
+                    "loopback" => AudioKind::Loopback,
+                    other => {
+                        return Err(format!(
+                            "--audio-source {other:?}: expected off, tone or loopback"
+                        ))
+                    }
                 }
             }
             "--source" => {
@@ -341,6 +347,23 @@ mod tests {
         );
         // Not silently defaulted: a typo that fell back to dxgi would produce a
         // control-arm measurement labelled as the IDD arm.
+        // Every documented value round-trips, and an undocumented one is
+        // refused. This test exists because the `loopback` arm was added to the
+        // enum and to `as_str` but NOT to the parser -- a silent no-op in a
+        // scripted edit -- and nothing caught it until a live host rejected the
+        // flag and the supervised agent went into a respawn loop.
+        for (text, kind) in [
+            ("off", AudioKind::Off),
+            ("tone", AudioKind::Tone),
+            ("loopback", AudioKind::Loopback),
+        ] {
+            let cfg = parse(&args(&["--source", "idd", "--audio-source", text])).unwrap();
+            assert_eq!(cfg.audio_source, kind, "--audio-source {text} must parse");
+            assert_eq!(kind.as_str(), text, "as_str must round-trip {text}");
+        }
+        let bad = parse(&args(&["--source", "idd", "--audio-source", "loopbak"])).unwrap_err();
+        assert!(bad.contains("expected off, tone or loopback"), "{bad}");
+
         let err = parse(&args(&["--output", "0", "--source", "iddcx"])).unwrap_err();
         assert!(err.contains("expected dxgi or idd"), "{err}");
         assert_eq!(Source::Dxgi.as_str(), "dxgi");
