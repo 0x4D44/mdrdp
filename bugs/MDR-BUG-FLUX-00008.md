@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00008 — Reveal after Suppress Output paints black: the resumed AVC444 stream fails to decode in a burst
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** gfx
 - **Raised:** 2026-08-19T07:15:59Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260820T101154Z-p9452-n781886000-c1
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T101154Z-p9452-n781886000-c1
-- **Owner base:** 40073535b9d9d0f447182e197cb6e3a46db108ae
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-20T10:11:54Z
-- **Owner until:** 2026-08-20T12:11:54Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=1, indeterminate=0
-- **State history:** Open (2026-08-19T07:15:59Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-20T09:48:39Z, deltic:auto role=fix run=fix-20260820T094820Z-p79668-n341034000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T094820Z-p79668-n341034000-c1 code=dc30a1e gate=manual) -> Open (2026-08-20T10:10:59Z, independent verification failed by Codex: kiln 0.1.102 reproduced 533 decode errors and the new black flash)
+- **State history:** Open (2026-08-19T07:15:59Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-20T09:48:39Z, deltic:auto role=fix run=fix-20260820T094820Z-p79668-n341034000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T094820Z-p79668-n341034000-c1 code=dc30a1e gate=manual) -> Open (2026-08-20T10:10:59Z, independent verification failed by Codex: kiln 0.1.102 reproduced 533 decode errors and the new black flash) -> Fixed (2026-08-20T10:43:52Z, deltic:auto role=fix run=fix-20260820T101154Z-p9452-n781886000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T101154Z-p9452-n781886000-c1 code=3403a72 gate=manual)
 
 ## Observation
 
