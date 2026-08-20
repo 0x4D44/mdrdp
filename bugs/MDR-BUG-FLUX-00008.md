@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00008 — Reveal after Suppress Output paints black: the resumed AVC444 stream fails to decode in a burst
 
-- **State:** Fixed
+- **State:** Open
 - **Priority:** Must
 - **Severity:** High
 - **Area:** gfx
 - **Raised:** 2026-08-19T07:15:59Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260820T101027Z-p6286-n334270000-c1
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00008-run-verify-20260820T101027Z-p6286-n334270000-c1
-- **Owner base:** 5a070a0ff49c00e81bf5dea2d50c0a437d685359
-- **Owner fingerprint:** sha256:0616f21824aed71869cf038c2f264609f33ef6eb60021a2abd6467e53b790784
-- **Owner since:** 2026-08-20T10:10:27Z
-- **Owner until:** 2026-08-20T12:10:27Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
-- **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T07:15:59Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-20T09:48:39Z, deltic:auto role=fix run=fix-20260820T094820Z-p79668-n341034000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T094820Z-p79668-n341034000-c1 code=dc30a1e gate=manual)
+- **Attempts:** fix=0, doubt=1, indeterminate=0
+- **State history:** Open (2026-08-19T07:15:59Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-20T09:48:39Z, deltic:auto role=fix run=fix-20260820T094820Z-p79668-n341034000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T094820Z-p79668-n341034000-c1 code=dc30a1e gate=manual) -> Open (2026-08-20T10:10:59Z, independent verification failed by Codex: kiln 0.1.102 reproduced 533 decode errors and the new black flash)
 
 ## Observation
 
@@ -368,3 +368,19 @@ live and unmitigated. Whatever eventually addresses it must work *with* occlusio
 suppression, not by removing it.
 
 ## Notes
+
+### Failed verification 2026-08-20 — the surface-switch reset thrashes
+
+Arthur reported that the 0.1.102 fix introduced a black flash when switching back to
+the fullscreen kiln session. The live, read-only `mdrdp -S` report then showed **533
+decode errors in 5m21s across 941 painted frames** on kiln, while the simultaneous
+Temper and Crucible sessions on 0.1.95 showed zero errors after more than five hours.
+
+That refutes the fix's stated limitation: "if a server ever kept two surfaces live and
+alternated updates between them, this would reset on every switch and thrash. It cannot
+happen today." The error rate rose from 109 over the earlier 14h26m evidence run to 533
+in five minutes after `retarget_decoder` landed. The one-screen kiln session therefore
+does exercise overlapping surface lifetimes during its graphics restart. Resetting the
+single channel decoder on each surface switch destroys both reference chains, exactly
+the thrash the fix predicted. FreeRDP avoids it with one H.264 context per surface; that
+is the repair direction for the reopened bug.
