@@ -26,9 +26,15 @@ needs Arthur, not a design-phase judgment call.
 - **Protocol comes from [IronRDP](https://github.com/Devolutions/IronRDP)**, not
   hand-rolled. Our value is the client layer above it. Do not reimplement PDUs, MCS,
   CredSSP, or codecs that IronRDP already has.
+- **Register CLIPRDR and RDPSND before the MCS join.** They are static channels and cannot
+  be added to a live session. When audio is enabled, set `enable_audio_playback = true`:
+  false sets `INFO_NOAUDIOPLAYBACK` and tells the server not to redirect audio.
 - **One OS process per session.** No-args = favourites launcher; `mdrdp <host>` = one
   session window. The launcher spawns sessions as children. This buys crash isolation
   and independent clipboard state for free.
+- **Create one winit `EventLoop` per process and reuse it with `run_app_on_demand`.** Create
+  later windows from `new_events` / `about_to_wait`, and perform disconnect cleanup in
+  `ApplicationHandler::exiting`; macOS Cmd+Q may terminate without `run_app` returning.
 - **Portable by default, platform-specific only at the edges.** Core logic is
   `cfg`-free. Platform code is confined to named modules behind a trait
   (window policy, credential store, hardware video decode).
@@ -40,6 +46,9 @@ needs Arthur, not a design-phase judgment call.
   explicit `--size` pins the resolution (drags then letterbox only), and Settings ▸
   Graphics ▸ Dynamic resolution off means letterbox always. (Decided 2026-08-17;
   before that, windowed drags never renegotiated.)
+- **Choose the planned DPI scale in the GCC before logon.** A later RDPEDISP scale change
+  makes Windows bitmap-stretch non-DPI-aware apps until they restart; the client cannot
+  remove that server-side blur.
 - **Credentials live in the OS keychain**, never in a config file, never in a log.
 
 ## Scope
@@ -63,6 +72,13 @@ cargo clippy --all-targets -- -D warnings
 
 Focused first: `cargo test -p mdrdp <module>` before the whole suite. Run suites with
 stdin closed — `cargo test </dev/null` — or a test that reads stdin hangs forever.
+
+**Refresh the nested viewer lock after any root dependency change.**
+`tools/latency-spike/viewer` is a separate workspace that depends on mdrdp by path, so a
+root dependency changes its graph too. Run
+`cargo metadata --manifest-path tools/latency-spike/viewer/Cargo.toml --offline
+--format-version 1` in the same task; otherwise Deltic's locked metadata check fails during
+integration.
 
 **`cargo test` does not test `vendor/`.** Those crates arrive through
 `[patch.crates-io]` as path dependencies, not workspace members, so cargo builds them as
@@ -153,7 +169,9 @@ ambiguous.
 
 ## The test hosts
 
-Two Windows boxes on the LAN, both on port 3389. **ICMP is blocked on both** (Windows
+Two headless Windows boxes on the LAN, both on port 3389. They cannot reproduce physical
+panel transitions such as idle power-off, backlight, lid, or dock changes; use a host with a
+real panel before claiming coverage of that class. **ICMP is blocked on both** (Windows
 Firewall default), so `ping` fails on a perfectly healthy host — test reachability with a
 TCP connect to 3389 instead. Verified on quench 2026-08-17: ping 100% loss, tcp/3389 open.
 
