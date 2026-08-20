@@ -278,6 +278,8 @@ pub struct AudioDepthDistribution {
     pub median_samples: u64,
     /// Largest observed ring depth in interleaved samples.
     pub max_samples: u64,
+    /// Least-squares depth trend in interleaved samples per hour.
+    pub trend_samples_per_hour: Option<f64>,
 }
 
 const DEPTH_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
@@ -366,6 +368,10 @@ impl Default for AudioStats {
 struct DepthHistogram {
     buckets: [u64; DEPTH_HISTOGRAM_BUCKETS],
     distribution: AudioDepthDistribution,
+    sum_x: f64,
+    sum_y: f64,
+    sum_xy: f64,
+    sum_x2: f64,
 }
 
 impl Default for DepthHistogram {
@@ -373,6 +379,10 @@ impl Default for DepthHistogram {
         Self {
             buckets: [0; DEPTH_HISTOGRAM_BUCKETS],
             distribution: AudioDepthDistribution::default(),
+            sum_x: 0.0,
+            sum_y: 0.0,
+            sum_xy: 0.0,
+            sum_x2: 0.0,
         }
     }
 }
@@ -382,6 +392,8 @@ impl DepthHistogram {
         let capacity = capacity.max(1);
         let depth = depth.min(capacity) as u64;
         let distribution = &mut self.distribution;
+        let x = distribution.n as f64;
+        let y = depth as f64;
         distribution.n = distribution.n.saturating_add(1);
         if distribution.n == 1 {
             distribution.min_samples = depth;
@@ -389,6 +401,14 @@ impl DepthHistogram {
             distribution.min_samples = distribution.min_samples.min(depth);
         }
         distribution.max_samples = distribution.max_samples.max(depth);
+        self.sum_x += x;
+        self.sum_y += y;
+        self.sum_xy += x * y;
+        self.sum_x2 += x * x;
+        let n = distribution.n as f64;
+        let denominator = n * self.sum_x2 - self.sum_x * self.sum_x;
+        distribution.trend_samples_per_hour = (denominator > 0.0)
+            .then(|| ((n * self.sum_xy - self.sum_x * self.sum_y) / denominator) * 3_600.0);
 
         let bucket = ((depth * DEPTH_HISTOGRAM_BUCKETS as u64) / capacity as u64)
             .min((DEPTH_HISTOGRAM_BUCKETS - 1) as u64) as usize;
@@ -1833,6 +1853,11 @@ mod tests {
         assert_eq!(histogram.distribution.min_samples, 10);
         assert_eq!(histogram.distribution.max_samples, 30);
         assert_eq!(histogram.buckets.len(), DEPTH_HISTOGRAM_BUCKETS);
+        assert_eq!(
+            histogram.distribution.trend_samples_per_hour,
+            Some(72_000.0),
+            "a 20-sample rise over one second is 72,000 samples/hour"
+        );
     }
 
     #[test]

@@ -374,6 +374,7 @@ mod tests {
                 min_samples: 8,
                 median_samples: 88,
                 max_samples: 120,
+                trend_samples_per_hour: Some(-24.5),
             },
             high_water_trims: 3,
             ..AudioStats::default()
@@ -391,6 +392,10 @@ mod tests {
         assert_eq!(json["audio"]["current_depth_samples"], 96);
         assert_eq!(json["audio"]["depth_distribution"]["n"], 42);
         assert_eq!(json["audio"]["depth_distribution"]["median_samples"], 88);
+        assert_eq!(
+            json["audio"]["depth_distribution"]["trend_samples_per_hour"],
+            -24.5
+        );
         assert_eq!(json["audio"]["high_water_trims"], 3);
     }
 
