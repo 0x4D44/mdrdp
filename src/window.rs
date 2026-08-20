@@ -638,7 +638,7 @@ pub fn fill_tartan(dst: &mut [u32], window_width: u32, window_height: u32) {
 pub fn blank_notice_lines(waiting: Option<Duration>) -> Vec<String> {
     let detail = match waiting {
         Some(d) => format!(
-            "Repaint requested {}s ago — nothing has arrived yet.",
+            "Repaint requested {}s ago - nothing has arrived yet.",
             d.as_secs()
         ),
         None => "No desktop surface has been received yet.".to_owned(),
@@ -646,7 +646,7 @@ pub fn blank_notice_lines(waiting: Option<Duration>) -> Vec<String> {
     vec![
         "Waiting for the server to send a picture.".to_owned(),
         detail,
-        "The connection is up — this is not a dropped session.".to_owned(),
+        "The connection is up - this is not a dropped session.".to_owned(),
     ]
 }
 
@@ -2870,6 +2870,18 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("14s")),
             "the wait must be quantified, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_blank_notice_uses_ascii_hyphens() {
+        assert_eq!(
+            blank_notice_lines(Some(Duration::from_secs(14))),
+            vec![
+                "Waiting for the server to send a picture.".to_owned(),
+                "Repaint requested 14s ago - nothing has arrived yet.".to_owned(),
+                "The connection is up - this is not a dropped session.".to_owned(),
+            ]
         );
     }
 
