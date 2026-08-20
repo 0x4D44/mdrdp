@@ -300,6 +300,11 @@ pub struct AudioStats {
     /// the RDP session even exists) is expected, not a glitch. One episode is one
     /// audible gap, so this number is directly comparable to what the user heard.
     pub underruns: u64,
+    /// Milliseconds after this stats handle was created when the first underrun began.
+    pub first_underrun_ms: Option<u64>,
+    /// Milliseconds after this stats handle was created when the latest underrun began.
+    /// This separates startup/teardown drain from a gap inside a measured tone window.
+    pub last_underrun_ms: Option<u64>,
     /// Audio-device failures observed (open failure, runtime device error). The session
     /// keeps running without audio when this is non-zero; see [`AudioPlayback`].
     pub device_errors: u64,
@@ -344,6 +349,8 @@ impl Default for AudioStats {
             bytes_played: 0,
             overruns: 0,
             underruns: 0,
+            first_underrun_ms: None,
+            last_underrun_ms: None,
             device_errors: 0,
             current_format: None,
             negotiated_formats: None,
@@ -447,6 +454,7 @@ pub struct AudioStatsHandle {
     stats: Arc<Mutex<AudioStats>>,
     current_depth_samples: Arc<AtomicU64>,
     depth_tracker: Arc<Mutex<DepthTracker>>,
+    started_at: Instant,
 }
 
 impl Default for AudioStatsHandle {
@@ -461,6 +469,7 @@ impl AudioStatsHandle {
             stats: Arc::new(Mutex::new(AudioStats::default())),
             current_depth_samples: Arc::new(AtomicU64::new(0)),
             depth_tracker: Arc::new(Mutex::new(DepthTracker::default())),
+            started_at: Instant::now(),
         }
     }
 
@@ -481,6 +490,15 @@ impl AudioStatsHandle {
 
     fn note<F: FnOnce(&mut AudioStats)>(&self, f: F) {
         f(&mut self.lock());
+    }
+
+    fn note_underrun(&self) {
+        let elapsed_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.note(|stats| {
+            stats.underruns = stats.underruns.saturating_add(1);
+            stats.first_underrun_ms.get_or_insert(elapsed_ms);
+            stats.last_underrun_ms = Some(elapsed_ms);
+        });
     }
 
     fn note_depth(&self, depth: usize, capacity: usize) {
@@ -794,8 +812,7 @@ impl AudioRing {
         };
         self.stats.note_depth(depth, capacity);
         if is_underrun {
-            self.stats
-                .note(|s| s.underruns = s.underruns.saturating_add(1));
+            self.stats.note_underrun();
         }
     }
 
@@ -1861,6 +1878,15 @@ mod tests {
             "missing samples must be silence, not stale/repeated data"
         );
         assert_eq!(stats.snapshot().underruns, 1);
+        assert!(
+            stats.snapshot().last_underrun_ms.is_some(),
+            "the evidence must locate the gap within the session"
+        );
+        assert_eq!(
+            stats.snapshot().first_underrun_ms,
+            stats.snapshot().last_underrun_ms,
+            "a single gap has the same first and last timestamp"
+        );
     }
 
     #[test]

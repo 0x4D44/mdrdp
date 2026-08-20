@@ -106,6 +106,9 @@ pub struct AudioCounters {
     /// diagnostic, not a measurement anyone will do arithmetic on.
     left_hz: AtomicU64,
     right_hz: AtomicU64,
+    /// One-shot per-channel RMS, scaled by one million to keep the report atomic.
+    left_rms_micros: AtomicU64,
+    right_rms_micros: AtomicU64,
     queue_drops: AtomicU64,
     capture_gaps: AtomicU64,
 }
@@ -122,6 +125,8 @@ impl AudioCounters {
             frames: AtomicU64::new(0),
             left_hz: AtomicU64::new(0),
             right_hz: AtomicU64::new(0),
+            left_rms_micros: AtomicU64::new(0),
+            right_rms_micros: AtomicU64::new(0),
             queue_drops: AtomicU64::new(0),
             capture_gaps: AtomicU64::new(0),
         }
@@ -163,14 +168,31 @@ impl AudioCounters {
         if let Some(hz) = peak_frequency(&right, rate, range) {
             self.right_hz.store(hz as u64, Ordering::Relaxed);
         }
+        let rms_micros = |samples: &[f32]| -> u64 {
+            if samples.is_empty() {
+                return 0;
+            }
+            let mean_square = samples
+                .iter()
+                .map(|sample| f64::from(*sample).powi(2))
+                .sum::<f64>()
+                / samples.len() as f64;
+            (mean_square.sqrt() * 1_000_000.0).round() as u64
+        };
+        self.left_rms_micros
+            .store(rms_micros(&left), Ordering::Relaxed);
+        self.right_rms_micros
+            .store(rms_micros(&right), Ordering::Relaxed);
     }
 
-    /// Frames received, and the measured tone in each channel if any.
-    pub fn report(&self) -> (u64, u64, u64) {
+    /// Frames received, and the measured tone and RMS in each channel if any.
+    pub fn report(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.frames.load(Ordering::Relaxed),
             self.left_hz.load(Ordering::Relaxed),
             self.right_hz.load(Ordering::Relaxed),
+            self.left_rms_micros.load(Ordering::Relaxed),
+            self.right_rms_micros.load(Ordering::Relaxed),
         )
     }
 
@@ -1337,6 +1359,23 @@ mod tests {
         let report = counters.metrics();
         assert_eq!(report.queue_drops, 1);
         assert_eq!(report.capture_gaps, 1);
+    }
+
+    #[test]
+    fn native_audio_probe_reports_nonzero_rms_for_each_channel() {
+        let counters = AudioCounters::new();
+        let frames = 4_800;
+        let mut stereo = Vec::with_capacity(frames * 2);
+        for sample in 0..frames {
+            let time = sample as f32 / 48_000.0;
+            stereo.push((std::f32::consts::TAU * 440.0 * time).sin() * 0.5);
+            stereo.push((std::f32::consts::TAU * 660.0 * time).sin() * 0.25);
+        }
+
+        counters.note_probe(&stereo, 48_000, 2);
+        let (_, _, _, left_rms_micros, right_rms_micros) = counters.report();
+        assert!(left_rms_micros > 300_000, "left RMS must prove signal");
+        assert!(right_rms_micros > 150_000, "right RMS must prove signal");
     }
 
     /// A pasteboard that holds nothing and never changes, so the poll thread

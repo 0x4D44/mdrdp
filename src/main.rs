@@ -249,7 +249,8 @@ fn report_session_epilogue(
         // `!is_native` along with everything else audio-related, so a working
         // native audio path would have printed nothing at all — which is the
         // same failure as silence that looks like a working connection.
-        let (audio_frames, left_hz, right_hz) = mdrdp::native::session::AUDIO.report();
+        let (audio_frames, left_hz, right_hz, left_rms_micros, right_rms_micros) =
+            mdrdp::native::session::AUDIO.report();
         let native_audio = mdrdp::native::session::AUDIO.metrics();
         let audio = audio_stats.snapshot();
         if audio_frames > 0
@@ -260,7 +261,7 @@ fn report_session_epilogue(
             eprintln!(
                 "  native: audio frames {audio_frames}  underruns {}  queue drops {}  \
                  capture gaps {}  high-water trims {}  ring depth {} samples  \
-                 distribution n={} min={} median={} max={}",
+                 distribution n={} min={} median={} max={}  underrun ms {:?}..{:?}",
                 audio.underruns,
                 native_audio.queue_drops,
                 native_audio.capture_gaps,
@@ -270,13 +271,20 @@ fn report_session_epilogue(
                 audio.depth_distribution.min_samples,
                 audio.depth_distribution.median_samples,
                 audio.depth_distribution.max_samples,
+                audio.first_underrun_ms,
+                audio.last_underrun_ms,
             );
             if left_hz > 0 || right_hz > 0 {
                 // The signal check, not a frame count. Reported with both ears
                 // named because the whole point is that they differ: the host
                 // sends 440 Hz left and 660 Hz right precisely so a swap cannot
                 // pass for a correct decode.
-                eprintln!("  native: audio tone left {left_hz} Hz  right {right_hz} Hz");
+                eprintln!(
+                    "  native: audio tone left {left_hz} Hz rms {:.6}  \
+                     right {right_hz} Hz rms {:.6}",
+                    left_rms_micros as f64 / 1_000_000.0,
+                    right_rms_micros as f64 / 1_000_000.0,
+                );
             }
         }
         let (sent, applied, echoes, refused) = mdrdp::native::clipboard::COUNTERS.snapshot();
