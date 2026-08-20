@@ -6,15 +6,15 @@
 - **Area:** idd/shared-pool
 - **Raised:** 2026-08-20T18:41:47Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260820T184219Z-56b84acc
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00025-run-fix-20260820T184219Z-56b84acc
+- **Owner base:** a24aac8858fda1cdf4634007a84cb6dcee3087de
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-20T18:42:19Z
+- **Owner until:** 2026-08-20T20:42:19Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
