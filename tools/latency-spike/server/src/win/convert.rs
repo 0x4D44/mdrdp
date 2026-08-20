@@ -13,10 +13,11 @@
 //!    conversion here would add a frame of latency for nothing.
 //! 5. Per frame: `CreateVideoProcessorInputView` on the captured texture (a new
 //!    texture each frame, so the view cannot be cached), then `VideoProcessorBlt`
-//!    into the next NV12 texture from a small round-robin pool.
+//!    into an NV12 texture that no encoder submission still owns.
 //!
 //! The pool exists because the encoder may still be reading frame *n-1* when frame
-//! *n* is converted. One texture would mean overwriting a surface the encoder holds.
+//! *n* is converted. A surface remains leased until the matching encoder output is
+//! returned; if every surface is leased, the pool grows instead of overwriting one.
 //!
 //! **`VideoProcessorBlt` submits; it does not wait.** `convert_end_us` is when the
 //! call returned, not when the GPU finished. The real cost shows up as back-pressure
@@ -40,17 +41,29 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
 
-/// How many NV12 surfaces to rotate through. Four covers an encoder that holds a
-/// couple of frames without letting the queue grow enough to hide latency.
+/// Initial NV12 surface count. The pool grows if the encoder has more submissions
+/// in flight; correctness must not depend on a guessed transform queue depth.
 pub const POOL_SIZE: usize = 4;
 
+struct Surface {
+    texture: ID3D11Texture2D,
+    output_view: ID3D11VideoProcessorOutputView,
+    in_use: bool,
+}
+
+pub struct ConvertedSurface {
+    pub texture: ID3D11Texture2D,
+    pub slot: usize,
+}
+
 pub struct Nv12Converter {
+    device: ID3D11Device,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
-    textures: Vec<ID3D11Texture2D>,
-    output_views: Vec<ID3D11VideoProcessorOutputView>,
+    texture_desc: D3D11_TEXTURE2D_DESC,
+    surfaces: Vec<Surface>,
     next: usize,
 }
 
@@ -130,53 +143,88 @@ impl Nv12Converter {
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
-        let mut textures = Vec::with_capacity(POOL_SIZE);
-        let mut output_views = Vec::with_capacity(POOL_SIZE);
+        let mut surfaces = Vec::with_capacity(POOL_SIZE);
         for _ in 0..POOL_SIZE {
-            let mut texture: Option<ID3D11Texture2D> = None;
-            // SAFETY: `desc` is fully initialised; the initial-data pointer is None
-            // because the surface is written by the video processor, not by us.
-            unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }?;
-            let texture = texture.ok_or("CreateTexture2D returned no NV12 texture")?;
-
-            let view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-                },
-            };
-            let mut view: Option<ID3D11VideoProcessorOutputView> = None;
-            // SAFETY: texture, enumerator and desc are all live for the call.
-            unsafe {
-                video_device.CreateVideoProcessorOutputView(
-                    &texture,
-                    &enumerator,
-                    &view_desc,
-                    Some(&mut view),
-                )
-            }?;
-            output_views.push(view.ok_or("CreateVideoProcessorOutputView returned nothing")?);
-            textures.push(texture);
+            surfaces.push(Self::create_surface(
+                device,
+                &video_device,
+                &enumerator,
+                &desc,
+            )?);
         }
 
         Ok(Self {
+            device: device.clone(),
             video_device,
             video_context,
             enumerator,
             processor,
-            textures,
-            output_views,
+            texture_desc: desc,
+            surfaces,
             next: 0,
         })
     }
 
-    /// Convert one captured BGRA texture into the next NV12 surface from the pool.
-    ///
-    /// Returns the surface. It stays valid until this converter has cycled through
-    /// the rest of the pool, which is the encoder's window to consume it.
-    pub fn convert(&mut self, source: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
-        let slot = self.next;
-        self.next = (self.next + 1) % self.textures.len();
+    fn create_surface(
+        device: &ID3D11Device,
+        video_device: &ID3D11VideoDevice,
+        enumerator: &ID3D11VideoProcessorEnumerator,
+        desc: &D3D11_TEXTURE2D_DESC,
+    ) -> Result<Surface> {
+        let mut texture: Option<ID3D11Texture2D> = None;
+        // SAFETY: `desc` is fully initialised; the initial-data pointer is None
+        // because the surface is written by the video processor, not by us.
+        unsafe { device.CreateTexture2D(desc, None, Some(&mut texture)) }?;
+        let texture = texture.ok_or("CreateTexture2D returned no NV12 texture")?;
+
+        let view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+            },
+        };
+        let mut output_view = None;
+        // SAFETY: texture, enumerator and desc are all live for the call.
+        unsafe {
+            video_device.CreateVideoProcessorOutputView(
+                &texture,
+                enumerator,
+                &view_desc,
+                Some(&mut output_view),
+            )
+        }?;
+        Ok(Surface {
+            texture,
+            output_view: output_view.ok_or("CreateVideoProcessorOutputView returned nothing")?,
+            in_use: false,
+        })
+    }
+
+    /// Convert one captured BGRA texture into a leased NV12 surface.
+    pub fn convert(&mut self, source: &ID3D11Texture2D) -> Result<ConvertedSurface> {
+        let slot = (0..self.surfaces.len())
+            .map(|offset| (self.next + offset) % self.surfaces.len())
+            .find(|&slot| !self.surfaces[slot].in_use)
+            .unwrap_or_else(|| {
+                let slot = self.surfaces.len();
+                // Creation failures are handled just below; reserve the index here.
+                slot
+            });
+        if slot == self.surfaces.len() {
+            let surface = Self::create_surface(
+                &self.device,
+                &self.video_device,
+                &self.enumerator,
+                &self.texture_desc,
+            )?;
+            self.surfaces.push(surface);
+            eprintln!(
+                "convert: NV12 pool grew to {} surfaces; encoder submissions are still in flight",
+                self.surfaces.len()
+            );
+        }
+        self.next = (slot + 1) % self.surfaces.len();
+        self.surfaces[slot].in_use = true;
 
         // The captured texture is a different object every frame, so its input view
         // cannot be cached the way the output views are.
@@ -216,7 +264,7 @@ impl Nv12Converter {
         let blt = unsafe {
             self.video_context.VideoProcessorBlt(
                 &self.processor,
-                &self.output_views[slot],
+                &self.surfaces[slot].output_view,
                 0,
                 std::slice::from_ref(&stream),
             )
@@ -224,8 +272,27 @@ impl Nv12Converter {
         // Reclaim the reference handed to the struct. `D3D11_VIDEO_PROCESSOR_STREAM`
         // has no `Drop`, so without this the input view would leak every frame.
         drop(ManuallyDrop::into_inner(stream.pInputSurface));
-        blt?;
+        if let Err(error) = blt {
+            self.surfaces[slot].in_use = false;
+            return Err(error.into());
+        }
 
-        Ok(self.textures[slot].clone())
+        Ok(ConvertedSurface {
+            texture: self.surfaces[slot].texture.clone(),
+            slot,
+        })
+    }
+
+    /// Return a surface after the encoder emitted or retired its submission.
+    pub fn release(&mut self, slot: usize) -> Result<()> {
+        let surface = self
+            .surfaces
+            .get_mut(slot)
+            .ok_or_else(|| format!("encoder retired unknown NV12 surface {slot}"))?;
+        if !surface.in_use {
+            return Err(format!("encoder retired free NV12 surface {slot}").into());
+        }
+        surface.in_use = false;
+        Ok(())
     }
 }

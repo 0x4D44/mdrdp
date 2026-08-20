@@ -125,6 +125,7 @@ pub trait Encoder {
         &mut self,
         sample: &IMFSample,
         meta: FrameMeta,
+        surface_slot: usize,
         sink: &mut dyn FnMut(EncodedAu) -> Result<()>,
     ) -> Result<()>;
     /// Deliver anything the encoder has finished without feeding it a new frame.
@@ -136,6 +137,11 @@ pub trait Encoder {
     /// consumer caching stream-derived state (the in-band VPS/SPS/PPS cache) must
     /// invalidate it when this changes.
     fn config_epoch(&self) -> u64;
+    /// Release every converter surface whose encoder submission is now retired.
+    fn release_retired_surfaces(
+        &mut self,
+        release: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<()>;
     /// Drain and stop streaming. Best-effort; failures here cannot be acted on.
     fn shutdown(&mut self);
 }
@@ -246,6 +252,8 @@ struct Mft {
     /// fallback: B-frames are off, so FIFO *should* hold, but "should" is an
     /// assumption and the timestamp is a contract.
     submitted: VecDeque<Submission>,
+    /// Converter slots whose submissions have produced output or been skipped.
+    retired_surfaces: Vec<usize>,
     /// Outputs whose timestamp matched nothing pending (paired FIFO on faith).
     stamp_mismatches: u64,
     /// Bumped on every mid-stream output-type renegotiation.
@@ -260,6 +268,7 @@ struct Submission {
     time_hns: i64,
     submit_qpc: i64,
     meta: FrameMeta,
+    surface_slot: usize,
 }
 
 impl Mft {
@@ -332,7 +341,8 @@ impl Mft {
                 // Anything queued ahead of the match produced no output of its own
                 // (coalesced or swallowed); those stamps can never pair now.
                 self.stamp_mismatches += idx as u64;
-                self.submitted.drain(..idx);
+                self.retired_surfaces
+                    .extend(self.submitted.drain(..idx).map(|s| s.surface_slot));
                 self.submitted
                     .pop_front()
                     .expect("position() proved presence")
@@ -347,7 +357,10 @@ impl Mft {
             }
         };
         let (submit_qpc, meta) = match matched {
-            Some(s) => (s.submit_qpc, s.meta),
+            Some(s) => {
+                self.retired_surfaces.push(s.surface_slot);
+                (s.submit_qpc, s.meta)
+            }
             // Nothing pending at all — an output from a drain after shutdown
             // started. Stamps are meaningless; mark them so instead of inventing.
             None => (out_qpc, FrameMeta::default()),
@@ -382,7 +395,13 @@ impl Mft {
         Ok(true)
     }
 
-    fn deliver(&mut self, stream_id: u32, sample: &IMFSample, meta: FrameMeta) -> Result<()> {
+    fn deliver(
+        &mut self,
+        stream_id: u32,
+        sample: &IMFSample,
+        meta: FrameMeta,
+        surface_slot: usize,
+    ) -> Result<()> {
         // The sample time is the correlation key `process_output` matches on.
         // SAFETY: `sample` is live.
         let time_hns = unsafe { sample.GetSampleTime() }.unwrap_or(0);
@@ -393,7 +412,18 @@ impl Mft {
             time_hns,
             submit_qpc,
             meta,
+            surface_slot,
         });
+        Ok(())
+    }
+
+    fn release_retired_surfaces(
+        &mut self,
+        release: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        for slot in self.retired_surfaces.drain(..) {
+            release(slot)?;
+        }
         Ok(())
     }
 
@@ -554,6 +584,7 @@ impl Encoder for AsyncEncoder {
         &mut self,
         sample: &IMFSample,
         meta: FrameMeta,
+        surface_slot: usize,
         sink: &mut dyn FnMut(EncodedAu) -> Result<()>,
     ) -> Result<()> {
         // Spend a credit if we already hold one; otherwise block until the encoder
@@ -561,7 +592,7 @@ impl Encoder for AsyncEncoder {
         // an encoder that has both work to give and room to take must not deadlock.
         if self.credits > 0 {
             self.credits -= 1;
-            self.mft.deliver(0, sample, meta)?;
+            self.mft.deliver(0, sample, meta, surface_slot)?;
         } else {
             loop {
                 // SAFETY: `events` is live; flags 0 means block until an event.
@@ -570,7 +601,7 @@ impl Encoder for AsyncEncoder {
                         .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))
                 }?;
                 if let Dispatched::NeedInput(id) = self.dispatch(&event, sink)? {
-                    self.mft.deliver(id, sample, meta)?;
+                    self.mft.deliver(id, sample, meta, surface_slot)?;
                     break;
                 }
             }
@@ -586,6 +617,13 @@ impl Encoder for AsyncEncoder {
 
     fn config_epoch(&self) -> u64 {
         self.mft.config_epoch
+    }
+
+    fn release_retired_surfaces(
+        &mut self,
+        release: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        self.mft.release_retired_surfaces(release)
     }
 
     fn shutdown(&mut self) {
@@ -668,9 +706,10 @@ impl Encoder for SyncEncoder {
         &mut self,
         sample: &IMFSample,
         meta: FrameMeta,
+        surface_slot: usize,
         sink: &mut dyn FnMut(EncodedAu) -> Result<()>,
     ) -> Result<()> {
-        self.mft.deliver(0, sample, meta)?;
+        self.mft.deliver(0, sample, meta, surface_slot)?;
         // A sync MFT is drained by polling until it says it needs more input.
         while self.mft.process_output(sink)? {}
         Ok(())
@@ -683,6 +722,13 @@ impl Encoder for SyncEncoder {
 
     fn config_epoch(&self) -> u64 {
         self.mft.config_epoch
+    }
+
+    fn release_retired_surfaces(
+        &mut self,
+        release: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        self.mft.release_retired_surfaces(release)
     }
 
     fn shutdown(&mut self) {
@@ -962,6 +1008,7 @@ fn configure(
             refused: settings.refused,
             parameter_sets,
             submitted: VecDeque::new(),
+            retired_surfaces: Vec::new(),
             stamp_mismatches: 0,
             config_epoch: 0,
             scratch: Vec::new(),

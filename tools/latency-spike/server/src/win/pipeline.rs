@@ -775,6 +775,9 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
                 // only delivers when pumped — on a static desktop that AU would
                 // otherwise never leave the transform.
                 state.encoder.pump(&mut |au| emit_au(au, &mut ctx))?;
+                state
+                    .encoder
+                    .release_retired_surfaces(&mut |slot| state.converter.release(slot))?;
                 housekeep(&state, &mut ctx, &mut want_keyframe, &mut last_epoch);
                 continue;
             }
@@ -949,12 +952,15 @@ fn capture_loop(state: CaptureState<'_>) -> Result<()> {
             .clock
             .micros(acquire_qpc.saturating_sub(start_qpc))
             .saturating_mul(10);
-        let sample = encode::sample_from_texture(&nv12, time_hns, frame_duration_hns)?;
+        let sample = encode::sample_from_texture(&nv12.texture, time_hns, frame_duration_hns)?;
 
         ctx.encoder_sets = state.encoder.parameter_sets().cloned();
         state
             .encoder
-            .encode(&sample, meta, &mut |au| emit_au(au, &mut ctx))?;
+            .encode(&sample, meta, nv12.slot, &mut |au| emit_au(au, &mut ctx))?;
+        state
+            .encoder
+            .release_retired_surfaces(&mut |slot| state.converter.release(slot))?;
         housekeep(&state, &mut ctx, &mut want_keyframe, &mut last_epoch);
     }
 }
