@@ -6,6 +6,12 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Measure live Windows scale from a PMv2 window, not the monitor factor (`agent_ops.rs:DpiProbeWindow`).
+  On Quench, `GetScaleFactorForMonitor` returned 180% after the user selected 200%. A fresh hidden
+  window placed on the target monitor receives the effective content DPI and can be queried through
+  the supported `GetDpiForWindow` API. Treat failure to establish PMv2 as fatal; otherwise an unaware
+  probe can confidently report 96 DPI / 100%.
+
 - Visual exactness may suppress predictive pixels, never codec input (`native/session.rs:on_tile_au`).
   Raw rects can make an encoded tile visually redundant while its P-picture remains a required
   reference. Always decode and validate the tile AU, then suppress only its canvas blit and paint
