@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00029 — Native tiled H.264 swaps red and blue channels
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/video
 - **Raised:** 2026-08-21T22:15:34Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260821T224248Z-4680dc52
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00029-run-fix-20260821T224248Z-4680dc52
-- **Owner base:** a0546d7ebd86f77acc5efc5a47ac8f9abde5856b
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-21T22:42:48Z
-- **Owner until:** 2026-08-22T00:42:48Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-21T22:15:34Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-21T22:15:34Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-21T22:49:47Z, deltic:auto role=fix run=fix-20260821T224248Z-4680dc52 branch=task/bug-MDR-BUG-FLU-00029-run-fix-20260821T224248Z-4680dc52 code=1b338550917ef5821a0dcd63573c7a68f7edcfd1 gate=manual)
 
 ## Observation
 
