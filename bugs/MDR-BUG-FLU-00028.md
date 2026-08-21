@@ -1,6 +1,6 @@
 # MDR-BUG-FLU-00028 — Rhydra agent cannot measure IDD scale above 100 percent because its monitor lookup is DPI-virtualized
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/agent
@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-21T16:31:35Z, raised via `deltic bugs new`) → Fixed (2026-08-21T16:45:51Z, `f856590ab9c8dd6fba98635501dfdab06adf882d`) → Open (2026-08-21T17:05:40Z, live verification found the API still reported 180% instead of the selected 200%) → Fixed (2026-08-21T17:05:40Z, `0ce21e5`)
+- **State history:** Open (2026-08-21T16:31:35Z, raised via `deltic bugs new`) → Fixed (2026-08-21T16:45:51Z, `f856590ab9c8dd6fba98635501dfdab06adf882d`) → Open (2026-08-21T17:05:40Z, live verification found the API still reported 180% instead of the selected 200%) → Fixed (2026-08-21T17:05:40Z, `0ce21e5`) → Closed (2026-08-21T17:28:56Z, independent verifier confirmed integrated and live Quench behavior)
 
 ## Observation
 
@@ -50,5 +50,11 @@ For the second layer, `win::agent_ops::tests::effective_dpi_converts_to_windows_
 was compiled for Windows and run on Quench. Its stub implementation failed the exact test
 (`None` versus `Some(100)`); the implementation then passed the same exact test. Live
 deployed-host verification remains required before independent closure.
+
+Independent verification against integrated v0.1.114 confirmed the fixed code path, two
+live 5120x2880/240 Hz status samples with actual and desired scale 200% on the same agent
+process, every doctor rung green, an advancing frame sequence, no viewer, and the
+interactive `rhydra-agent` task running as `marti` in active console session 3. No residual
+defect was found.
 
 ## Notes
