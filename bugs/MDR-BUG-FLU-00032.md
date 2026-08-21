@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00032 — mdrdp deploy resets Rhydra display scale to 100% during agent reinstall
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** deploy/display
 - **Raised:** 2026-08-21T23:26:41Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260821T232706Z-320466c2
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00032-run-fix-20260821T232706Z-320466c2
-- **Owner base:** 1cbb98e697887f2a69154e8955e7e1651f9fa414
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-21T23:27:06Z
-- **Owner until:** 2026-08-22T01:44:50Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-21T23:26:41Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-21T23:26:41Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-21T23:45:17Z, deltic:auto role=fix run=fix-20260821T232706Z-320466c2 branch=task/bug-MDR-BUG-FLU-00032-run-fix-20260821T232706Z-320466c2 code=83deec1 gate=manual)
 
 ## Observation
 
