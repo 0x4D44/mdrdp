@@ -21,6 +21,7 @@ use ironrdp::pdu::input::fast_path::{FastPathInput, FastPathInputEvent, Keyboard
 use ironrdp::pdu::input::mouse::PointerFlags;
 use ironrdp::pdu::input::mouse_x::PointerXFlags;
 use ironrdp::pdu::input::{MousePdu, MouseXPdu};
+use std::sync::Mutex;
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -114,6 +115,67 @@ pub enum InputEvent {
         x: u16,
         y: u16,
     },
+}
+
+/// Window-system pointer motion waiting for the native input pump.
+///
+/// Kept separate from reliable keys, buttons, wheels, and scripted input so
+/// physical mouse motion cannot put an arbitrary FIFO ahead of a keystroke.
+struct LatestMouseMoveState {
+    position: Option<(u16, u16)>,
+    receiver_alive: bool,
+}
+
+pub struct LatestMouseMove(Mutex<LatestMouseMoveState>);
+
+impl Default for LatestMouseMove {
+    fn default() -> Self {
+        Self(Mutex::new(LatestMouseMoveState {
+            position: None,
+            receiver_alive: true,
+        }))
+    }
+}
+
+impl LatestMouseMove {
+    pub fn replace(&self, x: u16, y: u16) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.receiver_alive {
+            return false;
+        }
+        state.position = Some((x, y));
+        true
+    }
+
+    pub fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .position
+            .take();
+    }
+
+    pub fn close(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.receiver_alive = false;
+        state.position = None;
+    }
+
+    pub fn take(&self) -> Option<InputEvent> {
+        let (x, y) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .position
+            .take()?;
+        Some(InputEvent::MouseMove { x, y })
+    }
 }
 
 /// How a window position becomes a session pixel.
@@ -722,6 +784,36 @@ pub fn encode_fastpath_input(events: Vec<FastPathInputEvent>) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ten_thousand_window_moves_collapse_to_the_latest_position() {
+        let moves = LatestMouseMove::default();
+        for x in 0..10_000u16 {
+            assert!(moves.replace(x, x + 1));
+        }
+
+        let mut emitted = Vec::new();
+        while let Some(event) = moves.take() {
+            emitted.push(event);
+        }
+        assert_eq!(
+            emitted,
+            [InputEvent::MouseMove {
+                x: 9_999,
+                y: 10_000
+            }]
+        );
+    }
+
+    #[test]
+    fn a_closed_native_receiver_refuses_more_window_motion() {
+        let moves = LatestMouseMove::default();
+        assert!(moves.replace(1, 2));
+        moves.close();
+
+        assert!(!moves.replace(3, 4));
+        assert_eq!(moves.take(), None);
+    }
 
     use winit::event::MouseButton as WButton;
 

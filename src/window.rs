@@ -904,6 +904,7 @@ pub struct SessionWindow {
     config: WindowConfig,
     store: Arc<Mutex<SurfaceStore>>,
     input: WakingSender<InputEvent>,
+    latest_mouse_move: Option<Arc<input::LatestMouseMove>>,
     stats: Option<StatsHandle>,
     on_exit: Option<Box<dyn FnMut()>>,
     commands: Option<WakingSender<SessionCommand>>,
@@ -950,6 +951,7 @@ impl SessionWindow {
             config,
             store,
             input,
+            latest_mouse_move: None,
             stats: None,
             on_exit: None,
             commands: None,
@@ -957,6 +959,13 @@ impl SessionWindow {
             transients: None,
             fullscreen_state,
         })
+    }
+
+    /// Coalesce only physical window motion for the native transport. Scripted
+    /// input keeps using the reliable FIFO, and RDP keeps its existing queue.
+    pub fn with_latest_mouse_move(mut self, moves: Option<Arc<input::LatestMouseMove>>) -> Self {
+        self.latest_mouse_move = moves;
+        self
     }
 
     /// Wire up the channel for asking the session to do things — currently, to
@@ -1038,6 +1047,7 @@ impl SessionWindow {
             config,
             store,
             input,
+            latest_mouse_move,
             stats,
             on_exit,
             commands,
@@ -1046,6 +1056,7 @@ impl SessionWindow {
             fullscreen_state,
         } = self;
         let mut app = SessionApp::new(config, store, input, stats);
+        app.latest_mouse_move = latest_mouse_move;
         app.on_exit = on_exit;
         app.commands = commands;
         app.diagnostics = diagnostics;
@@ -1104,6 +1115,7 @@ struct SessionApp {
     config: WindowConfig,
     store: Arc<Mutex<SurfaceStore>>,
     input: WakingSender<InputEvent>,
+    latest_mouse_move: Option<Arc<input::LatestMouseMove>>,
     window: Option<Arc<Window>>,
     presenter: Option<crate::present::Presenter>,
     viewport: Viewport,
@@ -1221,6 +1233,7 @@ impl SessionApp {
             config,
             store,
             input,
+            latest_mouse_move: None,
             window: None,
             presenter: None,
             viewport,
@@ -1743,6 +1756,24 @@ impl SessionApp {
 
     /// A closed receiver means the session is gone, so there is nothing left to show.
     fn send(&mut self, event_loop: &ActiveEventLoop, event: InputEvent) {
+        if let Some(moves) = &self.latest_mouse_move {
+            match event {
+                InputEvent::MouseMove { x, y } => {
+                    if !moves.replace(x, y) {
+                        event_loop.exit();
+                        return;
+                    }
+                    self.input.wake();
+                    return;
+                }
+                InputEvent::MouseButton { .. } | InputEvent::Scroll { .. } => {
+                    // These reliable events carry their own absolute position.
+                    // Discard an older pending move so it cannot land after them.
+                    moves.clear();
+                }
+                InputEvent::Key { .. } => {}
+            }
+        }
         if self.input.send(event).is_err() {
             event_loop.exit();
         }

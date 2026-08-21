@@ -379,17 +379,28 @@ pub struct InputEventRecord {
     pub kind: &'static str,
     pub recv_qpc_us: i64,
     pub injected_qpc_us: i64,
+    /// `false` means `SendInput` rejected this event; the timestamp then records
+    /// when that failure was observed, not a successful injection.
+    pub injected: bool,
 }
 
 impl InputEventRecord {
-    pub fn new(seq: u32, vk: u16, kind: &'static str, recv: i64, injected: i64) -> Self {
+    pub fn new(
+        seq: u32,
+        vk: u16,
+        kind: &'static str,
+        recv: i64,
+        injected_qpc_us: i64,
+        injected: bool,
+    ) -> Self {
         Self {
             record: "input",
             seq,
             vk,
             kind,
             recv_qpc_us: recv,
-            injected_qpc_us: injected,
+            injected_qpc_us,
+            injected,
         }
     }
 }
@@ -411,17 +422,26 @@ pub struct MouseEventRecord {
     pub value: i32,
     pub recv_qpc_us: i64,
     pub injected_qpc_us: i64,
+    pub injected: bool,
 }
 
 impl MouseEventRecord {
-    pub fn new(seq: u32, kind: &'static str, value: i32, recv: i64, injected: i64) -> Self {
+    pub fn new(
+        seq: u32,
+        kind: &'static str,
+        value: i32,
+        recv: i64,
+        injected_qpc_us: i64,
+        injected: bool,
+    ) -> Self {
         Self {
             record: "mouse",
             seq,
             kind,
             value,
             recv_qpc_us: recv,
-            injected_qpc_us: injected,
+            injected_qpc_us,
+            injected,
         }
     }
 }
@@ -435,6 +455,8 @@ pub struct MouseMoveSummaryRecord {
     pub record: &'static str,
     /// Moves injected since the previous summary line (or connection start).
     pub count: u64,
+    /// `SendInput` failures within `count`; must be zero for a valid latency run.
+    pub failed: u64,
     /// `recv_qpc` of the first move in this window.
     pub window_start_qpc_us: i64,
     /// `recv_qpc` of the last move in this window.
@@ -442,10 +464,11 @@ pub struct MouseMoveSummaryRecord {
 }
 
 impl MouseMoveSummaryRecord {
-    pub fn new(count: u64, window_start_qpc_us: i64, window_end_qpc_us: i64) -> Self {
+    pub fn new(count: u64, failed: u64, window_start_qpc_us: i64, window_end_qpc_us: i64) -> Self {
         Self {
             record: "mouse_move_summary",
             count,
+            failed,
             window_start_qpc_us,
             window_end_qpc_us,
         }
@@ -713,7 +736,7 @@ mod tests {
 
     #[test]
     fn an_input_line_names_the_kind_and_both_stamps() {
-        let r = InputEventRecord::new(9, 0x41, "down", 500, 620);
+        let r = InputEventRecord::new(9, 0x41, "down", 500, 620, true);
         let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
         assert_eq!(v["record"], "input");
         assert_eq!(v["seq"], 9);
@@ -721,12 +744,13 @@ mod tests {
         assert_eq!(v["kind"], "down");
         assert_eq!(v["recv_qpc_us"], 500);
         assert_eq!(v["injected_qpc_us"], 620);
-        assert_eq!(v.as_object().unwrap().len(), 6);
+        assert_eq!(v["injected"], true);
+        assert_eq!(v.as_object().unwrap().len(), 7);
     }
 
     #[test]
     fn a_mouse_line_names_the_kind_and_value_and_both_stamps() {
-        let r = MouseEventRecord::new(3, "btn_left_down", 1, 700, 810);
+        let r = MouseEventRecord::new(3, "btn_left_down", 1, 700, 810, false);
         let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
         assert_eq!(v["record"], "mouse");
         assert_eq!(v["seq"], 3);
@@ -734,14 +758,16 @@ mod tests {
         assert_eq!(v["value"], 1);
         assert_eq!(v["recv_qpc_us"], 700);
         assert_eq!(v["injected_qpc_us"], 810);
+        assert_eq!(v["injected"], false);
     }
 
     #[test]
     fn a_mouse_move_summary_line_names_the_window_and_count() {
-        let r = MouseMoveSummaryRecord::new(42, 1000, 2000);
+        let r = MouseMoveSummaryRecord::new(42, 3, 1000, 2000);
         let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
         assert_eq!(v["record"], "mouse_move_summary");
         assert_eq!(v["count"], 42);
+        assert_eq!(v["failed"], 3);
         assert_eq!(v["window_start_qpc_us"], 1000);
         assert_eq!(v["window_end_qpc_us"], 2000);
     }

@@ -91,10 +91,16 @@ impl<T> WakingSender<T> {
     /// woken by the ring always finds the event already in the channel.
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         self.tx.send(value)?;
+        self.wake();
+        Ok(())
+    }
+
+    /// Ring without putting a reliable event in this sender's FIFO. Native
+    /// window motion uses this after replacing its separate latest-value slot.
+    pub fn wake(&self) {
         if let Some(bell) = &self.bell {
             bell.ring();
         }
-        Ok(())
     }
 }
 

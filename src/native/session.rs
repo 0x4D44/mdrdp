@@ -37,7 +37,7 @@ use rhydra::rects::{self, RectUpdate};
 use crate::audio::{AudioFormatSummary, AudioRing};
 use crate::clipboard::ArboardClipboard;
 use crate::hevc::VideoDecoder;
-use crate::input::{InputEvent, MouseButton, ScrollAxis};
+use crate::input::{InputEvent, LatestMouseMove, MouseButton, ScrollAxis};
 use crate::session::{SessionCommand, SessionEnd};
 use crate::stats::StatsHandle;
 use crate::surface::{Rect, SurfaceStore};
@@ -328,6 +328,7 @@ pub fn spawn(
     transport: ProbedTransport,
     decoders: Vec<NativeDecoder>,
     store: Arc<Mutex<SurfaceStore>>,
+    latest_mouse_move: Arc<LatestMouseMove>,
     input_rx: Receiver<InputEvent>,
     commands: Receiver<SessionCommand>,
     waker: Waker,
@@ -439,14 +440,17 @@ pub fn spawn(
     let input_join = std::thread::Builder::new()
         .name("native-input".to_owned())
         .spawn(move || {
+            let moves = Arc::clone(&latest_mouse_move);
             let failure = pump_input(
                 input_sock,
+                latest_mouse_move,
                 input_rx,
                 commands,
                 wake_rx,
                 &input_stop,
                 input_clock,
             );
+            moves.close();
             input_stop.store(true, Ordering::Relaxed);
             let _ = input_video_sock.shutdown(Shutdown::Both);
             failure
@@ -794,6 +798,7 @@ fn dispatch_video_message(
 /// Returns `Some(reason)` on a failure worth reporting, `None` on a clean stop.
 fn pump_input(
     sock: TcpStream,
+    latest_mouse_move: Arc<LatestMouseMove>,
     input_rx: Receiver<InputEvent>,
     commands: Receiver<SessionCommand>,
     wake_rx: DoorbellReceiver,
@@ -839,8 +844,8 @@ fn pump_input(
         }
         let written_before = written.0;
         loop {
-            match input_rx.try_recv() {
-                Ok(event) => {
+            match next_native_input(&input_rx, &latest_mouse_move) {
+                Ok(Some(event)) => {
                     for record in wire_records(&event, &mut seq) {
                         let (bytes, len) = encode_record(record);
                         if let Err(e) = writer.write_all(&bytes[..len]) {
@@ -853,6 +858,7 @@ fn pump_input(
                         written.0 += 1;
                     }
                 }
+                Ok(None) => break,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return None,
             }
@@ -875,6 +881,20 @@ fn pump_input(
                 Err(_) => break,
             }
         }
+    }
+}
+
+fn next_native_input(
+    reliable: &Receiver<InputEvent>,
+    latest_mouse_move: &LatestMouseMove,
+) -> Result<Option<InputEvent>, TryRecvError> {
+    match reliable.try_recv() {
+        Ok(event) => Ok(Some(event)),
+        Err(TryRecvError::Empty) => Ok(latest_mouse_move.take()),
+        Err(TryRecvError::Disconnected) => match latest_mouse_move.take() {
+            Some(event) => Ok(Some(event)),
+            None => Err(TryRecvError::Disconnected),
+        },
     }
 }
 
@@ -905,25 +925,31 @@ fn wire_records(event: &InputEvent, seq: &mut u32) -> Vec<Record> {
             }]
         }
         InputEvent::MouseMove { x, y } => vec![Record::MouseMove { x, y, seq: next() }],
-        InputEvent::MouseButton { button, down, .. } => vec![Record::MouseButton {
-            button: match button {
-                MouseButton::Left => WireButton::Left,
-                MouseButton::Right => WireButton::Right,
-                MouseButton::Middle => WireButton::Middle,
-                MouseButton::X1 => WireButton::X1,
-                MouseButton::X2 => WireButton::X2,
+        InputEvent::MouseButton { button, down, x, y } => vec![
+            Record::MouseMove { x, y, seq: next() },
+            Record::MouseButton {
+                button: match button {
+                    MouseButton::Left => WireButton::Left,
+                    MouseButton::Right => WireButton::Right,
+                    MouseButton::Middle => WireButton::Middle,
+                    MouseButton::X1 => WireButton::X1,
+                    MouseButton::X2 => WireButton::X2,
+                },
+                down,
+                seq: next(),
             },
-            down,
-            seq: next(),
-        }],
-        InputEvent::Scroll { axis, units, .. } => vec![Record::Wheel {
-            axis: match axis {
-                ScrollAxis::Vertical => WheelAxis::Vertical,
-                ScrollAxis::Horizontal => WheelAxis::Horizontal,
+        ],
+        InputEvent::Scroll { axis, units, x, y } => vec![
+            Record::MouseMove { x, y, seq: next() },
+            Record::Wheel {
+                axis: match axis {
+                    ScrollAxis::Vertical => WheelAxis::Vertical,
+                    ScrollAxis::Horizontal => WheelAxis::Horizontal,
+                },
+                delta120: units,
+                seq: next(),
             },
-            delta120: units,
-            seq: next(),
-        }],
+        ],
     }
 }
 
@@ -1923,6 +1949,7 @@ mod tests {
         let join = std::thread::spawn(move || {
             pump_input(
                 sock,
+                Arc::new(LatestMouseMove::default()),
                 input_rx,
                 commands,
                 wake_rx,
@@ -1950,6 +1977,36 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         bell.ring();
         let _ = join.join();
+    }
+
+    #[test]
+    fn a_key_bypasses_ten_thousand_window_moves_and_the_final_position_survives() {
+        let latest = LatestMouseMove::default();
+        for x in 0..10_000u16 {
+            assert!(latest.replace(x, x + 1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let key = InputEvent::Key {
+            scancode: crate::input::Scancode::plain(0x1e),
+            down: true,
+        };
+        tx.send(key).unwrap();
+        drop(tx);
+
+        let mut emitted = Vec::new();
+        while let Ok(Some(event)) = next_native_input(&rx, &latest) {
+            emitted.push(event);
+        }
+        assert_eq!(
+            emitted,
+            [
+                key,
+                InputEvent::MouseMove {
+                    x: 9_999,
+                    y: 10_000
+                }
+            ]
+        );
     }
 
     #[test]
@@ -1998,7 +2055,8 @@ mod tests {
             },
             &mut seq,
         );
-        let (bytes, len) = encode_record(recs[0]);
+        assert_eq!(recs[0], Record::MouseMove { x: 5, y: 6, seq: 2 });
+        let (bytes, len) = encode_record(recs[1]);
         match decode_record(&bytes[..len]).unwrap() {
             Record::Wheel {
                 axis,
@@ -2007,7 +2065,7 @@ mod tests {
             } => {
                 assert_eq!(axis, WheelAxis::Horizontal);
                 assert_eq!(delta120, -120);
-                assert_eq!(s, 2);
+                assert_eq!(s, 3);
             }
             other => panic!("expected Wheel, got {other:?}"),
         }
@@ -2020,7 +2078,8 @@ mod tests {
             },
             &mut seq,
         );
-        let (bytes, len) = encode_record(recs[0]);
+        assert_eq!(recs[0], Record::MouseMove { x: 9, y: 9, seq: 4 });
+        let (bytes, len) = encode_record(recs[1]);
         match decode_record(&bytes[..len]).unwrap() {
             Record::MouseButton {
                 button,
@@ -2029,7 +2088,7 @@ mod tests {
             } => {
                 assert_eq!(button, WireButton::Right);
                 assert!(!down);
-                assert_eq!(s, 3);
+                assert_eq!(s, 5);
             }
             other => panic!("expected MouseButton, got {other:?}"),
         }

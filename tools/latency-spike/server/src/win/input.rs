@@ -250,17 +250,25 @@ const MOVE_SUMMARY_INTERVAL: u64 = 200;
 #[derive(Default)]
 struct MoveAggregate {
     count: u64,
+    failed: u64,
     window_start_qpc: Option<i64>,
     window_end_qpc: i64,
 }
 
 impl MoveAggregate {
-    fn record(&mut self, recv_qpc: i64, clock: QpcClock, lines: &SyncSender<String>) {
+    fn record(
+        &mut self,
+        recv_qpc: i64,
+        injected: bool,
+        clock: QpcClock,
+        lines: &SyncSender<String>,
+    ) {
         if self.window_start_qpc.is_none() {
             self.window_start_qpc = Some(recv_qpc);
         }
         self.window_end_qpc = recv_qpc;
         self.count += 1;
+        self.failed += u64::from(!injected);
         if self.count >= MOVE_SUMMARY_INTERVAL {
             self.flush(clock, lines);
         }
@@ -273,12 +281,14 @@ impl MoveAggregate {
         let start = self.window_start_qpc.unwrap_or(self.window_end_qpc);
         let line = stats::to_line(&MouseMoveSummaryRecord::new(
             self.count,
+            self.failed,
             clock.micros(start),
             clock.micros(self.window_end_qpc),
         ));
         // A full queue drops the *summary line*, never any injection.
         let _ = lines.try_send(line);
         self.count = 0;
+        self.failed = 0;
         self.window_start_qpc = None;
     }
 }
@@ -291,6 +301,7 @@ fn emit_key_line(
     kind: &'static str,
     recv_qpc: i64,
     injected_qpc: i64,
+    injected: bool,
 ) {
     let line = stats::to_line(&InputEventRecord::new(
         seq,
@@ -298,6 +309,7 @@ fn emit_key_line(
         kind,
         clock.micros(recv_qpc),
         clock.micros(injected_qpc),
+        injected,
     ));
     // A full queue drops the *stats line*, never the injection — the injection
     // already happened before this is called, so latency is untouched either way.
@@ -312,6 +324,7 @@ fn emit_mouse_line(
     value: i32,
     recv_qpc: i64,
     injected_qpc: i64,
+    injected: bool,
 ) {
     let line = stats::to_line(&MouseEventRecord::new(
         seq,
@@ -319,6 +332,7 @@ fn emit_mouse_line(
         value,
         clock.micros(recv_qpc),
         clock.micros(injected_qpc),
+        injected,
     ));
     let _ = lines.try_send(line);
 }
@@ -333,35 +347,42 @@ fn handle_record(
     lines: &SyncSender<String>,
     moves: &mut MoveAggregate,
 ) {
+    let injection = |result: Result<i64>| match result {
+        Ok(stamp) => (stamp, true),
+        Err(e) => {
+            eprintln!("input: {e}");
+            (qpc::now(), false)
+        }
+    };
     match record {
         Record::VkDown { vk, seq } => {
-            let injected_qpc = match inject(vk, KeyKind::Down) {
-                Ok(stamp) => stamp,
-                Err(e) => {
-                    eprintln!("input: {e}");
-                    qpc::now()
-                }
-            };
-            emit_key_line(lines, clock, seq, vk, "down", recv_qpc, injected_qpc);
+            let (injected_qpc, injected) = injection(inject(vk, KeyKind::Down));
+            emit_key_line(
+                lines,
+                clock,
+                seq,
+                vk,
+                "down",
+                recv_qpc,
+                injected_qpc,
+                injected,
+            );
         }
         Record::VkUp { vk, seq } => {
-            let injected_qpc = match inject(vk, KeyKind::Up) {
-                Ok(stamp) => stamp,
-                Err(e) => {
-                    eprintln!("input: {e}");
-                    qpc::now()
-                }
-            };
-            emit_key_line(lines, clock, seq, vk, "up", recv_qpc, injected_qpc);
+            let (injected_qpc, injected) = injection(inject(vk, KeyKind::Up));
+            emit_key_line(
+                lines,
+                clock,
+                seq,
+                vk,
+                "up",
+                recv_qpc,
+                injected_qpc,
+                injected,
+            );
         }
         Record::ScanDown { scancode, seq } => {
-            let injected_qpc = match inject_scan(scancode, true) {
-                Ok(stamp) => stamp,
-                Err(e) => {
-                    eprintln!("input: {e}");
-                    qpc::now()
-                }
-            };
+            let (injected_qpc, injected) = injection(inject_scan(scancode, true));
             emit_key_line(
                 lines,
                 clock,
@@ -370,16 +391,11 @@ fn handle_record(
                 "scan_down",
                 recv_qpc,
                 injected_qpc,
+                injected,
             );
         }
         Record::ScanUp { scancode, seq } => {
-            let injected_qpc = match inject_scan(scancode, false) {
-                Ok(stamp) => stamp,
-                Err(e) => {
-                    eprintln!("input: {e}");
-                    qpc::now()
-                }
-            };
+            let (injected_qpc, injected) = injection(inject_scan(scancode, false));
             emit_key_line(
                 lines,
                 clock,
@@ -388,24 +404,17 @@ fn handle_record(
                 "scan_up",
                 recv_qpc,
                 injected_qpc,
+                injected,
             );
         }
         Record::MouseMove { x, y, .. } => {
-            if let Err(e) = inject_mouse_move(x, y, origin) {
-                eprintln!("input: {e}");
-            }
+            let (_, injected) = injection(inject_mouse_move(x, y, origin));
             // No per-record stats line — see `MoveAggregate` and the module docs.
-            moves.record(recv_qpc, clock, lines);
+            moves.record(recv_qpc, injected, clock, lines);
         }
         Record::MouseButton { button, down, seq } => {
             let kind = mouse_button_kind(button, down);
-            let injected_qpc = match inject_mouse_button(button, down) {
-                Ok(stamp) => stamp,
-                Err(e) => {
-                    eprintln!("input: {e}");
-                    qpc::now()
-                }
-            };
+            let (injected_qpc, injected) = injection(inject_mouse_button(button, down));
             emit_mouse_line(
                 lines,
                 clock,
@@ -414,6 +423,7 @@ fn handle_record(
                 button as i32,
                 recv_qpc,
                 injected_qpc,
+                injected,
             );
         }
         Record::Wheel {
@@ -425,13 +435,7 @@ fn handle_record(
                 WheelAxis::Vertical => "wheel_v",
                 WheelAxis::Horizontal => "wheel_h",
             };
-            let injected_qpc = match inject_wheel(axis, delta120) {
-                Ok(stamp) => stamp,
-                Err(e) => {
-                    eprintln!("input: {e}");
-                    qpc::now()
-                }
-            };
+            let (injected_qpc, injected) = injection(inject_wheel(axis, delta120));
             emit_mouse_line(
                 lines,
                 clock,
@@ -440,6 +444,7 @@ fn handle_record(
                 delta120 as i32,
                 recv_qpc,
                 injected_qpc,
+                injected,
             );
         }
     }
