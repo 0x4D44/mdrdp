@@ -268,6 +268,10 @@ pub struct Evidence {
     /// The running agent's status, when the control port answered a status query:
     /// (version, green, server_running).
     pub agent: Option<AgentProbe>,
+    /// Complete schema-5+ client-selected display policy from the running agent.
+    /// Absent for fresh, unreachable, old-schema, or defaulted/partial status.
+    #[serde(default)]
+    pub desired_display: Option<DesiredDisplay>,
     /// The official VB-CABLE package is staged in the Windows driver store.
     #[serde(default)]
     pub audio_package_staged: bool,
@@ -302,6 +306,23 @@ pub struct AgentProbe {
     pub version: String,
     pub green: bool,
     pub server_running: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct DesiredDisplay {
+    pub width: u32,
+    pub height: u32,
+    pub hz: u32,
+    pub scale_percent: u32,
+}
+
+impl DesiredDisplay {
+    fn cli_args(self) -> String {
+        format!(
+            " --display {} {} {} {}",
+            self.width, self.height, self.hz, self.scale_percent
+        )
+    }
 }
 
 /// One executable unit of the plan. Deliberately closed at these two variants:
@@ -598,7 +619,13 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
     }
     plan.post.push(Action::Run {
         label: "install agent".to_owned(),
-        command: format!("\"{remote_dir}\\rhydra-agent.exe\" install"),
+        command: format!(
+            "\"{remote_dir}\\rhydra-agent.exe\" install{}",
+            evidence
+                .desired_display
+                .map(DesiredDisplay::cli_args)
+                .unwrap_or_default()
+        ),
     });
     // A fresh version directory never inherits the one-word source selector.
     // Re-run the verified configure operation after every full deploy so the
@@ -649,6 +676,7 @@ if ($TargetDir -and (Test-Path $TargetDir)) {
     Get-ChildItem -Path $TargetDir -Recurse -File | ForEach-Object { $sizes[$_.Name] = $_.Length }
 }
 $agent = $null
+$desiredDisplay = $null
 try {
     $client = New-Object Net.Sockets.TcpClient('127.0.0.1', $AgentPort)
     $client.ReceiveTimeout = 5000
@@ -662,6 +690,16 @@ try {
         $s = $reply.status
         $green = $s.device_present -and $s.mode_ok -and $s.server.running -and ($null -eq $s.stuck)
         $agent = @{ version = "$($s.version)"; green = [bool]$green; server_running = [bool]$s.server.running }
+        if ([int]$s.schema -ge 5 -and [uint32]$s.desired_display_mode.width -gt 0 -and
+            [uint32]$s.desired_display_mode.height -gt 0 -and [uint32]$s.desired_display_mode.hz -gt 0 -and
+            [uint32]$s.desired_desktop_scale_percent -gt 0) {
+            $desiredDisplay = @{
+                width = [uint32]$s.desired_display_mode.width
+                height = [uint32]$s.desired_display_mode.height
+                hz = [uint32]$s.desired_display_mode.hz
+                scale_percent = [uint32]$s.desired_desktop_scale_percent
+            }
+        }
     }
     $client.Close()
 } catch { $agent = $null }
@@ -769,6 +807,7 @@ $out = @{
     version_dirs = $versionDirs
     target_dir_sizes = $sizes
     agent = $agent
+    desired_display = $desiredDisplay
     audio_package_staged = [bool]$audioPackageStaged
     audio_setup_ran = [bool]$audioSetupRan
     audio_reboot_pending = [bool]$audioRebootPending
@@ -1195,7 +1234,60 @@ fn check_sizes(ssh: &Ssh, artifacts: &Artifacts) -> Result<(), String> {
     Ok(())
 }
 
-fn verify(ssh: &Ssh, artifacts: &Artifacts) -> Result<String, String> {
+fn verify_status(
+    line: &str,
+    expected_version: &str,
+    expected_display: Option<DesiredDisplay>,
+) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("status output: {e}\n{line}"))?;
+    let version = value["status"]["version"].as_str().unwrap_or("");
+    if version != expected_version {
+        return Err(format!(
+            "the running agent reports version {version:?}, expected {expected_version:?} — the old agent survived the deploy"
+        ));
+    }
+    if let Some(expected) = expected_display {
+        let status = &value["status"];
+        let read_display = |mode_field: &str, scale_field: &str| DesiredDisplay {
+            width: status[mode_field]["width"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            height: status[mode_field]["height"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            hz: status[mode_field]["hz"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            scale_percent: status[scale_field]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+        };
+        let desired = read_display("desired_display_mode", "desired_desktop_scale_percent");
+        let actual = read_display("display_mode", "desktop_scale_percent");
+        if desired != expected || actual != expected {
+            return Err(format!(
+                "display policy mismatch after deploy: expected {expected:?}, desired {desired:?}, actual {actual:?}"
+            ));
+        }
+    }
+    Ok(format!(
+        "agent v{version} stably green ({}x{} @ {} Hz)",
+        value["status"]["display_mode"]["width"],
+        value["status"]["display_mode"]["height"],
+        value["status"]["display_mode"]["hz"],
+    ))
+}
+
+fn verify(
+    ssh: &Ssh,
+    artifacts: &Artifacts,
+    expected_display: Option<DesiredDisplay>,
+) -> Result<String, String> {
     let command = format!(
         "\"{}\\rhydra-agent.exe\" status --wait 30",
         artifacts.remote_dir()
@@ -1203,22 +1295,7 @@ fn verify(ssh: &Ssh, artifacts: &Artifacts) -> Result<String, String> {
     match ssh.run(&command) {
         Ok(stdout) => {
             let line = stdout.lines().next().unwrap_or("");
-            let value: serde_json::Value =
-                serde_json::from_str(line).map_err(|e| format!("status output: {e}\n{stdout}"))?;
-            let version = value["status"]["version"].as_str().unwrap_or("");
-            if version != artifacts.version {
-                return Err(format!(
-                    "the running agent reports version {version:?}, expected {:?} — the old \
-                     agent survived the deploy",
-                    artifacts.version
-                ));
-            }
-            Ok(format!(
-                "agent v{version} stably green ({}x{} @ {} Hz)",
-                value["status"]["display_mode"]["width"],
-                value["status"]["display_mode"]["height"],
-                value["status"]["display_mode"]["hz"],
-            ))
+            verify_status(line, &artifacts.version, expected_display)
         }
         Err(e) => Err(format!(
             "verify failed. First diagnosis on this host class: is an interactive console \
@@ -1282,6 +1359,7 @@ pub fn run(args: &[String]) -> i32 {
     };
     report_evidence(&evidence);
 
+    let expected_display = evidence.desired_display;
     let branch = match decide(&cfg, &artifacts, &evidence) {
         Ok(b) => b,
         Err(stop) => {
@@ -1379,7 +1457,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 
-    match verify(&ssh, &artifacts) {
+    match verify(&ssh, &artifacts, expected_display) {
         Ok(summary) => {
             eprintln!("deploy: {summary}");
             // The native connect needs key auth (a GUI session has no tty for ssh
@@ -1436,7 +1514,7 @@ pub fn run(args: &[String]) -> i32 {
 
 fn report_evidence(ev: &Evidence) {
     eprintln!(
-        "deploy: host evidence: elevated={} console={} agent={} device={} staged_driver={:?} \
+        "deploy: host evidence: elevated={} console={} agent={} desired_display={:?} device={} staged_driver={:?} \
          audio={{package={} setup={} reboot={} identity={} render={} capture={} formats={} \
          default_active={}}}",
         ev.elevated,
@@ -1445,6 +1523,7 @@ fn report_evidence(ev: &Evidence) {
             .as_ref()
             .map(|a| format!("v{} green={}", a.version, a.green))
             .unwrap_or_else(|| "none".to_owned()),
+        ev.desired_display,
         ev.device_present,
         ev.staged_driver_vers,
         ev.audio_package_staged,
@@ -1556,6 +1635,7 @@ mod tests {
                 green: true,
                 server_running: false,
             }),
+            desired_display: None,
             audio_package_staged: true,
             audio_setup_ran: true,
             audio_reboot_pending: false,
@@ -1575,6 +1655,64 @@ mod tests {
             dry_run: false,
             force: false,
         }
+    }
+
+    #[test]
+    fn full_deploy_preserves_the_running_agents_complete_display_request() {
+        let dir = scratch_dir("display-preserve");
+        let art = test_artifacts(&dir);
+        let mut ev = healthy_evidence();
+        ev.desired_display = Some(DesiredDisplay {
+            width: 5120,
+            height: 2880,
+            hz: 240,
+            scale_percent: 200,
+        });
+
+        let Branch::Full(plan) = decide(&cfg(), &art, &ev).unwrap() else {
+            panic!("expected full deploy");
+        };
+        let install = plan
+            .post
+            .iter()
+            .find_map(|action| match action {
+                Action::Run { label, command } if label == "install agent" => Some(command),
+                _ => None,
+            })
+            .expect("full deploy installs the replacement agent");
+        assert!(
+            install.ends_with("install --display 5120 2880 240 200"),
+            "install must preserve the complete prior display tuple: {install}"
+        );
+
+        ev.desired_display = None;
+        let Branch::Full(plan) = decide(&cfg(), &art, &ev).unwrap() else {
+            panic!("expected full deploy");
+        };
+        let install = plan
+            .post
+            .iter()
+            .find_map(|action| match action {
+                Action::Run { label, command } if label == "install agent" => Some(command),
+                _ => None,
+            })
+            .unwrap();
+        assert!(install.ends_with(" install"), "{install}");
+    }
+
+    #[test]
+    fn verify_rejects_a_green_replacement_with_the_wrong_display_policy() {
+        let line = r#"{"ok":true,"status":{"version":"0.2.0","display_mode":{"width":2560,"height":1440,"hz":240},"desktop_scale_percent":100,"desired_display_mode":{"width":2560,"height":1440,"hz":240},"desired_desktop_scale_percent":100}}"#;
+        let expected = DesiredDisplay {
+            width: 5120,
+            height: 2880,
+            hz: 240,
+            scale_percent: 200,
+        };
+
+        let error = verify_status(line, "0.2.0", Some(expected))
+            .expect_err("a valid but wrong display policy must not pass deploy verification");
+        assert!(error.contains("display"), "{error}");
     }
 
     #[test]
@@ -1808,12 +1946,27 @@ mod tests {
             "signtool_present": false,
             "version_dirs": [],
             "target_dir_sizes": {},
-            "agent": null
+            "agent": null,
+            "desired_display": {
+                "width": 5120,
+                "height": 2880,
+                "hz": 240,
+                "scale_percent": 200
+            }
         }"#;
         let ev = parse_evidence(json).unwrap();
         assert!(ev.elevated);
         assert_eq!(ev.port9500_owner.as_deref(), Some("spike-server-inc3"));
         assert!(ev.agent.is_none());
+        assert_eq!(
+            ev.desired_display,
+            Some(DesiredDisplay {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+                scale_percent: 200,
+            })
+        );
 
         // PowerShell omits nothing here, but absent optional collections must
         // default rather than fail (a fresh host has no C:\mdrdp at all).
@@ -1825,6 +1978,7 @@ mod tests {
         }"#;
         let ev = parse_evidence(minimal).unwrap();
         assert!(ev.agent_exes.is_empty() && ev.version_dirs.is_empty());
+        assert!(ev.desired_display.is_none());
     }
 
     #[test]

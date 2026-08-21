@@ -13,12 +13,68 @@
 
 use std::process::ExitCode;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisplayArgs {
+    width: u32,
+    height: u32,
+    hz: u32,
+    scale: u32,
+}
+
+/// Parse the optional display tuple accepted by `run` and `install`.
+///
+/// The finite mode and scale validation belongs to `Reconciler`; this parser
+/// only turns the portable command-line representation into numbers so the
+/// Windows and non-Windows test builds share the same argument contract.
+fn parse_display(args: &[String]) -> Result<Option<DisplayArgs>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, width, height, hz, scale] if flag == "--display" => {
+            let parse = |name: &str, value: &str| {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| format!("--display {name} needs a whole number, got {value:?}"))
+            };
+            Ok(Some(DisplayArgs {
+                width: parse("<width>", width)?,
+                height: parse("<height>", height)?,
+                hz: parse("<hz>", hz)?,
+                scale: parse("<scale>", scale)?,
+            }))
+        }
+        _ => Err(format!(
+            "expected --display <width> <height> <hz> <scale>, got {args:?}"
+        )),
+    }
+}
+
+fn format_display_args(display: Option<DisplayArgs>) -> String {
+    display.map_or_else(String::new, |display| {
+        format!(
+            " --display {} {} {} {}",
+            display.width, display.height, display.hz, display.scale
+        )
+    })
+}
+
 #[cfg(windows)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("run") => win::run(),
-        Some("install") => win::install(),
+        Some("run") => match parse_display(&args[1..]) {
+            Ok(display) => win::run(display),
+            Err(e) => {
+                eprintln!("agent: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Some("install") => match parse_display(&args[1..]) {
+            Ok(display) => win::install(display),
+            Err(e) => {
+                eprintln!("agent: {e}");
+                ExitCode::from(2)
+            }
+        },
         Some("uninstall") => win::uninstall(),
         Some("configure-audio") => win::configure_audio(),
         Some("check-audio") => win::check_audio(),
@@ -31,7 +87,7 @@ fn main() -> ExitCode {
         },
         _ => {
             eprintln!(
-                "usage: rhydra-agent run|install|uninstall|configure-audio|check-audio|status [--wait <secs>]"
+                "usage: rhydra-agent run|install [--display <width> <height> <hz> <scale>]\n       rhydra-agent uninstall|configure-audio|check-audio|status [--wait <secs>]"
             );
             ExitCode::from(2)
         }
@@ -57,8 +113,49 @@ fn main() -> ExitCode {
     ExitCode::from(2)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{format_display_args, parse_display, DisplayArgs};
+
+    #[test]
+    fn parse_display_preserves_the_native_mode_tuple() {
+        let args = [
+            "--display".to_owned(),
+            "5120".to_owned(),
+            "2880".to_owned(),
+            "240".to_owned(),
+            "200".to_owned(),
+        ];
+
+        assert_eq!(
+            parse_display(&args),
+            Ok(Some(DisplayArgs {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+                scale: 200,
+            }))
+        );
+    }
+
+    #[test]
+    fn format_display_args_is_suitable_for_the_scheduled_task_command() {
+        assert_eq!(
+            format_display_args(Some(DisplayArgs {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+                scale: 200,
+            })),
+            " --display 5120 2880 240 200"
+        );
+        assert_eq!(format_display_args(None), "");
+    }
+}
+
 #[cfg(windows)]
 mod win {
+    use super::{format_display_args, DisplayArgs};
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::process::{Command, ExitCode};
@@ -124,7 +221,22 @@ mod win {
         rhydra::win::init_thread_dpi_awareness()
     }
 
-    pub fn run() -> ExitCode {
+    fn apply_display_request(
+        rec: &mut Reconciler,
+        display: Option<DisplayArgs>,
+    ) -> Result<(), String> {
+        if let Some(display) = display {
+            let mode = rhydra::agent::Mode {
+                width: display.width,
+                height: display.height,
+                hz: display.hz,
+            };
+            rec.request_display_mode(mode, display.scale)?;
+        }
+        Ok(())
+    }
+
+    pub fn run(display: Option<DisplayArgs>) -> ExitCode {
         if let Err(error) = initialize_reconcile_thread() {
             eprintln!("agent: SetThreadDpiAwarenessContext failed: {error}");
             return ExitCode::FAILURE;
@@ -161,6 +273,12 @@ mod win {
         ops.sweep_orphans();
 
         let mut rec = Reconciler::new();
+        if let Err(error) = apply_display_request(&mut rec, display) {
+            eprintln!("agent: invalid display request: {error}");
+            return ExitCode::from(2);
+        }
+        // Seed before the first tick so a replacement agent never spends a
+        // reconcile interval advertising the safe 1440p/100% defaults.
         let first = rec.status(0);
         let shared = Arc::new(Mutex::new(Shared {
             status_line: control::status_line(&first),
@@ -357,7 +475,12 @@ mod win {
         Ok(())
     }
 
-    pub fn install() -> ExitCode {
+    pub fn install(display: Option<DisplayArgs>) -> ExitCode {
+        let mut validator = Reconciler::new();
+        if let Err(error) = apply_display_request(&mut validator, display) {
+            eprintln!("agent: invalid display request: {error}");
+            return ExitCode::from(2);
+        }
         let exe = match std::env::current_exe() {
             Ok(e) => e,
             Err(e) => {
@@ -366,6 +489,7 @@ mod win {
             }
         };
         // onlogon alone would not fire until the NEXT logon, so start it now too.
+        let task_command = format!("\"{}\" run{}", exe.display(), format_display_args(display));
         let create = Command::new("schtasks")
             .args([
                 "/create",
@@ -377,7 +501,7 @@ mod win {
                 "highest",
                 "/f",
                 "/tr",
-                &format!("\"{}\" run", exe.display()),
+                &task_command,
             ])
             .status();
         match create {
