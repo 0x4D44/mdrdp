@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00030 — Native session shows two cursors and the remote cursor trails by seconds
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/input
 - **Raised:** 2026-08-21T22:15:35Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260821T225003Z-94169e2d
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00030-run-fix-20260821T225003Z-94169e2d
-- **Owner base:** efc8049188fe8e65b170e77b3b63aabecd3f1de6
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-21T22:50:03Z
-- **Owner until:** 2026-08-22T01:06:54Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-21T22:15:35Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-21T22:15:35Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-21T23:08:11Z, deltic:auto role=fix run=fix-20260821T225003Z-94169e2d branch=task/bug-MDR-BUG-FLU-00030-run-fix-20260821T225003Z-94169e2d code=40ae062 gate=manual)
 
 ## Observation
 
