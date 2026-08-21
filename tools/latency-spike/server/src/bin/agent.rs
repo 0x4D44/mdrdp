@@ -116,7 +116,18 @@ mod win {
         let _ = writeln!(file, "{line}");
     }
 
+    /// Put the reconcile thread's display APIs in one physical coordinate space.
+    /// `EnumDisplaySettingsW` reports physical geometry, while `MonitorFromPoint`
+    /// and `GetScaleFactorForMonitor` otherwise see a DPI-virtualised desktop and
+    /// can miss a 200%-scaled secondary display.
+    fn initialize_reconcile_thread() {
+        if let Err(error) = rhydra::win::init_thread_dpi_awareness() {
+            eprintln!("warning: SetThreadDpiAwarenessContext failed: {error}");
+        }
+    }
+
     pub fn run() -> ExitCode {
+        initialize_reconcile_thread();
         let root = match exe_root() {
             Ok(r) => r,
             Err(e) => {
@@ -595,6 +606,22 @@ mod win {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn reconcile_thread_selects_per_monitor_v2_dpi_awareness() {
+            super::initialize_reconcile_thread();
+            let context = unsafe { windows::Win32::UI::HiDpi::GetThreadDpiAwarenessContext() };
+            assert!(unsafe {
+                windows::Win32::UI::HiDpi::AreDpiAwarenessContextsEqual(
+                    context,
+                    windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                )
+            }
+            .as_bool());
         }
     }
 }

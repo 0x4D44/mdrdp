@@ -28,15 +28,16 @@ pub use pipeline::{list_outputs, run};
 /// Errors cross thread boundaries here, so they must be `Send + Sync`.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Set per-monitor-v2 DPI awareness. Must run before any display or metrics call —
-/// `main` calls this first, before `cli::parse` even looks at `--list-outputs` vs a
-/// live run (HLD tranche 3 §5.2, review S-M5): a DPI-unaware process reads
+/// Set process-wide per-monitor-v2 DPI awareness. The capture server calls this before
+/// `cli::parse` and therefore before any display or metrics call (HLD tranche 3 §5.2,
+/// review S-M5). The session agent instead uses [`init_thread_dpi_awareness`] below. A
+/// DPI-unaware process reads
 /// *logical* (OS-scaled) virtual-screen metrics, so every mouse injection computed
 /// against real pixels (`GetSystemMetrics(SM_*VIRTUALSCREEN)`, in the [`input`]
 /// module's mouse-move injector) would land off by the scale factor.
 ///
-/// Failure is reported, not treated as fatal here — the caller (currently `main`)
-/// decides whether a degraded run is still worth starting.
+/// Failure is reported, not treated as fatal here — each caller decides whether a
+/// degraded run is still worth starting.
 pub fn init_dpi_awareness() -> Result<()> {
     // SAFETY: no pointers cross the FFI boundary; the context value is one of the
     // library's own constants.
@@ -45,6 +46,24 @@ pub fn init_dpi_awareness() -> Result<()> {
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         )
     }?;
+    Ok(())
+}
+
+/// Set per-monitor-v2 awareness for the current thread.
+///
+/// The session agent uses this form because every display query happens on its reconcile
+/// thread. Unlike the process-wide setter, this remains available when a test harness or
+/// executable manifest has already fixed the process default.
+pub fn init_thread_dpi_awareness() -> Result<()> {
+    // SAFETY: the context is a library constant and affects only the calling thread.
+    let previous = unsafe {
+        windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+    };
+    if previous.0.is_null() {
+        return Err(windows::core::Error::from_thread().into());
+    }
     Ok(())
 }
 
