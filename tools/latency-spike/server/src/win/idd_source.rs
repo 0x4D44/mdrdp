@@ -801,6 +801,22 @@ impl FrameSource for IddSource {
         "idd"
     }
 
+    fn hide_local_cursor(&self) -> bool {
+        match self.section().read_header() {
+            Some(Ok(header))
+                if header.generation == self.pool.generation
+                    && header.name_suffix == self.pool.suffix =>
+            {
+                !matches!(
+                    header.cursor_plane,
+                    idd_section::CursorPlane::HardwareVisible
+                )
+            }
+            // A transient unreadable header must not strand the local cursor hidden.
+            _ => false,
+        }
+    }
+
     /// Overrides the trait's `(0, 0)` default: the IDD display is routinely not
     /// the desktop's top-left one, and the default silently mis-aimed every
     /// click by the display's offset (§5.2).

@@ -47,6 +47,8 @@ pub struct Sender {
     listener: TcpListener,
     client: Option<TcpStream>,
     connected: Arc<AtomicBool>,
+    cursor_hidden: Arc<AtomicBool>,
+    sent_cursor_hidden: Option<bool>,
     stats: Option<BufWriter<File>>,
     /// Replayed to every client that connects, so an archived capture is readable
     /// without the operator having to fetch the server's own file.
@@ -62,6 +64,7 @@ impl Sender {
         header_line: String,
         clock: QpcClock,
         connected: Arc<AtomicBool>,
+        cursor_hidden: Arc<AtomicBool>,
     ) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         listener.set_nonblocking(true)?;
@@ -78,6 +81,8 @@ impl Sender {
             listener,
             client: None,
             connected,
+            cursor_hidden,
+            sent_cursor_hidden: None,
             stats,
             header_line,
             clock,
@@ -106,6 +111,7 @@ impl Sender {
                 // it sees a single stamp.
                 let header = self.header_line.clone();
                 self.write_message(framing::MSG_STATS, header.as_bytes());
+                self.write_cursor_if_changed();
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => eprintln!("video: accept failed: {e}"),
@@ -117,6 +123,7 @@ impl Sender {
             eprintln!("video: disconnected ({why})");
         }
         self.connected.store(false, Ordering::Release);
+        self.sent_cursor_hidden = None;
     }
 
     /// Frame one message and push it. A write failure ends the connection; the
@@ -132,6 +139,20 @@ impl Sender {
             .and_then(|()| client.flush());
         if let Err(e) = outcome {
             self.drop_client(&e.to_string());
+        }
+    }
+
+    fn write_cursor_if_changed(&mut self) {
+        if self.client.is_none() {
+            return;
+        }
+        let hidden = self.cursor_hidden.load(Ordering::Acquire);
+        if self.sent_cursor_hidden == Some(hidden) {
+            return;
+        }
+        self.write_message(framing::MSG_CURSOR, &framing::encode_cursor(hidden));
+        if self.client.is_some() {
+            self.sent_cursor_hidden = Some(hidden);
         }
     }
 
@@ -227,6 +248,7 @@ impl Sender {
         loop {
             self.poll_client_eof();
             self.poll_accept();
+            self.write_cursor_if_changed();
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(msg) => batch.push(msg),
                 Err(RecvTimeoutError::Timeout) => continue,

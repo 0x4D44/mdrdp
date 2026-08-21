@@ -304,10 +304,18 @@ HRESULT Direct3DDevice::Init()
 
 #pragma region SwapChainProcessor
 
-SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, shared_ptr<SharedSection> Section)
-    : m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent), m_Section(std::move(Section))
+SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, IDDCX_MONITOR Monitor, shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, shared_ptr<SharedSection> Section)
+    : m_hSwapChain(hSwapChain),
+      m_Monitor(Monitor),
+      m_Device(Device),
+      m_hAvailableBufferEvent(NewFrameEvent),
+      m_LastCursorShapeId(0),
+      m_Section(std::move(Section))
 {
-    m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+    // Both the frame and cursor workers observe termination, so this must be
+    // manual-reset. The cursor event is auto-reset: one signal wakes one query.
+    m_hTerminateEvent.Attach(CreateEvent(nullptr, TRUE, FALSE, nullptr));
+    m_hCursorDataEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
 
     // Immediately create and run the swap-chain processing thread, passing 'this' as the thread parameter
     m_hThread.Attach(CreateThread(nullptr, 0, RunThread, this, 0, nullptr));
@@ -323,12 +331,92 @@ SwapChainProcessor::~SwapChainProcessor()
         // Wait for the thread to terminate
         WaitForSingleObject(m_hThread.Get(), INFINITE);
     }
+
+    if (m_hCursorThread.Get())
+    {
+        // The cursor worker shares the monitor and section lifetime with this object.
+        WaitForSingleObject(m_hCursorThread.Get(), INFINITE);
+    }
 }
 
 DWORD CALLBACK SwapChainProcessor::RunThread(LPVOID Argument)
 {
     reinterpret_cast<SwapChainProcessor*>(Argument)->Run();
     return 0;
+}
+
+DWORD CALLBACK SwapChainProcessor::CursorThread(LPVOID Argument)
+{
+    reinterpret_cast<SwapChainProcessor*>(Argument)->ConsumeCursorUpdates();
+    return 0;
+}
+
+void SwapChainProcessor::QueryHardwareCursor()
+{
+    IDARG_IN_QUERY_HWCURSOR QueryIn = {};
+    QueryIn.LastShapeId = m_LastCursorShapeId;
+    QueryIn.ShapeBufferSizeInBytes = sizeof(m_CursorShapeBuffer);
+    QueryIn.pShapeBuffer = m_CursorShapeBuffer;
+
+    IDARG_OUT_QUERY_HWCURSOR QueryOut = {};
+    const NTSTATUS Status = IddCxMonitorQueryHardwareCursor(m_Monitor, &QueryIn, &QueryOut);
+    if (!NT_SUCCESS(Status))
+    {
+        wchar_t Message[128];
+        swprintf_s(Message, L"mdrdp-idd: IddCxMonitorQueryHardwareCursor failed, status=0x%08lx\n",
+            static_cast<unsigned long>(Status));
+        OutputDebugStringW(Message);
+        if (m_Section != nullptr)
+        {
+            // A stale hidden state is worse than a visible default cursor: it can
+            // leave the viewer with no immediate pointer at all.
+            m_Section->PublishHardwareCursor(false);
+        }
+        return;
+    }
+
+    if (QueryOut.IsCursorShapeUpdated)
+    {
+        m_LastCursorShapeId = QueryOut.CursorShapeInfo.ShapeId;
+    }
+
+    // The cursor bitmap and position stay on the local platform. The shared word
+    // carries only visibility, so a hidden Windows cursor no longer gets baked into
+    // the delayed frame stream.
+    if (m_Section != nullptr)
+    {
+        m_Section->PublishHardwareCursor(QueryOut.IsCursorVisible == FALSE);
+    }
+
+}
+
+void SwapChainProcessor::ConsumeCursorUpdates()
+{
+    HANDLE WaitHandles[] =
+    {
+        m_hCursorDataEvent.Get(),
+        m_hTerminateEvent.Get()
+    };
+
+    for (;;)
+    {
+        const DWORD WaitResult = WaitForMultipleObjects(ARRAYSIZE(WaitHandles), WaitHandles, FALSE, INFINITE);
+        if (WaitResult == WAIT_OBJECT_0)
+        {
+            // Query once per notification. The auto-reset event preserves the
+            // lifetime-safe worker boundary while allowing subsequent notifications
+            // to wake the worker again immediately.
+            QueryHardwareCursor();
+        }
+        else if (WaitResult == WAIT_OBJECT_0 + 1)
+        {
+            return;
+        }
+        else
+        {
+            return;
+        }
+    }
 }
 
 void SwapChainProcessor::Run()
@@ -365,6 +453,40 @@ void SwapChainProcessor::RunCore()
     if (FAILED(hr))
     {
         return;
+    }
+
+    // Claim the cursor plane before the first surface is acquired. IddCx keeps
+    // unsupported shapes in software composition; the full alpha/XOR capability
+    // and 256x256 bounds cover the cursor classes used by the 200% desktop.
+    if (m_hCursorDataEvent.Get() != nullptr)
+    {
+        IDARG_IN_SETUP_HWCURSOR CursorSetup = {};
+        CursorSetup.CursorInfo.Size = sizeof(CursorSetup.CursorInfo);
+        CursorSetup.CursorInfo.AlphaCursorSupport = TRUE;
+        CursorSetup.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_FULL;
+        CursorSetup.CursorInfo.MaxX = MDRDP_IDD_CURSOR_MAX_X;
+        CursorSetup.CursorInfo.MaxY = MDRDP_IDD_CURSOR_MAX_Y;
+        CursorSetup.hNewCursorDataAvailable = m_hCursorDataEvent.Get();
+
+        const NTSTATUS CursorStatus = IddCxMonitorSetupHardwareCursor(m_Monitor, &CursorSetup);
+        if (NT_SUCCESS(CursorStatus))
+        {
+            // Seed visibility immediately. Waiting for the first change event can
+            // leave a newly connected viewer with a stale default state.
+            QueryHardwareCursor();
+            m_hCursorThread.Attach(CreateThread(nullptr, 0, CursorThread, this, 0, nullptr));
+            if (m_hCursorThread.Get() == nullptr)
+            {
+                OutputDebugStringW(L"mdrdp-idd: failed to create the hardware cursor worker\n");
+            }
+        }
+        else
+        {
+            wchar_t Message[128];
+            swprintf_s(Message, L"mdrdp-idd: IddCxMonitorSetupHardwareCursor failed, status=0x%08lx\n",
+                static_cast<unsigned long>(CursorStatus));
+            OutputDebugStringW(Message);
+        }
     }
 
     // mdrdp cadence instrumentation. Nothing here allocates or touches the filesystem:
@@ -649,7 +771,7 @@ void IndirectMonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID Ren
     else
     {
         // Create a new swap-chain processing thread
-        m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent, m_Section));
+        m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, m_Monitor, Device, NewFrameEvent, m_Section));
     }
 }
 

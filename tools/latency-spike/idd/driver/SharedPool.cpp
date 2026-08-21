@@ -247,6 +247,7 @@ void SharedSection::Create()
     pHeader->SlotCount = MDRDP_IDD_SLOT_COUNT;
     pHeader->Generation = 0;
     SeqlockEnd(&pHeader->HeaderSequence);
+    PublishSoftwareCursor();
 
     OutputDebugStringW(L"mdrdp-idd: shared section Global\\mdrdp-idd ready\n");
 }
@@ -273,6 +274,32 @@ void SharedSection::AdvertiseNoPool()
     SeqlockBegin(&pHeader->HeaderSequence);
     pHeader->Generation = 0;
     SeqlockEnd(&pHeader->HeaderSequence);
+}
+
+void SharedSection::PublishSoftwareCursor()
+{
+    if (m_pView == nullptr)
+    {
+        return;
+    }
+
+    volatile LONG* pCursorPlane = reinterpret_cast<volatile LONG*>(&Header()->Reserved);
+    InterlockedExchange(pCursorPlane, 0L);
+}
+
+void SharedSection::PublishHardwareCursor(bool Hidden)
+{
+    if (m_pView == nullptr)
+    {
+        return;
+    }
+
+    // Reserved is a standalone, 32-bit compatibility word. InterlockedExchange gives
+    // mapped readers a tear-free publication without perturbing HeaderSequence, which
+    // still describes only the frame-pool header fields. Zero stays the old driver's
+    // software-composited state; nonzero explicitly proves hardware ownership.
+    volatile LONG* pCursorPlane = reinterpret_cast<volatile LONG*>(&Header()->Reserved);
+    InterlockedExchange(pCursorPlane, Hidden ? 2L : 1L);
 }
 
 MdrdpSharedSlot* SharedSection::Slot(UINT32 Index) const
@@ -479,7 +506,6 @@ HRESULT SharedFramePool::Start(
     pHeader->DxgiFormat = static_cast<UINT32>(Desc.Format);
     pHeader->SlotCount = MDRDP_IDD_SLOT_COUNT;
     pHeader->NameSuffix = Suffix;
-    pHeader->Reserved = 0;
     SeqlockEnd(&pHeader->HeaderSequence);
 
 

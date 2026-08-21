@@ -42,7 +42,7 @@ use crate::session::{SessionCommand, SessionEnd};
 use crate::stats::StatsHandle;
 use crate::surface::{Rect, SurfaceStore};
 use crate::wake::{self, DoorbellReceiver};
-use crate::window::Waker;
+use crate::window::{CursorUpdate, Waker};
 
 use super::clipboard::{COUNTERS, TextOnly};
 use super::probe::{ProbedTransport, TileHeader};
@@ -389,19 +389,24 @@ pub fn spawn(
     let video = conn.video.try_clone()?;
     let input = conn.input.try_clone()?;
 
+    // A previous native session may have ended while the host cursor was hidden.
+    // Reset immediately; the host's initial cursor message then states the truth.
+    let _ = waker.cursor(CursorUpdate::Default);
+
     // One clock, both threads: `native-input` stamps it, `native-net` closes it
     // on the next paint. That is the session's input round trip.
     let input_clock = InputClock::default();
 
     let net_stop = Arc::clone(&stop);
     let net_input_sock = conn.input.try_clone()?;
+    let damage_waker = waker.clone();
     let mut sink = NativeSink::new_tiled(
         decoders,
         conn.header.tiles.clone(),
         store,
         (conn.header.width, conn.header.height),
         Box::new(move || {
-            let _ = waker.damaged();
+            let _ = damage_waker.damaged();
         }),
         stats,
         input_clock.clone(),
@@ -411,7 +416,17 @@ pub fn spawn(
     let video_join = std::thread::Builder::new()
         .name("native-net".to_owned())
         .spawn(move || {
-            let end = pump_video(&mut video_sock, &mut reassembler, &mut sink, &net_stop);
+            let mut on_cursor = |update| {
+                let _ = waker.cursor(update);
+            };
+            let end = pump_video(
+                &mut video_sock,
+                &mut reassembler,
+                &mut sink,
+                &mut on_cursor,
+                &net_stop,
+            );
+            let _ = waker.cursor(CursorUpdate::Default);
             // Either side's death tears the whole session down (HLD §6).
             net_stop.store(true, Ordering::Relaxed);
             let _ = net_input_sock.shutdown(Shutdown::Both);
@@ -691,6 +706,7 @@ fn pump_video(
     video: &mut TcpStream,
     reassembler: &mut Reassembler,
     sink: &mut NativeSink,
+    on_cursor: &mut dyn FnMut(CursorUpdate),
     stop: &AtomicBool,
 ) -> SessionEnd {
     let mut buf = vec![0u8; 64 * 1024];
@@ -731,27 +747,46 @@ fn pump_video(
             }
         }
         for m in batch.iter().filter(|m| m.msg_type != framing::MSG_RECTS) {
-            let outcome = match m.msg_type {
-                framing::MSG_VIDEO_SEQ => {
-                    if m.payload.len() < 8 {
-                        Err("MSG_VIDEO_SEQ shorter than its sequence prefix".to_owned())
-                    } else {
-                        let seq = u64::from_le_bytes(m.payload[..8].try_into().expect("8 bytes"));
-                        sink.on_au(&m.payload[8..], Some(seq))
-                    }
-                }
-                framing::MSG_VIDEO_TILE => match framing::decode_tile_au(&m.payload) {
-                    Ok(tile) => sink.on_tile_au(tile.tile_id, tile.au, tile.capture_seq),
-                    Err(e) => Err(format!("MSG_VIDEO_TILE: {e}")),
-                },
-                framing::MSG_VIDEO => sink.on_au(&m.payload, None),
-                framing::MSG_STATS => Ok(()), // per-frame server stats: not consumed yet
-                _ => Ok(()),                  // unknown types skip by design
-            };
+            let outcome = dispatch_video_message(m, sink, on_cursor);
             if let Err(reason) = outcome {
                 return SessionEnd::TransportFailed(reason);
             }
         }
+    }
+}
+
+fn dispatch_video_message(
+    message: &framing::Message,
+    sink: &mut NativeSink,
+    on_cursor: &mut dyn FnMut(CursorUpdate),
+) -> Result<(), String> {
+    match message.msg_type {
+        framing::MSG_VIDEO_SEQ => {
+            if message.payload.len() < 8 {
+                Err("MSG_VIDEO_SEQ shorter than its sequence prefix".to_owned())
+            } else {
+                let seq = u64::from_le_bytes(message.payload[..8].try_into().expect("8 bytes"));
+                sink.on_au(&message.payload[8..], Some(seq))
+            }
+        }
+        framing::MSG_VIDEO_TILE => match framing::decode_tile_au(&message.payload) {
+            Ok(tile) => sink.on_tile_au(tile.tile_id, tile.au, tile.capture_seq),
+            Err(e) => Err(format!("MSG_VIDEO_TILE: {e}")),
+        },
+        framing::MSG_VIDEO => sink.on_au(&message.payload, None),
+        framing::MSG_CURSOR => match framing::decode_cursor(&message.payload) {
+            Ok(true) => {
+                on_cursor(CursorUpdate::Hidden);
+                Ok(())
+            }
+            Ok(false) => {
+                on_cursor(CursorUpdate::Default);
+                Ok(())
+            }
+            Err(e) => Err(format!("MSG_CURSOR: {e}")),
+        },
+        framing::MSG_STATS => Ok(()), // per-frame server stats: not consumed yet
+        _ => Ok(()),                  // unknown types skip by design
     }
 }
 
@@ -1511,6 +1546,34 @@ mod tests {
     fn surface_fill(store: &Arc<Mutex<SurfaceStore>>) -> u8 {
         let guard = store.lock().unwrap();
         guard.get(OUTPUT_SURFACE).unwrap().pixels()[0]
+    }
+
+    #[test]
+    fn cursor_state_messages_reach_the_platform_cursor_without_painting() {
+        let (mut sink, _) = sink_with_store((1, 1));
+        let mut updates = Vec::new();
+        let mut collect = |update| updates.push(update);
+
+        dispatch_video_message(
+            &framing::Message {
+                msg_type: framing::MSG_CURSOR,
+                payload: framing::encode_cursor(true).to_vec(),
+            },
+            &mut sink,
+            &mut collect,
+        )
+        .unwrap();
+        dispatch_video_message(
+            &framing::Message {
+                msg_type: framing::MSG_CURSOR,
+                payload: framing::encode_cursor(false).to_vec(),
+            },
+            &mut sink,
+            &mut collect,
+        )
+        .unwrap();
+
+        assert_eq!(updates, [CursorUpdate::Hidden, CursorUpdate::Default]);
     }
 
     #[test]

@@ -195,6 +195,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     let header_line = stats::to_line(&header);
 
     let connected = Arc::new(AtomicBool::new(false));
+    let cursor_hidden = Arc::new(AtomicBool::new(source.hide_local_cursor()));
     let (tx, rx) = sync_channel::<send::Outbound>(QUEUE_DEPTH);
     let sender = send::Sender::new(
         cfg.video_port,
@@ -202,6 +203,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         header_line,
         clock,
         Arc::clone(&connected),
+        Arc::clone(&cursor_hidden),
     )?;
     std::thread::Builder::new()
         .name("spike-send".into())
@@ -277,6 +279,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         clock,
         tx,
         connected,
+        cursor_hidden,
         rects_enabled,
         diff_enabled,
     });
@@ -358,6 +361,7 @@ struct CaptureState<'a> {
     clock: QpcClock,
     tx: SyncSender<send::Outbound>,
     connected: Arc<AtomicBool>,
+    cursor_hidden: Arc<AtomicBool>,
     /// Whether the raw dirty-rect fast path may run at all: `--no-rects` and a
     /// desktop too large for the wire's u16 coordinates both switch it off.
     rects_enabled: bool,
@@ -827,6 +831,9 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         .collect();
 
     loop {
+        state
+            .cursor_hidden
+            .store(state.capture.hide_local_cursor(), Ordering::Release);
         let connected = state.connected.load(Ordering::Acquire);
         if !connected {
             // Nothing is watching. Capturing anyway would hold the compositor and

@@ -92,7 +92,7 @@ namespace Microsoft
             UINT32 SlotCount;           // 28 - == MDRDP_IDD_SLOT_COUNT
             UINT64 NameSuffix;          // 32 - random per generation; names are built from it
             UINT32 HeaderSequence;      // 40 - seqlock
-            UINT32 Reserved;            // 44 - 0
+            UINT32 Reserved;            // 44 - cursor plane: 0 software, 1 HW visible, 2 HW hidden
         };
 
         /// <summary>
@@ -171,6 +171,12 @@ namespace Microsoft
             // Header generation back to 0 - "no pool, wait" - so a torn-down pool never
             // strands a late-opening consumer on names whose objects are gone.
             void AdvertiseNoPool();
+
+            // Publish cursor visibility independently of the header seqlock. Reserved is
+            // an additive v1 field, so old consumers continue to ignore it and new
+            // consumers can read this word atomically while the frame header changes.
+            void PublishSoftwareCursor();
+            void PublishHardwareCursor(bool Hidden);
 
         private:
             SharedSection(const SharedSection&) = delete;

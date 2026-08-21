@@ -90,20 +90,33 @@ namespace Microsoft
         class SwapChainProcessor
         {
         public:
-            SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, std::shared_ptr<SharedSection> Section);
+            SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, IDDCX_MONITOR Monitor, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, std::shared_ptr<SharedSection> Section);
             ~SwapChainProcessor();
 
         private:
             static DWORD CALLBACK RunThread(LPVOID Argument);
+            static DWORD CALLBACK CursorThread(LPVOID Argument);
 
             void Run();
             void RunCore();
+            void ConsumeCursorUpdates();
+            void QueryHardwareCursor();
 
             IDDCX_SWAPCHAIN m_hSwapChain;
+            IDDCX_MONITOR m_Monitor;
             std::shared_ptr<Direct3DDevice> m_Device;
             HANDLE m_hAvailableBufferEvent;
             Microsoft::WRL::Wrappers::Thread m_hThread;
+            Microsoft::WRL::Wrappers::Thread m_hCursorThread;
             Microsoft::WRL::Wrappers::Event m_hTerminateEvent;
+            Microsoft::WRL::Wrappers::Event m_hCursorDataEvent;
+
+            static constexpr UINT MDRDP_IDD_CURSOR_MAX_X = 256;
+            static constexpr UINT MDRDP_IDD_CURSOR_MAX_Y = 256;
+            static constexpr UINT MDRDP_IDD_CURSOR_SHAPE_BUFFER_BYTES =
+                MDRDP_IDD_CURSOR_MAX_X * MDRDP_IDD_CURSOR_MAX_Y * sizeof(UINT32);
+            BYTE m_CursorShapeBuffer[MDRDP_IDD_CURSOR_SHAPE_BUFFER_BYTES];
+            DWORD m_LastCursorShapeId;
 
             // Null, or unusable, when the section could not be created; the loop then
             // behaves exactly as it did before the pool existed. A shared_ptr rather

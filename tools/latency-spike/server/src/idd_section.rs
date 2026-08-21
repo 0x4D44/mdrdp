@@ -99,6 +99,7 @@ const OFF_DXGI_FORMAT: usize = 24;
 const OFF_SLOT_COUNT: usize = 28;
 const OFF_NAME_SUFFIX: usize = 32;
 const OFF_HEADER_SEQUENCE: usize = 40;
+const OFF_CURSOR_HIDDEN: usize = 44;
 
 /// Bytes of the header page the contract actually defines.
 pub const HEADER_BYTES: usize = 48;
@@ -106,6 +107,18 @@ pub const HEADER_BYTES: usize = 48;
 /// Where the header's seqlock word sits, for a reader that samples it either side
 /// of the body copy without parsing anything.
 pub const HEADER_SEQUENCE_OFFSET: usize = OFF_HEADER_SEQUENCE;
+
+/// Who owns the cursor pixels advertised by the shared section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorPlane {
+    /// Layout-v1 producer with no hardware-cursor claim. Cursor pixels remain in
+    /// the captured surface, so a viewer must hide its local cursor.
+    Software,
+    /// The driver owns the cursor plane and Windows currently shows it.
+    HardwareVisible,
+    /// The driver owns the cursor plane and Windows currently hides it.
+    HardwareHidden,
+}
 
 // Slot field offsets, page-relative.
 const OFF_SLOT_SEQUENCE: usize = 0;
@@ -145,6 +158,9 @@ pub struct PoolHeader {
     /// Random per generation; qualifies the texture and event names so a
     /// straggling consumer's open handles cannot collide with a rebuilt pool.
     pub name_suffix: u64,
+    /// Cursor-plane ownership and visibility, updated atomically by the driver
+    /// independently of the header seqlock.
+    pub cursor_plane: CursorPlane,
     /// The seqlock word this header was read at. Even, by construction.
     pub sequence: u32,
 }
@@ -301,6 +317,16 @@ pub fn parse_header(page: &[u8]) -> Result<PoolHeader, LayoutError> {
         height: u32_at(page, OFF_HEIGHT),
         dxgi_format: u32_at(page, OFF_DXGI_FORMAT),
         name_suffix: u64_at(page, OFF_NAME_SUFFIX),
+        // This aligned word is written with InterlockedExchange independently of
+        // the header seqlock. A copied value is therefore wholly old or wholly new.
+        cursor_plane: match u32_at(page, OFF_CURSOR_HIDDEN) {
+            1 => CursorPlane::HardwareVisible,
+            2 => CursorPlane::HardwareHidden,
+            // Zero is the value every old layout-v1 driver already publishes.
+            // Unknown future values degrade the same way: keep the local pointer
+            // hidden rather than risk displaying it over software-composited pixels.
+            _ => CursorPlane::Software,
+        },
         sequence,
     })
 }
@@ -481,6 +507,7 @@ mod tests {
         b[28..32].copy_from_slice(&3u32.to_le_bytes()); // slot_count
         b[32..40].copy_from_slice(&0x0BAD_C0DE_DEAD_BEEFu64.to_le_bytes()); // name_suffix
         b[40..44].copy_from_slice(&12u32.to_le_bytes()); // header_sequence (even)
+        b[44..48].copy_from_slice(&2u32.to_le_bytes()); // hardware cursor hidden
 
         // Slot 0 at 4096, with two rects.
         b[4096..4100].copy_from_slice(&4u32.to_le_bytes()); // sequence
@@ -550,8 +577,19 @@ mod tests {
         assert_eq!(h.height, 1080);
         assert_eq!(h.dxgi_format, 87);
         assert_eq!(h.name_suffix, 0x0BAD_C0DE_DEAD_BEEF);
+        assert_eq!(h.cursor_plane, CursorPlane::HardwareHidden);
         assert_eq!(h.sequence, 12);
         assert_eq!(header_sequence(header_page(&b)).unwrap(), 12);
+    }
+
+    #[test]
+    fn an_old_layout_v1_producer_keeps_cursor_ownership_in_the_surface() {
+        let mut b = fixture();
+        b[44..48].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            parse_header(header_page(&b)).unwrap().cursor_plane,
+            CursorPlane::Software
+        );
     }
 
     #[test]

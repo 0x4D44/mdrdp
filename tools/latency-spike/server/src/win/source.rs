@@ -141,6 +141,11 @@ pub trait FrameSource {
     /// `dxgi` or `idd` — recorded in the stats header so an archived run names the
     /// path it was measured on.
     fn kind(&self) -> &'static str;
+    /// Whether the viewer should hide its immediate local pointer. Sources that
+    /// do not publish cursor state keep the platform cursor visible.
+    fn hide_local_cursor(&self) -> bool {
+        false
+    }
     /// Wait up to `timeout_ms` for the next frame.
     fn acquire(&mut self, timeout_ms: u32) -> Result<Acquired>;
     /// Read the pixels behind `change`'s rects back to the CPU, tightly packed.

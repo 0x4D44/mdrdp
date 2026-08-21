@@ -29,6 +29,29 @@ pub const MSG_VIDEO_SEQ: u8 = 4;
 /// Header-selected codec access unit: tile id + capture sequence + Annex B bytes.
 /// H.264 may advertise multiple tiles; the HEVC fallback advertises one full-frame tile.
 pub const MSG_VIDEO_TILE: u8 = 5;
+/// Host cursor visibility. The pointer pixels themselves stay out of the video
+/// surfaces so the viewer can draw its local cursor without capture latency.
+pub const MSG_CURSOR: u8 = 6;
+
+/// `[hidden: u8][reserved for later cursor metadata: 11]`.
+pub const CURSOR_PAYLOAD_BYTES: usize = 12;
+
+pub fn encode_cursor(hidden: bool) -> [u8; CURSOR_PAYLOAD_BYTES] {
+    let mut payload = [0; CURSOR_PAYLOAD_BYTES];
+    payload[0] = u8::from(hidden);
+    payload
+}
+
+pub fn decode_cursor(payload: &[u8]) -> Result<bool, &'static str> {
+    if payload.len() != CURSOR_PAYLOAD_BYTES {
+        return Err("cursor state is not its 12-byte payload");
+    }
+    match payload[0] {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err("cursor hidden flag is not 0 or 1"),
+    }
+}
 
 /// `[tile_id: u8][reserved: 3][capture_seq: u64 LE]`.
 pub const TILE_AU_PREFIX: usize = 12;
@@ -218,6 +241,19 @@ mod tests {
         assert_eq!(tile.capture_seq, 0x0102_0304_0506_0708);
         assert_eq!(tile.au, &[0x65, 0xaa]);
         assert!(decode_tile_au(&payload[..TILE_AU_PREFIX - 1]).is_err());
+    }
+
+    #[test]
+    fn cursor_visibility_round_trips_without_claiming_a_remote_position() {
+        let hidden = encode_cursor(true);
+        assert_eq!(hidden[1..], [0; CURSOR_PAYLOAD_BYTES - 1]);
+        assert!(decode_cursor(&hidden).expect("valid hidden cursor state"));
+        assert!(!decode_cursor(&encode_cursor(false)).expect("valid visible cursor state"));
+        assert!(decode_cursor(&hidden[..CURSOR_PAYLOAD_BYTES - 1]).is_err());
+
+        let mut malformed = hidden;
+        malformed[0] = 2;
+        assert!(decode_cursor(&malformed).is_err());
     }
 
     #[test]
