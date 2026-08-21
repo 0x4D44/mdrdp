@@ -6,15 +6,15 @@
 - **Area:** native/input
 - **Raised:** 2026-08-21T22:15:35Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260821T225003Z-94169e2d
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00030-run-fix-20260821T225003Z-94169e2d
+- **Owner base:** efc8049188fe8e65b170e77b3b63aabecd3f1de6
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-21T22:50:03Z
+- **Owner until:** 2026-08-22T00:50:03Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
