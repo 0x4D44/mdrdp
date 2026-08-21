@@ -11,16 +11,65 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, MonitorFromPoint,
     CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY,
     DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, MONITOR_DEFAULTTONULL,
 };
-use windows::Win32::UI::Shell::GetScaleFactorForMonitor;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+};
 
 use super::wide_to_string;
 use crate::agent::{AgentOps, ChildState, InputDesktopObservation, Mode, PoolObservation};
+
+fn scale_percent_from_dpi(dpi: u32) -> Option<u32> {
+    if dpi == 0 {
+        return None;
+    }
+    u32::try_from((u64::from(dpi) * 100 + 48) / 96).ok()
+}
+
+/// A short-lived, non-activating window used only to ask Windows which effective DPI it
+/// assigns content on a monitor. Destruction must happen on the creating thread, which is
+/// why the guard never leaves `display_scale_percent`.
+struct DpiProbeWindow(HWND);
+
+impl DpiProbeWindow {
+    fn at(point: windows::Win32::Foundation::POINT) -> Option<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                PCWSTR::null(),
+                WS_POPUP | WS_DISABLED,
+                point.x,
+                point.y,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .ok()?;
+        Some(Self(hwnd))
+    }
+
+    fn dpi(&self) -> u32 {
+        unsafe { GetDpiForWindow(self.0) }
+    }
+}
+
+impl Drop for DpiProbeWindow {
+    fn drop(&mut self) {
+        let _ = unsafe { DestroyWindow(self.0) };
+    }
+}
 
 /// The device string the IDD driver's INF declares — the same one the rig's
 /// scripts key on.
@@ -396,8 +445,8 @@ impl AgentOps for WinOps {
         if monitor.0.is_null() {
             return None;
         }
-        let scale = unsafe { GetScaleFactorForMonitor(monitor) }.ok()?;
-        u32::try_from(scale.0).ok().filter(|percent| *percent != 0)
+        let window = DpiProbeWindow::at(point)?;
+        scale_percent_from_dpi(window.dpi())
     }
 
     fn set_display_mode(&mut self, mode: Mode) -> Result<(), String> {
@@ -493,6 +542,19 @@ impl AgentOps for WinOps {
 impl Drop for WinOps {
     fn drop(&mut self) {
         self.kill_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scale_percent_from_dpi;
+
+    #[test]
+    fn effective_dpi_converts_to_windows_scale_percent() {
+        assert_eq!(scale_percent_from_dpi(0), None);
+        assert_eq!(scale_percent_from_dpi(96), Some(100));
+        assert_eq!(scale_percent_from_dpi(192), Some(200));
+        assert_eq!(scale_percent_from_dpi(173), Some(180));
     }
 }
 

@@ -118,16 +118,17 @@ mod win {
 
     /// Put the reconcile thread's display APIs in one physical coordinate space.
     /// `EnumDisplaySettingsW` reports physical geometry, while `MonitorFromPoint`
-    /// and `GetScaleFactorForMonitor` otherwise see a DPI-virtualised desktop and
+    /// and `GetDpiForWindow` otherwise see a DPI-virtualised desktop and
     /// can miss a 200%-scaled secondary display.
-    fn initialize_reconcile_thread() {
-        if let Err(error) = rhydra::win::init_thread_dpi_awareness() {
-            eprintln!("warning: SetThreadDpiAwarenessContext failed: {error}");
-        }
+    fn initialize_reconcile_thread() -> rhydra::win::Result<()> {
+        rhydra::win::init_thread_dpi_awareness()
     }
 
     pub fn run() -> ExitCode {
-        initialize_reconcile_thread();
+        if let Err(error) = initialize_reconcile_thread() {
+            eprintln!("agent: SetThreadDpiAwarenessContext failed: {error}");
+            return ExitCode::FAILURE;
+        }
         let root = match exe_root() {
             Ok(r) => r,
             Err(e) => {
@@ -613,7 +614,7 @@ mod win {
     mod tests {
         #[test]
         fn reconcile_thread_selects_per_monitor_v2_dpi_awareness() {
-            super::initialize_reconcile_thread();
+            super::initialize_reconcile_thread().expect("initialize reconcile-thread DPI context");
             let context = unsafe { windows::Win32::UI::HiDpi::GetThreadDpiAwarenessContext() };
             assert!(unsafe {
                 windows::Win32::UI::HiDpi::AreDpiAwarenessContextsEqual(
