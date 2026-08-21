@@ -183,6 +183,37 @@ impl Surface {
         Ok(std::mem::replace(&mut self.pixels, pixels))
     }
 
+    /// Blit a tightly packed RGBA rectangle with strict wire bounds.
+    ///
+    /// Decoded native tiles have an exact advertised extent. Clipping one would
+    /// hide a decoder or protocol mismatch, so both the rectangle and payload
+    /// must match exactly.
+    pub fn blit_rgba_strict(&mut self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
+        if dest.right > self.width || dest.bottom > self.height || dest.is_empty() {
+            return Err(SurfaceError::OutOfBounds {
+                rect: dest,
+                width: self.width,
+                height: self.height,
+            });
+        }
+        let row_bytes = dest.width() as usize * BPP;
+        let expected = row_bytes * dest.height() as usize;
+        if src.len() != expected {
+            return Err(SurfaceError::SizeMismatch {
+                expected,
+                got: src.len(),
+            });
+        }
+        for row in 0..dest.height() {
+            let src_off = row as usize * row_bytes;
+            let dst_off = self.row_start(dest.top + row) + dest.left as usize * BPP;
+            self.pixels[dst_off..dst_off + row_bytes]
+                .copy_from_slice(&src[src_off..src_off + row_bytes]);
+        }
+        self.painted = true;
+        Ok(())
+    }
+
     /// Blit a tightly packed **BGRA** rectangle, swizzling to RGBA in place.
     ///
     /// The native transport's rect path: wire payloads arrive BGRA (the capture
@@ -470,6 +501,23 @@ impl SurfaceStore {
         Ok(())
     }
 
+    /// Strict-bounds RGBA blit (the native tiled decoder path).
+    pub fn blit_rgba_strict(
+        &mut self,
+        id: u16,
+        dest: Rect,
+        src: &[u8],
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(SurfaceError::NoSuchSurface(id))?;
+        surface.blit_rgba_strict(dest, src)?;
+        self.cache_stats.bytes_from_wire += src.len() as u64;
+        self.finish_surface_mutation(id);
+        Ok(())
+    }
+
     pub fn solid_fill(
         &mut self,
         id: u16,
@@ -683,6 +731,29 @@ mod tests {
     }
 
     #[test]
+    fn rgba_strict_blit_copies_channels_and_rejects_invalid_input() {
+        let mut s = Surface::new(3, 3);
+        let rgba = [10u8, 20, 30, 40];
+        s.blit_rgba_strict(Rect::new(1, 1, 2, 2), &rgba).unwrap();
+        let off = (3 + 1) * BPP;
+        assert_eq!(&s.pixels()[off..off + BPP], rgba);
+
+        let before = s.pixels().to_vec();
+        assert!(matches!(
+            s.blit_rgba_strict(Rect::new(2, 2, 4, 4), &solid(2, 2, RED)),
+            Err(SurfaceError::OutOfBounds { .. })
+        ));
+        assert_eq!(
+            s.blit_rgba_strict(Rect::new(0, 0, 1, 1), &[1, 2, 3]),
+            Err(SurfaceError::SizeMismatch {
+                expected: BPP,
+                got: 3
+            })
+        );
+        assert_eq!(s.pixels(), before, "rejected blits must not mutate pixels");
+    }
+
+    #[test]
     fn store_adopt_and_strict_blit_bump_the_generation() {
         let mut store = SurfaceStore::new();
         store.create(0, 2, 2);
@@ -696,6 +767,19 @@ mod tests {
         assert!(
             store.generation() > g1,
             "strict blit must mark the store changed"
+        );
+        let g2 = store.generation();
+        let bytes_before = store.cache_stats().bytes_from_wire;
+        store
+            .blit_rgba_strict(0, Rect::new(1, 1, 2, 2), &[5, 6, 7, 8])
+            .unwrap();
+        assert!(
+            store.generation() > g2,
+            "strict RGBA blit must mark the store changed"
+        );
+        assert_eq!(
+            store.cache_stats().bytes_from_wire,
+            bytes_before + BPP as u64
         );
     }
 

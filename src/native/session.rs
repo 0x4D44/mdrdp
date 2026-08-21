@@ -1189,7 +1189,7 @@ impl NativeSink {
                 edge(header.y + header.height)?,
             );
             store
-                .blit_bgra_strict(OUTPUT_SURFACE, dest, decoded.data())
+                .blit_rgba_strict(OUTPUT_SURFACE, dest, decoded.data())
                 .map_err(|e| format!("tile blit: {e}"))?;
             store.generation()
         };
@@ -1460,6 +1460,15 @@ mod tests {
         }
     }
 
+    /// A 1x1 decoder whose AU is the exact RGBA pixel it produces.
+    struct PixelDecoder;
+
+    impl H264Decoder for PixelDecoder {
+        fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
+            Ok(DecodedFrame::new(data.to_vec(), 1, 1))
+        }
+    }
+
     struct CountingFakeDecoder {
         size: (u32, u32),
         calls: Arc<AtomicUsize>,
@@ -1553,6 +1562,37 @@ mod tests {
         let pixels = guard.get(OUTPUT_SURFACE).unwrap().pixels();
         assert_eq!(pixels[0], 0x11);
         assert_eq!(pixels[(2 * 4) as usize], 0x22);
+    }
+
+    #[test]
+    fn tiled_h264_preserves_distinct_rgba_channels() {
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, 1, 1);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let mut sink = NativeSink::new_tiled(
+            vec![NativeDecoder::H264(Box::new(PixelDecoder))],
+            vec![super::super::probe::TileHeader {
+                id: 7,
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+            Arc::clone(&store),
+            (1, 1),
+            Box::new(|| {}),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+
+        let rgba = [0x11, 0x22, 0x33, 0x44];
+        sink.on_tile_au(7, &rgba, 1).unwrap();
+
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.get(OUTPUT_SURFACE).unwrap().pixels(), rgba);
     }
 
     #[test]
