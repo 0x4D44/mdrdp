@@ -329,6 +329,8 @@ pub struct Reconciler {
     actual_mode: Option<Mode>,
     actual_scale_percent: Option<u32>,
     actual_placement: Option<DisplayPlacement>,
+    /// Latest correction failure for status only; cleared by health or a new request.
+    last_display_error: Option<String>,
     mode_ok: bool,
     restart_server_requested: bool,
     ticks: u64,
@@ -374,6 +376,7 @@ impl Reconciler {
             actual_mode: None,
             actual_scale_percent: None,
             actual_placement: None,
+            last_display_error: None,
             mode_ok: false,
             restart_server_requested: false,
             ticks: 0,
@@ -430,6 +433,7 @@ impl Reconciler {
         if self.desired != mode || self.desired_scale_percent != scale_percent {
             self.desired = mode;
             self.desired_scale_percent = scale_percent;
+            self.last_display_error = None;
             self.mode_ok = false;
             // Converter and encoder geometry is fixed at server construction.
             self.restart_server_requested = true;
@@ -504,7 +508,16 @@ impl Reconciler {
                 // default 60 Hz or a display topology moved by Windows gets put
                 // back. A failure is degraded, not down — status shows the
                 // mismatch and the loop moves on.
-                let corrected = ops.set_display_mode(self.desired).is_ok();
+                let corrected = match ops.set_display_mode(self.desired) {
+                    Ok(()) => {
+                        self.last_display_error = None;
+                        true
+                    }
+                    Err(error) => {
+                        self.last_display_error = Some(error);
+                        false
+                    }
+                };
                 self.actual_mode = ops.display_mode();
                 self.actual_placement = ops.display_placement();
                 // Capture and absolute-input mapping cache the display origin at
@@ -517,6 +530,8 @@ impl Reconciler {
                 {
                     self.restart_server_requested = true;
                 }
+            } else {
+                self.last_display_error = None;
             }
             self.actual_scale_percent = ops.display_scale_percent();
             self.mode_ok = self.actual_mode == Some(self.desired)
@@ -526,6 +541,7 @@ impl Reconciler {
             self.actual_mode = None;
             self.actual_scale_percent = None;
             self.actual_placement = None;
+            self.last_display_error = None;
             self.mode_ok = false;
         }
 
@@ -784,8 +800,12 @@ impl Reconciler {
                             )
                         },
                     );
+                    let correction = self.last_display_error.as_ref().map_or_else(
+                        String::new,
+                        |error| format!("; correction failed: {error}"),
+                    );
                     format!(
-                        "{mode}, {scale}, {placement}; wanted {}x{} @ {} Hz, {}% scale, primary at (0, 0)",
+                        "{mode}, {scale}, {placement}; wanted {}x{} @ {} Hz, {}% scale, primary at (0, 0){correction}",
                         self.desired.width,
                         self.desired.height,
                         self.desired.hz,
@@ -1673,6 +1693,37 @@ mod tests {
         assert!(detail.contains("secondary"), "{detail}");
         assert!(detail.contains("(1920, 0)"), "{detail}");
         assert!(detail.contains("primary at (0, 0)"), "{detail}");
+        assert!(detail.contains("scripted failure"), "{detail}");
+
+        rec.request_display_mode(
+            Mode {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+            },
+            200,
+        )
+        .unwrap();
+        let detail = rec
+            .status(0)
+            .rungs
+            .into_iter()
+            .find(|rung| rung.rung == Rung::DisplayMode)
+            .and_then(|rung| rung.detail)
+            .expect("new request remains unhealthy until reconciled");
+        assert!(!detail.contains("scripted failure"), "{detail}");
+
+        ops.mode_set_fails = false;
+        ops.scale_percent = Some(200);
+        rec.tick(&mut ops);
+        let rung = rec
+            .status(0)
+            .rungs
+            .into_iter()
+            .find(|rung| rung.rung == Rung::DisplayMode)
+            .expect("display rung exists");
+        assert_eq!(rung.state, RungState::Ok);
+        assert_eq!(rung.detail, None);
     }
 
     #[test]
