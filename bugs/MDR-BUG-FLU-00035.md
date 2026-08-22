@@ -6,15 +6,15 @@
 - **Area:** rhydra/display-provisioning
 - **Raised:** 2026-08-22T18:08:59Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260822T190258Z-363b54b0
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00035-run-fix-20260822T190258Z-363b54b0
+- **Owner base:** 03aa58c2e60dbb806231a233d7dc53731d3f179c
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-22T19:02:58Z
+- **Owner until:** 2026-08-22T21:02:58Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
