@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00035 — Rhydra leaves the physical display primary, so applications open outside the captured virtual desktop
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/display-provisioning
 - **Raised:** 2026-08-22T18:08:59Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260822T190258Z-363b54b0
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00035-run-fix-20260822T190258Z-363b54b0
-- **Owner base:** 03aa58c2e60dbb806231a233d7dc53731d3f179c
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-22T19:02:58Z
-- **Owner until:** 2026-08-22T21:02:58Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-22T18:08:59Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-22T18:52:06Z, deltic:auto role=fix run=fix-20260822T183242Z-2240d049 branch=task/bug-MDR-BUG-FLU-00035-run-fix-20260822T183242Z-2240d049 code=558c2a3 gate=manual) -> Open (2026-08-22T18:58:04Z, independent live verifier found deployed Quench still reported the IDD secondary at (1920, 0), mode_ok=false, and server stopped)
+- **State history:** Open (2026-08-22T18:08:59Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-22T18:52:06Z, deltic:auto role=fix run=fix-20260822T183242Z-2240d049 branch=task/bug-MDR-BUG-FLU-00035-run-fix-20260822T183242Z-2240d049 code=558c2a3 gate=manual) -> Open (2026-08-22T18:58:04Z, independent live verifier found deployed Quench still reported the IDD secondary at (1920, 0), mode_ok=false, and server stopped) -> Fixed (2026-08-22T19:31:32Z, deltic:auto role=fix run=fix-20260822T190258Z-363b54b0 branch=task/bug-MDR-BUG-FLU-00035-run-fix-20260822T190258Z-363b54b0 code=5f12d37322da2410885a02eedcb5165bcc885c18 gate=manual)
 
 ## Observation
 
