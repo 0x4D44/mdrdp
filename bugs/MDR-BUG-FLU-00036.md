@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00036 — 5K full-motion playback starves Rhydra mouse and keyboard handling
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/latency
 - **Raised:** 2026-08-22T18:08:59Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260822T183358Z-2efabf47
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00036-run-fix-20260822T183358Z-2efabf47
-- **Owner base:** e09ff2c071bd9d73dc83989fa7cd001db1abdfe4
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-22T18:33:58Z
-- **Owner until:** 2026-08-22T20:33:58Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-22T18:08:59Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-22T18:08:59Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-22T18:52:50Z, deltic:auto role=fix run=fix-20260822T183358Z-2efabf47 branch=task/bug-MDR-BUG-FLU-00036-run-fix-20260822T183358Z-2efabf47 code=91ee578 gate=manual)
 
 ## Observation
 
