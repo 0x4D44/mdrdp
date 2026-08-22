@@ -58,6 +58,27 @@ impl Mode {
     }
 }
 
+/// The IDD's placement in the Windows virtual desktop.
+///
+/// Rhydra captures the IDD, so it must also own the desktop origin and primary
+/// taskbar. Keeping this observation in the reconciler makes a topology drift
+/// a normal health failure instead of leaving the server capturing a secondary
+/// display while applications open on another monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayPlacement {
+    pub primary: bool,
+    pub origin: (i32, i32),
+}
+
+impl DisplayPlacement {
+    pub const fn primary_at_origin() -> Self {
+        Self {
+            primary: true,
+            origin: (0, 0),
+        }
+    }
+}
+
 /// What a poll of a supervised child found.
 ///
 /// Contract for implementors: `Exited` is returned exactly once per death — the
@@ -95,6 +116,8 @@ pub trait AgentOps {
     fn display_mode(&mut self) -> Option<Mode>;
     /// Effective Windows UI scale on that display, as a percentage.
     fn display_scale_percent(&mut self) -> Option<u32>;
+    /// Whether the IDD is the primary display and where its physical origin is.
+    fn display_placement(&mut self) -> Option<DisplayPlacement>;
     fn set_display_mode(&mut self, mode: Mode) -> Result<(), String>;
     fn poll_server(&mut self) -> ChildState;
     fn spawn_server(&mut self) -> Result<(), String>;
@@ -305,6 +328,7 @@ pub struct Reconciler {
     last_device_id: Option<String>,
     actual_mode: Option<Mode>,
     actual_scale_percent: Option<u32>,
+    actual_placement: Option<DisplayPlacement>,
     mode_ok: bool,
     restart_server_requested: bool,
     ticks: u64,
@@ -349,6 +373,7 @@ impl Reconciler {
             last_device_id: None,
             actual_mode: None,
             actual_scale_percent: None,
+            actual_placement: None,
             mode_ok: false,
             restart_server_requested: false,
             ticks: 0,
@@ -471,19 +496,36 @@ impl Reconciler {
         self.last_device_id = device_id;
         if self.device_present {
             self.actual_mode = ops.display_mode();
-            if self.actual_mode != Some(self.desired) {
+            self.actual_placement = ops.display_placement();
+            let placement_needs_correction =
+                self.actual_placement != Some(DisplayPlacement::primary_at_origin());
+            if self.actual_mode != Some(self.desired) || placement_needs_correction {
                 // Idempotent: checked every tick, so a device re-created at its
-                // default 60 Hz gets put back. A failure is degraded, not down —
-                // status shows mode_ok false and the loop moves on.
-                let _ = ops.set_display_mode(self.desired);
+                // default 60 Hz or a display topology moved by Windows gets put
+                // back. A failure is degraded, not down — status shows the
+                // mismatch and the loop moves on.
+                let corrected = ops.set_display_mode(self.desired).is_ok();
                 self.actual_mode = ops.display_mode();
+                self.actual_placement = ops.display_placement();
+                // Capture and absolute-input mapping cache the display origin at
+                // server start. Restart only after the platform reports that the
+                // correction actually landed, and only when a server was running.
+                if corrected
+                    && self.server.running
+                    && self.actual_mode == Some(self.desired)
+                    && self.actual_placement == Some(DisplayPlacement::primary_at_origin())
+                {
+                    self.restart_server_requested = true;
+                }
             }
             self.actual_scale_percent = ops.display_scale_percent();
             self.mode_ok = self.actual_mode == Some(self.desired)
-                && self.actual_scale_percent == Some(self.desired_scale_percent);
+                && self.actual_scale_percent == Some(self.desired_scale_percent)
+                && self.actual_placement == Some(DisplayPlacement::primary_at_origin());
         } else {
             self.actual_mode = None;
             self.actual_scale_percent = None;
+            self.actual_placement = None;
             self.mode_ok = false;
         }
 
@@ -728,8 +770,22 @@ impl Reconciler {
                         || "unknown scale".to_owned(),
                         |percent| format!("{percent}% scale"),
                     );
+                    let placement = self.actual_placement.map_or_else(
+                        || "unknown placement".to_owned(),
+                        |placement| {
+                            let role = if placement.primary {
+                                "primary"
+                            } else {
+                                "secondary"
+                            };
+                            format!(
+                                "{role} at ({}, {})",
+                                placement.origin.0, placement.origin.1
+                            )
+                        },
+                    );
                     format!(
-                        "{mode}, {scale}; wanted {}x{} @ {} Hz, {}% scale",
+                        "{mode}, {scale}, {placement}; wanted {}x{} @ {} Hz, {}% scale, primary at (0, 0)",
                         self.desired.width,
                         self.desired.height,
                         self.desired.hz,
@@ -885,6 +941,7 @@ mod tests {
         audio_endpoint: Option<bool>,
         mode: Option<Mode>,
         scale_percent: Option<u32>,
+        placement: Option<DisplayPlacement>,
         mode_set_fails: bool,
         server_running: bool,
         server_pending_exit: Option<i32>,
@@ -929,12 +986,19 @@ mod tests {
         fn display_scale_percent(&mut self) -> Option<u32> {
             Some(self.scale_percent.unwrap_or(100))
         }
+        fn display_placement(&mut self) -> Option<DisplayPlacement> {
+            Some(
+                self.placement
+                    .unwrap_or(DisplayPlacement::primary_at_origin()),
+            )
+        }
         fn set_display_mode(&mut self, mode: Mode) -> Result<(), String> {
             self.calls.push(format!("set_mode {}hz", mode.hz));
             if self.mode_set_fails {
                 Err("scripted failure".into())
             } else {
                 self.mode = Some(mode);
+                self.placement = Some(DisplayPlacement::primary_at_origin());
                 Ok(())
             }
         }
@@ -1507,6 +1571,108 @@ mod tests {
         rec.tick(&mut ops);
         assert!(ops.calls.contains(&"set_mode 240hz".to_owned()));
         assert_eq!(ops.mode, Some(DESIRED_MODE));
+    }
+
+    #[test]
+    fn display_health_requires_the_idd_to_be_primary_at_origin() {
+        for placement in [
+            DisplayPlacement {
+                primary: false,
+                origin: (0, 0),
+            },
+            DisplayPlacement {
+                primary: true,
+                origin: (1920, 0),
+            },
+        ] {
+            let mut ops = FakeOps {
+                device_id: Some("dpy-1".into()),
+                mode: Some(DESIRED_MODE),
+                placement: Some(placement),
+                mode_set_fails: true,
+                ..FakeOps::default()
+            };
+            let mut rec = Reconciler::new();
+
+            rec.tick(&mut ops);
+
+            let status = rec.status(0);
+            assert!(!status.mode_ok, "wrong placement must not be healthy");
+            assert_eq!(status.stuck.as_deref(), Some("display-mode"));
+            assert!(!ops.server_running, "server must wait for placement");
+        }
+    }
+
+    #[test]
+    fn placement_is_corrected_even_when_mode_matches() {
+        let wrong = DisplayPlacement {
+            primary: false,
+            origin: (1920, 0),
+        };
+        let mut ops = FakeOps {
+            device_id: Some("dpy-1".into()),
+            mode: Some(DESIRED_MODE),
+            placement: Some(wrong),
+            ..FakeOps::default()
+        };
+        let mut rec = Reconciler::new();
+
+        rec.tick(&mut ops);
+
+        assert!(ops.calls.contains(&"set_mode 240hz".into()));
+        assert_eq!(ops.placement, Some(DisplayPlacement::primary_at_origin()));
+        assert!(rec.status(0).mode_ok);
+    }
+
+    #[test]
+    fn placement_correction_restarts_a_running_server() {
+        let mut ops = FakeOps {
+            device_id: Some("dpy-1".into()),
+            mode: Some(DESIRED_MODE),
+            placement: Some(DisplayPlacement::primary_at_origin()),
+            ..FakeOps::default()
+        };
+        let mut rec = Reconciler::new();
+        rec.tick(&mut ops);
+        assert!(ops.server_running);
+        ops.calls.clear();
+
+        ops.placement = Some(DisplayPlacement {
+            primary: false,
+            origin: (1920, 0),
+        });
+        rec.tick(&mut ops);
+
+        assert!(ops.calls.contains(&"set_mode 240hz".into()));
+        assert!(ops.calls.contains(&"kill_server".into()));
+        assert!(!ops.server_running);
+    }
+
+    #[test]
+    fn status_detail_names_wrong_primary_and_origin() {
+        let mut ops = FakeOps {
+            device_id: Some("dpy-1".into()),
+            mode: Some(DESIRED_MODE),
+            placement: Some(DisplayPlacement {
+                primary: false,
+                origin: (1920, 0),
+            }),
+            mode_set_fails: true,
+            ..FakeOps::default()
+        };
+        let mut rec = Reconciler::new();
+        rec.tick(&mut ops);
+
+        let detail = rec
+            .status(0)
+            .rungs
+            .into_iter()
+            .find(|rung| rung.rung == Rung::DisplayMode)
+            .and_then(|rung| rung.detail)
+            .expect("display rung explains a placement mismatch");
+        assert!(detail.contains("secondary"), "{detail}");
+        assert!(detail.contains("(1920, 0)"), "{detail}");
+        assert!(detail.contains("primary at (0, 0)"), "{detail}");
     }
 
     #[test]

@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, POINTL};
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, MonitorFromPoint,
-    CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY,
-    DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, MONITOR_DEFAULTTONULL,
+    CDS_NORESET, CDS_SET_PRIMARY, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW,
+    DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE, DISP_CHANGE_SUCCESSFUL,
+    DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS,
+    MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -24,7 +26,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::wide_to_string;
-use crate::agent::{AgentOps, ChildState, InputDesktopObservation, Mode, PoolObservation};
+use crate::agent::{
+    AgentOps, ChildState, DisplayPlacement, InputDesktopObservation, Mode, PoolObservation,
+};
 
 fn scale_percent_from_dpi(dpi: u32) -> Option<u32> {
     if dpi == 0 {
@@ -89,27 +93,20 @@ pub const DISPLAY_DEVICE_STRING: &str = "mdrdp latency-spike display";
 /// AC2's corner clicks).
 pub fn idd_display_origin() -> Option<(i32, i32)> {
     let device_name = WinOps::find_display()?;
-    let mut devmode = DEVMODEW {
-        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-        ..Default::default()
-    };
-    // SAFETY: `device_name` is a NUL-terminated wide buffer we own, and the
-    // out-parameter is a correctly-sized `DEVMODEW` whose `dmSize` we set.
-    let ok = unsafe {
-        EnumDisplaySettingsW(
-            PCWSTR::from_raw(device_name.as_ptr()),
-            ENUM_CURRENT_SETTINGS,
-            &mut devmode,
-        )
-    }
-    .as_bool();
-    if !ok {
-        return None;
-    }
+    let devmode = WinOps::current_devmode(&device_name)?;
     // SAFETY: `dmPosition` is the active member for a display device queried with
     // ENUM_CURRENT_SETTINGS — the same union arm the rig's prep script reads.
     let position = unsafe { devmode.Anonymous1.Anonymous2.dmPosition };
     Some((position.x, position.y))
+}
+
+/// A currently attached desktop display and the state needed to stage a
+/// multi-display ChangeDisplaySettingsEx transaction.
+struct AttachedDisplay {
+    name: [u16; 32],
+    mode: DEVMODEW,
+    idd: bool,
+    primary: bool,
 }
 
 /// Whether anything is in LISTEN on the capture server's video port.
@@ -349,8 +346,9 @@ impl WinOps {
             .map_err(|e| format!("spawn {}: {e}", path.display()))
     }
 
-    /// The GDI device name (`\\.\DISPLAYn`) of the virtual display, if attached.
-    fn find_display() -> Option<[u16; 32]> {
+    /// The GDI device name (`\\.\DISPLAYn`) and primary flag of the virtual
+    /// display, if attached.
+    fn find_display_info() -> Option<([u16; 32], bool)> {
         for index in 0..32u32 {
             let mut device = DISPLAY_DEVICEW {
                 cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
@@ -361,14 +359,26 @@ impl WinOps {
             if !found {
                 return None;
             }
-            if wide_to_string(&device.DeviceString) == DISPLAY_DEVICE_STRING {
-                return Some(device.DeviceName);
+            if wide_to_string(&device.DeviceString) == DISPLAY_DEVICE_STRING
+                && device
+                    .StateFlags
+                    .contains(DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
+            {
+                return Some((
+                    device.DeviceName,
+                    device.StateFlags.contains(DISPLAY_DEVICE_PRIMARY_DEVICE),
+                ));
             }
         }
         None
     }
 
-    fn current_mode(device_name: &[u16; 32]) -> Option<Mode> {
+    /// The GDI device name of the virtual display, if attached.
+    fn find_display() -> Option<[u16; 32]> {
+        Self::find_display_info().map(|(name, _)| name)
+    }
+
+    fn current_devmode(device_name: &[u16; 32]) -> Option<DEVMODEW> {
         let mut devmode = DEVMODEW {
             dmSize: std::mem::size_of::<DEVMODEW>() as u16,
             ..Default::default()
@@ -384,11 +394,170 @@ impl WinOps {
         if !ok {
             return None;
         }
+        Some(devmode)
+    }
+
+    fn current_mode(device_name: &[u16; 32]) -> Option<Mode> {
+        let devmode = Self::current_devmode(device_name)?;
         Some(Mode {
             width: devmode.dmPelsWidth,
             height: devmode.dmPelsHeight,
             hz: devmode.dmDisplayFrequency,
         })
+    }
+
+    fn attached_displays() -> Result<Vec<AttachedDisplay>, String> {
+        let mut displays = Vec::new();
+        for index in 0..32u32 {
+            let mut device = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            let found =
+                unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0) }.as_bool();
+            if !found {
+                break;
+            }
+            if !device
+                .StateFlags
+                .contains(DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
+            {
+                continue;
+            }
+            let mode = Self::current_devmode(&device.DeviceName).ok_or_else(|| {
+                format!(
+                    "EnumDisplaySettingsW failed for attached display {}",
+                    wide_to_string(&device.DeviceName)
+                )
+            })?;
+            displays.push(AttachedDisplay {
+                name: device.DeviceName,
+                mode,
+                idd: wide_to_string(&device.DeviceString) == DISPLAY_DEVICE_STRING,
+                primary: device.StateFlags.contains(DISPLAY_DEVICE_PRIMARY_DEVICE),
+            });
+        }
+        if displays.is_empty() {
+            Err("no attached desktop displays".to_owned())
+        } else {
+            Ok(displays)
+        }
+    }
+
+    fn set_position(devmode: &mut DEVMODEW, x: i32, y: i32) {
+        devmode.dmFields |= DM_POSITION;
+        devmode.Anonymous1.Anonymous2.dmPosition = POINTL { x, y };
+    }
+
+    fn position(devmode: &DEVMODEW) -> POINTL {
+        // SAFETY: every DEVMODEW passed here came from EnumDisplaySettingsW and
+        // therefore has the display position arm selected.
+        unsafe { devmode.Anonymous1.Anonymous2.dmPosition }
+    }
+
+    fn change_display(
+        name: &[u16; 32],
+        mode: &DEVMODEW,
+        flags: windows::Win32::Graphics::Gdi::CDS_TYPE,
+    ) -> Result<(), String> {
+        let result = unsafe {
+            ChangeDisplaySettingsExW(
+                PCWSTR::from_raw(name.as_ptr()),
+                Some(mode),
+                None,
+                flags,
+                None,
+            )
+        };
+        if result == DISP_CHANGE_SUCCESSFUL {
+            Ok(())
+        } else {
+            Err(format!(
+                "ChangeDisplaySettingsExW({}) returned {}",
+                wide_to_string(name),
+                result.0
+            ))
+        }
+    }
+
+    fn restore_layout(originals: &[AttachedDisplay], commit: bool) -> Result<(), String> {
+        let base_flags = CDS_UPDATEREGISTRY | CDS_NORESET;
+        let mut failures = Vec::new();
+        for display in originals {
+            let flags = if display.primary {
+                base_flags | CDS_SET_PRIMARY
+            } else {
+                base_flags
+            };
+            if let Err(error) = Self::change_display(&display.name, &display.mode, flags) {
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() && commit {
+            let result = unsafe {
+                ChangeDisplaySettingsExW(PCWSTR::null(), None, None, Default::default(), None)
+            };
+            if result != DISP_CHANGE_SUCCESSFUL {
+                failures.push(format!("restoring display layout returned {}", result.0));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn verify_layout(displays: &[AttachedDisplay], requested: Mode) -> Result<(), String> {
+        let idd = displays
+            .iter()
+            .find(|display| display.idd)
+            .ok_or_else(|| "IDD is no longer attached after display commit".to_owned())?;
+        let idd_position = Self::position(&idd.mode);
+        if idd.mode.dmPelsWidth != requested.width
+            || idd.mode.dmPelsHeight != requested.height
+            || idd.mode.dmDisplayFrequency != requested.hz
+            || idd_position.x != 0
+            || idd_position.y != 0
+            || !idd.primary
+        {
+            return Err(format!(
+                "IDD verification failed: {}x{} @ {} Hz at ({}, {}), primary={}",
+                idd.mode.dmPelsWidth,
+                idd.mode.dmPelsHeight,
+                idd.mode.dmDisplayFrequency,
+                idd_position.x,
+                idd_position.y,
+                idd.primary
+            ));
+        }
+
+        let mut expected_x = i32::try_from(requested.width).map_err(|_| {
+            "requested display width exceeds the Windows coordinate range".to_owned()
+        })?;
+        for display in displays.iter().filter(|display| !display.idd) {
+            let position = Self::position(&display.mode);
+            if position.x != expected_x || position.y != 0 || display.primary {
+                return Err(format!(
+                    "display {} verification failed: at ({}, {}), primary={}; wanted ({}, 0)",
+                    wide_to_string(&display.name),
+                    position.x,
+                    position.y,
+                    display.primary,
+                    expected_x
+                ));
+            }
+            let width = i32::try_from(display.mode.dmPelsWidth).map_err(|_| {
+                format!(
+                    "display {} width exceeds the Windows coordinate range",
+                    wide_to_string(&display.name)
+                )
+            })?;
+            expected_x = expected_x.checked_add(width).ok_or_else(|| {
+                "the staged display layout exceeds the Windows coordinate range".to_owned()
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -410,6 +579,16 @@ impl AgentOps for WinOps {
 
     fn display_mode(&mut self) -> Option<Mode> {
         Self::find_display().and_then(|name| Self::current_mode(&name))
+    }
+
+    fn display_placement(&mut self) -> Option<DisplayPlacement> {
+        let (name, primary) = Self::find_display_info()?;
+        let mode = Self::current_devmode(&name)?;
+        let position = Self::position(&mode);
+        Some(DisplayPlacement {
+            primary,
+            origin: (position.x, position.y),
+        })
     }
 
     fn display_scale_percent(&mut self) -> Option<u32> {
@@ -450,29 +629,93 @@ impl AgentOps for WinOps {
     }
 
     fn set_display_mode(&mut self, mode: Mode) -> Result<(), String> {
-        let name = Self::find_display().ok_or("display not attached")?;
-        let devmode = DEVMODEW {
-            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-            dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
-            dmPelsWidth: mode.width,
-            dmPelsHeight: mode.height,
-            dmDisplayFrequency: mode.hz,
-            ..Default::default()
-        };
-        let result = unsafe {
-            ChangeDisplaySettingsExW(
-                PCWSTR::from_raw(name.as_ptr()),
-                Some(&devmode),
-                None,
-                CDS_UPDATEREGISTRY,
-                None,
-            )
-        };
-        if result == DISP_CHANGE_SUCCESSFUL {
-            Ok(())
-        } else {
-            Err(format!("ChangeDisplaySettingsExW returned {}", result.0))
+        let displays = Self::attached_displays()?;
+        let idd = displays
+            .iter()
+            .find(|display| display.idd)
+            .ok_or_else(|| "IDD display not attached".to_owned())?;
+        let flags = CDS_UPDATEREGISTRY | CDS_NORESET;
+        let first_physical_x = i32::try_from(mode.width).map_err(|_| {
+            "requested display width exceeds the Windows coordinate range".to_owned()
+        })?;
+        let mut layout_right = first_physical_x;
+
+        // Validate all coordinates before changing any registry value. This
+        // keeps every pre-commit failure on the rollback-free side of the
+        // transaction.
+        for display in displays.iter().filter(|display| !display.idd) {
+            let width = i32::try_from(display.mode.dmPelsWidth).map_err(|_| {
+                format!(
+                    "display {} width exceeds the Windows coordinate range",
+                    wide_to_string(&display.name)
+                )
+            })?;
+            layout_right = layout_right.checked_add(width).ok_or_else(|| {
+                "the staged display layout exceeds the Windows coordinate range".to_owned()
+            })?;
         }
+        let mut next_x = first_physical_x;
+
+        // Stage every other attached display first. They retain their current
+        // mode, but sit to the right of the IDD so normal applications open on
+        // the captured desktop rather than an invisible primary monitor.
+        for display in displays.iter().filter(|display| !display.idd) {
+            let mut staged = display.mode;
+            Self::set_position(&mut staged, next_x, 0);
+            if let Err(error) = Self::change_display(&display.name, &staged, flags) {
+                let rollback = Self::restore_layout(&displays, false);
+                return Err(match rollback {
+                    Ok(()) => format!("staging {} failed: {error}", wide_to_string(&display.name)),
+                    Err(rollback) => format!(
+                        "staging {} failed: {error}; rollback failed: {rollback}",
+                        wide_to_string(&display.name)
+                    ),
+                });
+            }
+            next_x = next_x
+                .checked_add(
+                    i32::try_from(display.mode.dmPelsWidth).expect("display widths prevalidated"),
+                )
+                .expect("display layout prevalidated");
+        }
+
+        let mut idd_mode = idd.mode;
+        idd_mode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+        idd_mode.dmPelsWidth = mode.width;
+        idd_mode.dmPelsHeight = mode.height;
+        idd_mode.dmDisplayFrequency = mode.hz;
+        Self::set_position(&mut idd_mode, 0, 0);
+        if let Err(error) = Self::change_display(&idd.name, &idd_mode, flags | CDS_SET_PRIMARY) {
+            let rollback = Self::restore_layout(&displays, false);
+            return Err(match rollback {
+                Ok(()) => format!("staging IDD failed: {error}"),
+                Err(rollback) => {
+                    format!("staging IDD failed: {error}; rollback failed: {rollback}")
+                }
+            });
+        }
+
+        // A null-device call commits all of the CDS_NORESET stages atomically.
+        let committed = unsafe {
+            ChangeDisplaySettingsExW(PCWSTR::null(), None, None, Default::default(), None)
+        };
+        if committed != DISP_CHANGE_SUCCESSFUL {
+            let rollback = Self::restore_layout(&displays, true);
+            return Err(match rollback {
+                Ok(()) => format!(
+                    "display layout commit returned {}; original layout restored",
+                    committed.0
+                ),
+                Err(rollback) => format!(
+                    "display layout commit returned {}; restoring original layout failed: {rollback}",
+                    committed.0
+                ),
+            });
+        }
+
+        let after = Self::attached_displays()?;
+        Self::verify_layout(&after, mode)
+            .map_err(|error| format!("display layout committed but {error}"))
     }
 
     fn audio_endpoint(&mut self) -> Option<bool> {
