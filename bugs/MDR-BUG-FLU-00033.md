@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00033 — deploy final driver check races PnP version propagation after install
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** Medium
 - **Area:** deploy/driver
 - **Raised:** 2026-08-22T00:09:13Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260822T001032Z-d0709899
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00033-run-fix-20260822T001032Z-d0709899
-- **Owner base:** 215a86832abfe350d11adc27f10d76ff811b4182
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-22T00:10:32Z
-- **Owner until:** 2026-08-22T02:10:32Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-22T00:09:13Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-22T00:09:13Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-22T00:24:59Z, deltic:auto role=fix run=fix-20260822T001032Z-d0709899 branch=task/bug-MDR-BUG-FLU-00033-run-fix-20260822T001032Z-d0709899 code=917c366 gate=manual)
 
 ## Observation
 
