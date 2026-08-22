@@ -6,6 +6,12 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Windows display topology belongs to CCD, not `ChangeDisplaySettingsExW` (`agent_ops.rs:make_idd_primary`).
+  Quench accepted width/height/refresh changes through the legacy GDI mode API but returned
+  `DISP_CHANGE_FAILED` for both complete and position-only physical-display requests. Preserve the
+  active `QueryDisplayConfig` path/mode arrays, move only source positions, and submit them through
+  `SetDisplayConfig`; verify full target state and re-check identities immediately before rollback.
+
 - Measure live Windows scale from a PMv2 window, not the monitor factor (`agent_ops.rs:DpiProbeWindow`).
   On Quench, `GetScaleFactorForMonitor` returned 180% after the user selected 200%. A fresh hidden
   window placed on the target monitor receives the effective content DPI and can be queried through

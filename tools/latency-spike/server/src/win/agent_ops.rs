@@ -12,13 +12,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, POINTL};
+use windows::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE,
+    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
+    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    QDC_VIRTUAL_MODE_AWARE, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_VALIDATE, SDC_VIRTUAL_MODE_AWARE,
+};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, POINTL};
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, MonitorFromPoint,
-    CDS_NORESET, CDS_SET_PRIMARY, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW,
+    CDS_UPDATEREGISTRY, DEVMODEW, DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE, DISPLAY_DEVICEW,
     DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE, DISP_CHANGE_SUCCESSFUL,
-    DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS,
-    MONITOR_DEFAULTTONULL,
+    DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -107,6 +115,27 @@ struct AttachedDisplay {
     mode: DEVMODEW,
     idd: bool,
     primary: bool,
+}
+
+struct TopologyError {
+    detail: String,
+    mode_restore_safe: bool,
+}
+
+impl TopologyError {
+    fn unchanged(detail: String) -> Self {
+        Self {
+            detail,
+            mode_restore_safe: true,
+        }
+    }
+
+    fn uncertain(detail: String) -> Self {
+        Self {
+            detail,
+            mode_restore_safe: false,
+        }
+    }
 }
 
 /// Whether anything is in LISTEN on the capture server's video port.
@@ -444,20 +473,15 @@ impl WinOps {
         }
     }
 
-    fn display_request(mode: Option<Mode>, x: i32, y: i32) -> DEVMODEW {
-        let mut request = DEVMODEW {
+    fn mode_request(mode: Mode) -> DEVMODEW {
+        DEVMODEW {
             dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-            dmFields: DM_POSITION,
+            dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
+            dmPelsWidth: mode.width,
+            dmPelsHeight: mode.height,
+            dmDisplayFrequency: mode.hz,
             ..Default::default()
-        };
-        request.Anonymous1.Anonymous2.dmPosition = POINTL { x, y };
-        if let Some(mode) = mode {
-            request.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-            request.dmPelsWidth = mode.width;
-            request.dmPelsHeight = mode.height;
-            request.dmDisplayFrequency = mode.hz;
         }
-        request
     }
 
     fn position(devmode: &DEVMODEW) -> POINTL {
@@ -491,39 +515,350 @@ impl WinOps {
         }
     }
 
-    fn restore_layout(originals: &[AttachedDisplay], commit: bool) -> Result<(), String> {
-        let base_flags = CDS_UPDATEREGISTRY | CDS_NORESET;
-        let mut failures = Vec::new();
-        for display in originals {
-            let position = Self::position(&display.mode);
-            let mode = Mode {
-                width: display.mode.dmPelsWidth,
-                height: display.mode.dmPelsHeight,
-                hz: display.mode.dmDisplayFrequency,
+    fn active_display_config(
+    ) -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+        let flags = QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE;
+        for _ in 0..3 {
+            let mut path_count = 0;
+            let mut mode_count = 0;
+            let sized =
+                unsafe { GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count) };
+            if sized != ERROR_SUCCESS {
+                return Err(format!("GetDisplayConfigBufferSizes returned {}", sized.0));
+            }
+            let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+            let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+            let queried = unsafe {
+                QueryDisplayConfig(
+                    flags,
+                    &mut path_count,
+                    paths.as_mut_ptr(),
+                    &mut mode_count,
+                    modes.as_mut_ptr(),
+                    None,
+                )
             };
-            let request = Self::display_request(Some(mode), position.x, position.y);
-            let flags = if display.primary {
-                base_flags | CDS_SET_PRIMARY
+            if queried == ERROR_INSUFFICIENT_BUFFER {
+                continue;
+            }
+            if queried != ERROR_SUCCESS {
+                return Err(format!("QueryDisplayConfig returned {}", queried.0));
+            }
+            paths.truncate(path_count as usize);
+            modes.truncate(mode_count as usize);
+            return Ok((paths, modes));
+        }
+        Err("display topology changed during three consecutive queries".to_owned())
+    }
+
+    fn display_config_source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, String> {
+        let mut packet = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        let result = unsafe {
+            DisplayConfigGetDeviceInfo(
+                (&mut packet as *mut DISPLAYCONFIG_SOURCE_DEVICE_NAME)
+                    .cast::<DISPLAYCONFIG_DEVICE_INFO_HEADER>(),
+            )
+        };
+        if result == 0 {
+            Ok(wide_to_string(&packet.viewGdiDeviceName))
+        } else {
+            Err(format!("DisplayConfigGetDeviceInfo returned {result}"))
+        }
+    }
+
+    fn source_mode_index(
+        path: &DISPLAYCONFIG_PATH_INFO,
+        modes: &[DISPLAYCONFIG_MODE_INFO],
+    ) -> Result<usize, String> {
+        // With virtual-mode awareness, winuser.h packs sourceModeInfoIdx into
+        // the high 16 bits after cloneGroupId. Legacy paths use the full index.
+        let raw = unsafe {
+            if path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0 {
+                path.sourceInfo.Anonymous.Anonymous._bitfield >> 16
             } else {
-                base_flags
-            };
-            if let Err(error) = Self::change_display(&display.name, &request, flags) {
-                failures.push(error);
+                path.sourceInfo.Anonymous.modeInfoIdx
             }
+        };
+        let index = usize::try_from(raw)
+            .map_err(|_| format!("display source mode index {raw} is not addressable"))?;
+        let info = modes
+            .get(index)
+            .ok_or_else(|| format!("display source mode index {raw} is out of range"))?;
+        if info.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+            || info.adapterId != path.sourceInfo.adapterId
+            || info.id != path.sourceInfo.id
+        {
+            return Err(format!(
+                "display source mode index {raw} does not match its active path"
+            ));
         }
-        if failures.is_empty() && commit {
-            let result = unsafe {
-                ChangeDisplaySettingsExW(PCWSTR::null(), None, None, Default::default(), None)
-            };
-            if result != DISP_CHANGE_SUCCESSFUL {
-                failures.push(format!("restoring display layout returned {}", result.0));
-            }
-        }
-        if failures.is_empty() {
+        Ok(index)
+    }
+
+    fn source_mode(
+        modes: &[DISPLAYCONFIG_MODE_INFO],
+        index: usize,
+    ) -> windows::Win32::Devices::Display::DISPLAYCONFIG_SOURCE_MODE {
+        // SAFETY: source_mode_index verifies infoType before an index is retained.
+        unsafe { modes[index].Anonymous.sourceMode }
+    }
+
+    fn set_source_position(modes: &mut [DISPLAYCONFIG_MODE_INFO], index: usize, position: POINTL) {
+        let mut source = Self::source_mode(modes, index);
+        source.position = position;
+        modes[index].Anonymous.sourceMode = source;
+    }
+
+    fn submit_display_config(
+        paths: &[DISPLAYCONFIG_PATH_INFO],
+        modes: &[DISPLAYCONFIG_MODE_INFO],
+        validate: bool,
+    ) -> Result<(), String> {
+        let mut flags = SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE;
+        flags |= if validate {
+            SDC_VALIDATE
+        } else {
+            SDC_APPLY | SDC_SAVE_TO_DATABASE
+        };
+        let result = unsafe { SetDisplayConfig(Some(paths), Some(modes), flags) };
+        if result == 0 {
             Ok(())
         } else {
-            Err(failures.join("; "))
+            let action = if validate { "validation" } else { "apply" };
+            Err(format!("SetDisplayConfig {action} returned {result}"))
         }
+    }
+
+    fn same_path_identities(
+        expected: &[DISPLAYCONFIG_PATH_INFO],
+        actual: &[DISPLAYCONFIG_PATH_INFO],
+    ) -> bool {
+        expected.len() == actual.len()
+            && expected.iter().zip(actual).all(|(wanted, found)| {
+                wanted.sourceInfo.adapterId == found.sourceInfo.adapterId
+                    && wanted.sourceInfo.id == found.sourceInfo.id
+                    && wanted.targetInfo.adapterId == found.targetInfo.adapterId
+                    && wanted.targetInfo.id == found.targetInfo.id
+            })
+    }
+
+    fn same_mode(expected: &DISPLAYCONFIG_MODE_INFO, actual: &DISPLAYCONFIG_MODE_INFO) -> bool {
+        if expected.infoType != actual.infoType
+            || expected.adapterId != actual.adapterId
+            || expected.id != actual.id
+        {
+            return false;
+        }
+        unsafe {
+            if expected.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                expected.Anonymous.sourceMode == actual.Anonymous.sourceMode
+            } else if expected.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET {
+                let wanted = expected.Anonymous.targetMode.targetVideoSignalInfo;
+                let found = actual.Anonymous.targetMode.targetVideoSignalInfo;
+                wanted.pixelRate == found.pixelRate
+                    && wanted.hSyncFreq == found.hSyncFreq
+                    && wanted.vSyncFreq == found.vSyncFreq
+                    && wanted.activeSize == found.activeSize
+                    && wanted.totalSize == found.totalSize
+                    && wanted.Anonymous.videoStandard == found.Anonymous.videoStandard
+                    && wanted.scanLineOrdering == found.scanLineOrdering
+            } else if expected.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE {
+                expected.Anonymous.desktopImageInfo == actual.Anonymous.desktopImageInfo
+            } else {
+                false
+            }
+        }
+    }
+
+    fn same_mode_set(
+        expected: &[DISPLAYCONFIG_MODE_INFO],
+        actual: &[DISPLAYCONFIG_MODE_INFO],
+    ) -> bool {
+        expected.len() == actual.len()
+            && expected.iter().all(|wanted| {
+                let mut matching = actual.iter().filter(|found| {
+                    wanted.infoType == found.infoType
+                        && wanted.adapterId == found.adapterId
+                        && wanted.id == found.id
+                });
+                let found = matching.next();
+                found.is_some_and(|found| Self::same_mode(wanted, found))
+                    && matching.next().is_none()
+            })
+    }
+
+    fn restore_idd_mode(name: &[u16; 32], original: Mode) -> Result<(), String> {
+        let current_name = Self::find_display()
+            .ok_or_else(|| "IDD disappeared before its mode could be restored".to_owned())?;
+        if current_name != *name {
+            return Err(format!(
+                "IDD identity changed from {} to {}; stale mode restore refused",
+                wide_to_string(name),
+                wide_to_string(&current_name)
+            ));
+        }
+        if Self::current_mode(name) == Some(original) {
+            return Ok(());
+        }
+        Self::change_display(name, &Self::mode_request(original), CDS_UPDATEREGISTRY)?;
+        let restored = Self::current_mode(name);
+        if restored == Some(original) {
+            Ok(())
+        } else {
+            Err(format!(
+                "IDD mode restore returned success but verification found {restored:?}"
+            ))
+        }
+    }
+
+    fn mode_change_failure(name: &[u16; 32], original: Mode, error: String) -> String {
+        match Self::restore_idd_mode(name, original) {
+            Ok(()) => format!("{error}; original IDD mode restored"),
+            Err(restore) => format!("{error}; restoring original IDD mode failed: {restore}"),
+        }
+    }
+
+    fn same_display_config(
+        expected_paths: &[DISPLAYCONFIG_PATH_INFO],
+        expected_modes: &[DISPLAYCONFIG_MODE_INFO],
+        actual_paths: &[DISPLAYCONFIG_PATH_INFO],
+        actual_modes: &[DISPLAYCONFIG_MODE_INFO],
+    ) -> Result<bool, String> {
+        if !Self::same_path_identities(expected_paths, actual_paths)
+            || !Self::same_mode_set(expected_modes, actual_modes)
+        {
+            return Ok(false);
+        }
+        for (wanted, found) in expected_paths.iter().zip(actual_paths) {
+            if wanted.sourceInfo.statusFlags != found.sourceInfo.statusFlags
+                || wanted.targetInfo.outputTechnology != found.targetInfo.outputTechnology
+                || wanted.targetInfo.rotation != found.targetInfo.rotation
+                || wanted.targetInfo.scaling != found.targetInfo.scaling
+                || wanted.targetInfo.refreshRate != found.targetInfo.refreshRate
+                || wanted.targetInfo.scanLineOrdering != found.targetInfo.scanLineOrdering
+                || wanted.targetInfo.targetAvailable != found.targetInfo.targetAvailable
+                || wanted.targetInfo.statusFlags != found.targetInfo.statusFlags
+                || wanted.flags != found.flags
+            {
+                return Ok(false);
+            }
+            let wanted_index = Self::source_mode_index(wanted, expected_modes)?;
+            let found_index = Self::source_mode_index(found, actual_modes)?;
+            if !Self::same_mode(&expected_modes[wanted_index], &actual_modes[found_index]) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn restore_display_config(
+        original_paths: &[DISPLAYCONFIG_PATH_INFO],
+        original_modes: &[DISPLAYCONFIG_MODE_INFO],
+    ) -> Result<(), String> {
+        // Re-query immediately before rollback. Applying a stale CCD snapshot can
+        // reconfigure a newly attached monitor, so identity drift is a hard stop.
+        let (current_paths, _) = Self::active_display_config()?;
+        if !Self::same_path_identities(original_paths, &current_paths) {
+            return Err("active display paths changed; stale rollback refused".to_owned());
+        }
+        Self::submit_display_config(original_paths, original_modes, false)?;
+        let (restored_paths, restored_modes) = Self::active_display_config()?;
+        match Self::same_display_config(
+            original_paths,
+            original_modes,
+            &restored_paths,
+            &restored_modes,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(
+                "rollback returned success but did not restore the original display configuration"
+                    .to_owned(),
+            ),
+            Err(error) => Err(format!("rollback verification failed: {error}")),
+        }
+    }
+
+    fn make_idd_primary(idd_name: &[u16; 32], requested: Mode) -> Result<(), TopologyError> {
+        let (paths, mut modes) = Self::active_display_config().map_err(TopologyError::unchanged)?;
+        let originals = modes.clone();
+        let wanted_name = wide_to_string(idd_name);
+        let mut idd_source = None;
+        let mut other_sources = Vec::new();
+        for path in &paths {
+            let index = Self::source_mode_index(path, &modes).map_err(TopologyError::unchanged)?;
+            let name = Self::display_config_source_name(path).map_err(TopologyError::unchanged)?;
+            if name.eq_ignore_ascii_case(&wanted_name) {
+                idd_source = Some(index);
+            } else if !other_sources.contains(&index) {
+                other_sources.push(index);
+            }
+        }
+        let idd_source = idd_source.ok_or_else(|| {
+            TopologyError::unchanged(format!(
+                "active DisplayConfig paths do not contain {wanted_name}"
+            ))
+        })?;
+        let idd_mode = Self::source_mode(&modes, idd_source);
+        if idd_mode.width != requested.width || idd_mode.height != requested.height {
+            return Err(TopologyError::unchanged(format!(
+                "IDD DisplayConfig source is {}x{} after mode set; wanted {}x{}",
+                idd_mode.width, idd_mode.height, requested.width, requested.height
+            )));
+        }
+
+        Self::set_source_position(&mut modes, idd_source, POINTL { x: 0, y: 0 });
+        let mut next_x = i32::try_from(requested.width).map_err(|_| {
+            TopologyError::unchanged(
+                "requested display width exceeds the Windows coordinate range".to_owned(),
+            )
+        })?;
+        for index in other_sources {
+            let source = Self::source_mode(&modes, index);
+            let width = i32::try_from(source.width).map_err(|_| {
+                TopologyError::unchanged(
+                    "an active display width exceeds the coordinate range".to_owned(),
+                )
+            })?;
+            Self::set_source_position(&mut modes, index, POINTL { x: next_x, y: 0 });
+            next_x = next_x.checked_add(width).ok_or_else(|| {
+                TopologyError::unchanged(
+                    "the requested display layout exceeds the coordinate range".to_owned(),
+                )
+            })?;
+        }
+
+        Self::submit_display_config(&paths, &modes, true).map_err(TopologyError::unchanged)?;
+        Self::submit_display_config(&paths, &modes, false).map_err(TopologyError::unchanged)?;
+
+        let verified = Self::active_display_config().and_then(|(current_paths, current_modes)| {
+            match Self::same_display_config(&paths, &modes, &current_paths, &current_modes)? {
+                true => Self::attached_displays()
+                    .and_then(|after| Self::verify_layout(&after, requested)),
+                false => Err(
+                    "SetDisplayConfig returned success but changed unsupplied display state"
+                        .to_owned(),
+                ),
+            }
+        });
+        if let Err(error) = verified {
+            return match Self::restore_display_config(&paths, &originals) {
+                Ok(()) => Err(TopologyError::unchanged(format!(
+                    "display topology applied but {error}; original layout restored"
+                ))),
+                Err(rollback) => Err(TopologyError::uncertain(format!(
+                    "display topology applied but {error}; restoring original layout failed: {rollback}"
+                ))),
+            };
+        }
+        Ok(())
     }
 
     fn verify_layout(displays: &[AttachedDisplay], requested: Mode) -> Result<(), String> {
@@ -553,7 +888,9 @@ impl WinOps {
         let mut expected_x = i32::try_from(requested.width).map_err(|_| {
             "requested display width exceeds the Windows coordinate range".to_owned()
         })?;
-        for display in displays.iter().filter(|display| !display.idd) {
+        let mut others: Vec<_> = displays.iter().filter(|display| !display.idd).collect();
+        others.sort_by_key(|display| Self::position(&display.mode).x);
+        for display in others {
             let position = Self::position(&display.mode);
             if position.x != expected_x || position.y != 0 || display.primary {
                 return Err(format!(
@@ -647,87 +984,37 @@ impl AgentOps for WinOps {
     }
 
     fn set_display_mode(&mut self, mode: Mode) -> Result<(), String> {
-        let displays = Self::attached_displays()?;
-        let idd = displays
-            .iter()
-            .find(|display| display.idd)
-            .ok_or_else(|| "IDD display not attached".to_owned())?;
-        let flags = CDS_UPDATEREGISTRY | CDS_NORESET;
-        let first_physical_x = i32::try_from(mode.width).map_err(|_| {
-            "requested display width exceeds the Windows coordinate range".to_owned()
-        })?;
-        let mut layout_right = first_physical_x;
-
-        // Validate all coordinates before changing any registry value. This
-        // keeps every pre-commit failure on the rollback-free side of the
-        // transaction.
-        for display in displays.iter().filter(|display| !display.idd) {
-            let width = i32::try_from(display.mode.dmPelsWidth).map_err(|_| {
-                format!(
-                    "display {} width exceeds the Windows coordinate range",
-                    wide_to_string(&display.name)
-                )
-            })?;
-            layout_right = layout_right.checked_add(width).ok_or_else(|| {
-                "the staged display layout exceeds the Windows coordinate range".to_owned()
-            })?;
-        }
-        let mut next_x = first_physical_x;
-
-        // Stage every other attached display first. They retain their current
-        // mode, but sit to the right of the IDD so normal applications open on
-        // the captured desktop rather than an invisible primary monitor.
-        for display in displays.iter().filter(|display| !display.idd) {
-            let staged = Self::display_request(None, next_x, 0);
-            if let Err(error) = Self::change_display(&display.name, &staged, flags) {
-                let rollback = Self::restore_layout(&displays, false);
-                return Err(match rollback {
-                    Ok(()) => format!("staging {} failed: {error}", wide_to_string(&display.name)),
-                    Err(rollback) => format!(
-                        "staging {} failed: {error}; rollback failed: {rollback}",
-                        wide_to_string(&display.name)
-                    ),
-                });
+        let name = Self::find_display().ok_or_else(|| "IDD display not attached".to_owned())?;
+        let original = Self::current_mode(&name)
+            .ok_or_else(|| "could not read the IDD's current display mode".to_owned())?;
+        let mode_changed = original != mode;
+        if mode_changed {
+            let request = Self::mode_request(mode);
+            if let Err(error) = Self::change_display(&name, &request, CDS_UPDATEREGISTRY) {
+                return Err(Self::mode_change_failure(&name, original, error));
             }
-            next_x = next_x
-                .checked_add(
-                    i32::try_from(display.mode.dmPelsWidth).expect("display widths prevalidated"),
-                )
-                .expect("display layout prevalidated");
+            let applied = Self::current_mode(&name);
+            if applied != Some(mode) {
+                return Err(Self::mode_change_failure(
+                    &name,
+                    original,
+                    format!(
+                        "IDD mode verification failed after ChangeDisplaySettingsExW: {applied:?}"
+                    ),
+                ));
+            }
         }
-
-        let idd_mode = Self::display_request(Some(mode), 0, 0);
-        if let Err(error) = Self::change_display(&idd.name, &idd_mode, flags | CDS_SET_PRIMARY) {
-            let rollback = Self::restore_layout(&displays, false);
-            return Err(match rollback {
-                Ok(()) => format!("staging IDD failed: {error}"),
-                Err(rollback) => {
-                    format!("staging IDD failed: {error}; rollback failed: {rollback}")
-                }
-            });
+        match Self::make_idd_primary(&name, mode) {
+            Ok(()) => Ok(()),
+            Err(error) if mode_changed && error.mode_restore_safe => Err(
+                Self::mode_change_failure(&name, original, error.detail),
+            ),
+            Err(error) if mode_changed => Err(format!(
+                "{}; original IDD mode was not restored because display identity or rollback state is uncertain",
+                error.detail
+            )),
+            Err(error) => Err(error.detail),
         }
-
-        // A null-device call commits all of the CDS_NORESET stages atomically.
-        let committed = unsafe {
-            ChangeDisplaySettingsExW(PCWSTR::null(), None, None, Default::default(), None)
-        };
-        if committed != DISP_CHANGE_SUCCESSFUL {
-            let rollback = Self::restore_layout(&displays, true);
-            return Err(match rollback {
-                Ok(()) => format!(
-                    "display layout commit returned {}; original layout restored",
-                    committed.0
-                ),
-                Err(rollback) => format!(
-                    "display layout commit returned {}; restoring original layout failed: {rollback}",
-                    committed.0
-                ),
-            });
-        }
-
-        let after = Self::attached_displays()?;
-        Self::verify_layout(&after, mode)
-            .map_err(|error| format!("display layout committed but {error}"))
     }
 
     fn audio_endpoint(&mut self) -> Option<bool> {
