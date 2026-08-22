@@ -175,7 +175,14 @@ pub fn driver_ver_from_inf(inf: &str) -> Option<String> {
         if line.to_ascii_lowercase().starts_with("driverver") {
             let value = line.split('=').nth(1)?.trim();
             let version = value.split(',').nth(1)?.trim();
-            if !version.is_empty() {
+            let components: Vec<&str> = version.split('.').collect();
+            if components.len() == 4
+                && components.iter().all(|component| {
+                    !component.is_empty()
+                        && component.bytes().all(|byte| byte.is_ascii_digit())
+                        && component.parse::<u16>().is_ok()
+                })
+            {
                 return Some(version.to_owned());
             }
         }
@@ -299,6 +306,33 @@ pub struct Evidence {
     /// A Windows default render endpoint is active.
     #[serde(default)]
     pub audio_default_render_active: bool,
+}
+
+/// One bounded, read-only view of the live IDD device and its signed-driver
+/// rows. `DRIVER_STATUS_PS1` refreshes this evidence until it matches or the
+/// wait expires; Rust remains the authority that decides whether it is valid.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DriverWaitEvidence {
+    #[serde(default)]
+    instances: Vec<DriverInstanceEvidence>,
+    #[serde(default)]
+    query_error: Option<String>,
+    #[serde(default)]
+    timed_out: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DriverInstanceEvidence {
+    instance_id: String,
+    #[serde(default)]
+    driver_rows: Vec<DriverRowEvidence>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DriverRowEvidence {
+    version: String,
+    #[serde(default)]
+    inf_name: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1006,6 +1040,68 @@ try {
 Write-Output 'RHYDRA-OK'
 "#;
 
+/// Re-enumerates the present, healthy IDD device and its bound driver until the
+/// expected version appears or the bounded wait expires. The script always
+/// returns its last raw observation; Rust validates the cardinality and value.
+pub const DRIVER_STATUS_PS1: &str = r#"
+param(
+    [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+    [int]$WaitSeconds = 30
+)
+$ErrorActionPreference = 'Stop'
+$deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+$last = [ordered]@{ timed_out = $false; query_error = $null; instances = @() }
+do {
+    $queryError = $null
+    $instances = @()
+    try {
+        $entities = @(Get-CimInstance Win32_PnPEntity `
+            -Filter "Name = 'mdrdp latency-spike display'" `
+            -OperationTimeoutSec 2 |
+            Where-Object {
+                $_.Present -eq $true -and $_.Status -eq 'OK' -and
+                $_.ConfigManagerErrorCode -eq 0
+            })
+        $drivers = @(Get-CimInstance Win32_PnPSignedDriver -OperationTimeoutSec 2)
+        foreach ($entity in $entities) {
+            $rows = @($drivers |
+                Where-Object { $_.DeviceID -eq $entity.PNPDeviceID } |
+                ForEach-Object {
+                    [ordered]@{
+                        version = "$($_.DriverVersion)"
+                        inf_name = "$($_.InfName)"
+                    }
+                })
+            $instances += [ordered]@{
+                instance_id = "$($entity.PNPDeviceID)"
+                driver_rows = @($rows)
+            }
+        }
+    } catch {
+        $queryError = $_.Exception.GetType().FullName
+        $instances = @()
+    }
+
+    $last = [ordered]@{
+        timed_out = $false
+        query_error = $queryError
+        instances = @($instances)
+    }
+    $matches = $null -eq $queryError -and $instances.Count -eq 1 -and
+        $instances[0].driver_rows.Count -eq 1 -and
+        $instances[0].driver_rows[0].version -eq $ExpectedVersion
+    if ($matches) { break }
+    if ([DateTime]::UtcNow -ge $deadline) {
+        $last.timed_out = $true
+        break
+    }
+    Start-Sleep -Milliseconds 250
+} while ($true)
+
+Write-Output (ConvertTo-Json -InputObject $last -Compress -Depth 5)
+Write-Output 'RHYDRA-OK'
+"#;
+
 /// Prints name->size JSON for a directory, then the sentinel. Used after the
 /// copies to verify what actually landed (a truncated scp otherwise surfaces
 /// as an opaque verify failure much later).
@@ -1155,6 +1251,7 @@ fn upload_scripts(ssh: &Ssh) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     for (name, body) in [
         ("probe.ps1", PROBE_PS1),
+        ("driver-status.ps1", DRIVER_STATUS_PS1),
         ("sizes.ps1", SIZES_PS1),
         ("driver-install.ps1", DRIVER_INSTALL_PS1),
         ("vbcable-install.ps1", VB_CABLE_INSTALL_PS1),
@@ -1287,13 +1384,41 @@ fn verify_status(
     ))
 }
 
-fn require_active_driver(evidence: &Evidence, expected_version: &str) -> Result<(), String> {
-    match evidence.active_driver_ver.as_deref() {
-        Some(actual) if evidence.device_present && actual == expected_version => Ok(()),
-        actual => Err(format!(
-            "active IDD driver after deploy is {actual:?}, expected {expected_version:?}"
-        )),
+fn parse_driver_wait_evidence(json: &str) -> Result<DriverWaitEvidence, String> {
+    serde_json::from_str(json.trim())
+        .map_err(|e| format!("invalid driver-status.ps1 JSON: {e}\n{json}"))
+}
+
+fn require_active_driver_wait(
+    evidence: &DriverWaitEvidence,
+    expected_version: &str,
+) -> Result<(), String> {
+    if evidence.query_error.is_none()
+        && evidence.instances.len() == 1
+        && evidence.instances[0].driver_rows.len() == 1
+        && evidence.instances[0].driver_rows[0].version == expected_version
+    {
+        return Ok(());
     }
+
+    let observed: Vec<String> = evidence
+        .instances
+        .iter()
+        .map(|instance| {
+            let rows: Vec<String> = instance
+                .driver_rows
+                .iter()
+                .map(|row| format!("{} ({})", row.version, row.inf_name))
+                .collect();
+            format!("{} => {rows:?}", instance.instance_id)
+        })
+        .collect();
+    Err(format!(
+        "active IDD driver did not converge to {expected_version:?}: instances={}, observed={observed:?}, query_error={:?}, timed_out={}",
+        evidence.instances.len(),
+        evidence.query_error,
+        evidence.timed_out
+    ))
 }
 
 fn verify(
@@ -1474,11 +1599,14 @@ pub fn run(args: &[String]) -> i32 {
         Ok(summary) => {
             let post_probe = ssh
                 .run_script(
-                    "probe.ps1",
-                    &format!("-TargetDir \"{}\"", artifacts.remote_dir()),
+                    "driver-status.ps1",
+                    &format!(
+                        "-ExpectedVersion \"{}\" -WaitSeconds 30",
+                        artifacts.driver_ver
+                    ),
                 )
-                .and_then(|out| parse_evidence(&out))
-                .and_then(|evidence| require_active_driver(&evidence, &artifacts.driver_ver));
+                .and_then(|out| parse_driver_wait_evidence(&out))
+                .and_then(|evidence| require_active_driver_wait(&evidence, &artifacts.driver_ver));
             if let Err(error) = post_probe {
                 eprintln!("deploy: final driver verification failed: {error}");
                 return 1;
@@ -1610,6 +1738,15 @@ mod tests {
         let inf = "[Version]\nSignature=\"$WINDOWS NT$\"\nDriverVer = 08/16/2026,1.0.0.1\n";
         assert_eq!(driver_ver_from_inf(inf).as_deref(), Some("1.0.0.1"));
         assert_eq!(driver_ver_from_inf("[Version]"), None);
+        assert_eq!(
+            driver_ver_from_inf("DriverVer = 08/16/2026,1.0.0.1\"; Write-Output pwned"),
+            None
+        );
+        assert_eq!(driver_ver_from_inf("DriverVer = 08/16/2026,1.2.3"), None);
+        assert_eq!(
+            driver_ver_from_inf("DriverVer = 08/16/2026,1.2.3.65536"),
+            None
+        );
     }
 
     // -- decide() scenarios ---------------------------------------------------
@@ -1739,14 +1876,114 @@ mod tests {
         assert!(error.contains("display"), "{error}");
     }
 
-    #[test]
-    fn verification_rejects_a_green_stack_bound_to_the_old_driver() {
-        let mut evidence = healthy_evidence();
-        evidence.active_driver_ver = Some("1.0.0.1".to_owned());
+    fn driver_wait_evidence(instances: &[(&str, &[(&str, &str)])]) -> DriverWaitEvidence {
+        DriverWaitEvidence {
+            instances: instances
+                .iter()
+                .map(|(instance_id, rows)| DriverInstanceEvidence {
+                    instance_id: (*instance_id).to_owned(),
+                    driver_rows: rows
+                        .iter()
+                        .map(|(version, inf_name)| DriverRowEvidence {
+                            version: (*version).to_owned(),
+                            inf_name: (*inf_name).to_owned(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            query_error: None,
+            timed_out: false,
+        }
+    }
 
-        let error = require_active_driver(&evidence, "1.0.0.2")
-            .expect_err("green runtime health must not hide a stale active driver package");
-        assert!(error.contains("1.0.0.1") && error.contains("1.0.0.2"));
+    #[test]
+    fn driver_wait_accepts_one_present_instance_with_one_expected_driver() {
+        let evidence =
+            driver_wait_evidence(&[(r"SWD\MDRDP_IDD\MDRDP_IDD", &[("0.3.0.2", "oem104.inf")])]);
+        require_active_driver_wait(&evidence, "0.3.0.2").unwrap();
+    }
+
+    #[test]
+    fn driver_status_wire_contract_is_bounded_read_only_and_parseable() {
+        assert_eq!(
+            DRIVER_STATUS_PS1.matches("-OperationTimeoutSec 2").count(),
+            2
+        );
+        for required in [
+            "$ExpectedVersion",
+            "$WaitSeconds = 30",
+            "[DateTime]::UtcNow",
+            "Get-CimInstance Win32_PnPEntity",
+            "Get-CimInstance Win32_PnPSignedDriver",
+            "Start-Sleep -Milliseconds 250",
+            "ConvertTo-Json -InputObject $last -Compress",
+        ] {
+            assert!(DRIVER_STATUS_PS1.contains(required), "missing {required}");
+        }
+        for forbidden in [
+            "pnputil",
+            "Start-Process",
+            "Set-Content",
+            "Remove-Item",
+            "Disable-PnpDevice",
+            "Enable-PnpDevice",
+        ] {
+            assert!(
+                !DRIVER_STATUS_PS1.contains(forbidden),
+                "driver status wait must be read-only: found {forbidden}"
+            );
+        }
+
+        let json = r#"{
+            "timed_out": false,
+            "query_error": null,
+            "instances": [{
+                "instance_id": "SWD\\MDRDP_IDD\\MDRDP_IDD",
+                "driver_rows": [{"version":"0.3.0.2","inf_name":"oem104.inf"}]
+            }]
+        }"#;
+        let evidence = parse_driver_wait_evidence(json).unwrap();
+        require_active_driver_wait(&evidence, "0.3.0.2").unwrap();
+    }
+
+    #[test]
+    fn driver_wait_rejects_stale_absent_ambiguous_and_query_error_evidence() {
+        let stale = driver_wait_evidence(&[("device", &[("0.3.0.1", "oem103.inf")])]);
+        let absent = driver_wait_evidence(&[]);
+        let no_row = driver_wait_evidence(&[("device", &[])]);
+        let duplicate_rows = driver_wait_evidence(&[(
+            "device",
+            &[("0.3.0.2", "oem104.inf"), ("0.3.0.1", "oem103.inf")],
+        )]);
+        let mixed_instances = driver_wait_evidence(&[
+            ("device-a", &[("0.3.0.2", "oem104.inf")]),
+            ("device-b", &[("0.3.0.2", "oem104.inf")]),
+        ]);
+        let query_error = DriverWaitEvidence {
+            query_error: Some("System.TimeoutException".to_owned()),
+            timed_out: true,
+            ..driver_wait_evidence(&[])
+        };
+
+        let stale_error = require_active_driver_wait(&stale, "0.3.0.2").unwrap_err();
+        assert!(
+            stale_error.contains("0.3.0.1") && stale_error.contains("0.3.0.2"),
+            "{stale_error}"
+        );
+        let absent_error = require_active_driver_wait(&absent, "0.3.0.2").unwrap_err();
+        assert!(absent_error.contains("instances=0"), "{absent_error}");
+        let no_row_error = require_active_driver_wait(&no_row, "0.3.0.2").unwrap_err();
+        assert!(no_row_error.contains("device => []"), "{no_row_error}");
+        let duplicate_error = require_active_driver_wait(&duplicate_rows, "0.3.0.2").unwrap_err();
+        assert!(duplicate_error.contains("oem103.inf"), "{duplicate_error}");
+        let mixed_error = require_active_driver_wait(&mixed_instances, "0.3.0.2").unwrap_err();
+        assert!(mixed_error.contains("instances=2"), "{mixed_error}");
+        let query_error = require_active_driver_wait(&query_error, "0.3.0.2").unwrap_err();
+        assert!(
+            query_error.contains("System.TimeoutException")
+                && query_error.contains("timed_out=true"),
+            "{query_error}"
+        );
     }
 
     #[test]
@@ -2034,6 +2271,7 @@ mod tests {
     fn scripts_end_with_the_sentinel() {
         for (name, body) in [
             ("probe", PROBE_PS1),
+            ("driver-status", DRIVER_STATUS_PS1),
             ("sizes", SIZES_PS1),
             ("driver-install", DRIVER_INSTALL_PS1),
             ("vbcable-install", VB_CABLE_INSTALL_PS1),
