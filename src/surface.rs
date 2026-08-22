@@ -349,6 +349,19 @@ pub struct SurfaceStore {
     cache_stats: CacheStats,
 }
 
+/// A complete, immutable presentation copy of the surface currently mapped to output.
+///
+/// The network/decode thread owns the store lock only while this snapshot is copied.
+/// Scaling, colour conversion, overlays, and the platform present happen after the lock
+/// is released, so a 5K scalar conversion cannot block the next decoded tile.
+#[derive(Debug, Default)]
+pub(crate) struct PresentationSnapshot {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) pixels: Vec<u8>,
+    pub(crate) generation: u64,
+}
+
 impl SurfaceStore {
     pub fn new() -> Self {
         Self::default()
@@ -450,6 +463,26 @@ impl SurfaceStore {
         self.output_surface()
             .filter(|surface| surface.is_painted())
             .or(self.presentation_fallback.as_ref())
+    }
+
+    /// Copy the current presentation surface into a reusable snapshot.
+    ///
+    /// The dimensions, pixels, and generation are read under the caller's store lock,
+    /// making them one coherent view. A `false` result means no painted surface exists;
+    /// the snapshot's capacity is retained for the next frame.
+    pub(crate) fn copy_presentation(&self, snapshot: &mut PresentationSnapshot) -> bool {
+        snapshot.generation = self.generation;
+        let Some(surface) = self.presentation_surface() else {
+            snapshot.width = 0;
+            snapshot.height = 0;
+            snapshot.pixels.clear();
+            return false;
+        };
+        snapshot.width = surface.width;
+        snapshot.height = surface.height;
+        snapshot.pixels.resize(surface.pixels.len(), 0);
+        snapshot.pixels.copy_from_slice(surface.pixels());
+        true
     }
 
     pub fn blit_rgba(
@@ -952,6 +985,36 @@ mod tests {
         let g = store.generation();
         store.solid_fill(1, &[Rect::new(0, 0, 1, 1)], RED).unwrap();
         assert_ne!(store.generation(), g);
+    }
+
+    #[test]
+    fn presentation_snapshot_copies_pixels_dimensions_and_generation_together() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        let expected_generation = store.generation();
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert!(store.copy_presentation(&mut snapshot));
+        assert_eq!(snapshot.width, 2);
+        assert_eq!(snapshot.height, 1);
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+        assert_eq!(snapshot.generation, expected_generation);
+
+        store
+            .blit_rgba_strict(1, Rect::new(1, 0, 2, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        assert_ne!(store.generation(), snapshot.generation);
+        assert_eq!(
+            snapshot.pixels,
+            solid(2, 1, RED),
+            "the old snapshot is immutable"
+        );
+
+        assert!(store.copy_presentation(&mut snapshot));
+        assert_eq!(snapshot.pixels, [RED, BLUE].concat());
+        assert_eq!(snapshot.generation, store.generation());
     }
 
     #[test]

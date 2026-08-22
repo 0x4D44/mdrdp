@@ -1027,8 +1027,10 @@ struct TileDecodeState {
 
 struct TileFrameProgress {
     seen: Vec<bool>,
+    changed: bool,
     bytes: u64,
     decode_us: u32,
+    generation: u64,
 }
 
 impl NativeSink {
@@ -1228,52 +1230,71 @@ impl NativeSink {
                 header.height
             ));
         }
-        if suppress_paint {
+        let (changed, generation) = if suppress_paint {
             self.suppressed += 1;
-            return Ok(());
-        }
+            (false, 0)
+        } else {
+            let generation = {
+                let mut store = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let edge = |value: u32| {
+                    u16::try_from(value)
+                        .map_err(|_| format!("tile {tile_id} edge {value} exceeds the canvas"))
+                };
+                let dest = Rect::new(
+                    edge(header.x)?,
+                    edge(header.y)?,
+                    edge(header.x + header.width)?,
+                    edge(header.y + header.height)?,
+                );
+                store
+                    .blit_rgba_strict(OUTPUT_SURFACE, dest, decoded.data())
+                    .map_err(|e| format!("tile blit: {e}"))?;
+                store.generation()
+            };
+            self.tile_decoders[tile_index].exact_through = Some(seq);
+            self.tile_decoders[tile_index].has_base = true;
+            (true, generation)
+        };
         let bytes = au.len() as u64;
         let decode_us = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
-        let generation = {
-            let mut store = self
-                .store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let edge = |value: u32| {
-                u16::try_from(value)
-                    .map_err(|_| format!("tile {tile_id} edge {value} exceeds the canvas"))
-            };
-            let dest = Rect::new(
-                edge(header.x)?,
-                edge(header.y)?,
-                edge(header.x + header.width)?,
-                edge(header.y + header.height)?,
-            );
-            store
-                .blit_rgba_strict(OUTPUT_SURFACE, dest, decoded.data())
-                .map_err(|e| format!("tile blit: {e}"))?;
-            store.generation()
-        };
-        self.tile_decoders[tile_index].exact_through = Some(seq);
-        self.tile_decoders[tile_index].has_base = true;
 
-        let complete = {
+        let (complete, changed, generation, bytes, decode_us) = {
             let progress = self
                 .tile_frames
                 .entry(seq)
                 .or_insert_with(|| TileFrameProgress {
                     seen: vec![false; self.tile_decoders.len()],
+                    changed: false,
                     bytes: 0,
                     decode_us: 0,
+                    generation: 0,
                 });
-            progress.seen[tile_index] = true;
-            progress.bytes = progress.bytes.saturating_add(bytes);
-            progress.decode_us = progress.decode_us.saturating_add(decode_us);
-            progress.seen.iter().all(|seen| *seen)
+            // A repeated tile in one sequence is still one arrival. This is
+            // normally suppressed by exactness, but keeping the accounting
+            // idempotent makes the logical-frame gate robust to duplicates.
+            if !progress.seen[tile_index] {
+                progress.seen[tile_index] = true;
+                progress.changed |= changed;
+                progress.bytes = progress.bytes.saturating_add(bytes);
+                progress.decode_us = progress.decode_us.saturating_add(decode_us);
+                if changed {
+                    progress.generation = generation;
+                }
+            }
+            (
+                progress.seen.iter().all(|seen| *seen),
+                progress.changed,
+                progress.generation,
+                progress.bytes,
+                progress.decode_us,
+            )
         };
+        let completed_changed = complete && changed;
         if complete {
-            let progress = self.tile_frames.remove(&seq).expect("entry just completed");
-            self.record_paint(progress.bytes, generation, Some(progress.decode_us));
+            self.tile_frames.remove(&seq).expect("entry just completed");
         }
         // A missing tile must not let an unbounded stream of newer AUs accumulate.
         // Sixteen capture sequences cover 67 ms at 240 Hz; older incomplete rows
@@ -1291,8 +1312,11 @@ impl NativeSink {
             .map(|tile| tile.exact_through)
             .collect::<Option<Vec<_>>>()
             .and_then(|seqs| seqs.into_iter().min());
-        (self.wake)();
-        self.try_apply_pending();
+        if completed_changed {
+            self.record_paint(bytes, generation, Some(decode_us));
+            (self.wake)();
+            self.try_apply_pending();
+        }
         Ok(())
     }
 
@@ -1651,6 +1675,167 @@ mod tests {
         let pixels = guard.get(OUTPUT_SURFACE).unwrap().pixels();
         assert_eq!(pixels[0], 0x11);
         assert_eq!(pixels[(2 * 4) as usize], 0x22);
+    }
+
+    #[test]
+    fn a_tiled_sequence_wakes_once_after_all_tiles_arrive() {
+        let size = (4, 2);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::clone(&wake_count);
+        let mut sink = NativeSink::new_tiled(
+            vec![
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+            ],
+            vec![
+                super::super::probe::TileHeader {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                super::super::probe::TileHeader {
+                    id: 1,
+                    x: 2,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+            ],
+            Arc::clone(&store),
+            size,
+            Box::new(move || {
+                wake.fetch_add(1, Ordering::Relaxed);
+            }),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+
+        sink.on_tile_au(0, &[0x11], 7).unwrap();
+        assert_eq!(
+            wake_count.load(Ordering::Relaxed),
+            0,
+            "an incomplete logical frame must not wake"
+        );
+        sink.on_tile_au(1, &[0x22], 7).unwrap();
+        assert_eq!(
+            wake_count.load(Ordering::Relaxed),
+            1,
+            "two tiles are one logical frame"
+        );
+
+        // Both AUs are fully redundant, but still need decoding to keep the H.264
+        // reference chains correct. They must not schedule another redraw.
+        sink.on_tile_au(0, &[0x33], 7).unwrap();
+        sink.on_tile_au(1, &[0x44], 7).unwrap();
+        assert_eq!(
+            wake_count.load(Ordering::Relaxed),
+            1,
+            "a redundant sequence must not wake"
+        );
+    }
+
+    #[test]
+    fn a_suppressed_tile_still_completes_a_changed_logical_frame() {
+        let size = (4, 2);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::clone(&wake_count);
+        let mut sink = NativeSink::new_tiled(
+            vec![
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+            ],
+            vec![
+                super::super::probe::TileHeader {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                super::super::probe::TileHeader {
+                    id: 1,
+                    x: 2,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+            ],
+            Arc::clone(&store),
+            size,
+            Box::new(move || {
+                wake.fetch_add(1, Ordering::Relaxed);
+            }),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+        sink.on_tile_au(0, &[0x11], 7).unwrap();
+        sink.on_tile_au(1, &[0x22], 7).unwrap();
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+
+        // Model a rect update that made tile 0 exact through seq 8 while tile 1
+        // still needs its encoded AU. Tile 0's decoded AU is an arrival, not a
+        // reason to paint or wake; tile 1 completes the logical frame.
+        sink.tile_decoders[0].exact_through = Some(8);
+        sink.on_tile_au(0, &[0x33], 8).unwrap();
+        assert_eq!(
+            wake_count.load(Ordering::Relaxed),
+            1,
+            "the suppressed half is not complete yet"
+        );
+        sink.on_tile_au(1, &[0x44], 8).unwrap();
+        assert_eq!(
+            wake_count.load(Ordering::Relaxed),
+            2,
+            "a changed tile completes the logical frame"
+        );
+    }
+
+    #[test]
+    fn a_single_tile_stream_wakes_once_per_changed_sequence() {
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, 1, 1);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::clone(&wake_count);
+        let mut sink = NativeSink::new_tiled(
+            vec![NativeDecoder::H264(Box::new(PixelDecoder))],
+            vec![super::super::probe::TileHeader {
+                id: 4,
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+            Arc::clone(&store),
+            (1, 1),
+            Box::new(move || {
+                wake.fetch_add(1, Ordering::Relaxed);
+            }),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+
+        sink.on_tile_au(4, &[1, 2, 3, 4], 1).unwrap();
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+        sink.on_tile_au(4, &[9, 8, 7, 6], 1).unwrap();
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

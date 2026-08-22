@@ -42,7 +42,7 @@ use winit::window::{CustomCursor, Fullscreen, Window, WindowAttributes, WindowId
 use crate::input::{self, InputEvent, PointerMap};
 use crate::session::SessionCommand;
 use crate::stats::{SessionStats, StatsHandle};
-use crate::surface::SurfaceStore;
+use crate::surface::{PresentationSnapshot, SurfaceStore};
 use crate::ui::font;
 use crate::window_policy::{Geometry, ResizeVerdict, WindowPolicy};
 
@@ -310,24 +310,82 @@ pub enum CursorUpdate {
     },
 }
 
+/// Large canvases spend enough time in scalar scaling that change-driven redraws can
+/// outrun the event loop. Keep one present at most every 33 ms (about 30 fps), while
+/// continuing to decode and retain the newest complete canvas.
+pub(crate) const DAMAGE_PRESENT_INTERVAL: Duration = Duration::from_millis(33);
+
+fn large_presentation(width: u16, height: u16) -> bool {
+    width > 2560 || height > 1440
+}
+
+/// Return the next legal present time for a large surface, or `None` when it may run now.
+fn presentation_deadline(
+    last_presented: Option<Instant>,
+    now: Instant,
+    width: u16,
+    height: u16,
+) -> Option<Instant> {
+    if !large_presentation(width, height) {
+        return None;
+    }
+    let deadline = last_presented?.checked_add(DAMAGE_PRESENT_INTERVAL)?;
+    (now < deadline).then_some(deadline)
+}
+
+/// The one pending `Damaged` notification shared by the producer and event-loop threads.
+///
+/// A notification means only "the store may have changed"; once one is queued, another
+/// carries no additional information. The bit is cleared at handler entry so damage that
+/// races with handling gets a fresh event.
+#[derive(Debug, Clone, Default)]
+struct DamageGate(Arc<AtomicBool>);
+
+impl DamageGate {
+    fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn clear(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+
+    fn send_failed(&self) {
+        self.clear();
+    }
+}
+
 /// A `Send` handle onto a running window, for the thread that owns the RDP session.
 #[derive(Debug, Clone)]
-pub struct Waker(EventLoopProxy<SessionEvent>);
+pub struct Waker {
+    proxy: EventLoopProxy<SessionEvent>,
+    damage: DamageGate,
+}
 
 impl Waker {
     /// Tell the window the store may have changed. `false` means the window is gone.
     pub fn damaged(&self) -> bool {
-        self.0.send_event(SessionEvent::Damaged).is_ok()
+        if !self.damage.claim() {
+            return true;
+        }
+        if self.proxy.send_event(SessionEvent::Damaged).is_ok() {
+            true
+        } else {
+            self.damage.send_failed();
+            false
+        }
     }
 
     /// Ask the window to close. `false` means it already has.
     pub fn close(&self) -> bool {
-        self.0.send_event(SessionEvent::Close).is_ok()
+        self.proxy.send_event(SessionEvent::Close).is_ok()
     }
 
     /// Mirror a remote pointer change. `false` means the window is gone.
     pub fn cursor(&self, update: CursorUpdate) -> bool {
-        self.0.send_event(SessionEvent::Cursor(update)).is_ok()
+        self.proxy.send_event(SessionEvent::Cursor(update)).is_ok()
     }
 }
 
@@ -901,6 +959,7 @@ fn friendly_codec(name: &str) -> &str {
 /// thread — `run` never returns until the window closes.
 pub struct SessionWindow {
     event_loop: EventLoop<SessionEvent>,
+    damage: DamageGate,
     config: WindowConfig,
     store: Arc<Mutex<SurfaceStore>>,
     input: WakingSender<InputEvent>,
@@ -948,6 +1007,7 @@ impl SessionWindow {
         let fullscreen_state = Arc::new(AtomicBool::new(config.fullscreen));
         Ok(SessionWindow {
             event_loop,
+            damage: DamageGate::default(),
             config,
             store,
             input,
@@ -1031,7 +1091,10 @@ impl SessionWindow {
 
     /// A handle the session thread can use to nudge or close the window.
     pub fn waker(&self) -> Waker {
-        Waker(self.event_loop.create_proxy())
+        Waker {
+            proxy: self.event_loop.create_proxy(),
+            damage: self.damage.clone(),
+        }
     }
 
     /// Run until the window closes. Returns the still-usable event loop, so an
@@ -1044,6 +1107,7 @@ impl SessionWindow {
         use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
         let SessionWindow {
             mut event_loop,
+            damage,
             config,
             store,
             input,
@@ -1056,6 +1120,7 @@ impl SessionWindow {
             fullscreen_state,
         } = self;
         let mut app = SessionApp::new(config, store, input, stats);
+        app.damage = damage;
         app.latest_mouse_move = latest_mouse_move;
         app.on_exit = on_exit;
         app.commands = commands;
@@ -1114,6 +1179,7 @@ fn follow_request(
 struct SessionApp {
     config: WindowConfig,
     store: Arc<Mutex<SurfaceStore>>,
+    damage: DamageGate,
     input: WakingSender<InputEvent>,
     latest_mouse_move: Option<Arc<input::LatestMouseMove>>,
     window: Option<Arc<Window>>,
@@ -1206,6 +1272,15 @@ struct SessionApp {
     /// Whether the current stall has already been announced, so the log and the toast
     /// fire once per episode rather than once per tick.
     stall_announced: bool,
+    /// Reused complete copy of the surface currently being presented. The store lock is
+    /// held only while this buffer is refreshed; all expensive conversion follows after
+    /// the copy.
+    presentation: PresentationSnapshot,
+    /// Completion time of the last successful present, used to pace 5K redraws without
+    /// sleeping the event-loop thread.
+    last_presented_at: Option<Instant>,
+    /// A deferred 5K redraw waiting for the cadence deadline.
+    redraw_deadline: Option<Instant>,
 }
 
 impl SessionApp {
@@ -1232,6 +1307,7 @@ impl SessionApp {
             present_failures: 0,
             config,
             store,
+            damage: DamageGate::default(),
             input,
             latest_mouse_move: None,
             window: None,
@@ -1271,6 +1347,9 @@ impl SessionApp {
             repaint_awaited: None,
             stall_announced: false,
             warn_line: None,
+            presentation: PresentationSnapshot::default(),
+            last_presented_at: None,
+            redraw_deadline: None,
         }
     }
 
@@ -1809,6 +1888,53 @@ impl SessionApp {
         store.generation()
     }
 
+    fn cadence_dimensions(&self) -> (u16, u16) {
+        if self.presentation.width != 0 && self.presentation.height != 0 {
+            (self.presentation.width, self.presentation.height)
+        } else {
+            (self.config.session_width, self.config.session_height)
+        }
+    }
+
+    /// Ask the window to present the newest generation, subject to the large-canvas
+    /// cadence. The event loop remains free to handle input while a deadline is pending.
+    fn request_damage_redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if self.occluded || self.presented == Some(self.generation()) {
+            return;
+        }
+        let now = Instant::now();
+        let (width, height) = self.cadence_dimensions();
+        if let Some(deadline) = presentation_deadline(self.last_presented_at, now, width, height) {
+            self.redraw_deadline = Some(
+                self.redraw_deadline
+                    .map_or(deadline, |current| current.max(deadline)),
+            );
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            return;
+        }
+        self.redraw_deadline = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Fire one deferred redraw once its cadence deadline arrives.
+    fn service_deferred_redraw(&mut self) {
+        let Some(deadline) = self.redraw_deadline else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.redraw_deadline = None;
+        if !self.occluded
+            && self.presented != Some(self.generation())
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let (Some(window), Some(presenter)) = (self.window.clone(), self.presenter.as_mut()) else {
             return;
@@ -1834,36 +1960,59 @@ impl SessionApp {
             }
         };
 
-        // The store lock is held only for the scale-and-convert pass, never across
-        // `present` — presenting blocks on a copy on macOS, and the decoder thread must
-        // not wait on that.
+        // Copy a coherent presentation snapshot under the store lock, then release it
+        // before scaling and colour conversion. The decoder can composite the next tile
+        // while this 5K frame is being turned into the platform buffer.
         let (generation, blank) = {
             let store = self
                 .store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let generation = store.generation();
-            let blank = match store.presentation_surface() {
-                Some(session) => {
-                    self.viewport =
-                        Viewport::letterbox(size.width, size.height, session.width, session.height);
-                    present_into(
-                        &mut buffer,
-                        size.width,
-                        size.height,
-                        &self.viewport,
-                        session.pixels(),
-                    );
-                    false
-                }
-                // Nothing mapped to output yet: black, not stale garbage.
-                None => {
-                    buffer.fill(0);
-                    true
-                }
-            };
+            let blank = !store.copy_presentation(&mut self.presentation);
+            let generation = self.presentation.generation;
             (generation, blank)
         };
+
+        // A platform redraw can arrive before our deferred deadline (for example, an
+        // expose event). Keep a newer generation from bypassing the 5K cadence, but let
+        // an expose repaint the already-presented generation immediately.
+        let (cadence_width, cadence_height) = if blank {
+            (self.config.session_width, self.config.session_height)
+        } else {
+            (self.presentation.width, self.presentation.height)
+        };
+        if self.presented != Some(generation)
+            && let Some(deadline) = presentation_deadline(
+                self.last_presented_at,
+                Instant::now(),
+                cadence_width,
+                cadence_height,
+            )
+        {
+            self.redraw_deadline = Some(deadline);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            return;
+        }
+        self.redraw_deadline = None;
+
+        if blank {
+            // Nothing mapped to output yet: black, not stale garbage.
+            buffer.fill(0);
+        } else {
+            self.viewport = Viewport::letterbox(
+                size.width,
+                size.height,
+                self.presentation.width,
+                self.presentation.height,
+            );
+            present_into(
+                &mut buffer,
+                size.width,
+                size.height,
+                &self.viewport,
+                &self.presentation.pixels,
+            );
+        }
 
         // Explain the black rectangle rather than leaving the user to guess, in the two
         // cases where there is provably nothing to obscure (MDR-BUG-FLUX-00008):
@@ -1913,6 +2062,7 @@ impl SessionApp {
         // across a long session would close a perfectly healthy window.
         self.present_failures = 0;
         self.presented = Some(generation);
+        self.last_presented_at = Some(Instant::now());
         // Close the paint→present handoff measurement for this generation.
         if let Some(stats) = &self.stats {
             stats.update(|s| s.mark_presented(generation));
@@ -1995,16 +2145,15 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: SessionEvent) {
         match event {
             SessionEvent::Damaged => {
+                // Clear before reading the generation. A producer that races with this
+                // handler then claims and sends the next notification instead of being
+                // lost behind the one currently being serviced.
+                self.damage.clear();
                 // The whole point of the generation counter: a nudge that turns out to
                 // change nothing costs one atomic-ish read and no frame. An occluded
                 // window presents to nobody, so damage accumulates silently until the
                 // reveal's own request_redraw shows the latest frame (Occluded arm).
-                if !self.occluded
-                    && self.presented != Some(self.generation())
-                    && let Some(window) = &self.window
-                {
-                    window.request_redraw();
-                }
+                self.request_damage_redraw(event_loop);
                 // Damage is also the clock for the title diagnostics: numbers only move
                 // when frames do.
                 self.maybe_refresh_title();
@@ -2024,6 +2173,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
     /// next. With neither pending the loop returns to plain `Wait`.
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
         self.service_settled_resize();
+        self.service_deferred_redraw();
 
         // An outstanding repaint keeps the tick alive too: a stalled session produces no
         // damage by definition, so without this the one condition that most needs
@@ -2050,14 +2200,15 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         }
 
         let diag_next = diag_active.then(|| self.last_diag_refresh + DIAG_REFRESH);
-        match (diag_next, self.resize_settle) {
-            (Some(a), Some(b)) => event_loop.set_control_flow(ControlFlow::WaitUntil(a.min(b))),
-            (Some(t), None) | (None, Some(t)) => {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(t));
-            }
+        let next = [diag_next, self.resize_settle, self.redraw_deadline]
+            .into_iter()
+            .flatten()
+            .min();
+        match next {
+            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             // A stale `WaitUntil` left set would spin the loop the moment its instant
             // passed, so the quiet state is restored explicitly.
-            (None, None) => event_loop.set_control_flow(ControlFlow::Wait),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -2448,6 +2599,47 @@ mod tests {
     fn a_degenerate_size_is_never_requested() {
         assert_eq!(follow_request(0, 1080, 1920, 1080), None);
         assert_eq!(follow_request(1920, 0, 1920, 1080), None);
+    }
+
+    #[test]
+    fn damage_gate_allows_one_event_until_the_handler_clears_it() {
+        let gate = DamageGate::default();
+        assert!(gate.claim(), "the first damage must enqueue an event");
+        assert!(
+            !gate.claim(),
+            "additional damage must coalesce while pending"
+        );
+        gate.clear();
+        assert!(
+            gate.claim(),
+            "damage after handler entry must enqueue a new event"
+        );
+    }
+
+    #[test]
+    fn damage_gate_send_failure_rolls_back_the_pending_claim() {
+        let gate = DamageGate::default();
+        assert!(gate.claim());
+        gate.send_failed();
+        assert!(
+            gate.claim(),
+            "a failed proxy send must not strand the pending bit"
+        );
+    }
+
+    #[test]
+    fn only_large_surfaces_are_cadence_limited_and_the_first_paint_is_immediate() {
+        let now = Instant::now();
+        assert_eq!(presentation_deadline(None, now, 5120, 2880), None);
+        assert_eq!(presentation_deadline(Some(now), now, 1920, 1080), None);
+        assert_eq!(
+            presentation_deadline(Some(now), now + Duration::from_millis(1), 5120, 2880),
+            Some(now + DAMAGE_PRESENT_INTERVAL)
+        );
+        assert_eq!(
+            presentation_deadline(Some(now), now + DAMAGE_PRESENT_INTERVAL, 5120, 2880),
+            None
+        );
     }
 
     #[test]
