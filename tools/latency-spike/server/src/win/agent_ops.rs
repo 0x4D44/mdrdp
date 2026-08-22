@@ -444,9 +444,20 @@ impl WinOps {
         }
     }
 
-    fn set_position(devmode: &mut DEVMODEW, x: i32, y: i32) {
-        devmode.dmFields |= DM_POSITION;
-        devmode.Anonymous1.Anonymous2.dmPosition = POINTL { x, y };
+    fn display_request(mode: Option<Mode>, x: i32, y: i32) -> DEVMODEW {
+        let mut request = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            dmFields: DM_POSITION,
+            ..Default::default()
+        };
+        request.Anonymous1.Anonymous2.dmPosition = POINTL { x, y };
+        if let Some(mode) = mode {
+            request.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+            request.dmPelsWidth = mode.width;
+            request.dmPelsHeight = mode.height;
+            request.dmDisplayFrequency = mode.hz;
+        }
+        request
     }
 
     fn position(devmode: &DEVMODEW) -> POINTL {
@@ -484,12 +495,19 @@ impl WinOps {
         let base_flags = CDS_UPDATEREGISTRY | CDS_NORESET;
         let mut failures = Vec::new();
         for display in originals {
+            let position = Self::position(&display.mode);
+            let mode = Mode {
+                width: display.mode.dmPelsWidth,
+                height: display.mode.dmPelsHeight,
+                hz: display.mode.dmDisplayFrequency,
+            };
+            let request = Self::display_request(Some(mode), position.x, position.y);
             let flags = if display.primary {
                 base_flags | CDS_SET_PRIMARY
             } else {
                 base_flags
             };
-            if let Err(error) = Self::change_display(&display.name, &display.mode, flags) {
+            if let Err(error) = Self::change_display(&display.name, &request, flags) {
                 failures.push(error);
             }
         }
@@ -660,8 +678,7 @@ impl AgentOps for WinOps {
         // mode, but sit to the right of the IDD so normal applications open on
         // the captured desktop rather than an invisible primary monitor.
         for display in displays.iter().filter(|display| !display.idd) {
-            let mut staged = display.mode;
-            Self::set_position(&mut staged, next_x, 0);
+            let staged = Self::display_request(None, next_x, 0);
             if let Err(error) = Self::change_display(&display.name, &staged, flags) {
                 let rollback = Self::restore_layout(&displays, false);
                 return Err(match rollback {
@@ -679,12 +696,7 @@ impl AgentOps for WinOps {
                 .expect("display layout prevalidated");
         }
 
-        let mut idd_mode = idd.mode;
-        idd_mode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-        idd_mode.dmPelsWidth = mode.width;
-        idd_mode.dmPelsHeight = mode.height;
-        idd_mode.dmDisplayFrequency = mode.hz;
-        Self::set_position(&mut idd_mode, 0, 0);
+        let idd_mode = Self::display_request(Some(mode), 0, 0);
         if let Err(error) = Self::change_display(&idd.name, &idd_mode, flags | CDS_SET_PRIMARY) {
             let rollback = Self::restore_layout(&displays, false);
             return Err(match rollback {
