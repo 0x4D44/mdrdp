@@ -492,10 +492,22 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
         AudioState::Healthy | AudioState::NeedsInstall | AudioState::NeedsConfigure => {}
     }
 
-    // Fast path: the exact version is already deployed, byte-sizes match, and
-    // the running agent reports that version healthy. (Same-version different
-    // bytes falls through to a full deploy: sizes are the tell.) Checked BEFORE
-    // the live-server guard: a fast path mutates nothing, so the normal state
+    // A live device is current only when it is actually bound to this package.
+    // When no device exists yet, a staged matching package is sufficient: the
+    // creator will bind it after the agent starts.
+    let desired_staged = evidence
+        .staged_driver_vers
+        .iter()
+        .any(|v| v == &artifacts.driver_ver);
+    let driver_current = if evidence.device_present {
+        evidence.active_driver_ver.as_deref() == Some(artifacts.driver_ver.as_str())
+    } else {
+        desired_staged
+    };
+
+    // Fast path: the exact runtime and driver package are already deployed,
+    // byte-sizes match, and the running agent reports that version healthy. Checked
+    // before the live-server guard: a fast path mutates nothing, so the normal state
     // after a successful deploy — server up — must not force-gate the no-op
     // re-run the idempotence criterion demands.
     let vdir = format!("v{}", artifacts.version);
@@ -511,6 +523,7 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
     });
     let exact_stack = evidence.version_dirs.iter().any(|d| d == &vdir)
         && sizes_match
+        && driver_current
         && evidence
             .agent
             .as_ref()
@@ -547,18 +560,6 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
         );
     }
 
-    // A live device is current only when it is actually bound to this package.
-    // When no device exists yet, a staged matching package is sufficient: the
-    // creator will bind it after the agent starts.
-    let desired_staged = evidence
-        .staged_driver_vers
-        .iter()
-        .any(|v| v == &artifacts.driver_ver);
-    let driver_current = if evidence.device_present {
-        evidence.active_driver_ver.as_deref() == Some(artifacts.driver_ver.as_str())
-    } else {
-        desired_staged
-    };
     if !(driver_current || (evidence.inf2cat_present && evidence.signtool_present)) {
         return Err(format!(
             "the driver ({}) is not installed and the host lacks Inf2Cat/signtool to install \
@@ -656,11 +657,14 @@ function PortOwner([int]$port) {
     $c = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($c) { (Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue).ProcessName } else { $null }
 }
-$device = $null -ne (Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+$displayDevices = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue |
     Where-Object { $_.FriendlyName -eq 'mdrdp latency-spike display' -and $_.Status -eq 'OK' })
-$activeDriver = Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
-    Where-Object { $_.DeviceName -eq 'mdrdp latency-spike display' } |
-    Select-Object -First 1 -ExpandProperty DriverVersion
+$device = $displayDevices.Count -gt 0
+$presentDisplayIds = @($displayDevices | ForEach-Object { $_.InstanceId })
+$activeDriverVersions = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
+    Where-Object { $presentDisplayIds -contains $_.DeviceID } |
+    ForEach-Object { "$($_.DriverVersion)" } | Sort-Object -Unique)
+$activeDriver = if ($activeDriverVersions.Count -eq 1) { $activeDriverVersions[0] } else { $null }
 $staged = @(Get-WindowsDriver -Online -ErrorAction SilentlyContinue |
     Where-Object { $_.OriginalFileName -like '*mdrdp-idd.inf' } | ForEach-Object { "$($_.Version)" })
 $inf2cat = $null -ne (Get-Command Inf2Cat.exe -ErrorAction SilentlyContinue)
@@ -1283,6 +1287,15 @@ fn verify_status(
     ))
 }
 
+fn require_active_driver(evidence: &Evidence, expected_version: &str) -> Result<(), String> {
+    match evidence.active_driver_ver.as_deref() {
+        Some(actual) if evidence.device_present && actual == expected_version => Ok(()),
+        actual => Err(format!(
+            "active IDD driver after deploy is {actual:?}, expected {expected_version:?}"
+        )),
+    }
+}
+
 fn verify(
     ssh: &Ssh,
     artifacts: &Artifacts,
@@ -1459,6 +1472,17 @@ pub fn run(args: &[String]) -> i32 {
 
     match verify(&ssh, &artifacts, expected_display) {
         Ok(summary) => {
+            let post_probe = ssh
+                .run_script(
+                    "probe.ps1",
+                    &format!("-TargetDir \"{}\"", artifacts.remote_dir()),
+                )
+                .and_then(|out| parse_evidence(&out))
+                .and_then(|evidence| require_active_driver(&evidence, &artifacts.driver_ver));
+            if let Err(error) = post_probe {
+                eprintln!("deploy: final driver verification failed: {error}");
+                return 1;
+            }
             eprintln!("deploy: {summary}");
             // The native connect needs key auth (a GUI session has no tty for ssh
             // prompts). Report the posture, never fail the deploy over it: the host
@@ -1716,6 +1740,16 @@ mod tests {
     }
 
     #[test]
+    fn verification_rejects_a_green_stack_bound_to_the_old_driver() {
+        let mut evidence = healthy_evidence();
+        evidence.active_driver_ver = Some("1.0.0.1".to_owned());
+
+        let error = require_active_driver(&evidence, "1.0.0.2")
+            .expect_err("green runtime health must not hide a stale active driver package");
+        assert!(error.contains("1.0.0.1") && error.contains("1.0.0.2"));
+    }
+
+    #[test]
     fn upgrade_deploy_orders_copy_before_quiesce() {
         let dir = scratch_dir("upgrade");
         let art = test_artifacts(&dir);
@@ -1916,6 +1950,21 @@ mod tests {
         let dir = scratch_dir("stale-driver");
         let art = test_artifacts(&dir);
         let mut ev = healthy_evidence();
+        ev.version_dirs = vec!["v0.2.0".to_owned()];
+        ev.agent = Some(AgentProbe {
+            version: "0.2.0".to_owned(),
+            green: true,
+            server_running: false,
+        });
+        for (name, len) in [
+            ("rhydra-server.exe", 10u64),
+            ("rhydra-agent.exe", 20),
+            ("mdrdp-idd-create.exe", 30),
+            ("mdrdp_idd.dll", 40),
+            ("mdrdp-idd.inf", 50),
+        ] {
+            ev.target_dir_sizes.insert(name.to_owned(), len);
+        }
         ev.active_driver_ver = Some("0.9.0.0".to_owned());
         ev.inf2cat_present = true;
         ev.signtool_present = true;
@@ -1995,6 +2044,13 @@ mod tests {
                 "{name}.ps1 must end by printing the sentinel, ends with {last:?}"
             );
         }
+    }
+
+    #[test]
+    fn probe_binds_the_active_driver_version_to_present_idd_instances() {
+        assert!(PROBE_PS1.contains("Get-PnpDevice -Class Display -PresentOnly"));
+        assert!(PROBE_PS1.contains("$presentDisplayIds -contains $_.DeviceID"));
+        assert!(!PROBE_PS1.contains("$_.DeviceName -eq 'mdrdp latency-spike display'"));
     }
 
     #[test]
