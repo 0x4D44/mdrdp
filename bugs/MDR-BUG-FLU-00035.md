@@ -1,6 +1,6 @@
 # MDR-BUG-FLU-00035 — Rhydra leaves the physical display primary, so applications open outside the captured virtual desktop
 
-- **State:** Fixed
+- **State:** Open
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/display-provisioning
@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-22T18:08:59Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-22T18:52:06Z, deltic:auto role=fix run=fix-20260822T183242Z-2240d049 branch=task/bug-MDR-BUG-FLU-00035-run-fix-20260822T183242Z-2240d049 code=558c2a3 gate=manual)
+- **State history:** Open (2026-08-22T18:08:59Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-22T18:52:06Z, deltic:auto role=fix run=fix-20260822T183242Z-2240d049 branch=task/bug-MDR-BUG-FLU-00035-run-fix-20260822T183242Z-2240d049 code=558c2a3 gate=manual) -> Open (2026-08-22T18:58:04Z, independent live verifier found deployed Quench still reported the IDD secondary at (1920, 0), mode_ok=false, and server stopped)
 
 ## Observation
 
@@ -27,6 +27,9 @@ On Quench, the Rhydra server captured the virtual display at physical origin (19
 
 ## Fix
 
-<unfixed — raised only>
+The first integrated attempt (`558c2a3`) made placement observable and tried a staged
+Win32 primary-display transaction. Live Quench verification showed that Windows rejected
+or failed that transaction; the agent did not retain the exact platform error, so the
+next fix must expose it before correcting the transaction.
 
 ## Notes
