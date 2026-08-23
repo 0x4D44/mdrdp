@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00044 — An unterminated Rhydra agent control request can grow memory without bound
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** rhydra/control
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T195542Z-8f67a99b
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00044-run-fix-20260823T195542Z-8f67a99b
-- **Owner base:** 08fe46e31ad9c4255ab09d5de2ec00ae8da4cb83
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T19:55:42Z
-- **Owner until:** 2026-08-23T21:55:42Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T20:01:26Z, deltic:auto role=fix run=fix-20260823T195542Z-8f67a99b branch=task/bug-MDR-BUG-FLU-00044-run-fix-20260823T195542Z-8f67a99b code=a071f0d gate=manual)
 
 ## Observation
 
