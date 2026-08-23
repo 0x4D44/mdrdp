@@ -1223,6 +1223,8 @@ impl GraphicsPipelineClient {
                         .on_decode_failure(codec_id, "avc444 malformed decoded frame");
                     return;
                 }
+                let luma_rects_covered =
+                    luma_rects_covered_by_frame(&self.yuv_scratch.0, &stream1_rects);
                 let decode_started = std::time::Instant::now();
                 if let Err(e) = self.decode_yuv420_for_surface(surface_id, stream2.data, true) {
                     warn!(error = %e, "AVC444 chroma stream decode failed; applying luma only");
@@ -1231,6 +1233,17 @@ impl GraphicsPipelineClient {
                     chroma_skipped = Some("avc444 malformed decoded frame".to_owned());
                 }
                 decode_us += decode_started.elapsed().as_micros();
+
+                if !luma_rects_covered {
+                    warn!(
+                        main_w = self.yuv_scratch.0.width,
+                        main_h = self.yuv_scratch.0.height,
+                        "AVC444 luma frame does not cover its region rects; skipping this frame"
+                    );
+                    self.handler
+                        .on_decode_failure(codec_id, "avc444 luma frame smaller than region");
+                    return;
+                }
 
                 let main = &self.yuv_scratch.0;
                 let aux = &self.yuv_scratch.1;
@@ -1283,6 +1296,16 @@ impl GraphicsPipelineClient {
                 if !self.yuv_scratch.0.is_well_formed() {
                     self.handler
                         .on_decode_failure(codec_id, "avc444 malformed decoded frame");
+                    return;
+                }
+                if !luma_rects_covered_by_frame(&self.yuv_scratch.0, &stream1_rects) {
+                    warn!(
+                        main_w = self.yuv_scratch.0.width,
+                        main_h = self.yuv_scratch.0.height,
+                        "AVC444 luma frame does not cover its region rects; skipping this frame"
+                    );
+                    self.handler
+                        .on_decode_failure(codec_id, "avc444 luma frame smaller than region");
                     return;
                 }
                 let main = &self.yuv_scratch.0;
@@ -1548,6 +1571,17 @@ fn valid_avc_rects(
         }
     }
     (out, dropped)
+}
+
+/// Whether every absolute luma region rect is covered by the decoded main frame.
+///
+/// A decoded frame may be smaller than its surface when the update is a valid ROI,
+/// so this deliberately checks each advertised rect rather than requiring full-surface
+/// dimensions. `right` and `bottom` are exclusive and already passed wire validation.
+fn luma_rects_covered_by_frame(frame: &Yuv420Frame, rects: &[ExclusiveRectangle]) -> bool {
+    rects.iter().all(|rect| {
+        usize::from(rect.right) <= frame.width && usize::from(rect.bottom) <= frame.height
+    })
 }
 
 /// Convert uncompressed 32bpp little-endian pixels to RGBA8888
@@ -2248,6 +2282,96 @@ mod tests {
             "outside the rect the full-resolution chroma persists"
         );
         assert!(!rx.try_iter().any(|e| matches!(e, Event::Failure(_))));
+    }
+
+    #[test]
+    fn avc444_lc1_skips_rects_not_covered_by_decoded_luma_frame() {
+        // The surface is 64x48, but the decoded main frame is only 32x24. The
+        // full wire rect is therefore not safe to repaint from the persistent buffer.
+        let (mut client, rx) = avc444_client(32, 24);
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
+
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 luma frame smaller than region")
+            ),
+            "the uncovered luma rect must be counted: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Update { .. })),
+            "an uncovered luma rect must not repaint persistent pixels: {events:?}"
+        );
+        assert!(
+            !client.avc444_buffers.contains_key(&1),
+            "a rejected luma update must not create or mutate a persistent buffer"
+        );
+    }
+
+    #[test]
+    fn avc444_lc0_skips_rects_not_covered_by_decoded_luma_frame() {
+        // LC=0 shares the same main/luma pass. Both decoded stub frames are
+        // undersized here, but the oversized luma rect must still skip the update.
+        let (mut client, rx) = avc444_client(32, 24);
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
+            stream2: Some(avc420_sub_stream(
+                vec![wire_rect(0, 0, 64, 48)],
+                &[20, 0, 0],
+            )),
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
+
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 luma frame smaller than region")
+            ),
+            "the uncovered luma rect must be counted: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Update { .. })),
+            "an uncovered luma rect must not repaint persistent pixels: {events:?}"
+        );
+        assert!(
+            !client.avc444_buffers.contains_key(&1),
+            "a rejected luma update must not create or mutate a persistent buffer"
+        );
+    }
+
+    #[test]
+    fn avc444_lc1_accepts_a_smaller_frame_for_a_covered_roi() {
+        // A smaller decoded frame is valid when the absolute wire rect fits it;
+        // do not turn the per-rect guard into an unnecessary full-surface check.
+        let (mut client, rx) = avc444_client(32, 24);
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 32, 24)], &[10, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &stream);
+
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::Update {
+                    rect: (0, 0, 32, 24),
+                    data_len
+                }] if *data_len == 32 * 24 * 4
+            ),
+            "a covered ROI should still paint: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Failure(_))),
+            "a covered ROI must not be counted as a geometry failure: {events:?}"
+        );
     }
 
     #[test]
