@@ -289,17 +289,18 @@ fn pump(
         wake_rx.drain();
 
         // --- outbound: input --------------------------------------------------
-        match drain_input(input, &mut established.framed) {
+        let input_batch_full = match drain_input(input, &mut established.framed) {
             Ok(Drained::Closed) => return SessionEnd::WindowClosed,
-            Ok(Drained::Sent) => {
+            Ok(Drained::Sent { batch_full }) => {
                 // Only the first unanswered input starts the clock: overwriting it with
                 // each later keystroke would measure the gap to the *last* one and make a
                 // slow link look fast.
                 input_sent_at.get_or_insert_with(Instant::now);
+                batch_full
             }
-            Ok(Drained::Idle) => {}
+            Ok(Drained::Idle) => false,
             Err(e) => return SessionEnd::Failed(e),
-        }
+        };
 
         // --- outbound: session commands ---------------------------------------
         // Only the newest of each kind matters: a user who toggled fullscreen twice
@@ -343,7 +344,11 @@ fn pump(
                 &mut bytes_since_flush,
                 &mut decode_spent,
             );
-            let ready = match wake::wait_readable(&established.socket, wake_rx, IDLE_WAIT) {
+            let ready = match wake::wait_readable(
+                &established.socket,
+                wake_rx,
+                readiness_wait_after_input(input_batch_full),
+            ) {
                 Ok(ready) => ready,
                 Err(e) => return SessionEnd::Failed(ConnectError::Io(e)),
             };
@@ -989,7 +994,7 @@ enum Drained {
     /// Nothing was waiting.
     Idle,
     /// Input went out on the wire.
-    Sent,
+    Sent { batch_full: bool },
     /// The window dropped its sender.
     Closed,
 }
@@ -1011,11 +1016,20 @@ fn drain_input<S: std::io::Read + std::io::Write>(
         return Ok(Drained::Idle);
     }
 
+    let batch_full = batch.len() == FASTPATH_INPUT_BATCH_MAX;
     // Batched into one PDU: a burst of mouse moves should not become a burst of writes.
     let encoded = encode_fastpath_input(batch)
         .map_err(|e| ConnectError::Protocol(format!("encode input: {e}")))?;
     framed.write_all(&encoded).map_err(ConnectError::Io)?;
-    Ok(Drained::Sent)
+    Ok(Drained::Sent { batch_full })
+}
+
+fn readiness_wait_after_input(batch_full: bool) -> Duration {
+    if batch_full {
+        Duration::ZERO
+    } else {
+        IDLE_WAIT
+    }
 }
 
 #[cfg(test)]
@@ -1265,7 +1279,7 @@ mod tests {
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
             drain_input(&rx, &mut framed).unwrap(),
-            Drained::Sent,
+            Drained::Sent { batch_full: false },
             "sending is what starts the latency clock"
         );
         let written = framed.into_inner_no_leftover().0;
@@ -1288,7 +1302,16 @@ mod tests {
         }
 
         let mut framed = Framed::new(Sink(Vec::new()));
-        assert_eq!(drain_input(&rx, &mut framed).unwrap(), Drained::Sent);
+        let drained = drain_input(&rx, &mut framed).unwrap();
+        assert_eq!(drained, Drained::Sent { batch_full: true });
+        let Drained::Sent { batch_full } = drained else {
+            unreachable!("asserted sent above")
+        };
+        assert_eq!(
+            readiness_wait_after_input(batch_full),
+            Duration::ZERO,
+            "a full batch may have consumed the only wake for its queued tail"
+        );
         assert!(
             rx.try_recv().is_ok(),
             "one event must remain queued so inbound processing gets a turn"
