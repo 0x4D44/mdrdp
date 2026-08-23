@@ -42,7 +42,7 @@ use winit::window::{CustomCursor, Fullscreen, Window, WindowAttributes, WindowId
 use crate::input::{self, InputEvent, PointerMap};
 use crate::session::SessionCommand;
 use crate::stats::{SessionStats, StatsHandle};
-use crate::surface::{PresentationSnapshot, SurfaceStore};
+use crate::surface::{PresentationCopy, PresentationSnapshot, SurfaceStore};
 use crate::ui::font;
 use crate::window_policy::{Geometry, ResizeVerdict, WindowPolicy};
 
@@ -344,7 +344,7 @@ fn copy_presentation_when_due(
     last_presented: Option<Instant>,
     now: Instant,
     fallback_dimensions: (u16, u16),
-) -> Result<bool, Instant> {
+) -> Result<PresentationCopy, Instant> {
     let generation = store.generation();
     let (width, height) = store
         .presentation_surface()
@@ -356,7 +356,7 @@ fn copy_presentation_when_due(
     {
         return Err(deadline);
     }
-    Ok(!store.copy_presentation(snapshot))
+    Ok(store.copy_presentation_state(snapshot))
 }
 
 /// The one pending `Damaged` notification shared by the producer and event-loop threads.
@@ -1975,7 +1975,16 @@ impl SessionApp {
             )
         };
         let blank = match copy_result {
-            Ok(blank) => blank,
+            Ok(PresentationCopy::Copied) => false,
+            Ok(PresentationCopy::Empty) => true,
+            // An active or aborted logical frame leaves the existing snapshot intact.
+            // If this is the first ever expose there is no snapshot to retain, so the
+            // normal empty-window path still paints black until the first commit.
+            Ok(PresentationCopy::Retained) => {
+                self.presentation.width == 0
+                    || self.presentation.height == 0
+                    || self.presentation.pixels.is_empty()
+            }
             Err(deadline) => {
                 self.redraw_deadline = Some(deadline);
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
@@ -2760,6 +2769,41 @@ mod tests {
             (7, 9, 11)
         );
         assert_eq!(snapshot.pixels, vec![0xA5; 3]);
+    }
+
+    #[test]
+    fn an_expose_during_a_frame_retains_the_last_snapshot() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store
+            .solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED)
+            .expect("paint surface");
+        store.map_to_output(1);
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let generation = store.generation();
+
+        store.begin_frame(17);
+        store
+            .solid_fill(1, &[Rect::new(0, 0, 1, 1)], BLUE)
+            .expect("paint frame payload");
+        assert_eq!(store.generation(), generation);
+
+        let result = copy_presentation_when_due(
+            &store,
+            &mut snapshot,
+            Some(generation),
+            None,
+            Instant::now(),
+            (2, 1),
+        );
+        assert_eq!(result, Ok(PresentationCopy::Retained));
+        assert_eq!(snapshot.pixels, [RED, RED].concat());
+        assert_eq!(snapshot.generation, generation);
     }
 
     #[test]

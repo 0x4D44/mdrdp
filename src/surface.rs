@@ -514,14 +514,47 @@ pub struct SurfaceStore {
     /// This is presentation state only. The replacement surface remains zero-initialized,
     /// so no stale pixels can leak into protocol operations or codec reference state.
     presentation_fallback: Option<Surface>,
+    /// Keep the window's already-copied snapshot when a frame commits without a presentable
+    /// output. The snapshot lives outside the store; this bit is the only transaction state
+    /// needed to retain it without cloning another full surface.
+    presentation_suppressed: bool,
     /// Bumped when the visible output changes, so a presenter can tell "changed" from
     /// "unchanged" without comparing buffers. Offscreen and cache state do not belong in
     /// this token: they must not wake or account a presentation.
+    ///
+    /// Logical-frame boundary for EGFX presentation. Pixels may be mutated in place while
+    /// a frame is active, but the presenter must keep its last committed snapshot until the
+    /// matching EndFrame. An aborted frame is terminal for presentation because there is no
+    /// rollback or second full-surface clone here.
+    frame_state: FrameState,
+    /// Whether the active frame, or a dirty frame that was aborted, touched presentation
+    /// state. Offscreen/cache-only work must not manufacture a redraw at EndFrame.
+    frame_visible_dirty: bool,
     generation: u64,
     /// Cache effectiveness, counted where the cache is actually used. Counting it here
     /// rather than in the EGFX handler means it measures what reached the pixels, not
     /// what the protocol asked for.
     cache_stats: CacheStats,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum FrameState {
+    #[default]
+    Idle,
+    Active(u32),
+    Aborted,
+}
+
+/// Result of asking the store to refresh a reusable presentation snapshot.
+///
+/// `Retained` is distinct from `Empty`: a frame transaction is in progress (or was
+/// aborted), so the caller must keep presenting its existing snapshot rather than turn
+/// the window black because the in-place surface is not yet publishable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresentationCopy {
+    Copied,
+    Retained,
+    Empty,
 }
 
 /// A complete, immutable presentation copy of the surface currently mapped to output.
@@ -558,11 +591,61 @@ impl SurfaceStore {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    fn mark_frame_visible_dirty(&mut self) {
+        if !matches!(self.frame_state, FrameState::Idle) {
+            self.frame_visible_dirty = true;
+        }
+    }
+
+    pub(crate) fn begin_frame(&mut self, frame_id: u32) {
+        if matches!(self.frame_state, FrameState::Aborted) {
+            // An aborted frame has already mutated the live surfaces without a rollback.
+            // Keep presentation suppressed rather than letting a later partial frame
+            // publish a mixture of pre- and post-abort pixels.
+            return;
+        }
+        if matches!(self.frame_state, FrameState::Idle) {
+            self.frame_visible_dirty = false;
+        }
+        self.frame_state = FrameState::Active(frame_id);
+    }
+
+    pub(crate) fn commit_frame(&mut self, frame_id: u32) -> bool {
+        if self.frame_state != FrameState::Active(frame_id) {
+            return false;
+        }
+        let frame_visible_dirty = self.frame_visible_dirty;
+        let had_fallback = self.presentation_fallback.is_some();
+        let had_suppressed_presentation = self.presentation_suppressed;
+        let output_complete = self.output_surface().is_some_and(Surface::is_complete);
+        self.frame_state = FrameState::Idle;
+        self.frame_visible_dirty = false;
+        if output_complete {
+            self.presentation_fallback = None;
+            self.presentation_suppressed = false;
+            if had_fallback || had_suppressed_presentation || frame_visible_dirty {
+                self.touch_presentation();
+            }
+        } else if had_suppressed_presentation || (!had_fallback && frame_visible_dirty) {
+            self.presentation_suppressed = true;
+        }
+        true
+    }
+
+    pub(crate) fn abort_frame(&mut self) {
+        if matches!(self.frame_state, FrameState::Active(_)) {
+            self.frame_state = FrameState::Aborted;
+        }
+    }
+
     fn retain_painted_output(&mut self) {
         // A partial replacement may already be mapped while the old output is retained.
         // Never replace that known-good fallback with the partial replacement during a
         // second handoff.
-        if self.presentation_fallback.is_some() {
+        if self.presentation_fallback.is_some()
+            || self.presentation_suppressed
+            || !matches!(self.frame_state, FrameState::Idle)
+        {
             return;
         }
         if let Some(surface) = self.output_surface().filter(|surface| surface.is_painted()) {
@@ -571,6 +654,14 @@ impl SurfaceStore {
     }
 
     fn finish_surface_mutation(&mut self, id: u16) {
+        if !matches!(self.frame_state, FrameState::Idle) {
+            let is_current_output = self.output == Some(id);
+            let is_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
+            if is_current_output && (self.presentation_fallback.is_none() || is_complete) {
+                self.frame_visible_dirty = true;
+            }
+            return;
+        }
         let is_current_output = self.output == Some(id);
         if !is_current_output {
             return;
@@ -578,10 +669,18 @@ impl SurfaceStore {
         let is_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
         if is_complete {
             self.presentation_fallback = None;
+            if self.presentation_suppressed {
+                self.presentation_suppressed = false;
+                self.touch_presentation();
+                return;
+            }
         }
         if self.presentation_fallback.is_some() && !is_complete {
             // The fallback is still the visible surface, so do not wake the presenter for
             // a replacement write that cannot change what it will copy.
+            return;
+        }
+        if self.presentation_suppressed {
             return;
         }
         self.touch_presentation();
@@ -589,6 +688,7 @@ impl SurfaceStore {
 
     pub fn create(&mut self, id: u16, width: u16, height: u16) {
         if self.output == Some(id) {
+            self.mark_frame_visible_dirty();
             self.retain_painted_output();
         }
         self.surfaces.insert(id, Surface::new(width, height));
@@ -596,6 +696,7 @@ impl SurfaceStore {
 
     pub fn delete(&mut self, id: u16) {
         if self.output == Some(id) {
+            self.mark_frame_visible_dirty();
             self.retain_painted_output();
         }
         self.surfaces.remove(&id);
@@ -627,20 +728,38 @@ impl SurfaceStore {
     pub fn map_to_output(&mut self, id: u16) {
         let mapping_changed = self.output != Some(id);
         if mapping_changed {
+            self.mark_frame_visible_dirty();
             self.retain_painted_output();
         }
         self.output = Some(id);
-        if self.surfaces.get(&id).is_some_and(Surface::is_complete) {
+        let output_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
+        let released_suppressed_presentation = if matches!(self.frame_state, FrameState::Idle)
+            && output_complete
+            && self.presentation_suppressed
+        {
             self.presentation_fallback = None;
-        }
+            self.presentation_suppressed = false;
+            self.touch_presentation();
+            true
+        } else {
+            if matches!(self.frame_state, FrameState::Idle) && output_complete {
+                self.presentation_fallback = None;
+            }
+            false
+        };
         // An unpainted or partial replacement leaves the fallback on screen. It becomes
         // a presentation change only when this mapping selects painted pixels without a
         // fallback still hiding them.
         if mapping_changed
             && self.surfaces.get(&id).is_some_and(Surface::is_painted)
             && self.presentation_fallback.is_none()
+            && !released_suppressed_presentation
         {
-            self.touch_presentation();
+            if matches!(self.frame_state, FrameState::Idle) {
+                self.touch_presentation();
+            } else {
+                self.mark_frame_visible_dirty();
+            }
         }
     }
 
@@ -656,6 +775,9 @@ impl SurfaceStore {
     /// The presenter must keep the last good desktop through that handoff instead of
     /// flashing the replacement's zero-filled allocation.
     pub fn presentation_surface(&self) -> Option<&Surface> {
+        if !matches!(self.frame_state, FrameState::Idle) {
+            return self.presentation_fallback.as_ref();
+        }
         if self.presentation_fallback.is_some() {
             self.output_surface()
                 .filter(|surface| surface.is_complete())
@@ -668,21 +790,38 @@ impl SurfaceStore {
     /// Copy the current presentation surface into a reusable snapshot.
     ///
     /// The dimensions, pixels, and generation are read under the caller's store lock,
-    /// making them one coherent view. A `false` result means no painted surface exists;
-    /// the snapshot's capacity is retained for the next frame.
-    pub(crate) fn copy_presentation(&self, snapshot: &mut PresentationSnapshot) -> bool {
+    /// making them one coherent view. A `Retained` result means an active or aborted frame
+    /// still owns the store; the snapshot is intentionally left untouched.
+    pub(crate) fn copy_presentation_state(
+        &self,
+        snapshot: &mut PresentationSnapshot,
+    ) -> PresentationCopy {
+        if self.presentation_suppressed || !matches!(self.frame_state, FrameState::Idle) {
+            return PresentationCopy::Retained;
+        }
         snapshot.generation = self.generation;
         let Some(surface) = self.presentation_surface() else {
             snapshot.width = 0;
             snapshot.height = 0;
             snapshot.pixels.clear();
-            return false;
+            return PresentationCopy::Empty;
         };
         snapshot.width = surface.width;
         snapshot.height = surface.height;
         snapshot.pixels.resize(surface.pixels.len(), 0);
         snapshot.pixels.copy_from_slice(surface.pixels());
-        true
+        PresentationCopy::Copied
+    }
+
+    /// Compatibility predicate for callers that only need to know whether a painted
+    /// surface existed. Transaction-aware callers should use
+    /// [`Self::copy_presentation_state`] so `Retained` is not mistaken for `Empty`.
+    #[cfg(test)]
+    pub(crate) fn copy_presentation(&self, snapshot: &mut PresentationSnapshot) -> bool {
+        matches!(
+            self.copy_presentation_state(snapshot),
+            PresentationCopy::Copied
+        )
     }
 
     pub fn blit_rgba(
@@ -700,6 +839,9 @@ impl SurfaceStore {
         // through `Surface` directly, so cached pixels are not counted twice here.
         let written = surface.blit_rgba(dest, src, src_stride_px)?;
         self.cache_stats.bytes_from_wire += written as u64;
+        if written == 0 {
+            return Ok(());
+        }
         self.finish_surface_mutation(id);
         Ok(())
     }
@@ -827,6 +969,15 @@ impl SurfaceStore {
             .surfaces
             .get_mut(&id)
             .ok_or(SurfaceError::NoSuchSurface(id))?;
+        if rects.is_empty() {
+            return Ok(());
+        }
+        let writes_anything = rects
+            .iter()
+            .any(|rect| rect.clip_to(surface.width, surface.height).is_some());
+        if !writes_anything {
+            return Ok(());
+        }
         for rect in rects {
             surface.fill(*rect, rgba);
         }
@@ -861,12 +1012,19 @@ impl SurfaceStore {
             .surfaces
             .get_mut(&dest_id)
             .ok_or(SurfaceError::NoSuchSurface(dest_id))?;
+        if dest_points.is_empty() {
+            return Ok(());
+        }
+        let mut written = 0usize;
         for (x, y) in dest_points {
             // Saturating, not wrapping: a destination that runs off the right edge is
             // clipped by blit_rgba. `x + w` on u16 panics in debug and wraps in release,
             // and a panic here poisons the store mutex and takes the session with it.
             let rect = Rect::new(*x, *y, x.saturating_add(w), y.saturating_add(h));
-            dest.blit_rgba(rect, &pixels, w)?;
+            written = written.saturating_add(dest.blit_rgba(rect, &pixels, w)?);
+        }
+        if written == 0 {
+            return Ok(());
         }
         self.finish_surface_mutation(dest_id);
         Ok(())
@@ -925,6 +1083,9 @@ impl SurfaceStore {
             .surfaces
             .get_mut(&dest_id)
             .ok_or(SurfaceError::NoSuchSurface(dest_id))?;
+        if dest_points.is_empty() {
+            return Ok(());
+        }
         let mut served = 0usize;
         for (x, y) in dest_points {
             let rect = Rect::new(
@@ -939,6 +1100,9 @@ impl SurfaceStore {
         // cached tile in twelve places saved twelve regions' worth of wire traffic.
         self.cache_stats.hits += dest_points.len() as u64;
         self.cache_stats.bytes_served += served as u64;
+        if served == 0 {
+            return Ok(());
+        }
         self.finish_surface_mutation(dest_id);
         Ok(())
     }
@@ -1414,7 +1578,10 @@ mod tests {
         let expected_generation = store.generation();
 
         let mut snapshot = PresentationSnapshot::default();
-        assert!(store.copy_presentation(&mut snapshot));
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
         assert_eq!(snapshot.width, 2);
         assert_eq!(snapshot.height, 1);
         assert_eq!(snapshot.pixels, solid(2, 1, RED));
@@ -1430,9 +1597,252 @@ mod tests {
             "the old snapshot is immutable"
         );
 
-        assert!(store.copy_presentation(&mut snapshot));
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
         assert_eq!(snapshot.pixels, [RED, BLUE].concat());
         assert_eq!(snapshot.generation, store.generation());
+    }
+
+    #[test]
+    fn a_logical_frame_publishes_split_writes_once_at_commit() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let before = store.generation();
+
+        store.begin_frame(7);
+        store
+            .blit_rgba_strict(1, Rect::new(0, 0, 1, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        assert_eq!(store.generation(), before);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+
+        store
+            .blit_rgba_strict(1, Rect::new(1, 0, 2, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        assert_eq!(store.generation(), before);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert!(store.commit_frame(7));
+        assert_eq!(store.generation(), before + 1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, BLUE));
+    }
+
+    #[test]
+    fn an_offscreen_frame_does_not_bump_generation_at_commit() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        store.create(2, 2, 1);
+        let before = store.generation();
+
+        store.begin_frame(11);
+        store
+            .blit_rgba_strict(2, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE))
+            .unwrap();
+        assert_eq!(store.generation(), before);
+        assert!(store.commit_frame(11));
+        assert_eq!(store.generation(), before);
+    }
+
+    #[test]
+    fn an_aborted_frame_blocks_a_later_partial_commit() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let before = store.generation();
+
+        store.begin_frame(8);
+        store
+            .blit_rgba_strict(1, Rect::new(0, 0, 1, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        store.abort_frame();
+        assert_eq!(store.generation(), before);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+
+        store.begin_frame(9);
+        store
+            .blit_rgba_strict(1, Rect::new(1, 0, 2, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        assert!(!store.commit_frame(9));
+        assert_eq!(store.generation(), before);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+    }
+
+    #[test]
+    fn same_id_replacement_during_a_frame_retains_the_snapshot_until_complete() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let before = store.generation();
+
+        store.begin_frame(12);
+        store.delete(1);
+        store.create(1, 2, 1);
+        store.map_to_output(1);
+        store
+            .blit_rgba_strict(1, Rect::new(0, 0, 1, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        assert!(store.commit_frame(12));
+        assert_eq!(store.generation(), before);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+
+        store.create(2, 2, 1);
+        store.map_to_output(2);
+        assert!(
+            store.presentation_fallback.is_none(),
+            "a suppressed partial output must not become a fallback on remap"
+        );
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+
+        store.begin_frame(13);
+        store.map_to_output(1);
+        store
+            .blit_rgba_strict(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE))
+            .unwrap();
+        assert!(store.commit_frame(13));
+        assert_eq!(store.generation(), before + 1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, BLUE));
+    }
+
+    #[test]
+    fn empty_store_mutations_do_not_advance_presentation_generation() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        assert_eq!(
+            store.surface_to_cache(1, Rect::new(0, 0, 2, 1), 7),
+            Ok(Some((2, 1)))
+        );
+        let before = store.generation();
+
+        store.solid_fill(1, &[], BLUE).unwrap();
+        store
+            .surface_to_surface(1, Rect::new(0, 0, 1, 1), 1, &[])
+            .unwrap();
+        store.cache_to_surface(7, 1, &[]).unwrap();
+
+        assert_eq!(
+            store.solid_fill(99, &[], BLUE),
+            Err(SurfaceError::NoSuchSurface(99))
+        );
+        assert_eq!(
+            store.surface_to_surface(99, Rect::new(0, 0, 1, 1), 1, &[]),
+            Err(SurfaceError::NoSuchSurface(99))
+        );
+        assert_eq!(
+            store.cache_to_surface(99, 1, &[]),
+            Err(SurfaceError::NoSuchCacheSlot(99))
+        );
+
+        assert_eq!(store.generation(), before);
+    }
+
+    #[test]
+    fn a_replacement_fallback_retires_only_at_frame_commit() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        store.create(2, 2, 1);
+        store.map_to_output(2);
+        assert!(store.presentation_fallback.is_some());
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let before = store.generation();
+
+        store.begin_frame(9);
+        store.create(2, 2, 1);
+        assert!(store.commit_frame(9));
+        assert_eq!(store.generation(), before);
+        assert!(store.presentation_fallback.is_some());
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+
+        store.begin_frame(10);
+        store
+            .blit_rgba_strict(2, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE))
+            .unwrap();
+        assert!(
+            store.presentation_fallback.is_some(),
+            "coverage completion must not retire a fallback mid-frame"
+        );
+        assert_eq!(store.generation(), before);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+
+        assert!(store.commit_frame(10));
+        assert!(store.presentation_fallback.is_none());
+        assert_eq!(store.generation(), before + 1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, BLUE));
     }
 
     #[test]

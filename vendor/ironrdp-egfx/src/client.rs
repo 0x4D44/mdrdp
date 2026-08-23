@@ -266,6 +266,13 @@ pub trait GraphicsPipelineHandler: Send {
     /// Called when the server resets the graphics output buffer
     fn on_reset_graphics(&mut self, _width: u32, _height: u32) {}
 
+    /// Called when a logical frame starts.
+    ///
+    /// All subsequent surface mutations belong to this frame until the matching
+    /// [`Self::on_frame_complete`] callback. The default is a no-op so existing
+    /// handlers retain their unframed, immediate-update behavior.
+    fn on_frame_start(&mut self, _frame_id: u32) {}
+
     /// Called when a surface is created by the server
     fn on_surface_created(&mut self, _surface: &Surface) {}
 
@@ -306,6 +313,13 @@ pub trait GraphicsPipelineHandler: Send {
     /// All bitmap updates between the corresponding `StartFrame`
     /// and this notification belong to the same logical frame.
     fn on_frame_complete(&mut self, _frame_id: u32) {}
+
+    /// Called when a logical frame cannot reach its matching `EndFrame`.
+    ///
+    /// The default is a no-op for handlers that do not need transactional
+    /// presentation. A handler that mutates pixels in place can suppress those
+    /// pixels until a later valid frame commits.
+    fn on_frame_aborted(&mut self, _frame_id: u32) {}
 
     /// Called when the EGFX channel is closed
     fn on_close(&mut self) {}
@@ -644,8 +658,8 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::ResetGraphics(reset) => {
-                self.handle_reset_graphics(reset.width, reset.height);
-                Ok(vec![])
+                self.handle_reset_graphics(reset.width, reset.height)
+                    .map(|()| vec![])
             }
             GfxPdu::CreateSurface(create) => {
                 self.handle_create_surface(
@@ -665,8 +679,13 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::StartFrame(start) => {
+                if self.current_frame_id.is_some() {
+                    self.abort_current_frame();
+                    return Err(pdu_other_err!("nested StartFrame"));
+                }
                 self.current_frame_id = Some(start.frame_id);
                 self.frames_queued = self.frames_queued.saturating_add(1);
+                self.handler.on_frame_start(start.frame_id);
                 trace!(frame_id = start.frame_id, "StartFrame");
                 Ok(vec![])
             }
@@ -804,7 +823,14 @@ impl GraphicsPipelineClient {
         self.handler.on_capabilities_confirmed(cap);
     }
 
-    fn handle_reset_graphics(&mut self, width: u32, height: u32) {
+    fn handle_reset_graphics(&mut self, width: u32, height: u32) -> PduResult<()> {
+        if self.current_frame_id.is_some() {
+            // ResetGraphics is a stream boundary between frames. Rejecting it while a
+            // frame is open avoids claiming that in-place pixels from before the reset
+            // belong to the next frame; the protocol error closes this transaction.
+            self.abort_current_frame();
+            return Err(pdu_other_err!("ResetGraphics inside frame"));
+        }
         // mdrdp patch: MS-RDPEGFX 3.3.5.14 resizes only the Graphics Output Buffer.
         // Surfaces and bitmap-cache entries have explicit delete/evict PDUs and survive
         // ResetGraphics; clearing this table makes later Map/DeleteSurface PDUs vanish.
@@ -814,7 +840,6 @@ impl GraphicsPipelineClient {
         // Capability state (negotiated_caps, codec_caps) is NOT reset here:
         // per spec, capabilities are negotiated via CapabilitiesConfirm before
         // ResetGraphics, and a ResetGraphics does not re-negotiate capabilities.
-        self.current_frame_id = None;
         self.frames_queued = 0;
 
         // mdrdp patch: the H.264 decoder is deliberately NOT reset here.
@@ -843,6 +868,7 @@ impl GraphicsPipelineClient {
 
         debug!(width, height, "Graphics reset");
         self.handler.on_reset_graphics(width, height);
+        Ok(())
     }
 
     fn handle_create_surface(
@@ -1425,6 +1451,10 @@ impl GraphicsPipelineClient {
         reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion"
     )]
     fn handle_end_frame(&mut self, frame_id: u32) -> PduResult<Vec<DvcMessage>> {
+        if self.current_frame_id != Some(frame_id) {
+            self.abort_current_frame();
+            return Err(pdu_other_err!("mismatched EndFrame"));
+        }
         self.total_frames_decoded = self.total_frames_decoded.wrapping_add(1);
         self.current_frame_id = None;
         self.frames_queued = self.frames_queued.saturating_sub(1);
@@ -1440,6 +1470,16 @@ impl GraphicsPipelineClient {
 
         trace!(frame_id, "Sending FrameAcknowledge");
         Ok(vec![Box::new(ack) as DvcMessage])
+    }
+
+    /// Abort the one frame that may be open. The client rejects malformed nesting and
+    /// mismatches, but the handler still needs an explicit boundary so an in-place
+    /// mutation cannot become visible after the protocol stream is abandoned.
+    fn abort_current_frame(&mut self) {
+        if let Some(frame_id) = self.current_frame_id.take() {
+            self.frames_queued = self.frames_queued.saturating_sub(1);
+            self.handler.on_frame_aborted(frame_id);
+        }
     }
 }
 
@@ -1467,6 +1507,7 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn close(&mut self, _channel_id: u32) {
+        self.abort_current_frame();
         self.state = ClientState::Closed;
         self.handler.on_close();
     }
@@ -1714,6 +1755,84 @@ mod tests {
     }
 
     #[test]
+    fn nested_start_frame_is_rejected_and_aborts_the_open_frame() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        let start = |frame_id| {
+            GfxPdu::StartFrame(crate::pdu::StartFramePdu {
+                timestamp: crate::pdu::Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id,
+            })
+        };
+
+        assert!(client.handle_pdu(start(1)).is_ok());
+        assert_eq!(client.current_frame_id, Some(1));
+        assert!(client.handle_pdu(start(2)).is_err());
+        assert_eq!(client.current_frame_id, None);
+        assert_eq!(client.frames_queued, 0);
+    }
+
+    #[test]
+    fn mismatched_end_frame_is_rejected_and_aborts_the_open_frame() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        let _ = client.handle_pdu(GfxPdu::StartFrame(crate::pdu::StartFramePdu {
+            timestamp: crate::pdu::Timestamp {
+                milliseconds: 0,
+                seconds: 0,
+                minutes: 0,
+                hours: 0,
+            },
+            frame_id: 7,
+        }));
+
+        assert!(client
+            .handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 8 }))
+            .is_err());
+        assert_eq!(client.current_frame_id, None);
+        assert_eq!(client.frames_queued, 0);
+        assert!(client
+            .handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 7 }))
+            .is_err());
+    }
+
+    #[test]
+    fn reset_and_close_abort_open_frames() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        let start = |frame_id| {
+            GfxPdu::StartFrame(crate::pdu::StartFramePdu {
+                timestamp: crate::pdu::Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id,
+            })
+        };
+
+        let _ = client.handle_pdu(start(3));
+        assert!(client
+            .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: 1920,
+                height: 1080,
+                monitors: vec![],
+            }))
+            .is_err());
+        assert_eq!(client.current_frame_id, None);
+        assert_eq!(client.frames_queued, 0);
+
+        let _ = client.handle_pdu(start(4));
+        client.close(0);
+        assert_eq!(client.current_frame_id, None);
+        assert_eq!(client.frames_queued, 0);
+        assert!(!client.is_active());
+    }
+
+    #[test]
     fn reset_graphics_preserves_surfaces_and_resets_frame_tracking() {
         // MS-RDPEGFX 3.3.5.14 resizes only the Graphics Output Buffer: surfaces have
         // their own delete PDU and survive a reset (the mdrdp patch in
@@ -1742,11 +1861,13 @@ mod tests {
         assert!(client.current_frame_id.is_some());
         assert_eq!(client.frames_queued, 1);
 
-        let _ = client.handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
-            width: 1920,
-            height: 1080,
-            monitors: vec![],
-        }));
+        assert!(client
+            .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: 1920,
+                height: 1080,
+                monitors: vec![],
+            }))
+            .is_err());
 
         assert_eq!(client.surfaces.len(), 1, "surfaces survive ResetGraphics");
         assert!(
@@ -1754,6 +1875,14 @@ mod tests {
             "frame_id should be reset"
         );
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
+
+        assert!(client
+            .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: 1920,
+                height: 1080,
+                monitors: vec![],
+            }))
+            .is_ok());
     }
 
     #[test]

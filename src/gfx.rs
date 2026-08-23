@@ -690,8 +690,21 @@ impl GraphicsPipelineHandler for GfxHandler {
         // ClearCodec reset does not break these hits in practice and ours measurably
         // does. Codec state dies with the SURFACE (see on_surface_deleted), never with
         // the reset.
+        self.with_store(SurfaceStore::abort_frame);
         self.stats
             .note(|s| s.reset_graphics = Some((width, height)));
+    }
+
+    fn on_frame_start(&mut self, frame_id: u32) {
+        self.with_store(|store| store.begin_frame(frame_id));
+    }
+
+    fn on_frame_aborted(&mut self, _frame_id: u32) {
+        self.with_store(SurfaceStore::abort_frame);
+    }
+
+    fn on_close(&mut self) {
+        self.with_store(SurfaceStore::abort_frame);
     }
 
     fn on_surface_created(&mut self, surface: &EgfxSurface) {
@@ -820,7 +833,10 @@ impl GraphicsPipelineHandler for GfxHandler {
         self.absorb(result);
     }
 
-    fn on_frame_complete(&mut self, _frame_id: u32) {
+    fn on_frame_complete(&mut self, frame_id: u32) {
+        self.with_store(|store| {
+            let _ = store.commit_frame(frame_id);
+        });
         self.stats
             .note(|s| s.frames_completed = s.frames_completed.saturating_add(1));
     }
@@ -1823,6 +1839,57 @@ mod tests {
             generation_before,
             "counting must not mutate the store"
         );
+    }
+
+    #[test]
+    fn split_bitmap_payloads_stay_hidden_until_end_frame() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 2, 1));
+        handler.on_surface_mapped(1, 0, 0);
+        handler.on_solid_fill(&SolidFillPdu {
+            surface_id: 1,
+            fill_pixel: Color {
+                b: 0,
+                g: 0,
+                r: 255,
+                xa: 0,
+            },
+            rectangles: vec![rect(0, 0, 2, 1)],
+        });
+
+        let mut snapshot = crate::surface::PresentationSnapshot::default();
+        assert_eq!(
+            store.lock().unwrap().copy_presentation_state(&mut snapshot),
+            crate::surface::PresentationCopy::Copied
+        );
+        let before = store.lock().unwrap().generation();
+        handler.on_frame_start(21);
+
+        for (left, color) in [(0, [0, 0, 255, 255]), (1, [0, 255, 0, 255])] {
+            handler.on_bitmap_updated(&BitmapUpdate::new(
+                1,
+                rect(left, 0, left + 1, 1),
+                Codec1Type::Uncompressed,
+                color.to_vec(),
+                1,
+                1,
+            ));
+        }
+        assert_eq!(store.lock().unwrap().generation(), before);
+        assert_eq!(
+            store.lock().unwrap().copy_presentation_state(&mut snapshot),
+            crate::surface::PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.pixels, vec![255, 0, 0, 255, 255, 0, 0, 255]);
+
+        handler.on_frame_complete(21);
+        assert_eq!(store.lock().unwrap().generation(), before + 1);
+        assert_eq!(
+            store.lock().unwrap().copy_presentation_state(&mut snapshot),
+            crate::surface::PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, vec![0, 0, 255, 255, 0, 255, 0, 255]);
     }
 
     /// EVERY mapping PDU must end with a surface on screen.
