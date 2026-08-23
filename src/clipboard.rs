@@ -699,33 +699,39 @@ impl ClipboardBridge {
     ) {
         // A dropped response is what wedges the remote's paste: every branch below submits
         // something, even on failure.
-        let response = match self.os.get_content() {
-            Ok(ClipboardContent::Text(text)) if format == ClipboardFormatId::CF_UNICODETEXT => {
-                OwnedFormatDataResponse::new_unicode_string(&text)
-            }
-            Ok(ClipboardContent::Text(text)) if format == ClipboardFormatId::CF_TEXT => {
-                OwnedFormatDataResponse::new_string(&text)
-            }
-            Ok(ClipboardContent::Image {
-                width,
-                height,
-                rgba,
-            }) if format == ClipboardFormatId::CF_DIB || format == ClipboardFormatId::CF_DIBV5 => {
-                match encode_dib(width, height, &rgba, self.max_image_bytes) {
-                    Ok(data) => OwnedFormatDataResponse::new_data(data),
-                    Err(error) => {
-                        warn!(%error, "failed to encode local clipboard image; sending error response");
-                        OwnedFormatDataResponse::new_error()
+        let response = if !self.allow_to_remote {
+            OwnedFormatDataResponse::new_error()
+        } else {
+            match self.os.get_content() {
+                Ok(ClipboardContent::Text(text)) if format == ClipboardFormatId::CF_UNICODETEXT => {
+                    OwnedFormatDataResponse::new_unicode_string(&text)
+                }
+                Ok(ClipboardContent::Text(text)) if format == ClipboardFormatId::CF_TEXT => {
+                    OwnedFormatDataResponse::new_string(&text)
+                }
+                Ok(ClipboardContent::Image {
+                    width,
+                    height,
+                    rgba,
+                }) if format == ClipboardFormatId::CF_DIB
+                    || format == ClipboardFormatId::CF_DIBV5 =>
+                {
+                    match encode_dib(width, height, &rgba, self.max_image_bytes) {
+                        Ok(data) => OwnedFormatDataResponse::new_data(data),
+                        Err(error) => {
+                            warn!(%error, "failed to encode local clipboard image; sending error response");
+                            OwnedFormatDataResponse::new_error()
+                        }
                     }
                 }
-            }
-            Ok(_) => {
-                debug!(?format, "remote requested an unsupported clipboard format");
-                OwnedFormatDataResponse::new_error()
-            }
-            Err(error) => {
-                warn!(%error, "failed to read OS clipboard for remote's paste request; sending error response");
-                OwnedFormatDataResponse::new_error()
+                Ok(_) => {
+                    debug!(?format, "remote requested an unsupported clipboard format");
+                    OwnedFormatDataResponse::new_error()
+                }
+                Err(error) => {
+                    warn!(%error, "failed to read OS clipboard for remote's paste request; sending error response");
+                    OwnedFormatDataResponse::new_error()
+                }
             }
         };
 
@@ -1759,6 +1765,44 @@ mod tests {
             bridge.local_pending.is_empty(),
             "the local change must not even be queued"
         );
+    }
+
+    #[test]
+    fn to_remote_off_rejects_a_data_request_without_reading_the_clipboard() {
+        let (state, os) = fake_clipboard();
+        let (backend, bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut bridge = bridge.with_policy(ClipboardPolicy {
+            to_remote: false,
+            ..ClipboardPolicy::default()
+        });
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        let reads_before = state.lock().unwrap().get_text_calls;
+
+        backend_mut(&mut cliprdr).on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        let messages = bridge.pump(&mut cliprdr);
+        assert_eq!(
+            messages.len(),
+            1,
+            "a rejected request must still be answered"
+        );
+        assert_eq!(
+            state.lock().unwrap().get_text_calls,
+            reads_before,
+            "a disabled to-remote request must not read the OS clipboard"
+        );
+
+        match only_pdu(messages) {
+            ClipboardPdu::FormatDataResponse(response) => {
+                assert!(
+                    response.is_error(),
+                    "a disabled request must return an error"
+                );
+            }
+            other => panic!("unexpected pdu: {other:?}"),
+        }
     }
 
     #[test]
