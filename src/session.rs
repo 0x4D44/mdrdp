@@ -15,7 +15,7 @@ use crate::clipboard::ClipboardBridge;
 use crate::connect::{ConnectError, Established, describe, send_shutdown};
 use crate::disconnect::{self, ServerFarewell};
 use crate::input::{InputEvent, LatestMouseMove, encode_fastpath_input, to_fastpath};
-use crate::stats::StatsHandle;
+use crate::stats::{CacheStats, StatsHandle};
 use crate::surface::SurfaceStore;
 use crate::wake::{self, Doorbell, DoorbellReceiver};
 use crate::window::{CursorUpdate, Waker};
@@ -219,7 +219,10 @@ fn run(
         desktop.height,
     );
 
-    let mut last_generation = store.lock().map(|s| s.generation()).unwrap_or(0);
+    let (mut last_generation, mut last_cache) = store
+        .lock()
+        .map(|s| (s.generation(), s.cache_stats()))
+        .unwrap_or((0, CacheStats::default()));
     let outcome = pump(
         &mut established,
         &store,
@@ -230,6 +233,7 @@ fn run(
         &stop,
         &mut image,
         &mut last_generation,
+        &mut last_cache,
         &mut services,
         &wake_rx,
     );
@@ -268,6 +272,7 @@ fn pump(
     stop: &Arc<AtomicBool>,
     image: &mut DecodedImage,
     last_generation: &mut u64,
+    last_cache: &mut CacheStats,
     services: &mut SessionServices,
     wake_rx: &DoorbellReceiver,
 ) -> SessionEnd {
@@ -349,6 +354,7 @@ fn pump(
                 store,
                 waker,
                 last_generation,
+                last_cache,
                 services,
                 &mut input_sent_at,
                 &mut bytes_since_flush,
@@ -381,6 +387,7 @@ fn pump(
                     store,
                     waker,
                     last_generation,
+                    last_cache,
                     services,
                     &mut input_sent_at,
                     &mut bytes_since_flush,
@@ -459,6 +466,7 @@ fn pump(
             store,
             waker,
             last_generation,
+            last_cache,
             services,
             &mut input_sent_at,
             &mut bytes_since_flush,
@@ -514,14 +522,41 @@ fn service_clipboard(
 ///
 /// The generation counter exists so the presenter never redraws an unchanged frame —
 /// redrawing on a timer would burn battery and add latency for nothing.
+#[allow(clippy::too_many_arguments)]
 fn notify_if_painted(
     store: &Arc<Mutex<SurfaceStore>>,
     waker: &Waker,
     last: &mut u64,
+    last_cache: &mut CacheStats,
     services: &SessionServices,
     input_sent_at: &mut Option<Instant>,
     bytes_since_flush: &mut u64,
     decode_spent: &mut Duration,
+) {
+    notify_if_painted_inner(
+        store,
+        last,
+        last_cache,
+        services,
+        input_sent_at,
+        bytes_since_flush,
+        decode_spent,
+        || {
+            waker.damaged();
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn notify_if_painted_inner<F: FnOnce()>(
+    store: &Arc<Mutex<SurfaceStore>>,
+    last: &mut u64,
+    last_cache: &mut CacheStats,
+    services: &SessionServices,
+    input_sent_at: &mut Option<Instant>,
+    bytes_since_flush: &mut u64,
+    decode_spent: &mut Duration,
+    damage: F,
 ) {
     let Ok(guard) = store.lock() else {
         return;
@@ -529,6 +564,7 @@ fn notify_if_painted(
     let now = guard.generation();
     let cache = guard.cache_stats();
     drop(guard);
+    refresh_cache_stats(cache, last_cache, services);
     if now == *last {
         return;
     }
@@ -568,7 +604,19 @@ fn notify_if_painted(
 
     *bytes_since_flush = 0;
     *decode_spent = Duration::ZERO;
-    waker.damaged();
+    damage();
+}
+
+/// Refresh cache diagnostics without treating cache bookkeeping as a painted frame.
+///
+/// Cache PDUs may be the only traffic in a pump turn. They must update the overlay's
+/// counters, but they must not wake the window, mark a paint, or answer input latency.
+fn refresh_cache_stats(cache: CacheStats, last_cache: &mut CacheStats, services: &SessionServices) {
+    if cache == *last_cache {
+        return;
+    }
+    *last_cache = cache;
+    services.stats.update(|s| s.cache = cache);
 }
 
 /// The largest frame a single H.264 stream can carry: level 5.2's 36 864-macroblock
@@ -1472,15 +1520,104 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_and_cache_work_refresh_stats_without_painting_or_waking() {
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut guard = store.lock().unwrap();
+            guard.create(1, 2, 2);
+            guard
+                .solid_fill(1, &[crate::surface::Rect::new(0, 0, 2, 2)], [1, 2, 3, 255])
+                .unwrap();
+            guard.map_to_output(1);
+        }
+
+        let mut last_generation = store.lock().unwrap().generation();
+        let mut last_cache = store.lock().unwrap().cache_stats();
+        let stats = StatsHandle::new();
+        let services = SessionServices {
+            stats: stats.clone(),
+            ..SessionServices::default()
+        };
+        let mut input_sent_at = Some(Instant::now());
+        let mut bytes_since_flush = 0;
+        let mut decode_spent = Duration::ZERO;
+        {
+            let mut guard = store.lock().unwrap();
+            guard.create(2, 2, 2);
+            guard
+                .solid_fill(2, &[crate::surface::Rect::new(0, 0, 2, 2)], [4, 5, 6, 255])
+                .unwrap();
+            assert_eq!(
+                guard.surface_to_cache(2, crate::surface::Rect::new(0, 0, 2, 2), 7),
+                Ok(Some((2, 2)))
+            );
+        }
+
+        let mut damaged = false;
+        notify_if_painted_inner(
+            &store,
+            &mut last_generation,
+            &mut last_cache,
+            &services,
+            &mut input_sent_at,
+            &mut bytes_since_flush,
+            &mut decode_spent,
+            || damaged = true,
+        );
+
+        assert!(!damaged, "non-presentation work must not wake the window");
+        assert_eq!(stats.snapshot().frames, 0);
+        assert_eq!(stats.snapshot().latency.count(), 0);
+        assert!(
+            input_sent_at.is_some(),
+            "unrelated work must not answer input"
+        );
+        assert_eq!(
+            stats.snapshot().cache,
+            store.lock().unwrap().cache_stats(),
+            "cache diagnostics must still refresh"
+        );
+
+        store
+            .lock()
+            .unwrap()
+            .solid_fill(1, &[crate::surface::Rect::new(0, 0, 1, 1)], [7, 8, 9, 255])
+            .unwrap();
+        notify_if_painted_inner(
+            &store,
+            &mut last_generation,
+            &mut last_cache,
+            &services,
+            &mut input_sent_at,
+            &mut bytes_since_flush,
+            &mut decode_spent,
+            || damaged = true,
+        );
+        assert!(damaged, "visible output work must wake the window");
+        assert_eq!(stats.snapshot().frames, 1);
+        assert_eq!(stats.snapshot().latency.count(), 1);
+        assert!(input_sent_at.is_none());
+    }
+
+    #[test]
     fn the_window_is_only_nudged_when_the_store_changed() {
         // Redrawing an unchanged frame wastes power and adds latency for nothing.
         let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut guard = store.lock().unwrap();
+            guard.create(1, 4, 4);
+            guard.map_to_output(1);
+        }
         let mut last = store.lock().unwrap().generation();
 
         // No waker available in a unit test, so assert on the generation bookkeeping,
         // which is the part that decides whether a nudge happens at all.
         let before = last;
-        store.lock().unwrap().create(1, 4, 4);
+        store
+            .lock()
+            .unwrap()
+            .solid_fill(1, &[crate::surface::Rect::new(0, 0, 1, 1)], [1, 2, 3, 255])
+            .unwrap();
         let after = store.lock().unwrap().generation();
         assert_ne!(after, before, "a mutation must bump the generation");
 

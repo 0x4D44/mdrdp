@@ -455,8 +455,9 @@ pub struct SurfaceStore {
     /// This is presentation state only. The replacement surface remains zero-initialized,
     /// so no stale pixels can leak into protocol operations or codec reference state.
     presentation_fallback: Option<Surface>,
-    /// Bumped on every mutation, so a presenter can tell "changed" from "unchanged"
-    /// without comparing buffers.
+    /// Bumped when the visible output changes, so a presenter can tell "changed" from
+    /// "unchanged" without comparing buffers. Offscreen and cache state do not belong in
+    /// this token: they must not wake or account a presentation.
     generation: u64,
     /// Cache effectiveness, counted where the cache is actually used. Counting it here
     /// rather than in the EGFX handler means it measures what reached the pixels, not
@@ -494,7 +495,7 @@ impl SurfaceStore {
         self.generation
     }
 
-    fn touch(&mut self) {
+    fn touch_presentation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -512,16 +513,19 @@ impl SurfaceStore {
 
     fn finish_surface_mutation(&mut self, id: u16) {
         let is_current_output = self.output == Some(id);
+        if !is_current_output {
+            return;
+        }
         let is_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
-        if is_current_output && is_complete {
+        if is_complete {
             self.presentation_fallback = None;
         }
-        if is_current_output && self.presentation_fallback.is_some() && !is_complete {
+        if self.presentation_fallback.is_some() && !is_complete {
             // The fallback is still the visible surface, so do not wake the presenter for
             // a replacement write that cannot change what it will copy.
             return;
         }
-        self.touch();
+        self.touch_presentation();
     }
 
     pub fn create(&mut self, id: u16, width: u16, height: u16) {
@@ -529,7 +533,6 @@ impl SurfaceStore {
             self.retain_painted_output();
         }
         self.surfaces.insert(id, Surface::new(width, height));
-        self.touch();
     }
 
     pub fn delete(&mut self, id: u16) {
@@ -540,7 +543,6 @@ impl SurfaceStore {
         if self.output == Some(id) {
             self.output = None;
         }
-        self.touch();
     }
 
     pub fn get(&self, id: u16) -> Option<&Surface> {
@@ -551,7 +553,6 @@ impl SurfaceStore {
     /// two cannot disagree about which slots exist.
     pub fn clear_cache(&mut self) {
         self.cache.clear();
-        self.touch();
     }
 
     /// Remove one server-selected cache slot.
@@ -561,19 +562,27 @@ impl SurfaceStore {
     pub fn evict_cache(&mut self, slot: u16) {
         if self.cache.remove(&slot).is_some() {
             self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(1);
-            self.touch();
         }
     }
 
     pub fn map_to_output(&mut self, id: u16) {
-        if self.output != Some(id) {
+        let mapping_changed = self.output != Some(id);
+        if mapping_changed {
             self.retain_painted_output();
         }
         self.output = Some(id);
         if self.surfaces.get(&id).is_some_and(Surface::is_complete) {
             self.presentation_fallback = None;
         }
-        self.touch();
+        // An unpainted or partial replacement leaves the fallback on screen. It becomes
+        // a presentation change only when this mapping selects painted pixels without a
+        // fallback still hiding them.
+        if mapping_changed
+            && self.surfaces.get(&id).is_some_and(Surface::is_painted)
+            && self.presentation_fallback.is_none()
+        {
+            self.touch_presentation();
+        }
     }
 
     /// The surface currently mapped to output in protocol state.
@@ -812,7 +821,6 @@ impl SurfaceStore {
             // high eviction count against a low hit rate means the cache is thrashing.
             self.cache_stats.evictions += 1;
         }
-        self.touch();
         Ok(Some((clipped.width(), clipped.height())))
     }
 
@@ -988,6 +996,7 @@ mod tests {
     fn store_adopt_and_strict_blit_bump_the_generation() {
         let mut store = SurfaceStore::new();
         store.create(0, 2, 2);
+        store.map_to_output(0);
         let g0 = store.generation();
         store.adopt_pixels(0, vec![9u8; 2 * 2 * BPP]).unwrap();
         let g1 = store.generation();
@@ -1155,6 +1164,7 @@ mod tests {
         store
             .blit_rgba(1, Rect::new(0, 0, 4, 4), &ramp(4, 4), 4)
             .unwrap();
+        store.map_to_output(2);
 
         let before = store.generation();
         store
@@ -1213,12 +1223,48 @@ mod tests {
     }
 
     #[test]
-    fn generation_changes_on_mutation_so_the_presenter_can_skip_redraws() {
+    fn generation_changes_on_visible_mutation_so_the_presenter_can_skip_redraws() {
         let mut store = SurfaceStore::new();
         store.create(1, 2, 2);
+        store.map_to_output(1);
         let g = store.generation();
         store.solid_fill(1, &[Rect::new(0, 0, 1, 1)], RED).unwrap();
         assert_ne!(store.generation(), g);
+    }
+
+    #[test]
+    fn offscreen_and_cache_only_work_does_not_advance_presentation_generation() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 2);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        store.map_to_output(1);
+
+        let mut before = PresentationSnapshot::default();
+        assert!(store.copy_presentation(&mut before));
+        let generation = store.generation();
+
+        store.create(2, 2, 2);
+        store.solid_fill(2, &[Rect::new(0, 0, 2, 2)], BLUE).unwrap();
+        store
+            .surface_to_surface(2, Rect::new(0, 0, 1, 1), 2, &[(1, 1)])
+            .unwrap();
+        assert_eq!(
+            store.surface_to_cache(2, Rect::new(0, 0, 2, 2), 7),
+            Ok(Some((2, 2)))
+        );
+        store.cache_to_surface(7, 2, &[(0, 0)]).unwrap();
+        store.evict_cache(7);
+        store.delete(2);
+
+        assert_eq!(
+            store.generation(),
+            generation,
+            "offscreen and cache-only work must not dirty presentation"
+        );
+        let mut after = PresentationSnapshot::default();
+        assert!(store.copy_presentation(&mut after));
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.pixels, before.pixels);
     }
 
     #[test]
