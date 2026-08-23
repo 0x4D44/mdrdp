@@ -10,6 +10,7 @@
 
 use super::{qpc, Result};
 use crate::framing;
+use crate::send_schedule::{self, BatchKind};
 use crate::stats::{FrameRecord, QpcClock, RectRecord};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -17,7 +18,7 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a blocked socket write is allowed to stall the sender before the client
 /// is treated as gone. Generous next to a frame interval, short next to a human.
@@ -50,6 +51,8 @@ pub struct Sender {
     cursor_hidden: Arc<AtomicBool>,
     sent_cursor_hidden: Option<bool>,
     stats: Option<BufWriter<File>>,
+    stats_dirty: bool,
+    last_stats_flush: Instant,
     /// Replayed to every client that connects, so an archived capture is readable
     /// without the operator having to fetch the server's own file.
     header_line: String,
@@ -84,6 +87,8 @@ impl Sender {
             cursor_hidden,
             sent_cursor_hidden: None,
             stats,
+            stats_dirty: false,
+            last_stats_flush: Instant::now(),
             header_line,
             clock,
             scratch: Vec::new(),
@@ -205,32 +210,51 @@ impl Sender {
 
     fn write_stats(&mut self, line: &str) {
         if let Some(file) = self.stats.as_mut() {
-            // Flushed per line: the operator kills this process with Ctrl-C, and a
-            // buffered tail lost at that moment is a measurement lost.
-            if let Err(e) = writeln!(file, "{line}").and_then(|()| file.flush()) {
+            if let Err(e) = writeln!(file, "{line}") {
                 eprintln!("stats: write failed, dropping the file: {e}");
                 self.stats = None;
+            } else {
+                self.stats_dirty = true;
             }
         }
         self.write_message(framing::MSG_STATS, line.as_bytes());
     }
 
-    /// Write one message and its stats row.
-    fn handle(&mut self, msg: Outbound) {
+    fn flush_stats(&mut self) {
+        let outcome = self.stats.as_mut().map(|file| file.flush());
+        if let Some(Err(e)) = outcome {
+            eprintln!("stats: flush failed, dropping the file: {e}");
+            self.stats = None;
+        }
+        self.stats_dirty = false;
+        self.last_stats_flush = Instant::now();
+    }
+
+    fn flush_stats_if_due(&mut self, now: Instant) {
+        if send_schedule::flush_due(
+            self.stats_dirty,
+            now.saturating_duration_since(self.last_stats_flush),
+        ) {
+            self.flush_stats();
+        }
+    }
+
+    /// Write one payload and return its stats row for the batch's telemetry pass.
+    fn handle(&mut self, msg: Outbound) -> String {
         match msg {
             Outbound::Frame(mut record, tile_id, seq, au) => {
                 self.write_video(tile_id, seq, &au);
                 record.send_done_us = self.clock.micros(qpc::now());
                 let line = crate::stats::to_line(&*record);
-                self.write_stats(&line);
+                line
             }
             Outbound::Rects(mut record, payload) => {
                 self.write_message(framing::MSG_RECTS, &payload);
                 record.send_done_us = self.clock.micros(qpc::now());
                 let line = crate::stats::to_line(&*record);
-                self.write_stats(&line);
+                line
             }
-            Outbound::Line(line) => self.write_stats(&line),
+            Outbound::Line(line) => line,
         }
     }
 
@@ -245,10 +269,12 @@ impl Sender {
     /// endless reordering pass; both passes keep arrival order within themselves.
     pub fn run(mut self, rx: Receiver<Outbound>) {
         let mut batch: Vec<Outbound> = Vec::with_capacity(DRAIN_BATCH + 1);
+        let mut stats_lines: Vec<String> = Vec::with_capacity(DRAIN_BATCH + 1);
         loop {
             self.poll_client_eof();
             self.poll_accept();
             self.write_cursor_if_changed();
+            self.flush_stats_if_due(Instant::now());
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(msg) => batch.push(msg),
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -263,20 +289,22 @@ impl Sender {
                     Err(_) => break,
                 }
             }
-            let mut i = 0;
-            while i < batch.len() {
-                if matches!(batch[i], Outbound::Rects(..)) {
-                    self.handle(batch.remove(i));
-                } else {
-                    i += 1;
-                }
-            }
+            // Timestamp and frame_seq carry causality. JSONL/socket position does not,
+            // so stats may follow payloads that arrived later in this bounded batch
+            // rather than delaying those payloads.
+            send_schedule::payload_first(&mut batch, |msg| match msg {
+                Outbound::Rects(..) => BatchKind::Rects,
+                Outbound::Frame(..) => BatchKind::Frame,
+                Outbound::Line(..) => BatchKind::Line,
+            });
             for msg in batch.drain(..) {
-                self.handle(msg);
+                stats_lines.push(self.handle(msg));
             }
+            for line in stats_lines.drain(..) {
+                self.write_stats(&line);
+            }
+            self.flush_stats_if_due(Instant::now());
         }
-        if let Some(file) = self.stats.as_mut() {
-            let _ = file.flush();
-        }
+        self.flush_stats();
     }
 }

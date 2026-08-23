@@ -27,6 +27,16 @@ With --out enabled, win/send.rs writes and flushes the stats file and sends a st
 
 ## Fix
 
-<unfixed — raised only>
+Keep stats in the existing `BufWriter` and flush at a 200 ms interval while the sender is
+making progress, plus once at shutdown, instead of flushing after every row. Reorder each
+already-bounded sender batch stably as rect payloads, video payloads, then telemetry so
+stats cannot split payloads already available to send. Timestamps and `frame_seq`, not
+JSONL position, remain the causal contract.
 
 ## Notes
+
+- The scheduling/flush regression was observed red with two failed tests, then passed 2/2.
+- Full Rhydra suite passed 312 tests and `scripts/check-windows.sh` passed.
+- The 200 ms persistence interval is best-effort while the sender runs. A dead client may
+  hold the same thread until the separate five-second socket timeout; a hard disk deadline
+  would require a separate persistence thread and is outside this fix.

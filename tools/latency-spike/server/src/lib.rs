@@ -27,6 +27,8 @@ pub mod input_proto;
 #[cfg(any(feature = "host", test))]
 pub(crate) mod input_state;
 pub mod rects;
+#[cfg(any(feature = "host", test))]
+pub(crate) mod send_schedule;
 pub mod stats;
 
 #[cfg(feature = "host")]
