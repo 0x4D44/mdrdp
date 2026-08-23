@@ -14,7 +14,7 @@
 use crate::clipboard::ClipboardBridge;
 use crate::connect::{ConnectError, Established, describe, send_shutdown};
 use crate::disconnect::{self, ServerFarewell};
-use crate::input::{InputEvent, encode_fastpath_input, to_fastpath};
+use crate::input::{InputEvent, LatestMouseMove, encode_fastpath_input, to_fastpath};
 use crate::stats::StatsHandle;
 use crate::surface::SurfaceStore;
 use crate::wake::{self, Doorbell, DoorbellReceiver};
@@ -158,6 +158,7 @@ impl SessionHandle {
 pub fn spawn(
     established: Established,
     store: Arc<Mutex<SurfaceStore>>,
+    latest_mouse_move: Arc<LatestMouseMove>,
     input: Receiver<InputEvent>,
     commands: Receiver<SessionCommand>,
     waker: Waker,
@@ -174,6 +175,7 @@ pub fn spawn(
             run(
                 established,
                 store,
+                latest_mouse_move,
                 input,
                 commands,
                 waker,
@@ -191,6 +193,7 @@ pub fn spawn(
 fn run(
     mut established: Established,
     store: Arc<Mutex<SurfaceStore>>,
+    latest_mouse_move: Arc<LatestMouseMove>,
     input: Receiver<InputEvent>,
     commands: Receiver<SessionCommand>,
     waker: Waker,
@@ -220,6 +223,7 @@ fn run(
     let outcome = pump(
         &mut established,
         &store,
+        &latest_mouse_move,
         &input,
         &commands,
         &waker,
@@ -229,6 +233,10 @@ fn run(
         &mut services,
         &wake_rx,
     );
+
+    // No later window event may keep replacing the physical position after the session
+    // has stopped draining it. This mirrors the native input thread's close-before-exit.
+    latest_mouse_move.close();
 
     // Always disconnect properly. Abandoning the socket leaves a session alive on the
     // Windows host, and they accumulate until it stops accepting logons.
@@ -253,6 +261,7 @@ fn run(
 fn pump(
     established: &mut Established,
     store: &Arc<Mutex<SurfaceStore>>,
+    latest_mouse_move: &LatestMouseMove,
     input: &Receiver<InputEvent>,
     commands: &Receiver<SessionCommand>,
     waker: &Waker,
@@ -289,7 +298,8 @@ fn pump(
         wake_rx.drain();
 
         // --- outbound: input --------------------------------------------------
-        let input_batch_full = match drain_input(input, &mut established.framed) {
+        let input_batch_full = match drain_input(input, latest_mouse_move, &mut established.framed)
+        {
             Ok(Drained::Closed) => return SessionEnd::WindowClosed,
             Ok(Drained::Sent { batch_full }) => {
                 // Only the first unanswered input starts the clock: overwriting it with
@@ -1002,18 +1012,30 @@ enum Drained {
 /// Send one bounded batch of queued input events.
 fn drain_input<S: std::io::Read + std::io::Write>(
     input: &Receiver<InputEvent>,
+    latest_mouse_move: &LatestMouseMove,
     framed: &mut Framed<S>,
 ) -> Result<Drained, ConnectError> {
     let mut batch = Vec::new();
+    let mut receiver_closed = false;
     while batch.len() < FASTPATH_INPUT_BATCH_MAX {
-        match input.try_recv() {
-            Ok(event) => batch.push(to_fastpath(event)),
+        match next_session_input(input, latest_mouse_move) {
+            Ok(Some(event)) => batch.push(to_fastpath(event)),
+            Ok(None) => break,
+            Err(TryRecvError::Disconnected) => {
+                receiver_closed = true;
+                break;
+            }
+            // `next_session_input` currently turns an empty reliable queue into
+            // `Ok(None)`, but keep the receiver's other non-blocking outcome explicit.
             Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => return Ok(Drained::Closed),
         }
     }
     if batch.is_empty() {
-        return Ok(Drained::Idle);
+        return Ok(if receiver_closed {
+            Drained::Closed
+        } else {
+            Drained::Idle
+        });
     }
 
     let batch_full = batch.len() == FASTPATH_INPUT_BATCH_MAX;
@@ -1022,6 +1044,24 @@ fn drain_input<S: std::io::Read + std::io::Write>(
         .map_err(|e| ConnectError::Protocol(format!("encode input: {e}")))?;
     framed.write_all(&encoded).map_err(ConnectError::Io)?;
     Ok(Drained::Sent { batch_full })
+}
+
+/// Take reliable input first, then the one pending physical position.
+///
+/// A disconnected reliable sender still gets one last chance to flush the physical slot;
+/// the following call reports `Disconnected` once that slot is empty.
+fn next_session_input(
+    reliable: &Receiver<InputEvent>,
+    latest_mouse_move: &LatestMouseMove,
+) -> Result<Option<InputEvent>, TryRecvError> {
+    match reliable.try_recv() {
+        Ok(event) => Ok(Some(event)),
+        Err(TryRecvError::Empty) => Ok(latest_mouse_move.take()),
+        Err(TryRecvError::Disconnected) => match latest_mouse_move.take() {
+            Some(event) => Ok(Some(event)),
+            None => Err(TryRecvError::Disconnected),
+        },
+    }
 }
 
 fn readiness_wait_after_input(batch_full: bool) -> Duration {
@@ -1035,7 +1075,10 @@ fn readiness_wait_after_input(batch_full: bool) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::LatestMouseMove;
     use crate::surface::SurfaceStore;
+    use ironrdp::core::decode;
+    use ironrdp::pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
     use std::sync::mpsc;
 
     // --- visibility / suppress output --------------------------------------------
@@ -1130,6 +1173,13 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    fn decode_input(wire: &[u8]) -> Vec<FastPathInputEvent> {
+        decode::<FastPathInput>(wire)
+            .expect("one encoded fast-path input PDU")
+            .input_events()
+            .to_vec()
     }
 
     #[test]
@@ -1262,8 +1312,12 @@ mod tests {
     fn an_empty_queue_writes_nothing() {
         // A quiet loop iteration must not emit an empty PDU every 5 ms.
         let (_tx, rx) = mpsc::channel::<InputEvent>();
+        let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
-        assert_eq!(drain_input(&rx, &mut framed).unwrap(), Drained::Idle);
+        assert_eq!(
+            drain_input(&rx, &latest, &mut framed).unwrap(),
+            Drained::Idle
+        );
         assert!(framed.into_inner_no_leftover().0.is_empty());
     }
 
@@ -1276,9 +1330,10 @@ mod tests {
         tx.send(InputEvent::MouseMove { x: 3, y: 4 }).unwrap();
         tx.send(InputEvent::MouseMove { x: 5, y: 6 }).unwrap();
 
+        let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &mut framed).unwrap(),
+            drain_input(&rx, &latest, &mut framed).unwrap(),
             Drained::Sent { batch_full: false },
             "sending is what starts the latency clock"
         );
@@ -1301,8 +1356,9 @@ mod tests {
             .unwrap();
         }
 
+        let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
-        let drained = drain_input(&rx, &mut framed).unwrap();
+        let drained = drain_input(&rx, &latest, &mut framed).unwrap();
         assert_eq!(drained, Drained::Sent { batch_full: true });
         let Drained::Sent { batch_full } = drained else {
             unreachable!("asserted sent above")
@@ -1323,8 +1379,96 @@ mod tests {
         // The window closing drops its Sender; that is the session's cue to disconnect.
         let (tx, rx) = mpsc::channel::<InputEvent>();
         drop(tx);
+        let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
-        assert_eq!(drain_input(&rx, &mut framed).unwrap(), Drained::Closed);
+        assert_eq!(
+            drain_input(&rx, &latest, &mut framed).unwrap(),
+            Drained::Closed
+        );
+    }
+
+    #[test]
+    fn ten_thousand_physical_moves_leave_only_the_final_position_after_a_reliable_key() {
+        let latest = LatestMouseMove::default();
+        for x in 0..10_000u16 {
+            assert!(latest.replace(x, x + 1));
+        }
+        let key = InputEvent::Key {
+            scancode: crate::input::Scancode::plain(0x1e),
+            down: true,
+        };
+        let (tx, rx) = mpsc::channel();
+        tx.send(key).unwrap();
+
+        let mut framed = Framed::new(Sink(Vec::new()));
+        assert_eq!(
+            drain_input(&rx, &latest, &mut framed).unwrap(),
+            Drained::Sent { batch_full: false }
+        );
+        let wire = framed.into_inner_no_leftover().0;
+        assert_eq!(
+            decode_input(&wire),
+            vec![
+                to_fastpath(key),
+                to_fastpath(InputEvent::MouseMove {
+                    x: 9_999,
+                    y: 10_000,
+                }),
+            ],
+            "the reliable key must not wait behind stale physical coordinates"
+        );
+    }
+
+    #[test]
+    fn scripted_reliable_motion_stays_fifo_before_the_physical_latest_value() {
+        let scripted_first = InputEvent::MouseMove { x: 10, y: 20 };
+        let scripted_second = InputEvent::MouseMove { x: 30, y: 40 };
+        let physical_final = InputEvent::MouseMove { x: 90, y: 100 };
+        let latest = LatestMouseMove::default();
+        assert!(latest.replace(90, 100));
+        let (tx, rx) = mpsc::channel();
+        tx.send(scripted_first).unwrap();
+        tx.send(scripted_second).unwrap();
+
+        let mut framed = Framed::new(Sink(Vec::new()));
+        assert_eq!(
+            drain_input(&rx, &latest, &mut framed).unwrap(),
+            Drained::Sent { batch_full: false }
+        );
+        let wire = framed.into_inner_no_leftover().0;
+        assert_eq!(
+            decode_input(&wire),
+            vec![
+                to_fastpath(scripted_first),
+                to_fastpath(scripted_second),
+                to_fastpath(physical_final),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_drain_does_not_replay_the_physical_latest_value() {
+        let latest = LatestMouseMove::default();
+        assert!(latest.replace(321, 654));
+        let (_tx, rx) = mpsc::channel::<InputEvent>();
+        let mut framed = Framed::new(Sink(Vec::new()));
+
+        assert_eq!(
+            drain_input(&rx, &latest, &mut framed).unwrap(),
+            Drained::Sent { batch_full: false }
+        );
+        let first_write = framed.get_inner().0.0.clone();
+        assert_eq!(decode_input(&first_write).len(), 1);
+
+        assert_eq!(
+            drain_input(&rx, &latest, &mut framed).unwrap(),
+            Drained::Idle
+        );
+        assert_eq!(
+            framed.get_inner().0.0.as_slice(),
+            first_write.as_slice(),
+            "taking the latest value must remove it from future drains"
+        );
     }
 
     #[test]

@@ -1047,8 +1047,8 @@ impl SessionWindow {
         })
     }
 
-    /// Coalesce only physical window motion for the native transport. Scripted
-    /// input keeps using the reliable FIFO, and RDP keeps its existing queue.
+    /// Coalesce only physical window motion. Scripted input, keys, buttons, and wheels
+    /// keep using the reliable FIFO on both transports.
     pub fn with_latest_mouse_move(mut self, moves: Option<Arc<input::LatestMouseMove>>) -> Self {
         self.latest_mouse_move = moves;
         self
@@ -1861,25 +1861,7 @@ impl SessionApp {
 
     /// A closed receiver means the session is gone, so there is nothing left to show.
     fn send(&mut self, event_loop: &ActiveEventLoop, event: InputEvent) {
-        if let Some(moves) = &self.latest_mouse_move {
-            match event {
-                InputEvent::MouseMove { x, y } => {
-                    if !moves.replace(x, y) {
-                        event_loop.exit();
-                        return;
-                    }
-                    self.input.wake();
-                    return;
-                }
-                InputEvent::MouseButton { .. } | InputEvent::Scroll { .. } => {
-                    // These reliable events carry their own absolute position.
-                    // Discard an older pending move so it cannot land after them.
-                    moves.clear();
-                }
-                InputEvent::Key { .. } => {}
-            }
-        }
-        if self.input.send(event).is_err() {
+        if !queue_input_event(&self.input, self.latest_mouse_move.as_deref(), event) {
             event_loop.exit();
         }
     }
@@ -2102,6 +2084,36 @@ impl SessionApp {
             stats.update(|s| s.mark_presented(generation));
         }
     }
+}
+
+/// Put one window event on its transport queue.
+///
+/// Physical motion is a latest-value slot. Every other event remains reliable, and a
+/// button or wheel event clears an older physical position because it carries its own
+/// absolute coordinates.
+fn queue_input_event(
+    input: &WakingSender<InputEvent>,
+    latest_mouse_move: Option<&input::LatestMouseMove>,
+    event: InputEvent,
+) -> bool {
+    if let Some(moves) = latest_mouse_move {
+        match event {
+            InputEvent::MouseMove { x, y } => {
+                if !moves.replace(x, y) {
+                    return false;
+                }
+                input.wake();
+                return true;
+            }
+            InputEvent::MouseButton { .. } | InputEvent::Scroll { .. } => {
+                // These reliable events carry their own absolute position. Discard an
+                // older pending move so it cannot land after them.
+                moves.clear();
+            }
+            InputEvent::Key { .. } => {}
+        }
+    }
+    input.send(event).is_ok()
 }
 
 impl ApplicationHandler<SessionEvent> for SessionApp {
@@ -2593,7 +2605,9 @@ mod session_menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{MouseButton, Scancode, ScrollAxis};
     use crate::surface::Rect;
+    use std::sync::mpsc;
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const GREEN: [u8; 4] = [0, 255, 0, 255];
@@ -2659,6 +2673,45 @@ mod tests {
             gate.claim(),
             "a failed proxy send must not strand the pending bit"
         );
+    }
+
+    #[test]
+    fn reliable_buttons_and_scroll_clear_pending_physical_moves() {
+        let (tx, rx) = mpsc::channel();
+        let input = WakingSender::silent(tx);
+        let latest = crate::input::LatestMouseMove::default();
+        let button = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            x: 40,
+            y: 50,
+        };
+        assert!(latest.replace(1, 2));
+        assert!(queue_input_event(&input, Some(&latest), button));
+        assert_eq!(latest.take(), None);
+        assert_eq!(rx.try_recv(), Ok(button));
+
+        let scroll = InputEvent::Scroll {
+            axis: ScrollAxis::Vertical,
+            units: 120,
+            x: 60,
+            y: 70,
+        };
+        assert!(latest.replace(3, 4));
+        assert!(queue_input_event(&input, Some(&latest), scroll));
+        assert_eq!(latest.take(), None);
+        assert_eq!(rx.try_recv(), Ok(scroll));
+
+        // Keys remain reliable and do not clear the pending physical position; the
+        // session drain will place the key before that final position.
+        let key = InputEvent::Key {
+            scancode: Scancode::plain(0x1e),
+            down: true,
+        };
+        assert!(latest.replace(5, 6));
+        assert!(queue_input_event(&input, Some(&latest), key));
+        assert_eq!(rx.try_recv(), Ok(key));
+        assert_eq!(latest.take(), Some(InputEvent::MouseMove { x: 5, y: 6 }));
     }
 
     #[test]

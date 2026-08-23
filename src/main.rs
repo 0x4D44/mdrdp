@@ -1004,7 +1004,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (raw_command_tx, command_rx) = mpsc::channel::<session::SessionCommand>();
     let input_tx = WakingSender::new(raw_input_tx, session_bell.clone());
     let command_tx = WakingSender::new(raw_command_tx, session_bell.clone());
-    let latest_mouse_move = is_native.then(|| Arc::new(mdrdp::input::LatestMouseMove::default()));
+    // Physical pointer motion uses a latest-value slot on both transports. Keys, buttons,
+    // wheels, and scripted input stay on the reliable FIFO below.
+    let latest_mouse_move = Arc::new(mdrdp::input::LatestMouseMove::default());
 
     // The EGFX handler is RDP machinery; a native session keeps fresh (all-zero)
     // stats handles so the diagnostics windows and the exit report still have
@@ -1374,7 +1376,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         script.spawn(input_tx.clone());
     }
     let window = SessionWindow::new(event_loop, window_config, Arc::clone(&store), input_tx)?
-        .with_latest_mouse_move(latest_mouse_move.clone());
+        .with_latest_mouse_move(Some(Arc::clone(&latest_mouse_move)));
     let session_stats = StatsHandle::new();
     let session_started = std::time::Instant::now();
     let resource_start = process_snapshot();
@@ -1700,6 +1702,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Connected::Rdp(established) => ActiveSession::Rdp(session::spawn(
             *established,
             Arc::clone(&store),
+            Arc::clone(&latest_mouse_move),
             input_rx,
             command_rx,
             waker,
@@ -1732,7 +1735,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     *transport,
                     decoders,
                     Arc::clone(&store),
-                    latest_mouse_move.expect("native sessions create a mouse-move slot"),
+                    Arc::clone(&latest_mouse_move),
                     input_rx,
                     command_rx,
                     waker,

@@ -117,10 +117,10 @@ pub enum InputEvent {
     },
 }
 
-/// Window-system pointer motion waiting for the native input pump.
+/// Window-system pointer motion waiting for the transport input pump.
 ///
-/// Kept separate from reliable keys, buttons, wheels, and scripted input so
-/// physical mouse motion cannot put an arbitrary FIFO ahead of a keystroke.
+/// Kept separate from reliable keys, buttons, wheels, and scripted input so physical
+/// mouse motion cannot put an arbitrary FIFO ahead of a keystroke on either transport.
 struct LatestMouseMoveState {
     position: Option<(u16, u16)>,
     receiver_alive: bool,
@@ -806,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_native_receiver_refuses_more_window_motion() {
+    fn a_closed_receiver_refuses_more_window_motion_on_either_transport() {
         let moves = LatestMouseMove::default();
         assert!(moves.replace(1, 2));
         moves.close();
