@@ -18,7 +18,6 @@
 //! until the AU that closes its gap arrives; painting over a hole would lose
 //! the missing frame's content forever (transport HLD decisions 13/16).
 
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1007,7 +1006,7 @@ impl InputClock {
 pub(crate) struct NativeSink {
     decoder: Option<Box<dyn H264Decoder>>,
     tile_decoders: Vec<TileDecodeState>,
-    tile_frames: BTreeMap<u64, TileFrameProgress>,
+    tile_frame: Option<TileFrameProgress>,
     codec_label: String,
     store: Arc<Mutex<SurfaceStore>>,
     wire_size: (u32, u32),
@@ -1035,12 +1034,18 @@ struct TileDecodeState {
     has_base: bool,
 }
 
+struct StagedTile {
+    dest: Rect,
+    pixels: Vec<u8>,
+}
+
 struct TileFrameProgress {
     seen: Vec<bool>,
     changed: bool,
+    tiles: Vec<Option<StagedTile>>,
+    seq: u64,
     bytes: u64,
     decode_us: u32,
-    generation: u64,
 }
 
 impl NativeSink {
@@ -1056,7 +1061,7 @@ impl NativeSink {
         Self {
             decoder,
             tile_decoders: Vec::new(),
-            tile_frames: BTreeMap::new(),
+            tile_frame: None,
             codec_label: CODEC_LABEL.to_owned(),
             store,
             wire_size,
@@ -1105,7 +1110,7 @@ impl NativeSink {
         Self {
             decoder: None,
             tile_decoders,
-            tile_frames: BTreeMap::new(),
+            tile_frame: None,
             codec_label,
             store,
             wire_size,
@@ -1240,94 +1245,129 @@ impl NativeSink {
                 header.height
             ));
         }
-        let (changed, generation) = if suppress_paint {
+        let dest = Self::tile_dest(tile_id, header)?;
+        if suppress_paint {
             self.suppressed += 1;
-            (false, 0)
-        } else {
-            let generation = {
-                let mut store = self
-                    .store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let edge = |value: u32| {
-                    u16::try_from(value)
-                        .map_err(|_| format!("tile {tile_id} edge {value} exceeds the canvas"))
-                };
-                let dest = Rect::new(
-                    edge(header.x)?,
-                    edge(header.y)?,
-                    edge(header.x + header.width)?,
-                    edge(header.y + header.height)?,
-                );
-                store
-                    .blit_rgba_strict(OUTPUT_SURFACE, dest, decoded.data())
-                    .map_err(|e| format!("tile blit: {e}"))?;
-                store.generation()
-            };
-            self.tile_decoders[tile_index].exact_through = Some(seq);
-            self.tile_decoders[tile_index].has_base = true;
-            (true, generation)
-        };
+        }
         let bytes = au.len() as u64;
         let decode_us = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
 
-        let (complete, changed, generation, bytes, decode_us) = {
-            let progress = self
-                .tile_frames
-                .entry(seq)
-                .or_insert_with(|| TileFrameProgress {
-                    seen: vec![false; self.tile_decoders.len()],
-                    changed: false,
-                    bytes: 0,
-                    decode_us: 0,
-                    generation: 0,
-                });
-            // A repeated tile in one sequence is still one arrival. This is
-            // normally suppressed by exactness, but keeping the accounting
-            // idempotent makes the logical-frame gate robust to duplicates.
-            if !progress.seen[tile_index] {
-                progress.seen[tile_index] = true;
-                progress.changed |= changed;
-                progress.bytes = progress.bytes.saturating_add(bytes);
-                progress.decode_us = progress.decode_us.saturating_add(decode_us);
-                if changed {
-                    progress.generation = generation;
-                }
+        // There is only one pixel-bearing in-flight sequence. TCP preserves the
+        // server's tile order, so a newer sequence supersedes an incomplete one;
+        // an older late tile is decoded for reference state and then discarded.
+        let mut progress = match self.tile_frame.take() {
+            Some(progress) if progress.seq == seq => progress,
+            Some(progress) if progress.seq > seq => {
+                self.tile_frame = Some(progress);
+                return Ok(());
             }
-            (
-                progress.seen.iter().all(|seen| *seen),
-                progress.changed,
-                progress.generation,
-                progress.bytes,
-                progress.decode_us,
-            )
+            Some(_) | None => TileFrameProgress {
+                seen: vec![false; self.tile_decoders.len()],
+                changed: false,
+                tiles: (0..self.tile_decoders.len()).map(|_| None).collect(),
+                seq,
+                bytes: 0,
+                decode_us: 0,
+            },
         };
-        let completed_changed = complete && changed;
-        if complete {
-            self.tile_frames.remove(&seq).expect("entry just completed");
+
+        // A repeated tile in one sequence still has to be decoded, but it must
+        // not replace the first staged pixels or inflate one logical frame.
+        if !progress.seen[tile_index] {
+            progress.seen[tile_index] = true;
+            progress.bytes = progress.bytes.saturating_add(bytes);
+            progress.decode_us = progress.decode_us.saturating_add(decode_us);
+            if !suppress_paint {
+                progress.changed = true;
+                progress.tiles[tile_index] = Some(StagedTile {
+                    dest,
+                    pixels: decoded.into_data(),
+                });
+            }
         }
-        // A missing tile must not let an unbounded stream of newer AUs accumulate.
-        // Sixteen capture sequences cover 67 ms at 240 Hz; older incomplete rows
-        // can no longer provide useful frame or input-latency telemetry.
-        while self.tile_frames.len() > 16 {
-            let Some(oldest) = self.tile_frames.keys().next().copied() else {
-                break;
-            };
-            self.tile_frames.remove(&oldest);
+
+        if !progress.seen.iter().all(|seen| *seen) {
+            self.tile_frame = Some(progress);
+            return Ok(());
         }
-        self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
-        self.exact_through = self
-            .tile_decoders
-            .iter()
-            .map(|tile| tile.exact_through)
-            .collect::<Option<Vec<_>>>()
-            .and_then(|seqs| seqs.into_iter().min());
-        if completed_changed {
+
+        let bytes = progress.bytes;
+        let decode_us = progress.decode_us;
+        let changed = progress.changed;
+        let generation = if changed {
+            let updates: Vec<_> = progress
+                .tiles
+                .iter()
+                .filter_map(|tile| {
+                    tile.as_ref()
+                        .map(|tile| (tile.dest, tile.pixels.as_slice()))
+                })
+                .collect();
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let generation = store
+                .blit_rgba_strict_batch(OUTPUT_SURFACE, &updates)
+                .map_err(|e| format!("tile batch: {e}"))?;
+
+            // The decoder already consumed every AU above. Visible exactness
+            // advances only after the complete batch passed validation and was
+            // copied into the output surface.
+            for (tile_index, staged) in progress.tiles.iter().enumerate() {
+                if staged.is_some() {
+                    self.tile_decoders[tile_index].exact_through = Some(seq);
+                }
+                self.tile_decoders[tile_index].has_base = true;
+            }
+            self.has_base = true;
+            self.exact_through = self
+                .tile_decoders
+                .iter()
+                .map(|tile| tile.exact_through)
+                .collect::<Option<Vec<_>>>()
+                .and_then(|seqs| seqs.into_iter().min());
             self.record_paint(bytes, generation, Some(decode_us));
+            Some(generation)
+        } else {
+            // A wholly suppressed sequence still counts as an arrival, but it
+            // has no visible mutation or wake. Decoder references progressed
+            // through every AU before this branch.
+            self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
+            self.exact_through = self
+                .tile_decoders
+                .iter()
+                .map(|tile| tile.exact_through)
+                .collect::<Option<Vec<_>>>()
+                .and_then(|seqs| seqs.into_iter().min());
+            None
+        };
+        if generation.is_some() {
             (self.wake)();
             self.try_apply_pending();
         }
         Ok(())
+    }
+
+    fn tile_dest(tile_id: u8, header: TileHeader) -> Result<Rect, String> {
+        let right = header
+            .x
+            .checked_add(header.width)
+            .ok_or_else(|| format!("tile {tile_id} right edge overflows"))?;
+        let bottom = header
+            .y
+            .checked_add(header.height)
+            .ok_or_else(|| format!("tile {tile_id} bottom edge overflows"))?;
+        let edge = |value: u32, name: &str| {
+            u16::try_from(value)
+                .map_err(|_| format!("tile {tile_id} {name} edge {value} exceeds the canvas"))
+        };
+        Ok(Rect::new(
+            edge(header.x, "left")?,
+            edge(header.y, "top")?,
+            edge(right, "right")?,
+            edge(bottom, "bottom")?,
+        ))
     }
 
     pub(crate) fn on_rects(&mut self, payload: &[u8]) -> Result<(), String> {
@@ -1403,7 +1443,16 @@ impl NativeSink {
                     .map_or(update.frame_seq, |seq| seq.max(update.frame_seq)),
             );
         }
-        self.tile_frames.retain(|seq, _| *seq > update.frame_seq);
+        if self
+            .tile_frame
+            .as_ref()
+            .is_some_and(|frame| frame.seq <= update.frame_seq)
+        {
+            // The rect update now carries this sequence's visible content; a
+            // staged tile set at or below it must not later overwrite that
+            // exact canvas. Newer staged sequences remain eligible.
+            self.tile_frame = None;
+        }
         (self.wake)();
         Ok(())
     }
@@ -1676,15 +1725,131 @@ mod tests {
             InputClock::default(),
         );
 
+        let before = store.lock().unwrap().generation();
         sink.on_tile_au(0, &[0x11], 7).unwrap();
         assert_eq!(stats.snapshot().frames, 0, "half a 5K frame is not a frame");
+        assert_eq!(
+            store.lock().unwrap().generation(),
+            before,
+            "staging the first tile must not publish a generation"
+        );
         sink.on_tile_au(1, &[0x22], 7).unwrap();
         assert_eq!(stats.snapshot().frames, 1, "both tiles are one frame");
 
         let guard = store.lock().unwrap();
+        assert_eq!(
+            guard.generation(),
+            before + 1,
+            "one logical frame is one commit"
+        );
         let pixels = guard.get(OUTPUT_SURFACE).unwrap().pixels();
         assert_eq!(pixels[0], 0x11);
         assert_eq!(pixels[(2 * 4) as usize], 0x22);
+    }
+
+    #[test]
+    fn the_first_tile_keeps_the_last_presentation_until_commit() {
+        let size = (4, 2);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+            surface
+                .blit_rgba_strict(OUTPUT_SURFACE, Rect::new(0, 0, 4, 2), &[7; 32])
+                .unwrap();
+        }
+        let mut sink = NativeSink::new_tiled(
+            vec![
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+            ],
+            vec![
+                super::super::probe::TileHeader {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                super::super::probe::TileHeader {
+                    id: 1,
+                    x: 2,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+            ],
+            Arc::clone(&store),
+            size,
+            Box::new(|| {}),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+
+        let before = store.lock().unwrap().generation();
+        sink.on_tile_au(0, &[0x11], 7).unwrap();
+
+        let mut snapshot = crate::surface::PresentationSnapshot::default();
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.generation(), before);
+        assert!(guard.copy_presentation(&mut snapshot));
+        assert_eq!(snapshot.generation, before);
+        assert_eq!(snapshot.pixels, vec![7; 32]);
+    }
+
+    #[test]
+    fn a_malformed_later_tile_cannot_partially_paint_a_staged_batch() {
+        let size = (4, 2);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+            surface
+                .blit_rgba_strict(OUTPUT_SURFACE, Rect::new(0, 0, 4, 2), &[7; 32])
+                .unwrap();
+        }
+        let mut sink = NativeSink::new_tiled(
+            vec![
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+            ],
+            vec![
+                super::super::probe::TileHeader {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                // The decoded extent is valid, but this advertised destination
+                // overhangs the output and must fail the batch preflight.
+                super::super::probe::TileHeader {
+                    id: 1,
+                    x: 3,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+            ],
+            Arc::clone(&store),
+            size,
+            Box::new(|| {}),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+
+        let before = store.lock().unwrap().generation();
+        sink.on_tile_au(0, &[0x11], 7).unwrap();
+        let error = sink.on_tile_au(1, &[0x22], 7).unwrap_err();
+        assert!(error.contains("tile batch"));
+
+        let mut snapshot = crate::surface::PresentationSnapshot::default();
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.generation(), before);
+        assert!(guard.copy_presentation(&mut snapshot));
+        assert_eq!(snapshot.pixels, vec![7; 32]);
     }
 
     #[test]

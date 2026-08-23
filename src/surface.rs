@@ -188,7 +188,7 @@ impl Surface {
     /// Decoded native tiles have an exact advertised extent. Clipping one would
     /// hide a decoder or protocol mismatch, so both the rectangle and payload
     /// must match exactly.
-    pub fn blit_rgba_strict(&mut self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
+    fn validate_rgba_strict(&self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
         if dest.right > self.width || dest.bottom > self.height || dest.is_empty() {
             return Err(SurfaceError::OutOfBounds {
                 rect: dest,
@@ -204,6 +204,12 @@ impl Surface {
                 got: src.len(),
             });
         }
+        Ok(())
+    }
+
+    pub fn blit_rgba_strict(&mut self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
+        self.validate_rgba_strict(dest, src)?;
+        let row_bytes = dest.width() as usize * BPP;
         for row in 0..dest.height() {
             let src_off = row as usize * row_bytes;
             let dst_off = self.row_start(dest.top + row) + dest.left as usize * BPP;
@@ -549,6 +555,47 @@ impl SurfaceStore {
         self.cache_stats.bytes_from_wire += src.len() as u64;
         self.finish_surface_mutation(id);
         Ok(())
+    }
+
+    /// Apply several tightly packed RGBA rectangles as one visible mutation.
+    ///
+    /// Native tiled frames decode outside the store lock. The caller holds the
+    /// decoded tile buffers until this method has validated every rectangle and
+    /// payload, so a malformed later tile cannot leave an earlier tile visible.
+    /// One batch accounts bytes and advances the presentation generation once.
+    pub(crate) fn blit_rgba_strict_batch(
+        &mut self,
+        id: u16,
+        updates: &[(Rect, &[u8])],
+    ) -> Result<u64, SurfaceError> {
+        if updates.is_empty() {
+            return Ok(self.generation);
+        }
+
+        {
+            let surface = self
+                .surfaces
+                .get(&id)
+                .ok_or(SurfaceError::NoSuchSurface(id))?;
+            for (dest, src) in updates {
+                surface.validate_rgba_strict(*dest, src)?;
+            }
+        }
+
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(SurfaceError::NoSuchSurface(id))?;
+        let mut bytes = 0u64;
+        for (dest, src) in updates {
+            // Every update was validated above while the store was still
+            // unchanged, so these writes cannot fail part-way through.
+            surface.blit_rgba_strict(*dest, src)?;
+            bytes = bytes.saturating_add(src.len() as u64);
+        }
+        self.cache_stats.bytes_from_wire = self.cache_stats.bytes_from_wire.saturating_add(bytes);
+        self.finish_surface_mutation(id);
+        Ok(self.generation)
     }
 
     pub fn solid_fill(
@@ -1112,6 +1159,36 @@ mod tests {
             store.presentation_surface().unwrap().pixels(),
             solid(2, 2, RED),
             "the recreated incarnation takes over when it is painted"
+        );
+    }
+
+    #[test]
+    fn a_tiled_batch_retires_the_presentation_fallback_at_commit() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 2);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        store.map_to_output(1);
+        store.create(2, 2, 2);
+        store.map_to_output(2);
+        assert!(store.presentation_fallback.is_some());
+
+        let left = solid(1, 2, BLUE);
+        let right = solid(1, 2, RED);
+        let before = store.generation();
+        let committed = store
+            .blit_rgba_strict_batch(
+                2,
+                &[
+                    (Rect::new(0, 0, 1, 2), left.as_slice()),
+                    (Rect::new(1, 0, 2, 2), right.as_slice()),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(committed, before + 1, "a tiled frame has one generation");
+        assert!(
+            store.presentation_fallback.is_none(),
+            "a committed replacement must retire its old presentation"
         );
     }
 
