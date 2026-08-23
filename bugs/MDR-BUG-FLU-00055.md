@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00055 — Native input latency telemetry starts after the whole queued burst
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** rhydra/telemetry
 - **Raised:** 2026-08-23T12:09:38Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T221118Z-3786a30b
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00055-run-fix-20260823T221118Z-3786a30b
-- **Owner base:** beacc1d090194b48eeab1d962df33e46a21d3576
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T22:11:18Z
-- **Owner until:** 2026-08-24T00:11:18Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:09:38Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T12:09:38Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T22:22:10Z, deltic:auto role=fix run=fix-20260823T221118Z-3786a30b branch=task/bug-MDR-BUG-FLU-00055-run-fix-20260823T221118Z-3786a30b code=9d88631 gate=manual)
 
 ## Observation
 
