@@ -9,7 +9,7 @@ Indented lines below the first are detail: kept for lookup, never injected.
 - Sparse auxiliary writes need explicit coverage, not seeded-pixel differences (`clearcodec::decode_over_with_coverage`).
   A decoded chroma or ClearCodec buffer starts with retained pixels, so comparing final colours
   cannot distinguish an explicit same-colour write from an untouched seed. Carry exact decoder
-  coverage into `SurfaceStore`; use that coverage for replacement readiness, caching, and damage.
+  coverage into `SurfaceStore`; use it for replacement readiness, caching, damage, and telemetry.
 
 - A logical frame can retain one published snapshot instead of cloning every surface (`surface.rs:FrameState`).
   Keep writes private while a frame is active, publish once on matching EndFrame, and make abort
