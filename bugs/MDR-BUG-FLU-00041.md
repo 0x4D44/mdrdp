@@ -6,15 +6,15 @@
 - **Area:** rhydra/codec
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T193446Z-e0329036
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00041-run-fix-20260823T193446Z-e0329036
+- **Owner base:** 5f9685f2c4928b78f1d057ad7888ce1c63d08741
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T19:34:46Z
+- **Owner until:** 2026-08-23T21:34:46Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
