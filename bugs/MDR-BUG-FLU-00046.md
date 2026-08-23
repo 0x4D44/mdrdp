@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00046 — A 256-event RDP input burst terminates the session
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** session/input
 - **Raised:** 2026-08-23T11:57:47Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T115827Z-c9dcbf14
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00046-run-fix-20260823T115827Z-c9dcbf14
-- **Owner base:** 6553cd278e80d1953ebc4a03abbcfaec9c2ae127
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T11:58:27Z
-- **Owner until:** 2026-08-23T13:58:27Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T11:57:47Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-23T11:57:47Z, raised via `deltic bugs new`) -> Fixed (2026-08-23T12:07:12Z, deltic:auto role=fix run=fix-20260823T115827Z-c9dcbf14 branch=task/bug-MDR-BUG-FLU-00046-run-fix-20260823T115827Z-c9dcbf14 code=59fcb85 gate=manual)
 
 ## Observation
 
