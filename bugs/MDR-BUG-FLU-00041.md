@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00041 — Rhydra 5K HEVC fallback requires Level 4.1, which cannot describe a 5K stream
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** rhydra/codec
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T193446Z-e0329036
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00041-run-fix-20260823T193446Z-e0329036
-- **Owner base:** 5f9685f2c4928b78f1d057ad7888ce1c63d08741
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T19:34:46Z
-- **Owner until:** 2026-08-23T21:34:46Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T19:35:07Z, deltic:auto role=fix run=fix-20260823T193446Z-e0329036 branch=task/bug-MDR-BUG-FLU-00041-run-fix-20260823T193446Z-e0329036 code=86c6731 gate=manual)
 
 ## Observation
 
