@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00064 — Rhydra raw rects can paint against a dropped video baseline during recovery
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** rhydra/rendering
 - **Raised:** 2026-08-23T19:42:47Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T194320Z-e1a72827
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00064-run-fix-20260823T194320Z-e1a72827
-- **Owner base:** ede2405fe4b4e481bec27b0ae0d6d6bac8cc2dbb
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T19:43:20Z
-- **Owner until:** 2026-08-23T21:43:20Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T19:42:47Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T19:42:47Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T19:46:30Z, deltic:auto role=fix run=fix-20260823T194320Z-e1a72827 branch=task/bug-MDR-BUG-FLU-00064-run-fix-20260823T194320Z-e1a72827 code=76ebf9f gate=manual)
 
 ## Observation
 
