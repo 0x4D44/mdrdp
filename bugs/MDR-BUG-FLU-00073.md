@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00073 — Native input writes can block forever when the host stops reading
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/input-latency
 - **Raised:** 2026-08-23T20:34:25Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T211540Z-b4924d4a
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00073-run-fix-20260823T211540Z-b4924d4a
-- **Owner base:** 5178f7633a528f56a9ae28c9a6041ff8e0c00ca8
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T21:15:40Z
-- **Owner until:** 2026-08-23T23:15:40Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T20:34:25Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-23T20:34:25Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-23T21:28:41Z, deltic:auto role=fix run=fix-20260823T211540Z-b4924d4a branch=task/bug-MDR-BUG-FLU-00073-run-fix-20260823T211540Z-b4924d4a code=d94c3dc6ee7971a3a753c11adbe150a5f83139a8 gate=manual)
 
 ## Observation
 
