@@ -6,6 +6,25 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Sparse auxiliary writes need explicit coverage, not seeded-pixel differences (`clearcodec::decode_over_with_coverage`).
+  A decoded chroma or ClearCodec buffer starts with retained pixels, so comparing final colours
+  cannot distinguish an explicit same-colour write from an untouched seed. Carry exact decoder
+  coverage into `SurfaceStore`; use that coverage for replacement readiness, caching, and damage.
+
+- A logical frame can retain one published snapshot instead of cloning every surface (`surface.rs:FrameState`).
+  Keep writes private while a frame is active, publish once on matching EndFrame, and make abort
+  terminal until a complete replacement arrives. This preserves atomic presentation without a
+  multi-megabyte clone at every frame boundary.
+
+- Bound decoded expansion, not just encoded input, before allocating (`zgfx::decompress_segment_with_limit`).
+  A small compressed segment can expand far beyond its wire size. Pass the remaining decoded-output
+  budget into every segment and history-copy path, and reject the segment before extending output.
+
+- Input latency starts at the first wire write, not after the burst (`native/session.rs:write_native_records`).
+  Timestamping after `write_all` excludes socket backpressure and makes a slow send look fast. Arm
+  the measurement when the first byte is accepted, then close it when that input's painted frame
+  arrives.
+
 - Windows display topology belongs to CCD, not `ChangeDisplaySettingsExW` (`agent_ops.rs:make_idd_primary`).
   Quench accepted width/height/refresh changes through the legacy GDI mode API but returned
   `DISP_CHANGE_FAILED` for both complete and position-only physical-display requests. Preserve the
