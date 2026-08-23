@@ -6,15 +6,15 @@
 - **Area:** rhydra/video-memory
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T133831Z-735aea9e
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00043-run-fix-20260823T133831Z-735aea9e
+- **Owner base:** f265c46e547b899b6a9e4dbbac84197778888698
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T13:38:31Z
+- **Owner until:** 2026-08-23T15:38:31Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
