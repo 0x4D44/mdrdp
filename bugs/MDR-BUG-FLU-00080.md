@@ -6,15 +6,15 @@
 - **Area:** rdp/clearcodec-rendering
 - **Raised:** 2026-08-23T22:00:53Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T220110Z-6bacf6a1
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00080-run-fix-20260823T220110Z-6bacf6a1
+- **Owner base:** 2ad5d0ccaa7e3bc62f210ac24bb884506bbba151
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T22:01:10Z
+- **Owner until:** 2026-08-24T00:01:10Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
