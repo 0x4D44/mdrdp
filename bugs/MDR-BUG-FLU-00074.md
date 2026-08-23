@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00074 — RDP mouse moves use an unbounded stale FIFO ahead of keys and buttons
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** rdp/input-latency
 - **Raised:** 2026-08-23T20:34:25Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T204628Z-83e09493
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00074-run-fix-20260823T204628Z-83e09493
-- **Owner base:** e08ad30a83db5c6e54b2b8e014bb3b4104ae9143
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T20:46:28Z
-- **Owner until:** 2026-08-23T22:46:28Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T20:34:25Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-23T20:34:25Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-23T21:15:15Z, deltic:auto role=fix run=fix-20260823T204628Z-83e09493 branch=task/bug-MDR-BUG-FLU-00074-run-fix-20260823T204628Z-83e09493 code=c1f90b345fe2def611ce48e834d9542621c3c74f gate=manual)
 
 ## Observation
 
