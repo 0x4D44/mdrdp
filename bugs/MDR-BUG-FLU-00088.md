@@ -6,15 +6,15 @@
 - **Area:** rdp/clearcodec-telemetry
 - **Raised:** 2026-08-23T23:16:08Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T231638Z-d27cebf9
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00088-run-fix-20260823T231638Z-d27cebf9
+- **Owner base:** 4b1aac5fdcbd1e0351f5bfd5a6c5f42d673c175a
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T23:16:38Z
+- **Owner until:** 2026-08-24T01:16:38Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
