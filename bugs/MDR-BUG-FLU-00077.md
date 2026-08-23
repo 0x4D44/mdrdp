@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00077 — Service ACL hardening strips access from deployed executables
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** Rhydra deploy
 - **Raised:** 2026-08-23T21:42:09Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T214409Z-8a9b6f88
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00077-run-fix-20260823T214409Z-8a9b6f88
-- **Owner base:** f6a31f15c24d64b8b5b46a8e4b0cf5924b26deb1
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T21:44:09Z
-- **Owner until:** 2026-08-23T23:44:09Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T21:42:09Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T21:42:09Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T21:44:21Z, deltic:auto role=fix run=fix-20260823T214409Z-8a9b6f88 branch=task/bug-MDR-BUG-FLU-00077-run-fix-20260823T214409Z-8a9b6f88 code=b8c04fc gate=manual)
 
 ## Observation
 
