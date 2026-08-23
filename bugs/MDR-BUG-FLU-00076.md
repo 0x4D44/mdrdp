@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00076 — Gradual AVC444 luma drift can keep stale chroma detail live indefinitely
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/avc444-chroma
 - **Raised:** 2026-08-23T21:33:59Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T213424Z-4d135b27
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00076-run-fix-20260823T213424Z-4d135b27
-- **Owner base:** 493095d7c6c02b514310a9a0a85107e044fb7267
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T21:34:24Z
-- **Owner until:** 2026-08-23T23:34:24Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T21:33:59Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-23T21:33:59Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-23T21:41:52Z, deltic:auto role=fix run=fix-20260823T213424Z-4d135b27 branch=task/bug-MDR-BUG-FLU-00076-run-fix-20260823T213424Z-4d135b27 code=0e8cf00aee1caea5f8e22b4e3d222328fc3b14bf gate=manual)
 
 ## Observation
 
