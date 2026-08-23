@@ -17,6 +17,7 @@
 use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource};
 use super::{convert, dxgi, encode, idd_source, input, pixel_diff, qpc, send, Result};
 use crate::annexb::{self, AvcParameterSets, ParameterSets};
+use crate::channel_listeners::BoundChannels;
 use crate::cli::{Config, Source, DECLARED_FPS};
 use crate::diff;
 use crate::logical_frame;
@@ -188,6 +189,14 @@ pub fn run(cfg: &Config) -> Result<()> {
     // re-testing a pair of flags per frame, and keeps the header honest.
     let diff_enabled = cfg.diff && rects_enabled;
 
+    // Every capability in the video header must already exist. Binding both side
+    // channels here makes startup fail before a viewer can receive a dead contract.
+    let BoundChannels {
+        input: input_listener,
+        aux: aux_listener,
+    } = BoundChannels::bind(cfg.input_port, cfg.aux_port)?;
+    let aux_enabled = aux_listener.is_some();
+
     let header = build_header(
         cfg,
         clock,
@@ -196,6 +205,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         &tiles,
         rects_enabled,
         diff_enabled,
+        aux_enabled,
     );
     let header_line = stats::to_line(&header);
 
@@ -215,7 +225,6 @@ pub fn run(cfg: &Config) -> Result<()> {
         .spawn(move || sender.run(rx))?;
 
     let input_tx = tx.clone();
-    let input_port = cfg.input_port;
     std::thread::Builder::new()
         .name("spike-input".into())
         .spawn(move || {
@@ -233,7 +242,7 @@ pub fn run(cfg: &Config) -> Result<()> {
                     }
                 })
                 .ok();
-            if let Err(e) = input::serve(input_port, clock, line_tx, capture_origin) {
+            if let Err(e) = input::serve_listener(input_listener, clock, line_tx, capture_origin) {
                 eprintln!("input: listener stopped: {e}");
             }
         })?;
@@ -242,15 +251,14 @@ pub fn run(cfg: &Config) -> Result<()> {
     // and its own listener, so neither the capture loop nor the input channel
     // can be delayed by it — the priority separation Arthur set out, made
     // structural rather than promised.
-    if cfg.aux_port != 0 {
-        let aux_port = cfg.aux_port;
+    if let Some(aux_listener) = aux_listener {
         let audio_kind = cfg.audio_source;
         std::thread::Builder::new()
             .name("spike-aux".into())
             .spawn(move || {
                 let policy = crate::clipboard::Policy::default();
-                if let Err(e) = crate::aux_server::serve(
-                    aux_port,
+                if let Err(e) = crate::aux_server::serve_listener(
+                    aux_listener,
                     || Box::new(super::clipboard::ClipboardOwner::new()),
                     std::sync::Arc::new(move || -> Box<dyn crate::audio_source::AudioSource> {
                         match audio_kind {
@@ -383,6 +391,7 @@ fn build_header(
     tiles: &[TilePipeline],
     rects_enabled: bool,
     diff_enabled: bool,
+    aux_enabled: bool,
 ) -> Header {
     let mut h = Header::new();
     h.qpc_frequency = clock.freq();
@@ -392,7 +401,7 @@ fn build_header(
     // whole safety gate is this flag: it opens 9503 if and only if this says
     // true, and a host that advertises a port nothing is listening on would
     // make every session pay a failed connect for no reason.
-    h.clipboard = cfg.aux_port != 0;
+    h.clipboard = aux_enabled;
     h.bitrate_kbps = cfg.bitrate_kbps;
     h.gop = cfg.gop;
     h.fps = DECLARED_FPS;

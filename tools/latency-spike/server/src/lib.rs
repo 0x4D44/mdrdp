@@ -17,6 +17,8 @@ pub mod audio_source;
 pub mod aux_proto;
 pub mod aux_server;
 pub mod auxchan;
+#[cfg(any(feature = "host", test))]
+pub(crate) mod channel_listeners;
 pub mod cli;
 pub mod clipboard;
 pub mod colorspace;

@@ -27,6 +27,14 @@ In tools/latency-spike/server/src/win/pipeline.rs:231-271, input and auxiliary l
 
 ## Fix
 
-<unfixed — raised only>
+Session startup now binds the input listener and the optional auxiliary listener
+as one synchronous transaction before constructing the video header or listener.
+The already-bound sockets move into their service threads, so a client can never
+receive an advertised side-channel contract whose bind failed. If the auxiliary
+bind fails, the input listener is dropped as the startup error unwinds.
+
+The auxiliary-disabled path still binds input alone and advertises no clipboard.
+Portable regression tests cover both successful shapes and all-or-nothing cleanup
+when the second bind is occupied.
 
 ## Notes

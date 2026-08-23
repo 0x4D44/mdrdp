@@ -601,12 +601,23 @@ pub fn serve(
     lines: SyncSender<String>,
     origin: (i32, i32),
 ) -> Result<()> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    serve_listener(listener, clock, lines, origin)
+}
+
+/// Serve on a listener synchronously pre-bound by the session startup gate.
+pub(crate) fn serve_listener(
+    listener: TcpListener,
+    clock: QpcClock,
+    lines: SyncSender<String>,
+    origin: (i32, i32),
+) -> Result<()> {
     // `SendInput` reaches a desktop only if this thread is on the input desktop of
     // the console window station. On a headless IddCx host the injection can succeed
     // (returns 1) yet reach nothing — this line names the station+desktop we are
     // actually on, so "keys do nothing" stops being a mystery (see module docs).
     log_input_desktop();
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    let port = listener.local_addr()?.port();
     eprintln!("input: listening on 127.0.0.1:{port}");
     loop {
         match listener.accept() {

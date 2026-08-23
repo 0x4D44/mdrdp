@@ -113,11 +113,22 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// not a reason to lose the clipboard for the rest of the host's uptime.
 pub fn serve(
     port: u16,
-    mut make_clipboard: impl FnMut() -> Box<dyn TextClipboard>,
+    make_clipboard: impl FnMut() -> Box<dyn TextClipboard>,
     make_audio: AudioFactory,
     policy: Policy,
 ) -> Result<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    serve_listener(listener, make_clipboard, make_audio, policy)
+}
+
+/// Serve on a listener synchronously pre-bound by the session startup gate.
+pub(crate) fn serve_listener(
+    listener: TcpListener,
+    mut make_clipboard: impl FnMut() -> Box<dyn TextClipboard>,
+    make_audio: AudioFactory,
+    policy: Policy,
+) -> Result<()> {
+    let port = listener.local_addr()?.port();
     eprintln!("aux: listening on 127.0.0.1:{port}");
     loop {
         match listener.accept() {
