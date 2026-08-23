@@ -21,6 +21,93 @@ use crate::stats::CacheStats;
 /// Bytes per pixel, everywhere in this module.
 pub const BPP: usize = 4;
 
+/// Exact pixel coverage for a surface incarnation.
+///
+/// The bitset is allocated only after a partial write. A full-surface write uses the
+/// marker without allocating anything, and a bitset is dropped when its last pixel is
+/// covered. At one bit per pixel this is 1.76 MiB for a 5120x2880 surface, versus the
+/// 56.25 MiB RGBA pixel buffer it describes.
+#[derive(Debug, Clone)]
+enum Coverage {
+    Empty,
+    Bits { bits: Vec<u8>, covered: usize },
+    Full,
+}
+
+impl Coverage {
+    fn is_full(&self) -> bool {
+        matches!(self, Coverage::Full)
+    }
+
+    fn mark_full(&mut self) {
+        *self = Coverage::Full;
+    }
+
+    fn mask_for_range(start: usize, end: usize) -> u8 {
+        debug_assert!(start < end && end <= 8);
+        (u8::MAX << start) & (u8::MAX >> (8 - end))
+    }
+
+    /// Mark pixels that were successfully written by a clipped or exact operation.
+    fn mark_rect(&mut self, width: u16, height: u16, rect: Rect) {
+        if self.is_full() {
+            return;
+        }
+        if rect.is_empty() {
+            return;
+        }
+
+        let total = width as usize * height as usize;
+        if rect.left == 0 && rect.top == 0 && rect.right == width && rect.bottom == height {
+            *self = Coverage::Full;
+            return;
+        }
+        if total == 0 {
+            return;
+        }
+
+        if matches!(self, Coverage::Empty) {
+            let bytes = total.div_ceil(8);
+            *self = Coverage::Bits {
+                bits: vec![0; bytes],
+                covered: 0,
+            };
+        }
+
+        let complete = match self {
+            Coverage::Bits { bits, covered } => {
+                let width = width as usize;
+                let left = rect.left as usize;
+                let right = rect.right as usize;
+                for y in rect.top as usize..rect.bottom as usize {
+                    let first_bit = y * width + left;
+                    let last_bit = y * width + right;
+                    let first_byte = first_bit / 8;
+                    let last_byte = (last_bit - 1) / 8;
+                    for (offset, byte_bits) in bits[first_byte..=last_byte].iter_mut().enumerate() {
+                        let byte = first_byte + offset;
+                        let byte_start = byte * 8;
+                        let start = first_bit.saturating_sub(byte_start).min(8);
+                        let end = last_bit.saturating_sub(byte_start).min(8);
+                        let mask = Self::mask_for_range(start, end);
+                        let old = *byte_bits;
+                        let new = old | mask;
+                        *byte_bits = new;
+                        *covered += (new ^ old).count_ones() as usize;
+                    }
+                }
+                *covered == total
+            }
+            Coverage::Full => true,
+            Coverage::Empty => false,
+        };
+
+        if complete {
+            *self = Coverage::Full;
+        }
+    }
+}
+
 /// A rectangle in surface coordinates, `right`/`bottom` exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -74,6 +161,7 @@ pub struct Surface {
     pub height: u16,
     pixels: Vec<u8>,
     painted: bool,
+    coverage: Coverage,
 }
 
 impl Surface {
@@ -83,6 +171,7 @@ impl Surface {
             height,
             pixels: vec![0u8; width as usize * height as usize * BPP],
             painted: false,
+            coverage: Coverage::Empty,
         }
     }
 
@@ -92,6 +181,21 @@ impl Surface {
 
     fn is_painted(&self) -> bool {
         self.painted
+    }
+
+    fn is_complete(&self) -> bool {
+        self.coverage.is_full()
+    }
+
+    /// Clone only presentation pixels; fallback surfaces never need protocol coverage.
+    fn clone_for_presentation(&self) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.clone(),
+            painted: self.painted,
+            coverage: Coverage::Full,
+        }
     }
 
     fn row_start(&self, y: u16) -> usize {
@@ -144,6 +248,7 @@ impl Surface {
                 .copy_from_slice(&src[src_off..src_off + row_bytes]);
         }
         self.painted = true;
+        self.coverage.mark_rect(self.width, self.height, clipped);
         Ok(row_bytes * clipped.height() as usize)
     }
 
@@ -160,6 +265,7 @@ impl Surface {
             }
         }
         self.painted = true;
+        self.coverage.mark_rect(self.width, self.height, dest);
     }
 
     /// Replace the pixel buffer wholesale with a caller-produced one, returning the
@@ -180,6 +286,7 @@ impl Surface {
             });
         }
         self.painted = true;
+        self.coverage.mark_full();
         Ok(std::mem::replace(&mut self.pixels, pixels))
     }
 
@@ -217,6 +324,7 @@ impl Surface {
                 .copy_from_slice(&src[src_off..src_off + row_bytes]);
         }
         self.painted = true;
+        self.coverage.mark_rect(self.width, self.height, dest);
         Ok(())
     }
 
@@ -256,6 +364,7 @@ impl Surface {
             }
         }
         self.painted = true;
+        self.coverage.mark_rect(self.width, self.height, dest);
         Ok(())
     }
 
@@ -390,14 +499,27 @@ impl SurfaceStore {
     }
 
     fn retain_painted_output(&mut self) {
+        // A partial replacement may already be mapped while the old output is retained.
+        // Never replace that known-good fallback with the partial replacement during a
+        // second handoff.
+        if self.presentation_fallback.is_some() {
+            return;
+        }
         if let Some(surface) = self.output_surface().filter(|surface| surface.is_painted()) {
-            self.presentation_fallback = Some(surface.clone());
+            self.presentation_fallback = Some(surface.clone_for_presentation());
         }
     }
 
     fn finish_surface_mutation(&mut self, id: u16) {
-        if self.output == Some(id) && self.surfaces.get(&id).is_some_and(Surface::is_painted) {
+        let is_current_output = self.output == Some(id);
+        let is_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
+        if is_current_output && is_complete {
             self.presentation_fallback = None;
+        }
+        if is_current_output && self.presentation_fallback.is_some() && !is_complete {
+            // The fallback is still the visible surface, so do not wake the presenter for
+            // a replacement write that cannot change what it will copy.
+            return;
         }
         self.touch();
     }
@@ -448,7 +570,7 @@ impl SurfaceStore {
             self.retain_painted_output();
         }
         self.output = Some(id);
-        if self.surfaces.get(&id).is_some_and(Surface::is_painted) {
+        if self.surfaces.get(&id).is_some_and(Surface::is_complete) {
             self.presentation_fallback = None;
         }
         self.touch();
@@ -466,9 +588,13 @@ impl SurfaceStore {
     /// The presenter must keep the last good desktop through that handoff instead of
     /// flashing the replacement's zero-filled allocation.
     pub fn presentation_surface(&self) -> Option<&Surface> {
-        self.output_surface()
-            .filter(|surface| surface.is_painted())
-            .or(self.presentation_fallback.as_ref())
+        if self.presentation_fallback.is_some() {
+            self.output_surface()
+                .filter(|surface| surface.is_complete())
+                .or(self.presentation_fallback.as_ref())
+        } else {
+            self.output_surface().filter(|surface| surface.is_painted())
+        }
     }
 
     /// Copy the current presentation surface into a reusable snapshot.
@@ -747,6 +873,28 @@ mod tests {
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    #[test]
+    fn coverage_counts_overlapping_unaligned_edges_without_tail_bits() {
+        let mut coverage = Coverage::Empty;
+        coverage.mark_rect(13, 2, Rect::new(1, 0, 10, 1));
+        coverage.mark_rect(13, 2, Rect::new(8, 0, 13, 1));
+        coverage.mark_rect(13, 2, Rect::new(0, 0, 1, 2));
+
+        match &coverage {
+            Coverage::Bits { bits, covered } => {
+                assert_eq!(bits.len(), 4, "26 pixels need four coverage bytes");
+                assert_eq!(*covered, 14, "overlapping pixels count only once");
+            }
+            Coverage::Empty | Coverage::Full => panic!("coverage should still be partial"),
+        }
+
+        coverage.mark_rect(13, 2, Rect::new(1, 1, 13, 2));
+        assert!(
+            coverage.is_full(),
+            "the final unaligned row completes coverage"
+        );
+    }
 
     #[test]
     fn adopt_swaps_the_buffer_and_returns_the_old_one() {
@@ -1189,6 +1337,106 @@ mod tests {
         assert!(
             store.presentation_fallback.is_none(),
             "a committed replacement must retire its old presentation"
+        );
+    }
+
+    #[test]
+    fn a_partial_replacement_keeps_the_fallback_when_painted_before_mapping() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 2);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        store.map_to_output(1);
+
+        store.create(2, 2, 2);
+        store
+            .blit_rgba_strict(2, Rect::new(0, 0, 1, 2), &solid(1, 2, BLUE))
+            .unwrap();
+        store.map_to_output(2);
+
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(2, 2, RED),
+            "a partial replacement must not cover the last good desktop"
+        );
+        assert!(
+            store.presentation_fallback.is_some(),
+            "mapping a partially painted replacement must retain the fallback"
+        );
+
+        store.create(3, 2, 2);
+        store.map_to_output(3);
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(2, 2, RED),
+            "a second handoff must preserve the original last good desktop"
+        );
+
+        store
+            .blit_rgba_strict(3, Rect::new(0, 0, 2, 2), &solid(2, 2, BLUE))
+            .unwrap();
+        assert!(
+            store.presentation_fallback.is_none(),
+            "the fallback retires once every replacement pixel is covered"
+        );
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(2, 2, BLUE)
+        );
+    }
+
+    #[test]
+    fn a_partial_current_replacement_does_not_advance_generation_until_complete() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 3, 2);
+        store.solid_fill(1, &[Rect::new(0, 0, 3, 2)], RED).unwrap();
+        store.map_to_output(1);
+        store.create(2, 3, 2);
+        store.map_to_output(2);
+
+        let before_partial = store.generation();
+        store
+            .blit_rgba_strict(2, Rect::new(0, 0, 1, 2), &solid(1, 2, BLUE))
+            .unwrap();
+        assert_eq!(
+            store.generation(),
+            before_partial,
+            "painting an incomplete replacement must not wake the presenter"
+        );
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(3, 2, RED)
+        );
+
+        store
+            .blit_rgba_strict(2, Rect::new(1, 0, 3, 2), &solid(2, 2, BLUE))
+            .unwrap();
+        assert_eq!(
+            store.generation(),
+            before_partial + 1,
+            "completing the replacement must publish exactly one generation"
+        );
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(3, 2, BLUE)
+        );
+    }
+
+    #[test]
+    fn a_full_adopt_retires_the_replacement_fallback() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 2);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        store.map_to_output(1);
+        store.create(2, 2, 2);
+        store.map_to_output(2);
+        assert!(store.presentation_fallback.is_some());
+
+        store.adopt_pixels(2, solid(2, 2, BLUE)).unwrap();
+
+        assert!(store.presentation_fallback.is_none());
+        assert_eq!(
+            store.presentation_surface().unwrap().pixels(),
+            solid(2, 2, BLUE)
         );
     }
 
