@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00051 — Rhydra 5K queue can drop one tile from an otherwise complete frame
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/server-latency
 - **Raised:** 2026-08-23T12:09:37Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T125338Z-38f85501
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00051-run-fix-20260823T125338Z-38f85501
-- **Owner base:** 0128484c7e96ce67fefeb4de07e12341ed08d26b
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T12:53:38Z
-- **Owner until:** 2026-08-23T14:53:38Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T13:17:06Z, deltic:auto role=fix run=fix-20260823T125338Z-38f85501 branch=task/bug-MDR-BUG-FLU-00051-run-fix-20260823T125338Z-38f85501 code=1dec4bb gate=manual)
 
 ## Observation
 
