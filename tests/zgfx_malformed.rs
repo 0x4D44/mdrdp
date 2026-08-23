@@ -15,3 +15,21 @@ fn multipart_segment_length_must_fit_remaining_payload() {
     assert!(decompressor.decompress(&malformed, &mut output).is_err());
     assert!(output.is_empty());
 }
+
+#[test]
+fn truncated_compressed_tokens_return_errors_instead_of_panicking() {
+    let malformed = [
+        &[0xe0, 0x24, 0x00, 0x07][..], // literal token without its eight-bit value
+        &[0xe0, 0x24, 0x09][..],       // impossible final-byte padding count
+    ];
+
+    for payload in malformed {
+        let mut decompressor = Decompressor::new();
+        let mut output = Vec::new();
+
+        assert!(
+            decompressor.decompress(payload, &mut output).is_err(),
+            "malformed payload {payload:02x?} was accepted"
+        );
+    }
+}

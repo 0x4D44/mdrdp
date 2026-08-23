@@ -17,6 +17,14 @@ impl<'a> Bits<'a> {
         }
     }
 
+    pub(crate) fn try_split_to(&mut self, at: usize) -> Option<&'a BitSlice<u8, Msb0>> {
+        if at > self.bits_slice.len() {
+            return None;
+        }
+
+        Some(self.split_to(at))
+    }
+
     pub(crate) fn split_to(&mut self, at: usize) -> &'a BitSlice<u8, Msb0> {
         let (value, new_bits) = self.bits_slice.split_at(at);
         self.bits_slice = new_bits;

@@ -83,26 +83,40 @@ impl Decompressor {
             return Ok(0);
         }
 
-        let mut bits = BitSlice::from_slice(encoded_data);
-
         // The value of the last byte indicates the number of unused bits in the final byte
-        bits = &bits
-            [..8 * (encoded_data.len() - 1) - usize::from(*encoded_data.last().expect("encoded_data is not empty"))];
+        let unused_bits = usize::from(*encoded_data.last().expect("encoded_data is not empty"));
+        if unused_bits > 7 {
+            return Err(ZgfxError::TruncatedBitstream);
+        }
+        let encoded_bits = (encoded_data.len() - 1)
+            .checked_mul(8)
+            .ok_or(ZgfxError::TruncatedBitstream)?;
+        let bit_len = encoded_bits
+            .checked_sub(unused_bits)
+            .ok_or(ZgfxError::TruncatedBitstream)?;
+        let bits = BitSlice::from_slice(encoded_data)
+            .get(..bit_len)
+            .ok_or(ZgfxError::TruncatedBitstream)?;
         let mut bits = Bits::new(bits);
         let mut bytes_written = 0;
 
         while !bits.is_empty() {
             let token = TOKEN_TABLE
                 .iter()
-                .find(|token| token.prefix == bits[..token.prefix.len()])
+                .find(|token| bits.get(..token.prefix.len()).is_some_and(|prefix| token.prefix == prefix))
                 .ok_or(ZgfxError::TokenBitsNotFound)?;
-            let _prefix = bits.split_to(token.prefix.len());
+            let _prefix = bits
+                .try_split_to(token.prefix.len())
+                .ok_or(ZgfxError::TruncatedBitstream)?;
 
             match token.ty {
                 TokenType::NullLiteral => {
                     // The prefix value is encoded with a "0" prefix,
                     // then read 8 bits containing the byte to output.
-                    let value = bits.split_to(8).load_be::<u8>();
+                    let value = bits
+                        .try_split_to(8)
+                        .ok_or(ZgfxError::TruncatedBitstream)?
+                        .load_be::<u8>();
 
                     self.history.write_u8(value)?;
                     output.push(value);
@@ -146,11 +160,15 @@ fn handle_match(
     // Each token has been assigned a different base distance
     // and number of additional value bits to be added to compute the full distance.
 
-    let distance = usize::try_from(distance_base + bits.split_to(distance_value_size).load_be::<u32>())
+    let distance_value = bits
+        .try_split_to(distance_value_size)
+        .ok_or(ZgfxError::TruncatedBitstream)?
+        .load_be::<u32>();
+    let distance = usize::try_from(distance_base + distance_value)
         .map_err(|_| ZgfxError::InvalidIntegralConversion("token's full distance"))?;
 
     if distance == 0 {
-        read_unencoded_bytes(bits, history, output).map_err(ZgfxError::from)
+        read_unencoded_bytes(bits, history, output)
     } else {
         read_encoded_bytes(bits, distance, history, output)
     }
@@ -160,18 +178,25 @@ fn read_unencoded_bytes(
     bits: &mut Bits<'_>,
     history: &mut FixedCircularBuffer,
     output: &mut Vec<u8>,
-) -> io::Result<usize> {
+) -> Result<usize, ZgfxError> {
     // A match distance of zero is a special case,
     // which indicates that an unencoded run of bytes follows.
     // The count of bytes is encoded as a 15-bit value
-    let length = bits.split_to(15).load_be::<usize>();
+    let length = bits
+        .try_split_to(15)
+        .ok_or(ZgfxError::TruncatedBitstream)?
+        .load_be::<usize>();
 
     if bits.remaining_bits_of_last_byte() > 0 {
         let pad_to_byte_boundary = 8 - bits.remaining_bits_of_last_byte();
-        bits.split_to(pad_to_byte_boundary);
+        bits
+            .try_split_to(pad_to_byte_boundary)
+            .ok_or(ZgfxError::TruncatedBitstream)?;
     }
 
-    let unencoded_bits = bits.split_to(length * 8);
+    let unencoded_bits = bits
+        .try_split_to(length * 8)
+        .ok_or(ZgfxError::TruncatedBitstream)?;
 
     // FIXME: not very efficient, but we need to rework the `Bits` helper and refactor a bit otherwise
     let unencoded_bits = unencoded_bits.to_bitvec();
@@ -193,19 +218,29 @@ fn read_encoded_bytes(
     // (the number of bytes to be copied).
 
     let length_token_size = bits.leading_ones();
-    bits.split_to(length_token_size + 1); // length token + zero bit
+    let length_field_size = length_token_size
+        .checked_add(1)
+        .ok_or(ZgfxError::InvalidIntegralConversion("length token size"))?;
+    bits
+        .try_split_to(length_field_size)
+        .ok_or(ZgfxError::TruncatedBitstream)?; // length token + zero bit
 
     let length = if length_token_size == 0 {
         // special case
 
         3
     } else {
-        let length = bits.split_to(length_token_size + 1).load_be::<usize>();
+        let length = bits
+            .try_split_to(length_field_size)
+            .ok_or(ZgfxError::TruncatedBitstream)?
+            .load_be::<usize>();
 
         let length_token_size = u32::try_from(length_token_size)
             .map_err(|_| ZgfxError::InvalidIntegralConversion("length of the token size"))?;
 
-        let base = 2usize.pow(length_token_size + 1);
+        let base = 1usize
+            .checked_shl(length_token_size + 1)
+            .ok_or(ZgfxError::InvalidIntegralConversion("match length base"))?;
 
         base + length
     };
@@ -452,6 +487,7 @@ pub enum ZgfxError {
         uncompressed_size: usize,
     },
     TokenBitsNotFound,
+    TruncatedBitstream,
     InvalidIntegralConversion(&'static str),
 }
 
@@ -469,6 +505,7 @@ impl core::fmt::Display for ZgfxError {
                 "decompressed size of segments ({decompressed_size}) does not equal to uncompressed size ({uncompressed_size})",
             ),
             Self::TokenBitsNotFound => write!(f, "token bits not found"),
+            Self::TruncatedBitstream => write!(f, "truncated ZGFX bitstream"),
             Self::InvalidIntegralConversion(type_name) => {
                 write!(f, "invalid `{type_name}`: out of range integral type conversion")
             }
@@ -484,6 +521,7 @@ impl core::error::Error for ZgfxError {
             Self::InvalidSegmentedDescriptor => None,
             Self::InvalidDecompressedSize { .. } => None,
             Self::TokenBitsNotFound => None,
+            Self::TruncatedBitstream => None,
             Self::InvalidIntegralConversion(_) => None,
         }
     }

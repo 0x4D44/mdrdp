@@ -15,6 +15,13 @@ impl FixedCircularBuffer {
     }
 
     pub(crate) fn read_with_offset(&self, offset: usize, length: usize, output: &mut impl io::Write) -> io::Result<()> {
+        if offset == 0 || offset > self.buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZGFX match offset exceeds the history buffer",
+            ));
+        }
+
         let position = (self.buffer.len() + self.position - offset) % self.buffer.len();
 
         // will take the offset if the destination length is greater than the offset,
@@ -213,5 +220,18 @@ mod tests {
         let mut output = Vec::with_capacity(expected.len());
         circular_buffer.read_with_offset(4, 7, &mut output).unwrap();
         assert_eq!(expected, output);
+    }
+
+    #[test]
+    fn fixed_circular_buffer_rejects_offset_beyond_history() {
+        let circular_buffer = FixedCircularBuffer::new(8);
+        let mut output = Vec::new();
+
+        let error = circular_buffer
+            .read_with_offset(9, 3, &mut output)
+            .expect_err("an offset beyond the history must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(output.is_empty());
     }
 }
