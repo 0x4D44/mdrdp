@@ -583,10 +583,13 @@ impl SurfaceStore {
             .surfaces
             .get(&src_id)
             .ok_or(SurfaceError::NoSuchSurface(src_id))?;
-        let Some(pixels) = src_surface.extract(src_rect) else {
+        let Some(clipped_src) = src_rect.clip_to(src_surface.width, src_surface.height) else {
             return Ok(());
         };
-        let (w, h) = (src_rect.width(), src_rect.height());
+        let Some(pixels) = src_surface.extract(clipped_src) else {
+            return Ok(());
+        };
+        let (w, h) = (clipped_src.width(), clipped_src.height());
 
         let dest = self
             .surfaces
@@ -947,6 +950,39 @@ mod tests {
         let s = store.get(1).unwrap();
         assert_eq!(&s.pixels()[BPP..2 * BPP], RED, "copied pixel");
         assert_eq!(&s.pixels()[2 * BPP..3 * BPP], RED, "copied pixel");
+    }
+
+    #[test]
+    fn surface_to_surface_uses_clipped_source_dimensions_for_all_destinations() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 4, 4);
+        store.create(2, 6, 6);
+        store
+            .blit_rgba(1, Rect::new(0, 0, 4, 4), &ramp(4, 4), 4)
+            .unwrap();
+
+        let before = store.generation();
+        store
+            .surface_to_surface(1, Rect::new(2, 2, 6, 6), 2, &[(0, 0), (4, 4)])
+            .expect("a clipped source rectangle should copy to every destination");
+
+        let dest = store.get(2).unwrap();
+        for &(x, y) in &[(0u16, 0u16), (4, 4)] {
+            for row in 0..2u16 {
+                for col in 0..2u16 {
+                    let off = ((y + row) as usize * dest.width as usize + (x + col) as usize) * BPP;
+                    assert_eq!(
+                        &dest.pixels()[off..off + BPP],
+                        &[col as u8 + 2, row as u8 + 2, 0, 255],
+                        "destination ({x},{y}) pixel ({col},{row}) differs"
+                    );
+                }
+            }
+        }
+        assert!(
+            store.generation() > before,
+            "a successful copy must announce its mutation"
+        );
     }
 
     #[test]
