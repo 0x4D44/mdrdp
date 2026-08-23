@@ -16,7 +16,7 @@ use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
-    TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+    TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
 };
 use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows::Win32::System::Services::{
@@ -202,19 +202,16 @@ fn launch_worker(session_id: u32) -> Result<Child, String> {
     let exe = std::env::current_exe().map_err(|error| format!("current_exe failed: {error}"))?;
     let mut service_token = HANDLE::default();
     // SAFETY: output handle points to valid storage and is closed below.
-    unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_DUPLICATE | TOKEN_QUERY,
-            &mut service_token,
-        )
-    }
-    .map_err(|error| format!("OpenProcessToken failed: {error}"))?;
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &mut service_token) }
+        .map_err(|error| format!("OpenProcessToken failed: {error}"))?;
     let mut console_token = HANDLE::default();
     let duplicate = unsafe {
         DuplicateTokenEx(
             service_token,
-            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_SESSIONID,
+            // Match the proven Sunshine service contract. A hand-selected
+            // subset compiled but SetTokenInformation(TokenSessionId) returned
+            // ERROR_ACCESS_DENIED on Quench under LocalSystem.
+            TOKEN_ALL_ACCESS,
             None,
             SecurityImpersonation,
             TokenPrimary,
