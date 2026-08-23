@@ -6,15 +6,15 @@
 - **Area:** rdp/display-surface
 - **Raised:** 2026-08-23T12:44:12Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T193108Z-286b9a76
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00062-run-fix-20260823T193108Z-286b9a76
+- **Owner base:** 4aef3c3f382d70cf3b0b4829d5bb90ac6fe84b1f
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T19:31:08Z
+- **Owner until:** 2026-08-23T21:31:08Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
