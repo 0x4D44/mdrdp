@@ -26,6 +26,164 @@ pub struct ClearCodecDecoder {
     glyph_cache: GlyphCache,
 }
 
+/// A rectangle whose pixels were supplied by a ClearCodec stream.
+///
+/// Coordinates are relative to the decoded bitmap and use exclusive `right` and
+/// `bottom` edges. A stream can write several disjoint rectangles into one decoded
+/// bitmap, so callers must not assume that the bitmap's full extent was supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearCodecRect {
+    pub left: u16,
+    pub top: u16,
+    pub right: u16,
+    pub bottom: u16,
+}
+
+/// Decoded ClearCodec pixels and the regions the stream actually wrote.
+///
+/// `pixels` remains a complete bitmap, including caller-supplied seed pixels that
+/// no layer touched. `written_regions` is the precise coverage of wire-supplied
+/// pixels and is independent of their colour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearCodecDecode {
+    pub pixels: Vec<u8>,
+    pub written_regions: Vec<ClearCodecRect>,
+}
+
+#[derive(Debug, Default)]
+struct WrittenRegions {
+    regions: Vec<ClearCodecRect>,
+}
+
+impl WrittenRegions {
+    fn push(&mut self, left: usize, top: usize, right: usize, bottom: usize) {
+        if left >= right || top >= bottom {
+            return;
+        }
+        let left = left as u16;
+        let top = top as u16;
+        let right = right as u16;
+        let bottom = bottom as u16;
+        if let Some(previous) = self.regions.last_mut() {
+            if previous.left == left && previous.right == right && previous.bottom == top {
+                previous.bottom = bottom;
+                return;
+            }
+        }
+        self.regions.push(ClearCodecRect {
+            left,
+            top,
+            right,
+            bottom,
+        });
+    }
+
+    fn is_full(&self, width: u16, height: u16) -> bool {
+        let width = usize::from(width);
+        let height = usize::from(height);
+        if width == 0 || height == 0 {
+            return true;
+        }
+
+        for y in 0..height {
+            let mut spans: Vec<(usize, usize)> = self
+                .regions
+                .iter()
+                .filter_map(|region| {
+                    let top = usize::from(region.top);
+                    let bottom = usize::from(region.bottom);
+                    if y < top || y >= bottom {
+                        return None;
+                    }
+                    let left = usize::from(region.left).min(width);
+                    let right = usize::from(region.right).min(width);
+                    (left < right).then_some((left, right))
+                })
+                .collect();
+            spans.sort_unstable();
+
+            let mut covered_until = 0;
+            for (left, right) in spans {
+                if left > covered_until {
+                    return false;
+                }
+                covered_until = covered_until.max(right);
+                if covered_until == width {
+                    break;
+                }
+            }
+            if covered_until < width {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn mark_linear(&mut self, start: usize, count: usize, width: u16, height: u16) {
+        let width = usize::from(width);
+        let height = usize::from(height);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let total = width * height;
+        let end = start.saturating_add(count).min(total);
+        let mut cursor = start.min(total);
+        while cursor < end {
+            let y = cursor / width;
+            let row_start = y * width;
+            let row_end = (row_start + width).min(end);
+            self.push(cursor - row_start, y, row_end - row_start, y + 1);
+            cursor = row_end;
+        }
+    }
+
+    fn mark_column(&mut self, x: usize, top: usize, rows: usize, width: u16, height: u16) {
+        let width = usize::from(width);
+        let height = usize::from(height);
+        if x >= width {
+            return;
+        }
+        let top = top.min(height);
+        let bottom = top.saturating_add(rows).min(height);
+        self.push(x, top, x + 1, bottom);
+    }
+
+    fn mark_subcodec_linear(
+        &mut self,
+        x_start: u16,
+        y_start: u16,
+        region_width: u16,
+        region_height: u16,
+        start: usize,
+        count: usize,
+        surface_width: u16,
+        surface_height: u16,
+    ) {
+        let region_width = usize::from(region_width);
+        if region_width == 0 {
+            return;
+        }
+        let region_pixels = region_width.saturating_mul(usize::from(region_height));
+        let end = start.saturating_add(count).min(region_pixels);
+        let mut cursor = start.min(region_pixels);
+        while cursor < end {
+            let row = cursor / region_width;
+            let row_start = row * region_width;
+            let row_end = (row_start + region_width).min(end);
+            let left = usize::from(x_start) + cursor - row_start;
+            let right = usize::from(x_start) + row_end - row_start;
+            let top = usize::from(y_start) + row;
+            self.push(
+                left.min(usize::from(surface_width)),
+                top.min(usize::from(surface_height)),
+                right.min(usize::from(surface_width)),
+                (top + 1).min(usize::from(surface_height)),
+            );
+            cursor = row_end;
+        }
+    }
+}
+
 impl ClearCodecDecoder {
     pub fn new() -> Self {
         Self {
@@ -68,6 +226,33 @@ impl ClearCodecDecoder {
         height: u16,
         existing: Option<Vec<u8>>,
     ) -> DecodeResult<Vec<u8>> {
+        self.decode_over_impl(data, width, height, existing, false)
+            .map(|decoded| decoded.pixels)
+    }
+
+    /// Decode over an optional seed and report only the pixels supplied by the stream.
+    ///
+    /// The returned bitmap still has the requested full extent. `written_regions` is
+    /// suitable for retiring a presentation fallback without treating untouched seed
+    /// pixels as newly decoded content.
+    pub fn decode_over_with_coverage(
+        &mut self,
+        data: &[u8],
+        width: u16,
+        height: u16,
+        existing: Option<Vec<u8>>,
+    ) -> DecodeResult<ClearCodecDecode> {
+        self.decode_over_impl(data, width, height, existing, true)
+    }
+
+    fn decode_over_impl(
+        &mut self,
+        data: &[u8],
+        width: u16,
+        height: u16,
+        existing: Option<Vec<u8>>,
+        capture_coverage: bool,
+    ) -> DecodeResult<ClearCodecDecode> {
         let mut src = ReadCursor::new(data);
         let stream = ClearCodecBitmapStream::decode(&mut src)?;
 
@@ -111,7 +296,19 @@ impl ClearCodecDecoder {
                     "cached glyph smaller than destination"
                 ));
             }
-            return Ok(entry.pixels[..needed].to_vec());
+            return Ok(ClearCodecDecode {
+                pixels: entry.pixels[..needed].to_vec(),
+                written_regions: if capture_coverage && width > 0 && height > 0 {
+                    vec![ClearCodecRect {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    }]
+                } else {
+                    Vec::new()
+                },
+            });
         }
 
         // Cap allocation to prevent OOM from adversarial dimensions.
@@ -138,28 +335,37 @@ impl ClearCodecDecoder {
             Some(buf) if buf.len() == pixel_count * 4 => buf,
             _ => vec![0u8; pixel_count * 4],
         };
+        let cache_candidate = stream.flags & FLAG_GLYPH_INDEX != 0 && pixel_count <= 1024;
+        let mut written = (capture_coverage || cache_candidate).then(WrittenRegions::default);
 
         if let Some(ref composite) = stream.composite {
-            self.decode_composite(composite, &mut output, width, height)?;
+            self.decode_composite(composite, &mut output, width, height, &mut written)?;
         }
 
-        // Store in glyph cache if applicable (area <= 1024 pixels)
-        if stream.flags & FLAG_GLYPH_INDEX != 0 {
+        // A glyph cache entry must be a complete bitmap. A sparse decode over a caller
+        // seed contains destination-specific pixels outside its explicit writes, so
+        // replaying it as a full glyph would claim coverage for the wrong content.
+        if cache_candidate
+            && written
+                .as_ref()
+                .is_some_and(|written| written.is_full(width, height))
+        {
             if let Some(glyph_index) = stream.glyph_index {
-                if pixel_count <= 1024 {
-                    self.glyph_cache.store(
-                        glyph_index,
-                        GlyphEntry {
-                            width,
-                            height,
-                            pixels: output.clone(),
-                        },
-                    );
-                }
+                self.glyph_cache.store(
+                    glyph_index,
+                    GlyphEntry {
+                        width,
+                        height,
+                        pixels: output.clone(),
+                    },
+                );
             }
         }
 
-        Ok(output)
+        Ok(ClearCodecDecode {
+            pixels: output,
+            written_regions: written.map_or_else(Vec::new, |written| written.regions),
+        })
     }
 
     fn decode_composite(
@@ -167,7 +373,8 @@ impl ClearCodecDecoder {
         composite: &CompositePayload<'_>,
         output: &mut [u8],
         width: u16,
-        _height: u16,
+        height: u16,
+        written: &mut Option<WrittenRegions>,
     ) -> DecodeResult<()> {
         let w = usize::from(width);
 
@@ -181,12 +388,16 @@ impl ClearCodecDecoder {
             for seg in &segments {
                 let pixels_remaining = (max_offset.saturating_sub(offset)) / 4;
                 let effective_run = u32::try_from(pixels_remaining).unwrap_or(u32::MAX).min(seg.run_length);
+                let start = offset / 4;
                 for _ in 0..effective_run {
                     output[offset] = seg.blue;
                     output[offset + 1] = seg.green;
                     output[offset + 2] = seg.red;
                     output[offset + 3] = 0xFF; // Alpha
                     offset += 4;
+                }
+                if let Some(written) = written.as_mut() {
+                    written.mark_linear(start, effective_run as usize, width, height);
                 }
                 if offset >= max_offset {
                     break;
@@ -221,6 +432,9 @@ impl ClearCodecDecoder {
                             output[dst_offset + 3] = 0xFF;
                         }
                     }
+                    if let Some(written) = written.as_mut() {
+                        written.mark_column(x, usize::from(band.y_start), pixel_rows, width, height);
+                    }
                 }
             }
         }
@@ -229,7 +443,7 @@ impl ClearCodecDecoder {
         if !composite.subcodec_data.is_empty() {
             let subcodecs = decode_subcodec_layer(composite.subcodec_data)?;
             for sub in &subcodecs {
-                self.decode_subcodec_region(sub, output, width)?;
+                self.decode_subcodec_region(sub, output, width, written)?;
             }
         }
 
@@ -290,6 +504,7 @@ impl ClearCodecDecoder {
         sub: &ironrdp_pdu::codecs::clearcodec::Subcodec<'_>,
         output: &mut [u8],
         surface_width: u16,
+        written: &mut Option<WrittenRegions>,
     ) -> DecodeResult<()> {
         let sw = usize::from(surface_width);
         let sh = output.len() / (sw * 4).max(1);
@@ -323,6 +538,14 @@ impl ClearCodecDecoder {
                         output[dst_idx + 3] = 0xFF;
                     }
                 }
+                if let Some(written) = written.as_mut() {
+                    written.push(
+                        usize::from(sub.x_start),
+                        usize::from(sub.y_start),
+                        x_end,
+                        y_end,
+                    );
+                }
             }
             SubcodecId::Rlex => {
                 let rlex = ironrdp_pdu::codecs::clearcodec::decode_rlex(sub.bitmap_data)?;
@@ -340,6 +563,7 @@ impl ClearCodecDecoder {
                     }
 
                     let color = &rlex.palette[usize::from(seg.start_index)];
+                    let run_start = px;
                     for _ in 0..seg.run_length {
                         if px >= region_pixels {
                             return Err(invalid_field_err!("rlex", "run exceeds region pixel count"));
@@ -353,7 +577,20 @@ impl ClearCodecDecoder {
                         output[dst_idx + 3] = 0xFF;
                         px += 1;
                     }
+                    if let Some(written) = written.as_mut() {
+                        written.mark_subcodec_linear(
+                            sub.x_start,
+                            sub.y_start,
+                            sub.width,
+                            sub.height,
+                            run_start,
+                            px - run_start,
+                            surface_width,
+                            sh as u16,
+                        );
+                    }
 
+                    let suite_start = px;
                     for palette_idx in seg.start_index..=seg.stop_index {
                         if px >= region_pixels {
                             return Err(invalid_field_err!("rlex", "suite exceeds region pixel count"));
@@ -368,6 +605,18 @@ impl ClearCodecDecoder {
                         output[dst_idx + 3] = 0xFF;
                         px += 1;
                     }
+                    if let Some(written) = written.as_mut() {
+                        written.mark_subcodec_linear(
+                            sub.x_start,
+                            sub.y_start,
+                            sub.width,
+                            sub.height,
+                            suite_start,
+                            px - suite_start,
+                            surface_width,
+                            sh as u16,
+                        );
+                    }
                 }
             }
             SubcodecId::NsCodec => {
@@ -378,6 +627,14 @@ impl ClearCodecDecoder {
                     let src = row * w * 4;
                     let dst = ((usize::from(sub.y_start) + row) * sw + usize::from(sub.x_start)) * 4;
                     output[dst..dst + w * 4].copy_from_slice(&decoded[src..src + w * 4]);
+                }
+                if let Some(written) = written.as_mut() {
+                    written.push(
+                        usize::from(sub.x_start),
+                        usize::from(sub.y_start),
+                        x_end,
+                        y_end,
+                    );
                 }
             }
         }

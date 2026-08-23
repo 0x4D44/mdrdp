@@ -460,36 +460,51 @@ impl GfxHandler {
                 rgba
             });
 
-        let mut pixels =
-            match self
-                .decoder
-                .decode_over(&pdu.bitmap_data, dest.width(), dest.height(), existing)
-            {
-                Ok(pixels) => pixels,
-                Err(e) => {
-                    self.capture
-                        .record(dest.width(), dest.height(), &pdu.bitmap_data);
-                    // The reason is recorded, not just the count. A bare counter said "177
-                    // tiles failed" and left no way to tell one cause from a hundred; the
-                    // error text carries protocol field names, never pixels, so it is safe
-                    // to keep. The tally is by reason so a single dominant fault is obvious.
-                    let reason = e.to_string();
-                    self.stats.note(|s| {
-                        s.decode_errors = s.decode_errors.saturating_add(1);
-                        *s.decode_error_reasons.entry(reason).or_insert(0) += 1;
-                    });
-                    // One dropped tile is a smear the next frame repaints; an error returned
-                    // to the DVC processor would end the session.
-                    return;
-                }
-            };
+        let decoded = match self.decoder.decode_over_with_coverage(
+            &pdu.bitmap_data,
+            dest.width(),
+            dest.height(),
+            existing,
+        ) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                self.capture
+                    .record(dest.width(), dest.height(), &pdu.bitmap_data);
+                // The reason is recorded, not just the count. A bare counter said "177
+                // tiles failed" and left no way to tell one cause from a hundred; the
+                // error text carries protocol field names, never pixels, so it is safe
+                // to keep. The tally is by reason so a single dominant fault is obvious.
+                let reason = e.to_string();
+                self.stats.note(|s| {
+                    s.decode_errors = s.decode_errors.saturating_add(1);
+                    *s.decode_error_reasons.entry(reason).or_insert(0) += 1;
+                });
+                // One dropped tile is a smear the next frame repaints; an error returned
+                // to the DVC processor would end the session.
+                return;
+            }
+        };
 
+        let mut pixels = decoded.pixels;
+        let coverage: Vec<Rect> = decoded
+            .written_regions
+            .into_iter()
+            .map(|region| {
+                Rect::new(
+                    dest.left.saturating_add(region.left),
+                    dest.top.saturating_add(region.top),
+                    dest.left.saturating_add(region.right),
+                    dest.top.saturating_add(region.bottom),
+                )
+            })
+            .collect();
         SurfaceStore::bgra_to_rgba_in_place(&mut pixels);
         // The decoder produced rows at the UNCLIPPED rect width — that is what it was
         // asked for. Passing the clipped width instead shears the tile.
         let stride = dest.width();
-        let result =
-            self.with_store(|store| store.blit_rgba(pdu.surface_id, dest, &pixels, stride));
+        let result = self.with_store(|store| {
+            store.blit_rgba_with_coverage(pdu.surface_id, dest, &pixels, stride, &coverage)
+        });
         self.note_painted(
             codec_name(pdu.codec_id),
             u64::from(dest.width()) * u64::from(dest.height()),
@@ -898,7 +913,7 @@ mod tests {
     use ironrdp_egfx::pdu::{
         CacheImportOfferPdu, Color, MapSurfaceToOutputPdu, PixelFormat, Point,
     };
-    use ironrdp_graphics::clearcodec::ClearCodecEncoder;
+    use ironrdp_graphics::clearcodec::{ClearCodecDecoder, ClearCodecEncoder, ClearCodecRect};
 
     const BPP: usize = 4;
 
@@ -960,6 +975,131 @@ mod tests {
         let surface = guard.get(id).expect("surface");
         let off = (y as usize * surface.width as usize + x as usize) * BPP;
         surface.pixels()[off..off + BPP].try_into().unwrap()
+    }
+
+    fn sparse_clearcodec_stream(x: u16, y: u16, bgr: [u8; 3]) -> Vec<u8> {
+        sparse_clearcodec_stream_with_glyph(x, y, bgr, None)
+    }
+
+    fn sparse_clearcodec_stream_with_glyph(
+        x: u16,
+        y: u16,
+        bgr: [u8; 3],
+        glyph_index: Option<u16>,
+    ) -> Vec<u8> {
+        let mut subcodec_data = Vec::new();
+        subcodec_data.extend_from_slice(&x.to_le_bytes());
+        subcodec_data.extend_from_slice(&y.to_le_bytes());
+        subcodec_data.extend_from_slice(&1u16.to_le_bytes());
+        subcodec_data.extend_from_slice(&1u16.to_le_bytes());
+        subcodec_data.extend_from_slice(&3u32.to_le_bytes());
+        subcodec_data.push(0x00); // SubcodecId::Raw
+        subcodec_data.extend_from_slice(&bgr);
+
+        let mut stream = vec![
+            glyph_index.map_or(0, |_| 0x01), // FLAG_GLYPH_INDEX
+            0x00,
+        ]; // flags, sequence number
+        if let Some(glyph_index) = glyph_index {
+            stream.extend_from_slice(&glyph_index.to_le_bytes());
+        }
+        stream.extend_from_slice(&0u32.to_le_bytes()); // residual
+        stream.extend_from_slice(&0u32.to_le_bytes()); // bands
+        stream.extend_from_slice(&(subcodec_data.len() as u32).to_le_bytes());
+        stream.extend_from_slice(&subcodec_data);
+        stream
+    }
+
+    #[test]
+    fn sparse_clearcodec_decoder_reports_explicit_writes_not_colour_differences() {
+        let seed: Vec<u8> = [0x10u8, 0x20, 0x30, 0xFF]
+            .iter()
+            .copied()
+            .cycle()
+            .take(2 * 2 * BPP)
+            .collect();
+        let mut decoder = ClearCodecDecoder::new();
+        let decoded = decoder
+            .decode_over_with_coverage(
+                &sparse_clearcodec_stream(1, 0, [0x10, 0x20, 0x30]),
+                2,
+                2,
+                Some(seed.clone()),
+            )
+            .expect("sparse raw subcodec must decode");
+
+        assert_eq!(decoded.pixels, seed, "the explicit write equals its seed");
+        assert_eq!(
+            decoded.written_regions,
+            vec![ClearCodecRect {
+                left: 1,
+                top: 0,
+                right: 2,
+                bottom: 1,
+            }],
+            "coverage must come from stream writes, not a colour comparison"
+        );
+    }
+
+    #[test]
+    fn sparse_clearcodec_decode_is_not_cached_as_a_full_glyph() {
+        let seed: Vec<u8> = [0x10u8, 0x20, 0x30, 0xFF]
+            .iter()
+            .copied()
+            .cycle()
+            .take(2 * 2 * BPP)
+            .collect();
+        let mut decoder = ClearCodecDecoder::new();
+        let decoded = decoder
+            .decode_over_with_coverage(
+                &sparse_clearcodec_stream_with_glyph(0, 0, [0x01, 0x02, 0x03], Some(42)),
+                2,
+                2,
+                Some(seed),
+            )
+            .expect("sparse glyph candidate must decode");
+        assert_eq!(decoded.written_regions.len(), 1);
+
+        let hit = [
+            0x01 | 0x02, // FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT
+            0x01,
+            42,
+            0,
+        ];
+        assert!(
+            decoder.decode_over_with_coverage(&hit, 2, 2, None).is_err(),
+            "a sparse seeded bitmap must not be available as a full glyph hit"
+        );
+    }
+
+    #[test]
+    fn fully_supplied_glyph_rows_coalesce_and_still_replay_as_full_coverage() {
+        let mut decoder = ClearCodecDecoder::new();
+        let mut stream = vec![0x01, 0x00, 0x00, 0x00]; // glyph index 0
+        stream.extend_from_slice(&4u32.to_le_bytes()); // residual
+        stream.extend_from_slice(&0u32.to_le_bytes()); // bands
+        stream.extend_from_slice(&0u32.to_le_bytes()); // subcodec
+        stream.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // four BGR pixels
+
+        let decoded = decoder
+            .decode_over_with_coverage(&stream, 2, 2, None)
+            .expect("full glyph candidate must decode");
+        assert_eq!(
+            decoded.written_regions,
+            vec![ClearCodecRect {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 2,
+            }]
+        );
+
+        let hit = [0x01 | 0x02, 0x01, 0x00, 0x00]; // glyph index 0
+        let replayed = decoder
+            .decode_over_with_coverage(&hit, 2, 2, None)
+            .expect("fully supplied glyph must remain cacheable");
+        assert_eq!(replayed.written_regions, decoded.written_regions);
+        assert_eq!(replayed.pixels, decoded.pixels);
     }
 
     #[test]
@@ -1418,6 +1558,81 @@ mod tests {
         assert_eq!(pixel_at(&store, 1, 5, 5), [0, 0, 0, 0]);
         assert_eq!(pixel_at(&store, 1, 3, 4), [0, 0, 0, 0]);
         assert_eq!(pixel_at(&store, 1, 3, 7), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn sparse_clearcodec_tiles_do_not_complete_a_replacement_until_pixels_are_written() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 4, 4));
+        handler.on_solid_fill(&SolidFillPdu {
+            surface_id: 1,
+            fill_pixel: Color {
+                b: 0xC0,
+                g: 0xB0,
+                r: 0xA0,
+                xa: 0,
+            },
+            rectangles: vec![rect(0, 0, 4, 4)],
+        });
+        handler.on_surface_mapped(1, 0, 0);
+
+        // A same-size CreateSurface starts a new zero-filled incarnation while the
+        // old, fully painted output remains the presentation fallback.
+        handler.on_surface_created(&egfx_surface(1, 4, 4));
+
+        for (x, y, bgr) in [
+            (0, 0, [0x01, 0x02, 0x03]),
+            (2, 0, [0x04, 0x05, 0x06]),
+            (0, 2, [0x07, 0x08, 0x09]),
+            (2, 2, [0x0A, 0x0B, 0x0C]),
+        ] {
+            handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id: Codec1Type::ClearCodec,
+                pixel_format: PixelFormat::XRgb,
+                destination_rectangle: rect(x, y, x + 2, y + 2),
+                bitmap_data: sparse_clearcodec_stream(0, 0, bgr),
+            }));
+        }
+
+        let guard = store.lock().unwrap();
+        let visible = guard
+            .presentation_surface()
+            .expect("the old output must remain presentable");
+        assert!(
+            visible
+                .pixels()
+                .chunks_exact(BPP)
+                .all(|pixel| pixel == [0xA0, 0xB0, 0xC0, 0xFF]),
+            "sparse writes must not retire the old output before replacement coverage is full"
+        );
+        drop(guard);
+
+        let full_bgra: Vec<u8> = [0x11u8, 0x22, 0x33, 0xFF]
+            .iter()
+            .copied()
+            .cycle()
+            .take(4 * 4 * BPP)
+            .collect();
+        handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id: 1,
+            codec_id: Codec1Type::ClearCodec,
+            pixel_format: PixelFormat::XRgb,
+            destination_rectangle: rect(0, 0, 4, 4),
+            bitmap_data: ClearCodecEncoder::new().encode(&full_bgra, 4, 4),
+        }));
+
+        let guard = store.lock().unwrap();
+        let visible = guard
+            .presentation_surface()
+            .expect("the fully supplied replacement must be presentable");
+        assert!(
+            visible
+                .pixels()
+                .chunks_exact(BPP)
+                .all(|pixel| pixel == [0x33, 0x22, 0x11, 0xFF])
+        );
     }
 
     #[test]

@@ -220,9 +220,41 @@ impl Surface {
         src: &[u8],
         src_stride_px: u16,
     ) -> Result<usize, SurfaceError> {
+        self.blit_rgba_covered(dest, src, src_stride_px, None)
+    }
+
+    /// Copy a complete decoded rectangle while marking only the supplied regions as
+    /// coverage. The regions are absolute surface coordinates and must be contained by
+    /// `dest`; clipping here keeps a malformed caller from proving unrelated pixels.
+    fn blit_rgba_covered(
+        &mut self,
+        dest: Rect,
+        src: &[u8],
+        src_stride_px: u16,
+        coverage: Option<&[Rect]>,
+    ) -> Result<usize, SurfaceError> {
         let Some(clipped) = dest.clip_to(self.width, self.height) else {
             return Ok(0);
         };
+        let explicit_bytes = coverage.map(|regions| {
+            regions.iter().fold(0u64, |bytes, region| {
+                let covered = Rect::new(
+                    region.left.max(clipped.left),
+                    region.top.max(clipped.top),
+                    region.right.min(clipped.right),
+                    region.bottom.min(clipped.bottom),
+                );
+                if covered.is_empty() {
+                    bytes
+                } else {
+                    let pixels = u64::from(covered.width()) * u64::from(covered.height());
+                    bytes.saturating_add(pixels.saturating_mul(BPP as u64))
+                }
+            })
+        });
+        if explicit_bytes == Some(0) {
+            return Ok(0);
+        }
         let stride_bytes = src_stride_px as usize * BPP;
         let row_bytes = clipped.width() as usize * BPP;
 
@@ -247,9 +279,36 @@ impl Surface {
             self.pixels[dst_off..dst_off + row_bytes]
                 .copy_from_slice(&src[src_off..src_off + row_bytes]);
         }
-        self.painted = true;
-        self.coverage.mark_rect(self.width, self.height, clipped);
-        Ok(row_bytes * clipped.height() as usize)
+
+        match coverage {
+            None => {
+                self.painted = true;
+                self.coverage.mark_rect(self.width, self.height, clipped);
+            }
+            Some(regions) => {
+                let mut marked = false;
+                for region in regions {
+                    let covered = Rect::new(
+                        region.left.max(clipped.left),
+                        region.top.max(clipped.top),
+                        region.right.min(clipped.right),
+                        region.bottom.min(clipped.bottom),
+                    );
+                    if covered.is_empty() {
+                        continue;
+                    }
+                    self.coverage.mark_rect(self.width, self.height, covered);
+                    marked = true;
+                }
+                if marked {
+                    self.painted = true;
+                }
+            }
+        }
+        let copied_bytes = row_bytes * clipped.height() as usize;
+        Ok(explicit_bytes.map_or(copied_bytes, |bytes| {
+            usize::try_from(bytes).unwrap_or(usize::MAX)
+        }))
     }
 
     /// Fill a rectangle with one RGBA colour.
@@ -640,6 +699,31 @@ impl SurfaceStore {
         // This is the wire path — pixels a decoder produced. `cache_to_surface` blits
         // through `Surface` directly, so cached pixels are not counted twice here.
         let written = surface.blit_rgba(dest, src, src_stride_px)?;
+        self.cache_stats.bytes_from_wire += written as u64;
+        self.finish_surface_mutation(id);
+        Ok(())
+    }
+
+    /// Blit a complete decoded rectangle while retiring coverage only for the exact
+    /// regions the decoder says it supplied.
+    pub(crate) fn blit_rgba_with_coverage(
+        &mut self,
+        id: u16,
+        dest: Rect,
+        src: &[u8],
+        src_stride_px: u16,
+        coverage: &[Rect],
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(SurfaceError::NoSuchSurface(id))?;
+        let written = surface.blit_rgba_covered(dest, src, src_stride_px, Some(coverage))?;
+        if written == 0 {
+            // No explicit decoder coverage landed on the surface. Do not account or
+            // publish a mutation for a bitmap that cannot affect presentation.
+            return Ok(());
+        }
         self.cache_stats.bytes_from_wire += written as u64;
         self.finish_surface_mutation(id);
         Ok(())
@@ -1265,6 +1349,60 @@ mod tests {
         assert!(store.copy_presentation(&mut after));
         assert_eq!(after.generation, before.generation);
         assert_eq!(after.pixels, before.pixels);
+    }
+
+    #[test]
+    fn empty_or_out_of_clip_coverage_does_not_account_or_wake() {
+        let mut empty = SurfaceStore::new();
+        empty.create(1, 2, 2);
+        empty.solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        empty.map_to_output(1);
+        let empty_generation = empty.generation();
+        let empty_stats = empty.cache_stats();
+        empty
+            .blit_rgba_with_coverage(1, Rect::new(0, 0, 1, 1), &solid(1, 1, RED), 1, &[])
+            .unwrap();
+        assert_eq!(empty.generation(), empty_generation);
+        assert_eq!(empty.cache_stats(), empty_stats);
+        assert_eq!(empty.get(1).unwrap().pixels(), &solid(2, 2, RED));
+
+        let mut outside = SurfaceStore::new();
+        outside.create(1, 2, 2);
+        outside
+            .solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED)
+            .unwrap();
+        outside.map_to_output(1);
+        let outside_generation = outside.generation();
+        let outside_stats = outside.cache_stats();
+        outside
+            .blit_rgba_with_coverage(
+                1,
+                Rect::new(2, 2, 3, 3),
+                &solid(1, 1, RED),
+                1,
+                &[Rect::new(2, 2, 3, 3)],
+            )
+            .unwrap();
+        assert_eq!(outside.generation(), outside_generation);
+        assert_eq!(outside.cache_stats(), outside_stats);
+        assert_eq!(outside.get(1).unwrap().pixels(), &solid(2, 2, RED));
+
+        let mut partial = SurfaceStore::new();
+        partial.create(1, 2, 2);
+        partial
+            .blit_rgba_with_coverage(
+                1,
+                Rect::new(0, 0, 2, 2),
+                &solid(2, 2, RED),
+                2,
+                &[Rect::new(0, 0, 1, 1)],
+            )
+            .unwrap();
+        assert_eq!(
+            partial.cache_stats().bytes_from_wire,
+            BPP as u64,
+            "wire accounting follows explicit coverage, not the seeded bitmap"
+        );
     }
 
     #[test]
