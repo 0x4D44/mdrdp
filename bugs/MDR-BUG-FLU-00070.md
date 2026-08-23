@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00070 — Native tiled frames can be presented after only one tile has updated
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/rendering-atomicity
 - **Raised:** 2026-08-23T20:34:24Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T204716Z-15a4fc0c
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00070-run-fix-20260823T204716Z-15a4fc0c
-- **Owner base:** 18b52a579c9d43d860e90fc44b9d4a5ddc60284e
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T20:47:16Z
-- **Owner until:** 2026-08-23T22:47:16Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-23T21:14:47Z, deltic:auto role=fix run=fix-20260823T204716Z-15a4fc0c branch=task/bug-MDR-BUG-FLU-00070-run-fix-20260823T204716Z-15a4fc0c code=42b82b1d63e7cd8b0b36ae6887f61891d23a3171 gate=manual)
 
 ## Observation
 
