@@ -6,15 +6,15 @@
 - **Area:** rdp/avc444-rendering
 - **Raised:** 2026-08-23T20:34:24Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T203614Z-16b2f89b
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00067-run-fix-20260823T203614Z-16b2f89b
+- **Owner base:** 81fef86c078d398588f4f383dbb41c805b7ffccb
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T20:36:14Z
+- **Owner until:** 2026-08-23T22:36:14Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
