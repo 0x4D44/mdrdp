@@ -37,6 +37,9 @@ use std::time::{Duration, Instant};
 /// while the socket is quiet. It only caps the wait for the tail of a PDU whose head
 /// is already buffered, where more socket data is the only thing that can help.
 const READ_SLICE: Duration = Duration::from_millis(5);
+/// Fast-path's event count is one byte. Limiting one pump turn to one valid PDU also
+/// prevents a producer that stays ahead of the wire from starving inbound processing.
+const FASTPATH_INPUT_BATCH_MAX: usize = 255;
 
 /// How long the idle sleep lasts when neither the socket nor the doorbell fires.
 ///
@@ -991,13 +994,13 @@ enum Drained {
     Closed,
 }
 
-/// Send every queued input event.
+/// Send one bounded batch of queued input events.
 fn drain_input<S: std::io::Read + std::io::Write>(
     input: &Receiver<InputEvent>,
     framed: &mut Framed<S>,
 ) -> Result<Drained, ConnectError> {
     let mut batch = Vec::new();
-    loop {
+    while batch.len() < FASTPATH_INPUT_BATCH_MAX {
         match input.try_recv() {
             Ok(event) => batch.push(to_fastpath(event)),
             Err(TryRecvError::Empty) => break,
@@ -1267,6 +1270,29 @@ mod tests {
         );
         let written = framed.into_inner_no_leftover().0;
         assert!(!written.is_empty(), "three events should produce a PDU");
+    }
+
+    #[test]
+    fn an_oversized_input_burst_is_split_across_pump_turns() {
+        // Fast-path carries an 8-bit event count. A busy window can queue more than
+        // 255 events while decode owns the session thread; one pump turn must send a
+        // valid bounded batch and leave the remainder for the next turn, not end the
+        // session with BadBatchSize or monopolise the pump until the queue is empty.
+        let (tx, rx) = mpsc::channel();
+        for x in 0..=u8::MAX {
+            tx.send(InputEvent::MouseMove {
+                x: u16::from(x),
+                y: 0,
+            })
+            .unwrap();
+        }
+
+        let mut framed = Framed::new(Sink(Vec::new()));
+        assert_eq!(drain_input(&rx, &mut framed).unwrap(), Drained::Sent);
+        assert!(
+            rx.try_recv().is_ok(),
+            "one event must remain queued so inbound processing gets a turn"
+        );
     }
 
     #[test]
