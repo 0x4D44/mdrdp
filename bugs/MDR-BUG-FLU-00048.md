@@ -27,6 +27,13 @@ The Windows input server injects key and mouse-button transitions immediately bu
 
 ## Fix
 
-<unfixed — raised only>
+Track successfully injected virtual keys, scancodes, and mouse buttons for each input
+connection. Successful ups clear the matching hold; duplicate downs remain one hold. Every
+connection exit now flushes pending move telemetry and attempts matching releases before
+the serial listener accepts another peer. Failed releases are explicit in the server log.
 
 ## Notes
+
+- The release-plan regression was observed red with two failed assertions before the
+  implementation, then passed 2/2.
+- The full Rhydra suite passed 310 tests and `scripts/check-windows.sh` passed.

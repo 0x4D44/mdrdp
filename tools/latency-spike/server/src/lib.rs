@@ -24,6 +24,8 @@ pub mod control;
 pub mod diff;
 pub mod framing;
 pub mod input_proto;
+#[cfg(any(feature = "host", test))]
+pub(crate) mod input_state;
 pub mod rects;
 pub mod stats;
 

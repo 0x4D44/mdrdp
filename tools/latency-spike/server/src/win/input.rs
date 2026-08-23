@@ -15,6 +15,7 @@
 
 use super::{qpc, Result};
 use crate::input_proto::{self, KeyKind, MouseButton, Record, WheelAxis};
+use crate::input_state::{HeldInputs, InputTransition};
 use crate::stats::{self, InputEventRecord, MouseEventRecord, MouseMoveSummaryRecord, QpcClock};
 use std::io::Read;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -346,6 +347,7 @@ fn handle_record(
     clock: QpcClock,
     lines: &SyncSender<String>,
     moves: &mut MoveAggregate,
+    held: &mut HeldInputs,
 ) {
     let injection = |result: Result<i64>| match result {
         Ok(stamp) => (stamp, true),
@@ -354,9 +356,19 @@ fn handle_record(
             (qpc::now(), false)
         }
     };
+    let mut tracked_injection = |result: Result<i64>, transition: InputTransition| {
+        let (stamp, injected) = injection(result);
+        if injected {
+            held.apply(transition);
+        }
+        (stamp, injected)
+    };
     match record {
         Record::VkDown { vk, seq } => {
-            let (injected_qpc, injected) = injection(inject(vk, KeyKind::Down));
+            let (injected_qpc, injected) = tracked_injection(
+                inject(vk, KeyKind::Down),
+                InputTransition::VirtualKey { vk, down: true },
+            );
             emit_key_line(
                 lines,
                 clock,
@@ -369,7 +381,10 @@ fn handle_record(
             );
         }
         Record::VkUp { vk, seq } => {
-            let (injected_qpc, injected) = injection(inject(vk, KeyKind::Up));
+            let (injected_qpc, injected) = tracked_injection(
+                inject(vk, KeyKind::Up),
+                InputTransition::VirtualKey { vk, down: false },
+            );
             emit_key_line(
                 lines,
                 clock,
@@ -382,7 +397,13 @@ fn handle_record(
             );
         }
         Record::ScanDown { scancode, seq } => {
-            let (injected_qpc, injected) = injection(inject_scan(scancode, true));
+            let (injected_qpc, injected) = tracked_injection(
+                inject_scan(scancode, true),
+                InputTransition::Scancode {
+                    scancode,
+                    down: true,
+                },
+            );
             emit_key_line(
                 lines,
                 clock,
@@ -395,7 +416,13 @@ fn handle_record(
             );
         }
         Record::ScanUp { scancode, seq } => {
-            let (injected_qpc, injected) = injection(inject_scan(scancode, false));
+            let (injected_qpc, injected) = tracked_injection(
+                inject_scan(scancode, false),
+                InputTransition::Scancode {
+                    scancode,
+                    down: false,
+                },
+            );
             emit_key_line(
                 lines,
                 clock,
@@ -414,7 +441,10 @@ fn handle_record(
         }
         Record::MouseButton { button, down, seq } => {
             let kind = mouse_button_kind(button, down);
-            let (injected_qpc, injected) = injection(inject_mouse_button(button, down));
+            let (injected_qpc, injected) = tracked_injection(
+                inject_mouse_button(button, down),
+                InputTransition::MouseButton { button, down },
+            );
             emit_mouse_line(
                 lines,
                 clock,
@@ -450,6 +480,19 @@ fn handle_record(
     }
 }
 
+fn release_held(held: &mut HeldInputs) {
+    for transition in held.release_plan() {
+        let result = match transition {
+            InputTransition::VirtualKey { vk, .. } => inject(vk, KeyKind::Up),
+            InputTransition::Scancode { scancode, .. } => inject_scan(scancode, false),
+            InputTransition::MouseButton { button, .. } => inject_mouse_button(button, false),
+        };
+        if let Err(e) = result {
+            eprintln!("input: disconnect release failed: {e}");
+        }
+    }
+}
+
 fn serve_one(
     mut stream: TcpStream,
     clock: QpcClock,
@@ -459,7 +502,8 @@ fn serve_one(
     stream.set_nodelay(true)?;
     let mut buf = [0u8; input_proto::MAX_RECORD_LEN];
     let mut moves = MoveAggregate::default();
-    loop {
+    let mut held = HeldInputs::default();
+    let result: std::io::Result<()> = loop {
         // Read the kind byte first — a frameless stream cannot know how many more
         // bytes belong to this record until it knows the kind (`kind_len`, §5.1).
         //
@@ -470,25 +514,22 @@ fn serve_one(
         match stream.read_exact(&mut buf[..1]) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                moves.flush(clock, lines);
-                return Ok(());
+                break Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => break Err(e),
         }
         let kind = buf[0];
         let Some(len) = input_proto::kind_len(kind) else {
             eprintln!("input: closing connection: unknown record kind {kind}");
-            moves.flush(clock, lines);
-            return Ok(());
+            break Ok(());
         };
         if len > 1 {
             match stream.read_exact(&mut buf[1..len]) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    moves.flush(clock, lines);
-                    return Ok(());
+                    break Ok(());
                 }
-                Err(e) => return Err(e),
+                Err(e) => break Err(e),
             }
         }
         let recv_qpc = qpc::now();
@@ -496,12 +537,16 @@ fn serve_one(
             Ok(r) => r,
             Err(e) => {
                 eprintln!("input: closing connection: {e}");
-                moves.flush(clock, lines);
-                return Ok(());
+                break Ok(());
             }
         };
-        handle_record(record, recv_qpc, origin, clock, lines, &mut moves);
-    }
+        handle_record(
+            record, recv_qpc, origin, clock, lines, &mut moves, &mut held,
+        );
+    };
+    moves.flush(clock, lines);
+    release_held(&mut held);
+    result
 }
 
 /// Log this thread's window station and desktop names, and whether that desktop is
