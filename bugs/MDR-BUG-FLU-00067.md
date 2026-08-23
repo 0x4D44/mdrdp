@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00067 — AVC444 transient luma changes can pin valid chroma detail in permanent 4:2:0 fallback
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/avc444-rendering
 - **Raised:** 2026-08-23T20:34:24Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T203614Z-16b2f89b
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00067-run-fix-20260823T203614Z-16b2f89b
-- **Owner base:** 81fef86c078d398588f4f383dbb41c805b7ffccb
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T20:36:14Z
-- **Owner until:** 2026-08-23T22:36:14Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-23T20:45:22Z, deltic:auto role=fix run=fix-20260823T203614Z-16b2f89b branch=task/bug-MDR-BUG-FLU-00067-run-fix-20260823T203614Z-16b2f89b code=49805c0bc37268473237bf80e756e2cb7a286d6e gate=manual)
 
 ## Observation
 
