@@ -337,6 +337,28 @@ fn presentation_deadline(
     (now < deadline).then_some(deadline)
 }
 
+fn copy_presentation_when_due(
+    store: &SurfaceStore,
+    snapshot: &mut PresentationSnapshot,
+    presented: Option<u64>,
+    last_presented: Option<Instant>,
+    now: Instant,
+    fallback_dimensions: (u16, u16),
+) -> Result<bool, Instant> {
+    let generation = store.generation();
+    let (width, height) = store
+        .presentation_surface()
+        .map_or(fallback_dimensions, |surface| {
+            (surface.width, surface.height)
+        });
+    if presented != Some(generation)
+        && let Some(deadline) = presentation_deadline(last_presented, now, width, height)
+    {
+        return Err(deadline);
+    }
+    Ok(!store.copy_presentation(snapshot))
+}
+
 /// The one pending `Damaged` notification shared by the producer and event-loop threads.
 ///
 /// A notification means only "the store may have changed"; once one is queued, another
@@ -1940,9 +1962,12 @@ impl SessionApp {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(window), Some(presenter)) = (self.window.clone(), self.presenter.as_mut()) else {
+        let Some(window) = self.window.clone() else {
             return;
         };
+        if self.presenter.is_none() {
+            return;
+        }
         let size = window.inner_size();
         let (Some(width), Some(height)) =
             (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
@@ -1950,6 +1975,37 @@ impl SessionApp {
             return; // Minimised. Nothing to draw into.
         };
 
+        // Gate large-canvas work while holding the same lock that makes the generation,
+        // dimensions, and eventual snapshot coherent. A platform expose inside the
+        // cadence window must not copy tens of MiB only to discard them afterward.
+        let copy_result = {
+            let store = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            copy_presentation_when_due(
+                &store,
+                &mut self.presentation,
+                self.presented,
+                self.last_presented_at,
+                Instant::now(),
+                (self.config.session_width, self.config.session_height),
+            )
+        };
+        let blank = match copy_result {
+            Ok(blank) => blank,
+            Err(deadline) => {
+                self.redraw_deadline = Some(deadline);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                return;
+            }
+        };
+        let generation = self.presentation.generation;
+        self.redraw_deadline = None;
+
+        let Some(presenter) = self.presenter.as_mut() else {
+            return;
+        };
         if let Err(e) = presenter.resize(width, height) {
             // Transient: skip this frame. Only a sustained run of failures is fatal —
             // ending an RDP session because one present hiccuped is a bad trade.
@@ -1963,41 +2019,6 @@ impl SessionApp {
                 return;
             }
         };
-
-        // Copy a coherent presentation snapshot under the store lock, then release it
-        // before scaling and colour conversion. The decoder can composite the next tile
-        // while this 5K frame is being turned into the platform buffer.
-        let (generation, blank) = {
-            let store = self
-                .store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let blank = !store.copy_presentation(&mut self.presentation);
-            let generation = self.presentation.generation;
-            (generation, blank)
-        };
-
-        // A platform redraw can arrive before our deferred deadline (for example, an
-        // expose event). Keep a newer generation from bypassing the 5K cadence, but let
-        // an expose repaint the already-presented generation immediately.
-        let (cadence_width, cadence_height) = if blank {
-            (self.config.session_width, self.config.session_height)
-        } else {
-            (self.presentation.width, self.presentation.height)
-        };
-        if self.presented != Some(generation)
-            && let Some(deadline) = presentation_deadline(
-                self.last_presented_at,
-                Instant::now(),
-                cadence_width,
-                cadence_height,
-            )
-        {
-            self.redraw_deadline = Some(deadline);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            return;
-        }
-        self.redraw_deadline = None;
 
         if blank {
             // Nothing mapped to output yet: black, not stale garbage.
@@ -2653,6 +2674,39 @@ mod tests {
             presentation_deadline(Some(now), now + DAMAGE_PRESENT_INTERVAL, 5120, 2880),
             None
         );
+    }
+
+    #[test]
+    fn an_early_large_redraw_does_not_copy_the_presentation_snapshot() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2561, 1);
+        store
+            .solid_fill(1, &[Rect::new(0, 0, 2561, 1)], RED)
+            .expect("paint surface");
+        store.map_to_output(1);
+
+        let mut snapshot = PresentationSnapshot {
+            width: 7,
+            height: 9,
+            pixels: vec![0xA5; 3],
+            generation: 11,
+        };
+        let now = Instant::now();
+        let result = copy_presentation_when_due(
+            &store,
+            &mut snapshot,
+            Some(store.generation().wrapping_sub(1)),
+            Some(now),
+            now + Duration::from_millis(1),
+            (1920, 1080),
+        );
+
+        assert_eq!(result, Err(now + DAMAGE_PRESENT_INTERVAL));
+        assert_eq!(
+            (snapshot.width, snapshot.height, snapshot.generation),
+            (7, 9, 11)
+        );
+        assert_eq!(snapshot.pixels, vec![0xA5; 3]);
     }
 
     #[test]
