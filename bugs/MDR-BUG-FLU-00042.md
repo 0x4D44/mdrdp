@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00042 — Malformed CF_UNICODETEXT can make Rhydra read past the clipboard allocation
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/clipboard
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T121122Z-dad0a66c
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00042-run-fix-20260823T121122Z-dad0a66c
-- **Owner base:** 32f4d383ce09bd594529e835489179b0a4899e59
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T12:11:22Z
-- **Owner until:** 2026-08-23T14:11:22Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T12:23:17Z, deltic:auto role=fix run=fix-20260823T121122Z-dad0a66c branch=task/bug-MDR-BUG-FLU-00042-run-fix-20260823T121122Z-dad0a66c code=ca2fa8e gate=manual)
 
 ## Observation
 
