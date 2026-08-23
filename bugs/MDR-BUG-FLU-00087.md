@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00087 — Remote CLIPRDR data request bypasses the to-remote clipboard policy
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/clipboard-policy
 - **Raised:** 2026-08-23T22:57:27Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T225750Z-4c02622f
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00087-run-fix-20260823T225750Z-4c02622f
-- **Owner base:** d65656a62e64038e778114391a5d355cf458dcaf
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T22:57:50Z
-- **Owner until:** 2026-08-24T00:57:50Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T22:57:27Z, raised via `deltic bugs new` model=gpt-5.6-sol@max)
+- **State history:** Open (2026-08-23T22:57:27Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-23T23:03:17Z, deltic:auto role=fix run=fix-20260823T225750Z-4c02622f branch=task/bug-MDR-BUG-FLU-00087-run-fix-20260823T225750Z-4c02622f code=3d2f34c gate=manual)
 
 ## Observation
 
