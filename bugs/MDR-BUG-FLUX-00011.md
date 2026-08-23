@@ -31,6 +31,17 @@ The fix is a viewer bootstrap: on the connect edge the server must encode the CU
 
 ## Fix
 
-<unfixed — raised only>
+The capture loop now keeps the last admitted desktop texture on the GPU even when
+pixel diffing is disabled. On a viewer connect edge it polls the real source first;
+if that bounded poll is idle, it submits the retained texture with fresh synthetic
+timestamps after requesting an all-tile keyframe. A real frame therefore wins, a
+source rebuild invalidates stale pixels before reuse, and a static desktop paints
+without requiring user input.
+
+The bootstrap remains armed until a frame passes whole-frame surface admission.
+Later recovery keyframe requests may also reuse the retained texture, so a reconnect
+cannot freeze merely because its first recovery frame met a full outbound queue.
+Portable state tests cover cold missing state, reconnect, rebuild invalidation,
+successful admission, and recovery retry.
 
 ## Notes

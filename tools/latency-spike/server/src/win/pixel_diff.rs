@@ -39,7 +39,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
-/// Retains the previous frame and measures the delta against it.
+/// Retains the previous frame for viewer bootstrap and measures deltas against it.
 ///
 /// Three textures, all desktop-sized and all created on first use: one
 /// `D3D11_USAGE_DEFAULT` copy of the previous frame (GPU-resident, never mapped),
@@ -51,9 +51,9 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 /// destination coordinates identical, so there is no offset arithmetic to get
 /// wrong — and the packed rects come out in desktop coordinates already.
 ///
-/// Lazy because a run that never diffs (`--no-diff`, `--no-rects`, a desktop the
-/// wire's `u16` coordinates cannot address, or simply no idle-regime frame) should
-/// not pay for three full-desktop surfaces it will never touch.
+/// The GPU copy is allocated after the first admitted frame because a reconnect must
+/// paint a static desktop without waiting for another compositor event. The two CPU
+/// staging surfaces remain lazy, so a run that never diffs does not pay for them.
 pub struct PixelDiff {
     width: u32,
     height: u32,
@@ -90,6 +90,15 @@ impl PixelDiff {
     /// the allocation is still the right size for the next frame.
     pub fn invalidate(&mut self) {
         self.prev_valid = false;
+    }
+
+    /// The last admitted desktop frame, when it does not predate a source rebuild.
+    pub fn retained(&self) -> Option<ID3D11Texture2D> {
+        if self.prev_valid {
+            self.prev.clone()
+        } else {
+            None
+        }
     }
 
     /// `prev := texture`, GPU-to-GPU, and mark the baseline usable.

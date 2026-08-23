@@ -17,6 +17,7 @@
 use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource};
 use super::{convert, dxgi, encode, idd_source, input, pixel_diff, qpc, send, Result};
 use crate::annexb::{self, AvcParameterSets, ParameterSets};
+use crate::bootstrap::ViewerBootstrap;
 use crate::channel_listeners::BoundChannels;
 use crate::cli::{Config, Source, DECLARED_FPS};
 use crate::diff;
@@ -826,7 +827,7 @@ fn send_rects(
 
 fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
     let mut frame_seq: u64 = 0;
-    let mut was_connected = false;
+    let mut bootstrap = ViewerBootstrap::new();
     let mut want_keyframe = true;
     let mut recovery = logical_frame::Recovery::waiting();
     let mut assembler =
@@ -901,15 +902,14 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         if !connected {
             // Nothing is watching. Capturing anyway would hold the compositor and
             // run the GPU encoder for an audience of nobody.
-            was_connected = false;
+            bootstrap.observe(false);
             recovery.reset();
             assembler.discard_through(frame_seq);
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
-        if !was_connected {
+        if bootstrap.observe(true) {
             // A new viewer starts mid-GOP and cannot decode a P-frame.
-            was_connected = true;
             want_keyframe = true;
         }
         // Drain completed output before waiting for another capture. This keeps a
@@ -935,7 +935,8 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             )
             .into());
         }
-        request_keyframes(&mut state.tiles, &mut contexts, &mut want_keyframe);
+        let keyframe_requested =
+            request_keyframes(&mut state.tiles, &mut contexts, &mut want_keyframe);
 
         let acquired = state.capture.acquire(ACQUIRE_TIMEOUT_MS)?;
         let (texture, present_qpc, acquire_qpc, change) = match acquired {
@@ -945,10 +946,28 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 acquire_qpc,
                 change,
             } => (texture, present_qpc, acquire_qpc, change),
-            Acquired::Timeout => continue,
-            Acquired::PointerOnly => continue,
+            Acquired::Timeout | Acquired::PointerOnly
+                if bootstrap.use_retained_on_idle(pixel_diff.valid(), keyframe_requested) =>
+            {
+                // Give a newly attached viewer the current desktop even when DWM is
+                // idle. Polling the source first lets a rebuild invalidate this copy
+                // and lets genuinely fresh pixels win. Both timestamps describe the
+                // synthetic acquisition now; the retained presentation time would
+                // otherwise report the idle interval as capture latency.
+                let now = qpc::now();
+                (
+                    pixel_diff
+                        .retained()
+                        .expect("valid retained frame must have a texture"),
+                    now,
+                    now,
+                    None,
+                )
+            }
+            Acquired::Timeout | Acquired::PointerOnly => continue,
             Acquired::Recreated => {
                 eprintln!("capture: frame source lost and rebuilt");
+                bootstrap.source_recreated();
                 want_keyframe = true;
                 recovery.reset();
                 assembler.discard_through(frame_seq);
@@ -973,6 +992,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             suppress_rects_once = true;
             continue;
         }
+        bootstrap.frame_admitted();
 
         let claimed_changed_pixels = change.as_ref().map(|change| {
             let bounds: Vec<_> = change
@@ -1091,14 +1111,12 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         suppress_rects_once = false;
 
         // Still inside the frame's validity window, and before the converter touches
-        // it: this frame becomes the next one's baseline. Unconditional while the
-        // diff is on — see [`pixel_diff`] for why a conditional copy would buy less
-        // than it costs in ways to be wrong.
-        if state.diff_enabled {
-            let device = state.capture.device();
-            let context = state.capture.context();
-            pixel_diff.retain(device, context, &texture)?;
-        }
+        // it: this frame becomes the next one's baseline and the current desktop a
+        // later viewer can bootstrap from. The staging surfaces still stay lazy when
+        // diff is off — see [`pixel_diff`].
+        let device = state.capture.device();
+        let context = state.capture.context();
+        pixel_diff.retain(device, context, &texture)?;
         last_acquire_qpc = Some(acquire_qpc);
 
         let time_hns = state
@@ -1191,15 +1209,16 @@ fn request_keyframes(
     tiles: &mut [TilePipeline],
     contexts: &mut [EmitCtx],
     want_keyframe: &mut bool,
-) {
+) -> bool {
     if !*want_keyframe {
-        return;
+        return false;
     }
     for (tile, ctx) in tiles.iter_mut().zip(contexts) {
         tile.encoder.request_keyframe();
         ctx.awaiting_keyframe = Some(0);
     }
     *want_keyframe = false;
+    true
 }
 
 fn pump_tiles(
