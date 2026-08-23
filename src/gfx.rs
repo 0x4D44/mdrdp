@@ -450,7 +450,7 @@ impl GfxHandler {
             .with_store(|store| {
                 store
                     .get(pdu.surface_id)
-                    .and_then(|surface| surface.extract(dest))
+                    .and_then(|surface| surface.extract_with_zero_padding(dest))
             })
             .map(|mut rgba| {
                 // The surface stores RGBA; the ClearCodec decoder works in BGRA and its
@@ -1574,6 +1574,59 @@ mod tests {
         assert_eq!(pixel_at(&store, 1, 5, 5), [0, 0, 0, 0]);
         assert_eq!(pixel_at(&store, 1, 3, 4), [0, 0, 0, 0]);
         assert_eq!(pixel_at(&store, 1, 3, 7), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn clearcodec_right_bottom_overhang_seeds_the_full_requested_extent() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 3, 3));
+
+        // Distinct pixels make a clipped seed's missing stride visible. The requested
+        // 3x3 tile starts at (1,1), so only its 2x2 top-left corner is in the surface.
+        let seed: Vec<u8> = (0..3)
+            .flat_map(|y| (0..3).flat_map(move |x| [0x10 + x, 0x20 + y, 0x30, 0xFF]))
+            .collect();
+        store
+            .lock()
+            .unwrap()
+            .blit_rgba(1, Rect::new(0, 0, 3, 3), &seed, 3)
+            .unwrap();
+
+        // Only the top-left pixel of the requested tile is supplied. The other visible
+        // pixels must come from the full-stride seed, not from the decoder's black fill.
+        handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id: 1,
+            codec_id: Codec1Type::ClearCodec,
+            pixel_format: PixelFormat::XRgb,
+            destination_rectangle: rect(1, 1, 4, 4),
+            bitmap_data: sparse_clearcodec_stream(0, 0, [0x01, 0x02, 0x03]),
+        }));
+
+        assert_eq!(pixel_at(&store, 1, 1, 1), [0x03, 0x02, 0x01, 0xFF]);
+        assert_eq!(pixel_at(&store, 1, 2, 1), [0x12, 0x21, 0x30, 0xFF]);
+        assert_eq!(pixel_at(&store, 1, 1, 2), [0x11, 0x22, 0x30, 0xFF]);
+        assert_eq!(pixel_at(&store, 1, 2, 2), [0x12, 0x22, 0x30, 0xFF]);
+    }
+
+    #[test]
+    fn oversized_clearcodec_destination_keeps_the_decoder_error_path() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 1, 1));
+
+        handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id: 1,
+            codec_id: Codec1Type::ClearCodec,
+            pixel_format: PixelFormat::XRgb,
+            destination_rectangle: rect(0, 0, 8193, 1),
+            bitmap_data: sparse_clearcodec_stream(0, 0, [0x01, 0x02, 0x03]),
+        }));
+
+        let stats = handler.stats().snapshot();
+        assert_eq!(stats.decode_errors, 1);
+        assert_eq!(stats.surface_errors, 0);
+        assert_eq!(pixel_at(&store, 1, 0, 0), [0, 0, 0, 0]);
     }
 
     #[test]

@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 
 use crate::stats::CacheStats;
+use ironrdp_graphics::clearcodec::MAX_DECODE_DIM;
 
 /// Bytes per pixel, everywhere in this module.
 pub const BPP: usize = 4;
@@ -435,6 +436,39 @@ impl Surface {
         for row in src.top..src.bottom {
             let start = self.row_start(row) + src.left as usize * BPP;
             out.extend_from_slice(&self.pixels[start..start + row_bytes]);
+        }
+        Some(out)
+    }
+
+    /// Extract a full requested rectangle, zero-filling the part outside this surface.
+    ///
+    /// ClearCodec decodes over a buffer whose stride is the requested rectangle's width,
+    /// even when the rectangle overhangs the surface. A clipped, tightly packed extract
+    /// has the wrong length and is discarded by the decoder, so copy the visible rows at
+    /// their offset inside the full requested extent.
+    pub(crate) fn extract_with_zero_padding(&self, src: Rect) -> Option<Vec<u8>> {
+        if src.width() > MAX_DECODE_DIM || src.height() > MAX_DECODE_DIM {
+            return None;
+        }
+        let width = src.width() as usize;
+        let height = src.height() as usize;
+        let len = width.checked_mul(height)?.checked_mul(BPP)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).ok()?;
+        out.resize(len, 0);
+
+        let Some(clipped) = src.clip_to(self.width, self.height) else {
+            return Some(out);
+        };
+        let src_row_bytes = clipped.width() as usize * BPP;
+        let dst_stride_bytes = width * BPP;
+        let dst_left_bytes = (clipped.left - src.left) as usize * BPP;
+        let dst_top = (clipped.top - src.top) as usize;
+        for row in 0..clipped.height() {
+            let src_start = self.row_start(clipped.top + row) + clipped.left as usize * BPP;
+            let dst_start = (dst_top + usize::from(row)) * dst_stride_bytes + dst_left_bytes;
+            out[dst_start..dst_start + src_row_bytes]
+                .copy_from_slice(&self.pixels[src_start..src_start + src_row_bytes]);
         }
         Some(out)
     }
@@ -1384,6 +1418,17 @@ mod tests {
             .unwrap();
         let taken = s.extract(Rect::new(1, 1, 3, 3)).unwrap();
         assert_eq!(taken, solid(2, 2, RED));
+    }
+
+    #[test]
+    fn clearcodec_seed_padding_rejects_an_oversized_extent_before_reserving() {
+        let surface = Surface::new(1, 1);
+        assert!(
+            surface
+                .extract_with_zero_padding(Rect::new(0, 0, MAX_DECODE_DIM + 1, 1))
+                .is_none(),
+            "the seed helper must reject dimensions outside ClearCodec's limit"
+        );
     }
 
     #[test]

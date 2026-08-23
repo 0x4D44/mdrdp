@@ -14,6 +14,9 @@ pub use self::vbar_cache::{FullVBar, ShortVBar, VBarCache};
 /// Glyph cache size as u16 for index arithmetic. GLYPH_CACHE_SIZE=4000 fits in u16.
 const GLYPH_CACHE_WRAP: u16 = 4_000;
 
+/// Maximum width or height accepted by the decoder before allocating a bitmap.
+pub const MAX_DECODE_DIM: u16 = 8_192;
+
 use ironrdp_core::{DecodeResult, ReadCursor, invalid_field_err};
 use ironrdp_pdu::codecs::clearcodec::{
     ClearCodecBitmapStream, CompositePayload, FLAG_GLYPH_INDEX, RgbRunSegment, SubcodecId, VBar, decode_bands_layer,
@@ -321,7 +324,6 @@ impl ClearCodecDecoder {
         // (49M pixels, under cap) that allocate ~197MB from a few
         // attacker-controlled bytes. Capping each axis directly
         // rejects implausible tile shapes regardless of total area.
-        const MAX_DECODE_DIM: u16 = 8192;
         if width > MAX_DECODE_DIM || height > MAX_DECODE_DIM {
             return Err(invalid_field_err!(
                 "dimensions",
