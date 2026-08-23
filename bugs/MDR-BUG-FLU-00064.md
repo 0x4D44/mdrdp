@@ -27,6 +27,15 @@ When a complete encoded frame is dropped by the bounded outbound queue, logical-
 
 ## Fix
 
-<unfixed — raised only>
+`logical_frame::Recovery` now exposes whether the viewer has an admitted all-tile
+keyframe baseline. The capture loop snapshots that state once per captured frame and
+allows neither metadata rects nor measured pixel-diff rects while recovery is waiting.
+After a complete recovery keyframe enters the bounded outbound queue, both overlay
+paths resume against the retained texture from that same admitted desktop frame.
+
+The regression test proves overlays start disabled, become legal only after an
+all-keyframe admission, and are disabled again by a recovery reset. The existing
+recovery test also covers incomplete frames, mixed-tile keyframes, queue rejection,
+and pre-encode shedding.
 
 ## Notes

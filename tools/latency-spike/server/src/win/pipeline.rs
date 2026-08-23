@@ -1005,11 +1005,12 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         let mut measured_changed_pixels = None;
         let mut raw_rect_attempted = false;
         let mut raw_rect_sent = false;
+        let overlays_allowed = recovery.allows_overlays();
 
         // The fast path is an overlay, not a branch: whatever happens here, the
         // frame still goes on to convert, encode and send as H.264 below.
         let mut metadata_took_fast_path = false;
-        if state.rects_enabled && !suppress_rects_once {
+        if state.rects_enabled && overlays_allowed && !suppress_rects_once {
             if let Some(change) = change.as_ref().filter(|c| takes_fast_path(c)) {
                 raw_rect_attempted = true;
                 raw_rect_sent =
@@ -1039,6 +1040,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         };
         let metadata_claims_no_change = change.as_ref().is_some_and(|c| c.rects.is_empty());
         if state.diff_enabled
+            && overlays_allowed
             && !suppress_rects_once
             && !metadata_took_fast_path
             && pixel_diff.valid()

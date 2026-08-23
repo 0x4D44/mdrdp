@@ -76,6 +76,12 @@ impl Recovery {
         self.dropped
     }
 
+    /// Rect overlays are deltas against the viewer's painted desktop. They are
+    /// trustworthy only after a complete recovery keyframe entered the send queue.
+    pub(crate) fn allows_overlays(&self) -> bool {
+        !self.waiting_for_keyframe
+    }
+
     #[cfg(test)]
     fn waiting_for_keyframe(&self) -> bool {
         self.waiting_for_keyframe
@@ -248,6 +254,7 @@ mod tests {
     #[test]
     fn recovery_suppresses_deltas_and_survives_a_full_queue() {
         let mut recovery = Recovery::waiting();
+        assert!(!recovery.allows_overlays());
         recovery.drop_incomplete(1);
         assert_eq!(recovery.prepare(false, false), RecoveryDecision::Suppress);
         assert_eq!(recovery.dropped(), 2);
@@ -260,12 +267,14 @@ mod tests {
         );
         assert_eq!(recovery.prepare(true, true), RecoveryDecision::Admit);
         recovery.admitted(true);
+        assert!(recovery.allows_overlays());
         assert!(!recovery.waiting_for_keyframe());
         let dropped = recovery.dropped();
         recovery.drop_before_encode();
         assert_eq!(recovery.dropped(), dropped + 1);
         assert!(!recovery.waiting_for_keyframe());
         recovery.reset();
+        assert!(!recovery.allows_overlays());
         assert!(recovery.waiting_for_keyframe());
     }
 
