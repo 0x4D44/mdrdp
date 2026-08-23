@@ -3,7 +3,8 @@
 //! One JSON object per line in each direction, on 127.0.0.1 only — SSH is the
 //! security boundary, exactly as for the video and input ports. The agent serves
 //! one client at a time with a short read timeout, so a connected-but-silent
-//! client cannot wedge the listener.
+//! client cannot wedge the listener. Each line also has a strict byte ceiling, so
+//! a peer that keeps dribbling without a newline cannot grow the agent indefinitely.
 //!
 //! `shutdown` is the sanctioned way to stop the agent: it kills the supervised
 //! children before exiting. Ending the scheduled task instead (`schtasks /end`)
@@ -11,9 +12,40 @@
 //! held by processes nothing supervises.
 
 use serde::{Deserialize, Serialize};
+use std::io::{self, BufRead, Read};
 
 /// Where the agent's control listener binds, next to video (9500) and input (9501).
 pub const CONTROL_PORT: u16 = 9502;
+
+/// Maximum bytes in one control request, including its line ending.
+///
+/// Ordinary requests are under 200 bytes. The allowance also fits the auxiliary
+/// channel's largest legal clipboard value after worst-case JSON `\u00xx` escaping,
+/// plus the request envelope, while still bounding an unterminated line strictly.
+pub const MAX_REQUEST_LINE_BYTES: usize = crate::aux_proto::MAX_CLIPBOARD_BYTES * 6 + 256;
+
+/// Read one control request without ever growing `line` beyond the protocol bound.
+pub fn read_request_line(reader: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut line = String::new();
+    let mut bounded = reader.take(MAX_REQUEST_LINE_BYTES as u64 + 1);
+    let read = bounded.read_line(&mut line)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.len() > MAX_REQUEST_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("control request exceeds the {MAX_REQUEST_LINE_BYTES}-byte line limit"),
+        ));
+    }
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Ok(Some(line))
+}
 
 /// Bumped on any incompatible change to the request or response shapes.
 /// 2: `StatusReport.version` (defaulted on read, so a 2-client reads a 1-agent).
@@ -668,6 +700,51 @@ pub fn wait_stable_green(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unterminated_control_line_is_rejected_at_the_byte_ceiling() {
+        let wire = vec![b'x'; MAX_REQUEST_LINE_BYTES * 2];
+        let mut reader = std::io::Cursor::new(wire);
+
+        let error = read_request_line(&mut reader).expect_err("the line is over the ceiling");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(reader.position(), MAX_REQUEST_LINE_BYTES as u64 + 1);
+    }
+
+    #[test]
+    fn bounded_control_reader_preserves_complete_and_final_lines() {
+        let mut reader = std::io::Cursor::new(b"first\nlast".as_slice());
+
+        assert_eq!(
+            read_request_line(&mut reader).unwrap().as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            read_request_line(&mut reader).unwrap().as_deref(),
+            Some("last")
+        );
+        assert_eq!(read_request_line(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn the_largest_legal_clipboard_expectation_still_fits_the_control_bound() {
+        let expected = "\0".repeat(crate::aux_proto::MAX_CLIPBOARD_BYTES);
+        let mut wire = serde_json::json!({
+            "cmd": "clipboard-matches",
+            "expected": expected,
+        })
+        .to_string();
+        wire.push('\n');
+        assert!(wire.len() <= MAX_REQUEST_LINE_BYTES);
+
+        let mut reader = std::io::Cursor::new(wire);
+        let line = read_request_line(&mut reader).unwrap().unwrap();
+        let Request::ClipboardMatches { expected } = parse_request(&line).unwrap() else {
+            panic!("the request changed kind");
+        };
+        assert_eq!(expected.len(), crate::aux_proto::MAX_CLIPBOARD_BYTES);
+    }
 
     #[test]
     fn each_command_parses() {

@@ -370,9 +370,8 @@ mod win {
 
     fn serve_one(stream: TcpStream, shared: &Mutex<Shared>) -> std::io::Result<()> {
         let mut writer = stream.try_clone()?;
-        let reader = BufReader::new(stream);
-        for line in reader.lines() {
-            let line = line?;
+        let mut reader = BufReader::new(stream);
+        while let Some(line) = control::read_request_line(&mut reader)? {
             if line.trim().is_empty() {
                 continue;
             }

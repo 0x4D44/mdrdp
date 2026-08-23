@@ -27,6 +27,14 @@ tools/latency-spike/server/src/bin/agent.rs:359-379 reads control requests with 
 
 ## Fix
 
-<unfixed — raised only>
+The portable control protocol now reads through a `Take`-bounded `BufRead` view and
+rejects a line immediately after one byte beyond `MAX_REQUEST_LINE_BYTES`. The
+Windows agent uses that reader instead of `BufRead::lines`, preserving LF/CRLF and
+final unterminated-line semantics while placing a hard ceiling on allocation.
+
+The ceiling allows the auxiliary channel's largest legal clipboard expectation even
+after worst-case JSON escaping, plus its request envelope. Regression tests prove an
+unterminated stream is consumed only through limit + 1, ordinary and EOF-final lines
+retain their content, and the maximum supported clipboard comparison still parses.
 
 ## Notes
