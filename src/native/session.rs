@@ -81,6 +81,12 @@ const CODEC_LABEL: &str = "AVC (rhydra)";
 /// macOS has no change notification worth using, so this is a poll.
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Bound a host that accepts the input channel and then stops reading it. Five seconds is
+/// the existing native auxiliary/video write bound: generous beside an input burst, finite
+/// beside a dead peer, and long enough not to turn a transient congestion window into a
+/// disconnect.
+const NATIVE_INPUT_WRITE_TIMEOUT: Duration = auxchan::WRITE_TIMEOUT;
+
 /// Everything one session's auxiliary channel owns, so [`NativeHandle`] carries
 /// one optional field rather than five.
 ///
@@ -814,10 +820,36 @@ fn pump_input(
     stop: &AtomicBool,
     input_clock: InputClock,
 ) -> Option<String> {
+    pump_input_with_timeout(
+        sock,
+        latest_mouse_move,
+        input_rx,
+        commands,
+        wake_rx,
+        stop,
+        input_clock,
+        NATIVE_INPUT_WRITE_TIMEOUT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pump_input_with_timeout(
+    sock: TcpStream,
+    latest_mouse_move: Arc<LatestMouseMove>,
+    input_rx: Receiver<InputEvent>,
+    commands: Receiver<SessionCommand>,
+    wake_rx: DoorbellReceiver,
+    stop: &AtomicBool,
+    input_clock: InputClock,
+    write_timeout: Duration,
+) -> Option<String> {
     let mut writer = match sock.try_clone() {
         Ok(w) => w,
         Err(e) => return Some(format!("input socket: {e}")),
     };
+    if let Err(e) = writer.set_write_timeout(Some(write_timeout)) {
+        return Some(format!("input write setup: {e}"));
+    }
     // How many records this session put on the wire — printed however the thread
     // exits; the one number that splits "the client never sent it" from "the host
     // never injected it".
@@ -2337,6 +2369,84 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         bell.ring();
         let _ = join.join();
+    }
+
+    #[test]
+    fn a_nonreading_input_peer_times_out_instead_of_wedging_native_input() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sock = TcpStream::connect(addr).unwrap();
+        // Keep the receive side open but never read it: the sender must eventually
+        // exhaust the kernel's window and exercise the native writer timeout.
+        let peer = listener.accept().unwrap().0;
+
+        let (bell, wake_rx) = crate::wake::doorbell().unwrap();
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let (_commands_tx, commands) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let clock = InputClock::default();
+        let thread_stop = Arc::clone(&stop);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let join = std::thread::spawn(move || {
+            let result = pump_input_with_timeout(
+                sock,
+                Arc::new(LatestMouseMove::default()),
+                input_rx,
+                commands,
+                wake_rx,
+                &thread_stop,
+                clock,
+                Duration::from_millis(25),
+            );
+            let _ = done_tx.send(result);
+        });
+
+        // A button carries two reliable records, so this bounded test burst exceeds a
+        // loopback send window without depending on platform-specific socket options.
+        let event = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            x: 1,
+            y: 2,
+        };
+        for _ in 0..1_000_000 {
+            input_tx.send(event).unwrap();
+        }
+        bell.ring();
+
+        let outcome = done_rx.recv_timeout(Duration::from_secs(3));
+        if outcome.is_err() {
+            // Let the no-timeout mutation below unwind cleanly instead of leaving a
+            // writer thread parked on the deliberately stalled peer.
+            stop.store(true, Ordering::Relaxed);
+            bell.ring();
+            drop(peer);
+            let _ = join.join();
+            panic!("native input writer did not reach its timeout");
+        }
+        let failure = outcome
+            .unwrap()
+            .expect("a timed-out write must fail the native input pump");
+        assert!(
+            failure.starts_with("input write:"),
+            "unexpected native input failure: {failure}"
+        );
+
+        // The receiver is gone with the failed pump, so a later reliable event cannot
+        // remain queued behind the stalled write or be accepted out of order.
+        assert!(
+            input_tx
+                .send(InputEvent::Key {
+                    scancode: crate::input::Scancode::plain(0x1e),
+                    down: true,
+                })
+                .is_err(),
+            "later input must not survive a failed native input channel"
+        );
+        stop.store(true, Ordering::Relaxed);
+        bell.ring();
+        drop(peer);
+        join.join().unwrap();
     }
 
     #[test]
