@@ -191,10 +191,11 @@ Three caveats a reader must know, because each one will otherwise be misread:
   That wait is real latency and belongs in the budget.
 
 Other per-frame fields: `au_bytes`, `keyframe`, `param_sets_prepended` (below), and
-`dropped_frames` — a cumulative count of frames discarded because the send queue was
-full. The queue is bounded at two frames and **lossy on purpose**: a queued frame is
-a stale frame, and dropping the newest keeps the latency number honest. Every drop is
-counted, so the loss is never silent.
+`dropped_frames` — a cumulative count of complete logical desktop frames withheld
+because a tile set was incomplete, decoder recovery needed a keyframe, or the send
+queue was full. The queue is bounded at two logical frames and **lossy on purpose**:
+a queued frame is a stale frame, and dropping the newest keeps latency honest. A 5K
+frame's two H.264 tiles enter or miss that queue together.
 
 The header line carries the config, the adapter and output description, `source`
 (`dxgi` or `idd` — which capture path produced the run), the selected
@@ -204,8 +205,8 @@ frequency, and — the field to check first when something looks odd —
 `AVLowLatencyMode` is the single most likely explanation for a surprising encode
 stage, and this makes that visible without a debugger.
 
-Stats lines are flushed per line. The operator kills this process with Ctrl-C, and a
-buffered tail lost at that moment is a measurement lost.
+Stats lines are buffered and flushed every 200 ms while the sender makes progress,
+and once more on orderly shutdown. This keeps file I/O off the per-message hot path.
 
 ---
 

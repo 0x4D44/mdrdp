@@ -32,16 +32,23 @@ const DRAIN_BATCH: usize = 8;
 
 /// What the sender thread consumes.
 pub enum Outbound {
-    /// An encoded access unit plus the stats row it belongs to and its capture
-    /// sequence number (the `MSG_VIDEO_SEQ` prefix). `send_done_us` is filled in
-    /// here, because only this thread knows when the write returned.
-    Frame(Box<FrameRecord>, u8, u64, Vec<u8>),
+    /// Every independently encoded tile for one captured desktop frame. The set is
+    /// one queue item, so backpressure can drop a logical frame but never strand
+    /// half of a 5K frame at the viewer.
+    FrameSet(Vec<FrameTile>),
     /// One captured frame's raw dirty rects — a complete `MSG_RECTS` payload as
     /// `crate::rects::encode` produced it — plus its stats row. `send_done_us` is
-    /// filled in here for the same reason as [`Outbound::Frame`]'s.
+    /// filled in here because only this thread knows when the write returned.
     Rects(Box<RectRecord>, Vec<u8>),
     /// A pre-serialised JSONL line (the header, or an input event).
     Line(String),
+}
+
+pub struct FrameTile {
+    pub record: Box<FrameRecord>,
+    pub tile_id: u8,
+    pub seq: u64,
+    pub au: Vec<u8>,
 }
 
 pub struct Sender {
@@ -239,22 +246,22 @@ impl Sender {
         }
     }
 
-    /// Write one payload and return its stats row for the batch's telemetry pass.
-    fn handle(&mut self, msg: Outbound) -> String {
+    /// Write one payload and append its rows for the batch's telemetry pass.
+    fn handle(&mut self, msg: Outbound, stats_lines: &mut Vec<String>) {
         match msg {
-            Outbound::Frame(mut record, tile_id, seq, au) => {
-                self.write_video(tile_id, seq, &au);
-                record.send_done_us = self.clock.micros(qpc::now());
-                let line = crate::stats::to_line(&*record);
-                line
+            Outbound::FrameSet(tiles) => {
+                for mut tile in tiles {
+                    self.write_video(tile.tile_id, tile.seq, &tile.au);
+                    tile.record.send_done_us = self.clock.micros(qpc::now());
+                    stats_lines.push(crate::stats::to_line(&*tile.record));
+                }
             }
             Outbound::Rects(mut record, payload) => {
                 self.write_message(framing::MSG_RECTS, &payload);
                 record.send_done_us = self.clock.micros(qpc::now());
-                let line = crate::stats::to_line(&*record);
-                line
+                stats_lines.push(crate::stats::to_line(&*record));
             }
-            Outbound::Line(line) => line,
+            Outbound::Line(line) => stats_lines.push(line),
         }
     }
 
@@ -294,11 +301,11 @@ impl Sender {
             // rather than delaying those payloads.
             send_schedule::payload_first(&mut batch, |msg| match msg {
                 Outbound::Rects(..) => BatchKind::Rects,
-                Outbound::Frame(..) => BatchKind::Frame,
+                Outbound::FrameSet(..) => BatchKind::Frame,
                 Outbound::Line(..) => BatchKind::Line,
             });
             for msg in batch.drain(..) {
-                stats_lines.push(self.handle(msg));
+                self.handle(msg, &mut stats_lines);
             }
             for line in stats_lines.drain(..) {
                 self.write_stats(&line);

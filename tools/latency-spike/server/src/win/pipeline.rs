@@ -19,6 +19,7 @@ use super::{convert, dxgi, encode, idd_source, input, pixel_diff, qpc, send, Res
 use crate::annexb::{self, AvcParameterSets, ParameterSets};
 use crate::cli::{Config, Source, DECLARED_FPS};
 use crate::diff;
+use crate::logical_frame;
 use crate::rects;
 use crate::stats::{self, FrameRecord, Header, QpcClock};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +36,10 @@ const KEYFRAME_RETRY_FRAMES: u32 = DECLARED_FPS;
 /// write with the next encode and small enough that a stall shows up as a drop
 /// rather than as growing latency.
 const QUEUE_DEPTH: usize = 2;
+
+/// Async tile encoders may finish a few captures apart. Three incomplete logical
+/// frames cover that skew without letting missing encoder output become backlog.
+const MAX_PENDING_LOGICAL_FRAMES: usize = 3;
 
 /// How long one [`FrameSource::acquire`] waits for a frame. Short enough that a
 /// rebuilt source or a newly connected client is noticed promptly, long enough not
@@ -433,8 +438,6 @@ struct EmitCtx {
     clock: QpcClock,
     tx: SyncSender<send::Outbound>,
     tile_id: u8,
-    /// Cumulative frames dropped because the send queue was full.
-    dropped: u64,
     /// Cumulative rect messages dropped for the same reason. Counted separately so
     /// fast-path pressure is visible on its own.
     dropped_rects: u64,
@@ -454,9 +457,9 @@ struct EmitCtx {
     awaiting_keyframe: Option<u32>,
     /// Set inside the sink; acted on by the loop (which owns the encoder).
     rerequest_keyframe: bool,
-    /// A frame was dropped from the send queue; the decoder is desynced until the
-    /// next IRAP, so ask for one.
-    drop_wants_keyframe: bool,
+    /// AUs prepared by this encoder callback. The capture loop drains them into the
+    /// shared logical-frame assembler after the encoder borrow ends.
+    emitted: Vec<send::FrameTile>,
 }
 
 enum CodecEmitState {
@@ -581,7 +584,6 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     record.config_epoch = ctx.config_epoch;
     record.param_set_failures = ctx.param_set_failures;
     record.clean_point_mismatches = ctx.clean_point_mismatches;
-    record.dropped_frames = ctx.dropped;
     record.dropped_rects = ctx.dropped_rects;
     record.diff_runs = ctx.diff_runs;
     record.diff_hits = ctx.diff_hits;
@@ -619,23 +621,58 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
         None => {}
     }
 
-    match ctx.tx.try_send(send::Outbound::Frame(
-        Box::new(record),
-        ctx.tile_id,
-        au.meta.seq,
-        bytes.into_owned(),
-    )) {
-        Ok(()) => Ok(()),
-        // Full means the socket is behind. Drop the newest rather than queue it: a
-        // late frame is worse than a missing one here. But a dropped AU desyncs
-        // the viewer's decoder until the next IRAP, so request one.
-        Err(TrySendError::Full(_)) => {
-            ctx.dropped += 1;
-            ctx.drop_wants_keyframe = true;
-            Ok(())
+    ctx.emitted.push(send::FrameTile {
+        record: Box::new(record),
+        tile_id: ctx.tile_id,
+        seq: au.meta.seq,
+        au: bytes.into_owned(),
+    });
+    Ok(())
+}
+
+fn admit_emitted(
+    ctx: &mut EmitCtx,
+    assembler: &mut logical_frame::Assembler<send::FrameTile>,
+    tx: &SyncSender<send::Outbound>,
+    recovery: &mut logical_frame::Recovery,
+    want_keyframe: &mut bool,
+) -> Result<()> {
+    for tile in ctx.emitted.drain(..) {
+        let assembled = assembler.push(tile.seq, tile.tile_id, tile);
+        if assembled.dropped != 0 {
+            recovery.drop_incomplete(assembled.dropped);
+            *want_keyframe = true;
         }
-        Err(TrySendError::Disconnected(_)) => Err("sender thread has gone away".to_owned().into()),
+        for mut frame in assembled.ready {
+            debug_assert!(frame.tiles.iter().all(|tile| tile.seq == frame.seq));
+            let has_keyframe = frame.tiles.iter().any(|tile| tile.record.keyframe);
+            let is_recovery = frame.tiles.iter().all(|tile| tile.record.keyframe);
+            match recovery.prepare(has_keyframe, is_recovery) {
+                logical_frame::RecoveryDecision::Admit => {}
+                logical_frame::RecoveryDecision::Suppress => continue,
+                logical_frame::RecoveryDecision::SuppressAndRequest => {
+                    *want_keyframe = true;
+                    continue;
+                }
+            }
+            for tile in &mut frame.tiles {
+                tile.record.dropped_frames = recovery.dropped();
+            }
+            match tx.try_send(send::Outbound::FrameSet(frame.tiles)) {
+                Ok(()) => recovery.admitted(is_recovery),
+                Err(TrySendError::Full(_)) => {
+                    // Even a complete recovery frame may be the item rejected by
+                    // the queue, so every full admission needs a fresh all-tile IRAP.
+                    recovery.queue_full();
+                    *want_keyframe = true;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err("sender thread has gone away".to_owned().into());
+                }
+            }
+        }
     }
+    Ok(())
 }
 
 /// Does this frame's change metadata put it on the raw fast path?
@@ -772,6 +809,9 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
     let mut frame_seq: u64 = 0;
     let mut was_connected = false;
     let mut want_keyframe = true;
+    let mut recovery = logical_frame::Recovery::waiting();
+    let mut assembler =
+        logical_frame::Assembler::new(state.tiles.len(), MAX_PENDING_LOGICAL_FRAMES);
     // HLD §5: the first frame after a rebuilt duplication is forced down the
     // full-frame path. Its dirty metadata describes change since the *new*
     // duplication's baseline, and whatever changed between the last delivered
@@ -801,7 +841,6 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             clock: state.clock,
             tx: state.tx.clone(),
             tile_id: tile.header.id,
-            dropped: 0,
             dropped_rects: 0,
             diff_runs: 0,
             diff_hits: 0,
@@ -826,7 +865,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             clean_point_mismatches: 0,
             awaiting_keyframe: None,
             rerequest_keyframe: false,
-            drop_wants_keyframe: false,
+            emitted: Vec::new(),
         })
         .collect();
 
@@ -839,6 +878,8 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             // Nothing is watching. Capturing anyway would hold the compositor and
             // run the GPU encoder for an audience of nobody.
             was_connected = false;
+            recovery.reset();
+            assembler.discard_through(frame_seq);
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
@@ -876,6 +917,13 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                     tile.encoder.pump(&mut |au| emit_au(au, ctx))?;
                     tile.encoder
                         .release_retired_surfaces(&mut |slot| tile.converter.release(slot))?;
+                    admit_emitted(
+                        ctx,
+                        &mut assembler,
+                        &state.tx,
+                        &mut recovery,
+                        &mut want_keyframe,
+                    )?;
                     housekeep(tile.encoder.as_ref(), ctx, &mut want_keyframe, last_epoch);
                 }
                 continue;
@@ -884,6 +932,8 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             Acquired::Recreated => {
                 eprintln!("capture: frame source lost and rebuilt");
                 want_keyframe = true;
+                recovery.reset();
+                assembler.discard_through(frame_seq);
                 suppress_rects_once = true;
                 // The retained frame predates the rebuild, so it is no longer the
                 // baseline the viewer is painting on top of; a diff against it would
@@ -1097,6 +1147,13 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 .encode(&sample, meta, nv12.slot, &mut |au| emit_au(au, ctx))?;
             tile.encoder
                 .release_retired_surfaces(&mut |slot| tile.converter.release(slot))?;
+            admit_emitted(
+                ctx,
+                &mut assembler,
+                &state.tx,
+                &mut recovery,
+                &mut want_keyframe,
+            )?;
             housekeep(tile.encoder.as_ref(), ctx, &mut want_keyframe, last_epoch);
             debug_assert_eq!(usize::from(tile.header.id), tile_index);
         }
@@ -1135,10 +1192,6 @@ fn housekeep(
         eprintln!(
             "encode: keyframe request ignored for {KEYFRAME_RETRY_FRAMES} frames; asking again"
         );
-        *want_keyframe = true;
-    }
-    if ctx.drop_wants_keyframe {
-        ctx.drop_wants_keyframe = false;
         *want_keyframe = true;
     }
 }

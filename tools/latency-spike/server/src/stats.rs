@@ -155,6 +155,8 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
     }]
 }
 
+/// Schema 10: `dropped_frames` counts complete logical desktop frames withheld by
+/// assembly, recovery, or queue admission rather than independently dropped tiles.
 /// Schema 9: headers advertise the selected codec and exact tile layout, and frame
 /// rows identify the tile whose independently encoded access unit they describe.
 /// Schema 8: frame rows report exact claimed/measured rectangle-union area, the
@@ -173,7 +175,7 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
 /// (Schema 4: the header gained `source`, naming which capture path the run used.
 /// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
-pub const SCHEMA: u32 = 9;
+pub const SCHEMA: u32 = 10;
 /// Bumped 4 → 5 by the return to H.264 and the tiled `MSG_VIDEO_TILE` envelope.
 /// (Bumped 3 → 4 by tranche 6b's H.264 → HEVC bitstream change.
 /// (Bumped 2 → 3 by tranche 3's input dialect (input-channel v2: scan/mouse/wheel
@@ -263,7 +265,9 @@ pub struct FrameRecord {
     pub param_set_failures: u64,
     /// Cumulative disagreements between MF's CleanPoint flag and the bitstream IDR.
     pub clean_point_mismatches: u64,
-    /// Cumulative count of frames dropped because the send queue was full.
+    /// Cumulative count of complete logical desktop frames withheld before the
+    /// sender: incomplete tile sets, recovery-fenced deltas, and full-queue drops.
+    /// Every tile row in one admitted frame carries the same value.
     pub dropped_frames: u64,
     /// Cumulative count of rect messages dropped for the same reason. Carried on
     /// every frame row — not only on `rects` rows — so a socket so far behind that
