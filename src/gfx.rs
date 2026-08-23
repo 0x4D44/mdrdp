@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex};
 use ironrdp::pdu::geometry::ExclusiveRectangle;
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface as EgfxSurface};
 use ironrdp_egfx::pdu::{
-    CacheToSurfacePdu, CapabilitiesV107Flags, CapabilitySet, Codec1Type, EvictCacheEntryPdu,
-    GfxPdu, Point, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface1Pdu,
+    CacheToSurfacePdu, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
+    EvictCacheEntryPdu, GfxPdu, Point, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu,
+    WireToSurface1Pdu,
 };
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::ProgressiveDecoder;
@@ -197,6 +198,10 @@ pub struct GfxHandler {
     /// then reject or corrupt every refinement — the same reason the ClearCodec decoder
     /// is long-lived.
     progressive: ProgressiveDecoder,
+    /// The active wire encoding context most recently used successfully for each surface.
+    /// Progressive tile state remains keyed by surface, so an obsolete delete must not
+    /// retire a state that a rotated context is still refining.
+    progressive_contexts: HashMap<u16, u32>,
     stats: GfxStatsHandle,
     /// Surfaces we have mirrored into the store. Surface lifetime ends only at an explicit
     /// `DeleteSurface`; `ResetGraphics` changes the output-buffer dimensions without
@@ -244,6 +249,7 @@ impl GfxHandler {
             store,
             decoder: ClearCodecDecoder::new(),
             progressive: ProgressiveDecoder::new(),
+            progressive_contexts: HashMap::new(),
             stats: GfxStatsHandle::new(),
             live_surfaces: HashSet::new(),
             cache_dims: HashMap::new(),
@@ -393,6 +399,12 @@ impl GfxHandler {
                 return;
             }
         };
+
+        // Progressive state is keyed by surface so a rotated wire context can keep
+        // refining the same tile grid. Remember the context only after a successful
+        // decode: a malformed update must not make a later delete retire live state.
+        self.progressive_contexts
+            .insert(surface_id, pdu.codec_context_id);
 
         let mut painted_px: u64 = 0;
         for tile in tiles {
@@ -669,6 +681,11 @@ impl GraphicsPipelineHandler for GfxHandler {
     }
 
     fn on_surface_created(&mut self, surface: &EgfxSurface) {
+        // CreateSurface may reuse an id without a preceding DeleteSurface. The new
+        // incarnation must not inherit the old surface's progressive tile grid or
+        // active wire context.
+        self.progressive.delete_context(u32::from(surface.id));
+        self.progressive_contexts.remove(&surface.id);
         self.live_surfaces.insert(surface.id);
         let (id, width, height) = (surface.id, surface.width, surface.height);
         self.with_store(|store| store.create(id, width, height));
@@ -685,6 +702,7 @@ impl GraphicsPipelineHandler for GfxHandler {
         // progressive_delete_surface_context the same way. A recreated surface with the
         // same id must start from empty tile state, not refine the old surface's pixels.
         self.progressive.delete_context(u32::from(surface_id));
+        self.progressive_contexts.remove(&surface_id);
         self.stats
             .note(|s| s.surfaces_deleted = s.surfaces_deleted.saturating_add(1));
     }
@@ -816,6 +834,16 @@ impl GraphicsPipelineHandler for GfxHandler {
         let slot = pdu.cache_slot;
         self.slots.update(|s| s.evict(slot));
         self.with_store(|store| store.evict_cache(pdu.cache_slot));
+    }
+
+    fn on_delete_encoding_context(&mut self, pdu: &DeleteEncodingContextPdu) {
+        // Context ids can rotate while a surface's progressive tile state remains
+        // live. Retire the surface only when the server deletes the context currently
+        // associated with it; an obsolete delete must be harmless.
+        if self.progressive_contexts.get(&pdu.surface_id).copied() == Some(pdu.codec_context_id) {
+            self.progressive.delete_context(u32::from(pdu.surface_id));
+            self.progressive_contexts.remove(&pdu.surface_id);
+        }
     }
 
     /// The ClearCodec seam.
@@ -2162,10 +2190,14 @@ mod tests {
         .expect("encode progressive stream")
     }
 
-    fn decode_progressive_into(handler: &mut GfxHandler, surface_id: u16) {
+    fn decode_progressive_into_with_context(
+        handler: &mut GfxHandler,
+        surface_id: u16,
+        codec_context_id: u32,
+    ) {
         let pdu = ironrdp_egfx::pdu::WireToSurface2Pdu {
             surface_id,
-            codec_context_id: 0,
+            codec_context_id,
             codec_id: ironrdp_egfx::pdu::Codec2Type::RemoteFxProgressive,
             pixel_format: ironrdp_egfx::pdu::PixelFormat::XRgb,
             bitmap_data: minimal_progressive_stream(),
@@ -2176,6 +2208,10 @@ mod tests {
             0,
             "the fixture stream must decode, or the test observes nothing"
         );
+    }
+
+    fn decode_progressive_into(handler: &mut GfxHandler, surface_id: u16) {
+        decode_progressive_into_with_context(handler, surface_id, 0);
     }
 
     /// Progressive tile state is keyed by surface id, so a deleted surface must take its
@@ -2195,6 +2231,71 @@ mod tests {
             0,
             "the surface's tile state must die with the surface"
         );
+    }
+
+    #[test]
+    fn deleting_an_active_progressive_context_drops_its_surface_state() {
+        let mut handler = GfxHandler::new(store());
+        handler.on_surface_created(&egfx_surface(5, 64, 64));
+        decode_progressive_into_with_context(&mut handler, 5, 11);
+        assert_eq!(handler.progressive_contexts.get(&5), Some(&11));
+
+        handler.on_delete_encoding_context(&DeleteEncodingContextPdu {
+            surface_id: 5,
+            codec_context_id: 11,
+        });
+
+        assert_eq!(handler.progressive.context_count(), 0);
+        assert!(!handler.progressive_contexts.contains_key(&5));
+    }
+
+    #[test]
+    fn deleting_an_obsolete_rotated_context_keeps_live_progressive_state() {
+        let mut handler = GfxHandler::new(store());
+        handler.on_surface_created(&egfx_surface(6, 64, 64));
+        decode_progressive_into_with_context(&mut handler, 6, 21);
+        decode_progressive_into_with_context(&mut handler, 6, 22);
+        assert_eq!(handler.progressive.context_count(), 1);
+        assert_eq!(handler.progressive_contexts.get(&6), Some(&22));
+
+        handler.on_delete_encoding_context(&DeleteEncodingContextPdu {
+            surface_id: 6,
+            codec_context_id: 21,
+        });
+
+        assert_eq!(handler.progressive.context_count(), 1);
+        assert_eq!(handler.progressive_contexts.get(&6), Some(&22));
+    }
+
+    #[test]
+    fn recreating_a_surface_id_clears_progressive_state_and_context_mapping() {
+        let mut handler = GfxHandler::new(store());
+        handler.on_surface_created(&egfx_surface(7, 64, 64));
+        decode_progressive_into_with_context(&mut handler, 7, 31);
+        assert_eq!(handler.progressive.context_count(), 1);
+
+        handler.on_surface_created(&egfx_surface(7, 32, 32));
+
+        assert_eq!(handler.progressive.context_count(), 0);
+        assert!(!handler.progressive_contexts.contains_key(&7));
+    }
+
+    #[test]
+    fn deleting_one_surface_context_does_not_touch_another_surface() {
+        let mut handler = GfxHandler::new(store());
+        handler.on_surface_created(&egfx_surface(8, 64, 64));
+        handler.on_surface_created(&egfx_surface(9, 64, 64));
+        decode_progressive_into_with_context(&mut handler, 8, 41);
+        decode_progressive_into_with_context(&mut handler, 9, 41);
+
+        handler.on_delete_encoding_context(&DeleteEncodingContextPdu {
+            surface_id: 8,
+            codec_context_id: 41,
+        });
+
+        assert_eq!(handler.progressive.context_count(), 1);
+        assert!(!handler.progressive_contexts.contains_key(&8));
+        assert_eq!(handler.progressive_contexts.get(&9), Some(&41));
     }
 
     /// A reset must NOT discard codec state for surviving surfaces. Measured on quench:
