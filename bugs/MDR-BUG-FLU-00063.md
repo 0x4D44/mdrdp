@@ -6,15 +6,15 @@
 - **Area:** rdp/zgfx-decoder
 - **Raised:** 2026-08-23T19:39:08Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T194353Z-c50fa622
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00063-run-fix-20260823T194353Z-c50fa622
+- **Owner base:** 078bb7abe1fadef80767a5dc723427bb2ad75e2c
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T19:43:53Z
+- **Owner until:** 2026-08-23T21:43:53Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
