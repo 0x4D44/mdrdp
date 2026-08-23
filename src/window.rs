@@ -315,6 +315,10 @@ pub enum CursorUpdate {
 /// continuing to decode and retain the newest complete canvas.
 pub(crate) const DAMAGE_PRESENT_INTERVAL: Duration = Duration::from_millis(33);
 
+/// A full IOSurface pool is transient compositor backpressure. Retry quickly enough
+/// to stay below one 240 Hz refresh interval without spinning the event loop.
+const PRESENT_BACKPRESSURE_RETRY: Duration = Duration::from_millis(2);
+
 fn large_presentation(width: u16, height: u16) -> bool {
     width > 2560 || height > 1440
 }
@@ -2054,9 +2058,18 @@ impl SessionApp {
         }
 
         window.pre_present_notify();
-        if let Err(e) = buffer.present() {
-            self.note_present_failure(event_loop, e);
-            return;
+        match buffer.present() {
+            Ok(crate::present::PresentStatus::Presented) => {}
+            Ok(crate::present::PresentStatus::Busy) => {
+                let deadline = Instant::now() + PRESENT_BACKPRESSURE_RETRY;
+                self.redraw_deadline = Some(deadline);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                return;
+            }
+            Err(e) => {
+                self.note_present_failure(event_loop, e);
+                return;
+            }
         }
         // Streak counts CONSECUTIVE failures: without this reset, 30 unrelated hiccups
         // across a long session would close a perfectly healthy window.

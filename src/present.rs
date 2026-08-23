@@ -107,10 +107,22 @@ pub enum FrameBuf<'a> {
     Layer(&'a mut macos::LayerPresenter),
 }
 
+/// Result of a successful presentation attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentStatus {
+    /// The frame was handed to the platform compositor.
+    Presented,
+    /// Every safe backing surface is still owned by the compositor; retry later.
+    Busy,
+}
+
 impl FrameBuf<'_> {
-    pub fn present(self) -> Result<(), String> {
+    pub fn present(self) -> Result<PresentStatus, String> {
         match self {
-            Self::Soft(buffer) => buffer.present().map_err(|e| e.to_string()),
+            Self::Soft(buffer) => buffer
+                .present()
+                .map(|()| PresentStatus::Presented)
+                .map_err(|e| e.to_string()),
             #[cfg(target_os = "macos")]
             Self::Layer(layer) => layer.present(),
         }
@@ -170,9 +182,20 @@ fn copy_rows_bgra(src: &[u32], width: usize, height: usize, dst: &mut [u8], dst_
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn pick_surface_for_write(
+    pool_len: usize,
+    last: Option<usize>,
+    mut is_in_use: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    (0..pool_len)
+        .filter(|i| Some(*i) != last)
+        .find(|i| !is_in_use(*i))
+}
+
 #[cfg(target_os = "macos")]
 pub mod macos {
-    use super::copy_rows_bgra;
+    use super::{PresentStatus, copy_rows_bgra, pick_surface_for_write};
     use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool};
@@ -273,9 +296,9 @@ pub mod macos {
         }
 
         /// Copy the staging frame into a free surface and put it on glass.
-        pub fn present(&mut self) -> Result<(), String> {
+        pub fn present(&mut self) -> Result<PresentStatus, String> {
             if self.width == 0 || self.height == 0 {
-                return Ok(()); // Minimised; nothing to show it to.
+                return Ok(PresentStatus::Presented); // Minimised; nothing to show it to.
             }
             if self.surfaces.is_empty() {
                 self.surfaces = make_pool(self.width, self.height)?;
@@ -284,11 +307,11 @@ pub mod macos {
             // Never rewrite the surface currently on glass: CoreAnimation may
             // short-circuit a `setContents` naming the object it already shows, so
             // in-place writes could silently stop updating the screen.
-            let pick = (0..self.surfaces.len())
-                .filter(|i| Some(*i) != self.last)
-                .find(|i| !self.surfaces[*i].is_in_use())
-                .or_else(|| (0..self.surfaces.len()).find(|i| Some(*i) != self.last))
-                .expect("pool of 3 always has a surface that is not on glass");
+            let Some(pick) = pick_surface_for_write(self.surfaces.len(), self.last, |i| {
+                self.surfaces[i].is_in_use()
+            }) else {
+                return Ok(PresentStatus::Busy);
+            };
             {
                 let surface = &self.surfaces[pick];
                 // SAFETY: lock gives exclusive CPU access to the surface memory;
@@ -326,7 +349,7 @@ pub mod macos {
             unsafe { self.layer.setContents(Some(contents)) };
             CATransaction::commit();
             self.last = Some(pick);
-            Ok(())
+            Ok(PresentStatus::Presented)
         }
 
         /// Keep our sublayer covering the view and rendering at its scale.
@@ -426,5 +449,14 @@ mod tests {
         // Row 0 copied, row 1 left alone.
         assert_eq!(dst[3], 0xFF);
         assert_eq!(dst[8], 0xEE);
+    }
+
+    #[test]
+    fn a_busy_surface_pool_never_selects_compositor_owned_memory() {
+        let in_use = [true, true, true];
+        assert_eq!(
+            pick_surface_for_write(in_use.len(), Some(0), |i| in_use[i]),
+            None
+        );
     }
 }
