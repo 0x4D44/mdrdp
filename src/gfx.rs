@@ -505,11 +505,13 @@ impl GfxHandler {
         let result = self.with_store(|store| {
             store.blit_rgba_with_coverage(pdu.surface_id, dest, &pixels, stride, &coverage)
         });
-        self.note_painted(
-            codec_name(pdu.codec_id),
-            u64::from(dest.width()) * u64::from(dest.height()),
-        );
-        self.absorb(result);
+        match result {
+            Ok(written) if written > 0 => {
+                self.note_painted(codec_name(pdu.codec_id), (written / BPP) as u64);
+            }
+            Ok(_) => {}
+            Err(error) => self.absorb(Err(error)),
+        }
     }
 
     fn apply_solid_fill(&mut self, pdu: &SolidFillPdu) {
@@ -1760,6 +1762,39 @@ mod tests {
         assert_eq!(stats.decode_errors, 0, "the decode itself succeeded");
         assert_eq!(stats.surface_errors, 1, "the store refusal is the count");
         assert_eq!(stats.surface_error_reasons.get("no_such_surface"), Some(&1));
+        assert_eq!(
+            stats.codec_bytes_painted.get("ClearCodec"),
+            None,
+            "a refused surface write must not claim painted bytes"
+        );
+    }
+
+    #[test]
+    fn empty_clearcodec_coverage_does_not_report_painted_bytes() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 2, 2));
+
+        let mut empty_composite = vec![0x00, 0x00]; // flags, sequence number
+        empty_composite.extend_from_slice(&0u32.to_le_bytes()); // residual
+        empty_composite.extend_from_slice(&0u32.to_le_bytes()); // bands
+        empty_composite.extend_from_slice(&0u32.to_le_bytes()); // subcodec
+        handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id: 1,
+            codec_id: Codec1Type::ClearCodec,
+            pixel_format: PixelFormat::XRgb,
+            destination_rectangle: rect(0, 0, 2, 2),
+            bitmap_data: empty_composite,
+        }));
+
+        let stats = handler.stats().snapshot();
+        assert_eq!(stats.decode_errors, 0);
+        assert_eq!(stats.surface_errors, 0);
+        assert_eq!(
+            stats.codec_bytes_painted.get("ClearCodec"),
+            None,
+            "zero explicit coverage must not claim painted bytes"
+        );
     }
 
     #[test]

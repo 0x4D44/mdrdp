@@ -881,7 +881,8 @@ impl SurfaceStore {
     }
 
     /// Blit a complete decoded rectangle while retiring coverage only for the exact
-    /// regions the decoder says it supplied.
+    /// regions the decoder says it supplied. Returns the explicit bytes that landed
+    /// after clipping, so codec telemetry cannot count seeded or refused pixels.
     pub(crate) fn blit_rgba_with_coverage(
         &mut self,
         id: u16,
@@ -889,7 +890,7 @@ impl SurfaceStore {
         src: &[u8],
         src_stride_px: u16,
         coverage: &[Rect],
-    ) -> Result<(), SurfaceError> {
+    ) -> Result<usize, SurfaceError> {
         let surface = self
             .surfaces
             .get_mut(&id)
@@ -898,11 +899,11 @@ impl SurfaceStore {
         if written == 0 {
             // No explicit decoder coverage landed on the surface. Do not account or
             // publish a mutation for a bitmap that cannot affect presentation.
-            return Ok(());
+            return Ok(0);
         }
         self.cache_stats.bytes_from_wire += written as u64;
         self.finish_surface_mutation(id);
-        Ok(())
+        Ok(written)
     }
 
     /// Swap a full decoded frame into a surface (the native AU path). Returns the
