@@ -489,6 +489,7 @@ enum CodecEmitState {
         stream_config: Option<annexb::StreamConfig>,
         expected_width: u32,
         expected_height: u32,
+        expected_level_idc: u8,
         awaiting_epoch_irap: bool,
         config_wait_drops: u64,
     },
@@ -525,6 +526,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
             stream_config,
             expected_width,
             expected_height,
+            expected_level_idc,
             awaiting_epoch_irap,
             config_wait_drops,
         } => {
@@ -543,6 +545,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
                         &sets.to_annex_b(),
                         *expected_width,
                         *expected_height,
+                        *expected_level_idc,
                     )
                     .map_err(|error| format!("encode: refusing HEVC configuration: {error}"))?;
                     *stream_sets = Some(sets);
@@ -873,6 +876,10 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                     stream_config: None,
                     expected_width: tile.header.width,
                     expected_height: tile.header.height,
+                    expected_level_idc: tile
+                        .encoder
+                        .hevc_level_idc()
+                        .expect("HEVC encoder must publish its selected level"),
                     awaiting_epoch_irap: true,
                     config_wait_drops: 0,
                 },

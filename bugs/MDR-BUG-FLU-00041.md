@@ -27,6 +27,13 @@ tools/latency-spike/server/src/win/pipeline.rs:304-307 creates one 5120x2880 HEV
 
 ## Fix
 
-<unfixed — raised only>
+Rhydra now selects the smallest HEVC Main-tier level whose H.265 picture-size,
+dimension, luma-sample-rate, and bitrate limits cover the requested stream. The
+default 2560×1440@60 fallback requests and validates Level 5; 5120×2880@60 requests
+and validates Level 6. Contracts beyond Level 6.2 fail before an encoder is opened.
+
+The selected level is applied to the Media Foundation output type, retained through
+mid-stream renegotiation checks, and independently enforced against the emitted SPS
+before any HEVC access unit reaches the viewer.
 
 ## Notes

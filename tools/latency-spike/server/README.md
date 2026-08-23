@@ -227,9 +227,11 @@ Settings: `MFVideoFormat_NV12` in; H.264 or HEVC out; best-effort
 `CODECAPI_AVLowLatencyMode = TRUE`; `AVEncCommonRateControlMode = CBR` with the
 `--bitrate-kbps` value; zero B-pictures; `AVEncMPVGOPSize` from `--gop`; Main 4:2:0
 8-bit and studio-range BT.709. The HEVC fallback additionally requires
-`ICodecAPI`, accepted low-latency mode, Main tier and Level 4.1. Failure to construct
-any H.264 tile drops the partial path before one full-frame HEVC encoder is attempted.
-The codec never changes during a session.
+`ICodecAPI`, accepted low-latency mode, Main tier, and the smallest level whose
+picture, luma-rate, dimension, and Main-tier bitrate limits cover the negotiated
+stream. At the default 60 fps and 20 Mbit/s that is Level 5 for 2560×1440 and Level 6
+for 5120×2880. Failure to construct any H.264 tile drops the partial path before one
+full-frame HEVC encoder is attempted. The codec never changes during a session.
 
 ### Which parameter-set route was taken
 

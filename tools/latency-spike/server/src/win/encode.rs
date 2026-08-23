@@ -52,7 +52,7 @@
 //! timestamp with FIFO as a counted fallback (`stamp_mismatches`).
 
 use super::{qpc, Result};
-use crate::annexb::{AvcParameterSets, ParameterSets};
+use crate::annexb::{self, AvcParameterSets, ParameterSets};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use windows::core::{Interface, GUID};
@@ -150,6 +150,8 @@ pub trait Encoder {
     fn codec_api_refused(&self) -> &[String];
     /// Codec parameter sets from `MF_MT_MPEG_SEQUENCE_HEADER`, when published.
     fn parameter_sets(&self) -> Option<&CodecParameterSets>;
+    /// HEVC general_level_idc selected from picture, rate, and Main-tier bitrate.
+    fn hevc_level_idc(&self) -> Option<u8>;
     /// Ask for an IDR on the next frame. Best-effort: an encoder that refuses
     /// `CODECAPI_AVEncVideoForceKeyFrame` will still produce one at the next GOP.
     fn request_keyframe(&mut self);
@@ -294,6 +296,7 @@ struct Mft {
     scratch: Vec<u8>,
     expected_width: u32,
     expected_height: u32,
+    expected_level_idc: Option<u8>,
 }
 
 /// One `ProcessInput` not yet matched to a `ProcessOutput`.
@@ -355,6 +358,7 @@ impl Mft {
                     self.codec,
                     self.expected_width,
                     self.expected_height,
+                    self.expected_level_idc,
                 )?;
                 unsafe { self.transform.SetOutputType(0, &new_type, 0) }?;
                 self.parameter_sets = read_sequence_header(&new_type, self.codec);
@@ -497,6 +501,7 @@ fn validate_output_type(
     codec: Codec,
     width: u32,
     height: u32,
+    expected_level_idc: Option<u8>,
 ) -> Result<()> {
     // These attributes are only claims by the MFT; the pipeline independently
     // parses and enforces the emitted SPS. Checking both catches a wrong
@@ -511,11 +516,13 @@ fn validate_output_type(
         .into());
     }
     if codec == Codec::Hevc {
+        let expected_level_idc =
+            expected_level_idc.ok_or("internal error: HEVC output has no selected level")?;
         let checks = [
             ("profile", eAVEncH265VProfile_Main_420_8.0 as u32, unsafe {
                 media_type.GetUINT32(&MF_MT_VIDEO_PROFILE)
             }?),
-            ("level", eAVEncH265VLevel4_1.0 as u32, unsafe {
+            ("level", u32::from(expected_level_idc), unsafe {
                 media_type.GetUINT32(&MF_MT_MPEG2_LEVEL)
             }?),
             ("nominal range", MFNominalRange_16_235.0 as u32, unsafe {
@@ -627,6 +634,10 @@ impl Encoder for AsyncEncoder {
 
     fn parameter_sets(&self) -> Option<&CodecParameterSets> {
         self.mft.parameter_sets.as_ref()
+    }
+
+    fn hevc_level_idc(&self) -> Option<u8> {
+        self.mft.expected_level_idc
     }
 
     fn request_keyframe(&mut self) {
@@ -749,6 +760,10 @@ impl Encoder for SyncEncoder {
 
     fn parameter_sets(&self) -> Option<&CodecParameterSets> {
         self.mft.parameter_sets.as_ref()
+    }
+
+    fn hevc_level_idc(&self) -> Option<u8> {
+        self.mft.expected_level_idc
     }
 
     fn request_keyframe(&mut self) {
@@ -910,6 +925,15 @@ fn configure(
     gop: u32,
     manager: Option<&IMFDXGIDeviceManager>,
 ) -> Result<(Mft, bool)> {
+    let expected_level_idc = match codec {
+        Codec::H264 => None,
+        Codec::Hevc => Some(annexb::required_level_idc(
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+        )?),
+    };
     // Contract step 4 — attributes, and the mandatory async unlock.
     // SAFETY: `transform` is live for every call in this function.
     let attributes = unsafe { transform.GetAttributes() }.ok();
@@ -996,7 +1020,10 @@ fn configure(
             Codec::Hevc => {
                 output_type
                     .SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?;
-                output_type.SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH265VLevel4_1.0 as u32)?;
+                output_type.SetUINT32(
+                    &MF_MT_MPEG2_LEVEL,
+                    u32::from(expected_level_idc.expect("HEVC level selected above")),
+                )?;
             }
         }
         output_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
@@ -1049,7 +1076,7 @@ fn configure(
         .ok()
         .and_then(|t| read_sequence_header(&t, codec));
     let current_type = unsafe { transform.GetOutputCurrentType(0) }?;
-    validate_output_type(&current_type, codec, width, height)?;
+    validate_output_type(&current_type, codec, width, height, expected_level_idc)?;
 
     // Contract step 7 — start streaming.
     // SAFETY: the transform is live.
@@ -1076,6 +1103,7 @@ fn configure(
             scratch: Vec::new(),
             expected_width: width,
             expected_height: height,
+            expected_level_idc,
         },
         is_async,
     ))

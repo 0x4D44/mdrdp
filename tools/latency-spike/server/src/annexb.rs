@@ -411,19 +411,113 @@ impl std::fmt::Display for StreamContractError {
     }
 }
 
+#[cfg(any(all(feature = "host", windows), test))]
+struct LevelLimit {
+    idc: u8,
+    max_luma_picture: u64,
+    max_luma_rate: u64,
+    max_main_bitrate_kbps: u32,
+}
+
+// ITU-T H.265 Table A.1/A.2 limits relevant to Rhydra's Main-tier fallback.
+// Lower levels cannot carry either supported desktop at the declared 60 fps.
+#[cfg(any(all(feature = "host", windows), test))]
+const LEVEL_LIMITS: &[LevelLimit] = &[
+    LevelLimit {
+        idc: 123,
+        max_luma_picture: 2_228_224,
+        max_luma_rate: 133_693_440,
+        max_main_bitrate_kbps: 20_000,
+    },
+    LevelLimit {
+        idc: 150,
+        max_luma_picture: 8_912_896,
+        max_luma_rate: 267_386_880,
+        max_main_bitrate_kbps: 25_000,
+    },
+    LevelLimit {
+        idc: 153,
+        max_luma_picture: 8_912_896,
+        max_luma_rate: 534_773_760,
+        max_main_bitrate_kbps: 40_000,
+    },
+    LevelLimit {
+        idc: 156,
+        max_luma_picture: 8_912_896,
+        max_luma_rate: 1_069_547_520,
+        max_main_bitrate_kbps: 60_000,
+    },
+    LevelLimit {
+        idc: 180,
+        max_luma_picture: 35_651_584,
+        max_luma_rate: 1_069_547_520,
+        max_main_bitrate_kbps: 60_000,
+    },
+    LevelLimit {
+        idc: 183,
+        max_luma_picture: 35_651_584,
+        max_luma_rate: 2_139_095_040,
+        max_main_bitrate_kbps: 120_000,
+    },
+    LevelLimit {
+        idc: 186,
+        max_luma_picture: 35_651_584,
+        max_luma_rate: 4_278_190_080,
+        max_main_bitrate_kbps: 240_000,
+    },
+];
+
+/// Smallest relevant HEVC Main-tier level that can describe this encoded contract.
+#[cfg(any(all(feature = "host", windows), test))]
+pub(crate) fn required_level_idc(
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+) -> Result<u8, String> {
+    if width == 0 || height == 0 || fps == 0 || bitrate_kbps == 0 {
+        return Err("HEVC dimensions, frame rate, and bitrate must be non-zero".to_owned());
+    }
+    let picture = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| "HEVC picture size overflow".to_owned())?;
+    let rate = picture
+        .checked_mul(u64::from(fps))
+        .ok_or_else(|| "HEVC luma sample rate overflow".to_owned())?;
+    LEVEL_LIMITS
+        .iter()
+        .find(|limit| {
+            picture <= limit.max_luma_picture
+                && u64::from(width) * u64::from(width) <= limit.max_luma_picture * 8
+                && u64::from(height) * u64::from(height) <= limit.max_luma_picture * 8
+                && rate <= limit.max_luma_rate
+                && bitrate_kbps <= limit.max_main_bitrate_kbps
+        })
+        .map(|limit| limit.idc)
+        .ok_or_else(|| {
+            format!(
+                "HEVC Main-tier contract {width}x{height}@{fps} at {bitrate_kbps} kbit/s exceeds Level 6.2"
+            )
+        })
+}
+
 /// Enforce the exact stream contract chosen for rhydra tranche 6b.
 pub fn validate_config(
     config: StreamConfig,
     expected_width: u32,
     expected_height: u32,
+    expected_level_idc: u8,
 ) -> Result<(), StreamContractError> {
     let fields = [
         ("profile_idc", 1, u64::from(config.profile_idc)),
-        // The negotiated 20 Mbit/s stream is exactly within Level 4.1 Main
-        // tier. Media Foundation has no HEVC tier control, and quench's Intel
-        // MFT emits Main tier for this configuration.
+        // Media Foundation has no HEVC tier control, so the selected level must
+        // fit Rhydra's bitrate inside Main tier as well as its picture and rate.
         ("high_tier", 0, u64::from(config.high_tier)),
-        ("level_idc", 123, u64::from(config.level_idc)),
+        (
+            "level_idc",
+            u64::from(expected_level_idc),
+            u64::from(config.level_idc),
+        ),
         ("chroma_format_idc", 1, u64::from(config.chroma_format_idc)),
         ("bit_depth_luma", 8, u64::from(config.bit_depth_luma)),
         ("bit_depth_chroma", 8, u64::from(config.bit_depth_chroma)),
@@ -450,9 +544,11 @@ pub fn validate_stream(
     stream: &[u8],
     expected_width: u32,
     expected_height: u32,
+    expected_level_idc: u8,
 ) -> Result<StreamConfig, String> {
     let config = stream_config(stream).map_err(|error| error.to_string())?;
-    validate_config(config, expected_width, expected_height).map_err(|error| error.to_string())?;
+    validate_config(config, expected_width, expected_height, expected_level_idc)
+        .map_err(|error| error.to_string())?;
     Ok(config)
 }
 
@@ -770,7 +866,7 @@ mod tests {
             width: 1920,
             height: 1080,
         };
-        assert_eq!(validate_config(expected, 1920, 1080), Ok(()));
+        assert_eq!(validate_config(expected, 1920, 1080, 123), Ok(()));
 
         let wrong = [
             StreamConfig {
@@ -808,9 +904,24 @@ mod tests {
         ];
         for config in wrong {
             assert!(
-                validate_config(config, 1920, 1080).is_err(),
+                validate_config(config, 1920, 1080, 123).is_err(),
                 "accepted {config:?}"
             );
         }
+    }
+
+    #[test]
+    fn hevc_level_is_selected_from_picture_rate_and_main_tier_bitrate() {
+        assert_eq!(required_level_idc(2560, 1440, 60, 20_000), Ok(150));
+        assert_eq!(required_level_idc(5120, 2880, 60, 20_000), Ok(180));
+        assert_eq!(required_level_idc(2560, 1440, 60, 30_000), Ok(153));
+        assert_eq!(required_level_idc(5120, 2880, 120, 20_000), Ok(183));
+    }
+
+    #[test]
+    fn hevc_level_refuses_a_contract_beyond_level_6_2() {
+        assert!(required_level_idc(0, 2880, 60, 20_000).is_err());
+        assert!(required_level_idc(5120, 2880, 300, 20_000).is_err());
+        assert!(required_level_idc(5120, 2880, 60, 300_000).is_err());
     }
 }
