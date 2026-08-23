@@ -164,7 +164,7 @@ mod win {
 
     use rhydra::agent::{Reconciler, TICK_SECS};
     use rhydra::control::{self, Request, CONTROL_PORT};
-    use rhydra::win::agent_ops::{exe_root, WinOps, OWNED_IMAGES};
+    use rhydra::win::agent_ops::{exe_root, terminate_owned_processes, WinOps, OWNED_IMAGES};
 
     const TASK_NAME: &str = "rhydra-agent";
 
@@ -636,21 +636,21 @@ mod win {
             }
             Err(_) => {
                 // No listener. Either no agent, or one that is wedged/starting with
-                // its port down — kill other instances of our own image by PID
-                // filter (plain /im would kill this process too), then sweep the
-                // orphans a hard-killed agent leaves behind.
-                let self_pid = std::process::id().to_string();
-                let _ = Command::new("taskkill")
-                    .args([
-                        "/f",
-                        "/fi",
-                        "IMAGENAME eq rhydra-agent.exe",
-                        "/fi",
-                        &format!("PID ne {self_pid}"),
-                    ])
-                    .status();
-                for image in OWNED_IMAGES {
-                    let _ = Command::new("taskkill").args(["/f", "/im", image]).status();
+                // its port down. Terminate only executables from this installation;
+                // another user's same-named test process is not ours to kill.
+                let root = match exe_root() {
+                    Ok(root) => root,
+                    Err(error) => {
+                        eprintln!("agent: cannot identify installation: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let images = ["rhydra-agent.exe", OWNED_IMAGES[0], OWNED_IMAGES[1]];
+                if let Err(error) =
+                    terminate_owned_processes(&root, &images, Some(std::process::id()))
+                {
+                    eprintln!("agent: fallback shutdown failed: {error}");
+                    return ExitCode::FAILURE;
                 }
             }
         }

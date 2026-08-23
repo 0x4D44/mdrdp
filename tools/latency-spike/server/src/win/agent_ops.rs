@@ -2,7 +2,7 @@
 //!
 //! Children are plain `std::process::Child`ren: `try_wait` gives the reap-once
 //! contract [`ChildState`] documents, and `Drop` kills whatever is still running
-//! on a clean exit. `Drop` never runs on a hard kill (`taskkill /f`), which is
+//! on a clean exit. `Drop` never runs on a hard kill, which is
 //! why every agent start begins with [`WinOps::sweep_orphans`] — a previous
 //! agent's children would otherwise hold the device and ports 9500–9502 and the
 //! fresh supervision would crash-loop on bind.
@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -21,12 +21,21 @@ use windows::Win32::Devices::Display::{
     QDC_VIRTUAL_MODE_AWARE, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
     SDC_VALIDATE, SDC_VIRTUAL_MODE_AWARE,
 };
-use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, POINTL};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, HWND, POINTL, WAIT_OBJECT_0,
+};
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, MonitorFromPoint,
     CDS_UPDATEREGISTRY, DEVMODEW, DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE, DISPLAY_DEVICEW,
     DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE, DISP_CHANGE_SUCCESSFUL,
     DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, MONITOR_DEFAULTTONULL,
+};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -37,6 +46,7 @@ use super::wide_to_string;
 use crate::agent::{
     AgentOps, ChildState, DisplayPlacement, InputDesktopObservation, Mode, PoolObservation,
 };
+use crate::process_ownership::same_windows_executable;
 
 fn scale_percent_from_dpi(dpi: u32) -> Option<u32> {
     if dpi == 0 {
@@ -299,6 +309,131 @@ fn observe_input_desktop() -> InputDesktopObservation {
 /// itself) or the rig's `spike-server-inc3.exe`.
 pub const OWNED_IMAGES: [&str; 2] = ["rhydra-server.exe", "mdrdp-idd-create.exe"];
 
+struct ProcessHandle(HANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: this guard owns the handle returned by a Win32 open/snapshot call.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn process_image_path(process: HANDLE) -> Result<PathBuf, String> {
+    let mut buffer = vec![0u16; 32_768];
+    let mut len = buffer.len() as u32;
+    // SAFETY: `process` remains open for the call and the buffer advertises its full size.
+    unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .map_err(|error| format!("QueryFullProcessImageNameW: {error}"))?;
+    buffer.truncate(len as usize);
+    Ok(PathBuf::from(String::from_utf16_lossy(&buffer)))
+}
+
+/// Terminate only processes whose opened executable resolves to a sibling in this
+/// Rhydra installation. Image names are merely a cheap candidate filter; the full
+/// path read from the opened process handle is the ownership check.
+pub fn terminate_owned_processes(
+    root: &Path,
+    image_names: &[&str],
+    excluded_pid: Option<u32>,
+) -> Result<usize, String> {
+    let expected: Vec<PathBuf> = image_names
+        .iter()
+        .map(|image| {
+            let path = root.join(image);
+            std::fs::canonicalize(&path).unwrap_or(path)
+        })
+        .collect();
+
+    // SAFETY: the returned snapshot handle is immediately placed under an owning guard.
+    let snapshot = ProcessHandle(
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+            .map_err(|error| format!("process snapshot: {error}"))?,
+    );
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    unsafe { Process32FirstW(snapshot.0, &mut entry) }
+        .map_err(|error| format!("read process snapshot: {error}"))?;
+
+    let mut terminated = 0;
+    let mut failures = Vec::new();
+    loop {
+        let pid = entry.th32ProcessID;
+        let image = wide_to_string(&entry.szExeFile);
+        if Some(pid) != excluded_pid
+            && image_names
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&image))
+        {
+            // SAFETY: PID came from the snapshot. The path and terminate operations use
+            // this same opened handle, so PID reuse cannot redirect the termination.
+            match unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                    false,
+                    pid,
+                )
+            } {
+                Ok(handle) => {
+                    let process = ProcessHandle(handle);
+                    match process_image_path(process.0) {
+                        Ok(actual) => {
+                            let actual = std::fs::canonicalize(&actual).unwrap_or(actual);
+                            if expected
+                                .iter()
+                                .any(|path| same_windows_executable(path, &actual))
+                            {
+                                // SAFETY: the handle still identifies the path checked above.
+                                match unsafe { TerminateProcess(process.0, 1) } {
+                                    Ok(()) => {
+                                        // Termination is asynchronous. Do not race a new server
+                                        // against the old process still holding ports or files.
+                                        if unsafe { WaitForSingleObject(process.0, 5_000) }
+                                            == WAIT_OBJECT_0
+                                        {
+                                            terminated += 1;
+                                        } else {
+                                            failures.push(format!(
+                                                "owned process {pid} did not exit within 5 s"
+                                            ));
+                                        }
+                                    }
+                                    Err(error) => failures.push(format!(
+                                        "could not terminate owned process {pid}: {error}"
+                                    )),
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("agent: could not identify candidate process {pid}: {error}")
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("agent: could not open candidate process {pid}: {error}")
+                }
+            }
+        }
+
+        if unsafe { Process32NextW(snapshot.0, &mut entry) }.is_err() {
+            break;
+        }
+    }
+    if failures.is_empty() {
+        Ok(terminated)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 pub struct WinOps {
     /// Directory holding the sibling exes; logs go to `<root>\logs\`.
     root: PathBuf,
@@ -320,13 +455,8 @@ impl WinOps {
 
     /// Kill stray owned images from a previous agent whose `Drop` never ran.
     pub fn sweep_orphans(&mut self) {
-        for image in OWNED_IMAGES {
-            // Exit status deliberately ignored: 128 just means "no such process".
-            let _ = Command::new("taskkill")
-                .args(["/f", "/im", image])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        if let Err(error) = terminate_owned_processes(&self.root, &OWNED_IMAGES, None) {
+            eprintln!("agent: orphan sweep failed: {error}");
         }
     }
 

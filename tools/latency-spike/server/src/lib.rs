@@ -34,6 +34,8 @@ pub(crate) mod input_state;
 pub(crate) mod input_stream;
 #[cfg(any(feature = "host", test))]
 pub(crate) mod logical_frame;
+#[cfg(any(feature = "host", test))]
+pub mod process_ownership;
 pub mod rects;
 #[cfg(any(feature = "host", test))]
 pub(crate) mod send_schedule;
