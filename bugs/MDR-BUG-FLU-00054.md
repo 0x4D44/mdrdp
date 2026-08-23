@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00054 — Native video readers can dispatch an unbounded message batch before later video
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** rhydra/client-latency
 - **Raised:** 2026-08-23T12:09:37Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T200848Z-6f2d92db
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00054-run-fix-20260823T200848Z-6f2d92db
-- **Owner base:** 9527fac41e6c8167b2df292bff462672b7dbde40
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T20:08:48Z
-- **Owner until:** 2026-08-23T22:08:48Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T20:15:50Z, deltic:auto role=fix run=fix-20260823T200848Z-6f2d92db branch=task/bug-MDR-BUG-FLU-00054-run-fix-20260823T200848Z-6f2d92db code=b67dff4 gate=manual)
 
 ## Observation
 
