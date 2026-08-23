@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00048 — Rhydra disconnect can leave injected keys or mouse buttons held
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/input
 - **Raised:** 2026-08-23T12:09:37Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T122412Z-d7777dc8
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00048-run-fix-20260823T122412Z-d7777dc8
-- **Owner base:** 072639a61dd41df369facfbea57e90f332b9095b
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T12:24:12Z
-- **Owner until:** 2026-08-23T14:24:12Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T12:36:42Z, deltic:auto role=fix run=fix-20260823T122412Z-d7777dc8 branch=task/bug-MDR-BUG-FLU-00048-run-fix-20260823T122412Z-d7777dc8 code=f5f5fc9 gate=manual)
 
 ## Observation
 
