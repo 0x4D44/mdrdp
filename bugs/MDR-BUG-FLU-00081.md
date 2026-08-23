@@ -6,15 +6,15 @@
 - **Area:** rdp/surface-cache
 - **Raised:** 2026-08-23T22:02:07Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T220228Z-01dc9cf1
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00081-run-fix-20260823T220228Z-01dc9cf1
+- **Owner base:** 456d960fbe130a3aa9a33346155d750e3bad0533
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T22:02:28Z
+- **Owner until:** 2026-08-24T00:02:28Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
