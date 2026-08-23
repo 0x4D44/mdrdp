@@ -50,7 +50,12 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-fn sync_input_desktop() -> Result<()> {
+/// Attach the calling thread to the console session's current input desktop.
+///
+/// The input listener calls this around `SendInput`. The console-session agent also
+/// calls it before reconciliation so children created while Winlogon is active inherit
+/// Winlogon rather than cold-starting the virtual display on a hidden Default desktop.
+pub fn sync_thread_to_input_desktop() -> Result<String> {
     use windows::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop,
         SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
@@ -96,7 +101,7 @@ fn sync_input_desktop() -> Result<()> {
     let current = unsafe { GetThreadDesktop(GetCurrentThreadId()) }?;
     if desktop_name(current).is_ok_and(|name| name == input_name) {
         let _ = unsafe { CloseDesktop(desktop) };
-        return Ok(());
+        return Ok(input_name);
     }
     if let Err(error) = unsafe { SetThreadDesktop(desktop) } {
         let _ = unsafe { CloseDesktop(desktop) };
@@ -107,13 +112,15 @@ fn sync_input_desktop() -> Result<()> {
             let _ = unsafe { CloseDesktop(previous) };
         }
     });
-    Ok(())
+    Ok(input_name)
 }
 
 fn send_one(input: INPUT, sync_due: bool, failure: impl FnOnce() -> String) -> Result<i64> {
-    let delivered = deliver_with_desktop_sync(sync_due, sync_input_desktop, || unsafe {
-        SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 1
-    })?;
+    let delivered = deliver_with_desktop_sync(
+        sync_due,
+        || sync_thread_to_input_desktop().map(|_| ()),
+        || unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 1 },
+    )?;
     let stamp = qpc::now();
     if !delivered {
         return Err(failure().into());
@@ -751,7 +758,7 @@ pub(crate) fn serve_listener(
     // Start on the live input desktop so the first PIN event is never sacrificed
     // to discovering a desktop transition. A failed sync remains visible and each
     // rejected SendInput will retry it.
-    if let Err(error) = sync_input_desktop() {
+    if let Err(error) = sync_thread_to_input_desktop() {
         eprintln!("input: initial desktop synchronisation failed: {error}");
     }
     log_input_desktop();

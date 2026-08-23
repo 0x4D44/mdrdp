@@ -291,12 +291,22 @@ mod win {
         let _ = writeln!(file, "{line}");
     }
 
-    /// Put the reconcile thread's display APIs in one physical coordinate space.
+    /// Put the reconcile thread on the live console desktop and in one physical
+    /// coordinate space before it creates either child process.
+    ///
+    /// A worker launched while Windows is locked starts on `winsta0\\default` by
+    /// service convention. If its reconcile thread stays there, the children inherit
+    /// that hidden desktop and the new IDD publishes black frames. Joining Winlogon
+    /// first makes a cold service start behave like the already-working transition
+    /// from an unlocked desktop into Winlogon.
+    ///
     /// `EnumDisplaySettingsW` reports physical geometry, while `MonitorFromPoint`
     /// and `GetDpiForWindow` otherwise see a DPI-virtualised desktop and
     /// can miss a 200%-scaled secondary display.
-    fn initialize_reconcile_thread() -> rhydra::win::Result<()> {
-        rhydra::win::init_thread_dpi_awareness()
+    fn initialize_reconcile_thread() -> rhydra::win::Result<String> {
+        let desktop = rhydra::win::input::sync_thread_to_input_desktop()?;
+        rhydra::win::init_thread_dpi_awareness()?;
+        Ok(desktop)
     }
 
     fn apply_display_request(
@@ -315,10 +325,13 @@ mod win {
     }
 
     pub fn run(display: Option<DisplayArgs>) -> ExitCode {
-        if let Err(error) = initialize_reconcile_thread() {
-            eprintln!("agent: SetThreadDpiAwarenessContext failed: {error}");
-            return ExitCode::FAILURE;
-        }
+        let mut reconcile_desktop = match initialize_reconcile_thread() {
+            Ok(desktop) => desktop,
+            Err(error) => {
+                eprintln!("agent: interactive thread initialisation failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
         let root = match exe_root() {
             Ok(r) => r,
             Err(e) => {
@@ -345,6 +358,10 @@ mod win {
         log(
             &mut log_file,
             &format!("agent starting in {}", root.display()),
+        );
+        log(
+            &mut log_file,
+            &format!("reconcile thread desktop {reconcile_desktop:?}"),
         );
 
         let mut ops = WinOps::new(root);
@@ -409,6 +426,30 @@ mod win {
                     if let Err(e) = rec.request_display_mode(mode, scale_percent) {
                         log(&mut log_file, &format!("display request rejected: {e}"));
                     }
+                }
+            }
+
+            // Follow lock, unlock and UAC desktop transitions before a reconcile
+            // pass can replace either child. Existing children keep running while
+            // a transient desktop query fails; starting a replacement on a stale
+            // desktop would be worse than delaying the pass by one tick.
+            match rhydra::win::input::sync_thread_to_input_desktop() {
+                Ok(desktop) => {
+                    if desktop != reconcile_desktop {
+                        log(
+                            &mut log_file,
+                            &format!("reconcile thread desktop {desktop:?}"),
+                        );
+                        reconcile_desktop = desktop;
+                    }
+                }
+                Err(error) => {
+                    log(
+                        &mut log_file,
+                        &format!("input desktop unavailable; delaying reconcile: {error}"),
+                    );
+                    std::thread::sleep(Duration::from_secs(u64::from(TICK_SECS)));
+                    continue;
                 }
             }
 
