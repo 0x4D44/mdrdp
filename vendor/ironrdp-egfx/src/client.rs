@@ -1179,15 +1179,20 @@ impl GraphicsPipelineClient {
         // - HEIGHT: the payload lives in the display rows, so anything in
         //   `surface ..= align16(surface)` is complete — 1920x1080 legitimately
         //   decodes as 1080 rows (coded 1088) and must not degrade.
-        // - WIDTH: the v2 split offsets are `align32(surface)/2` and `/4` INTO the
-        //   row, so a row narrower than align32(surface) has the V half at an
-        //   unknowable offset — running the pass would shear every frame's chroma.
+        // - WIDTH: v1 interleaves full-width U/V rows and needs only the surface
+        //   width. The v2 split offsets are `align32(surface)/2` and `/4` INTO the
+        //   row, so a v2 row narrower than align32(surface) has the V half at an
+        //   unknowable offset — running that pass would shear every frame's chroma.
         //
         // Outside those bounds, degrade to luma-only 4:2:0 output (counted below).
         // 32-aligned widths (1920, 2560, ...) are unaffected either way.
         let aligned_h = usize::from(surf_h).div_ceil(16) * 16;
+        let min_frame_width = match codec_id {
+            Codec1Type::Avc444 => usize::from(surf_w),
+            _ => ironrdp_graphics::avc444::align32(usize::from(surf_w)),
+        };
         let geometry_ok = |frame: &Yuv420Frame| {
-            frame.width >= ironrdp_graphics::avc444::align32(usize::from(surf_w))
+            frame.width >= min_frame_width
                 && (usize::from(surf_h)..=aligned_h).contains(&frame.height)
         };
 
@@ -2398,6 +2403,51 @@ mod tests {
                 |e| matches!(e, Event::Failure(s) if s.as_str() == "avc444 frame geometry mismatch")
             ),
             "the degradation must be counted"
+        );
+    }
+
+    #[test]
+    fn avc444_v1_accepts_a_frame_at_the_unaligned_surface_width() {
+        // AVC444 v1 interleaves U/V in 16-row blocks. Unlike v2, it has no
+        // horizontal align32 split, so an SPS-cropped 60-wide frame is complete.
+        let (tx, rx) = channel();
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(Recorder(tx)),
+            Some(Box::new(StubYuvDecoder {
+                width: 60,
+                height: 32,
+            })),
+        );
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 60,
+            height: 32,
+            pixel_format: PixelFormat::XRgb,
+        }));
+
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 60, 32)], &[10, 0, 0]),
+            stream2: Some(avc420_sub_stream(
+                vec![wire_rect(0, 0, 60, 32)],
+                &[20, 0, 0],
+            )),
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444, &stream);
+
+        let buffer = client.avc444_buffers.get(&1).expect("buffer");
+        let (_, u, v) = buffer.planes();
+        let row_stride = 60usize;
+        let odd_row_pixel = row_stride + 5;
+        let aux_v_offset = (8 * row_stride + 5) % 256;
+        assert_eq!(u[odd_row_pixel], 20u8.wrapping_add(5));
+        assert_eq!(
+            v[odd_row_pixel],
+            20u8.wrapping_add(u8::try_from(aux_v_offset).expect("offset reduced modulo 256"))
+        );
+        assert!(
+            !rx.try_iter().any(|e| matches!(e, Event::Failure(_))),
+            "valid v1 geometry must not degrade to luma-only"
         );
     }
 
