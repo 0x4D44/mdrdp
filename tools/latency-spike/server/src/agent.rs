@@ -58,6 +58,16 @@ impl Mode {
     }
 }
 
+/// Bitrate used by the supervised product path. The 1440p spike established
+/// 20 Mbit/s; 5K contains exactly four times as many pixels, so preserve the
+/// same bits-per-pixel budget instead of dividing 20 Mbit/s across both tiles.
+pub fn supervised_bitrate_kbps(mode: Mode) -> u32 {
+    match (mode.width, mode.height) {
+        (5120, 2880) => 80_000,
+        _ => 20_000,
+    }
+}
+
 /// The IDD's placement in the Windows virtual desktop.
 ///
 /// Rhydra captures the IDD, so it must also own the desktop origin and primary
@@ -946,6 +956,19 @@ impl Default for Reconciler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervised_five_k_gets_four_times_the_1440p_bitrate() {
+        assert_eq!(supervised_bitrate_kbps(DESIRED_MODE), 20_000);
+        assert_eq!(
+            supervised_bitrate_kbps(Mode {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+            }),
+            80_000
+        );
+    }
 
     /// A scripted platform. Children run until `kill_*` or a scripted death;
     /// spawns are recorded with the tick-relative call order.

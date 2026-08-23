@@ -44,7 +44,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::wide_to_string;
 use crate::agent::{
-    AgentOps, ChildState, DisplayPlacement, InputDesktopObservation, Mode, PoolObservation,
+    supervised_bitrate_kbps, AgentOps, ChildState, DisplayPlacement, InputDesktopObservation, Mode,
+    PoolObservation,
 };
 use crate::process_ownership::same_windows_executable;
 
@@ -1161,9 +1162,22 @@ impl AgentOps for WinOps {
         let stats = self.root.join("logs").join("server-stats.jsonl");
         let stats = stats.to_string_lossy().into_owned();
         let audio = audio_source_arg(&self.root);
+        let bitrate = Self::find_display()
+            .and_then(|name| Self::current_mode(&name))
+            .ok_or_else(|| "cannot read the IDD display mode for encoder bitrate".to_owned())?;
+        let bitrate = supervised_bitrate_kbps(bitrate).to_string();
         self.server = Some(self.spawn(
             "rhydra-server.exe",
-            &["--source", "idd", "--out", &stats, "--audio-source", &audio],
+            &[
+                "--source",
+                "idd",
+                "--out",
+                &stats,
+                "--audio-source",
+                &audio,
+                "--bitrate-kbps",
+                &bitrate,
+            ],
             "server.log",
         )?);
         Ok(())

@@ -351,11 +351,12 @@ fn build_tiles(
             Some(manager),
         )?;
         eprintln!(
-            "encode: {} tile {} {}x{} — {} ({})",
+            "encode: {} tile {} {}x{} at {} kbit/s — {} ({})",
             codec.wire_name(),
             header.id,
             header.width,
             header.height,
+            per_tile_bitrate,
             encoder.name(),
             encoder.kind()
         );
