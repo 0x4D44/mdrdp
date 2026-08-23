@@ -27,6 +27,13 @@ tools/latency-spike/server/src/win/clipboard.rs:297-314 scans a locked CF_UNICOD
 
 ## Fix
 
-<unfixed — raised only>
+Bound the Win32 handle with `GlobalSize` before constructing a Rust slice, reject zero,
+odd-sized, and unterminated allocations, and use an RAII guard so every successful
+`GlobalLock` is unlocked on both success and error exits. Portable helper tests cover the
+malformed allocation and rounded slack without needing to dereference hostile memory in a
+unit test.
 
 ## Notes
+
+- Regression observed red before implementation: the unterminated allocation was accepted.
+- Focused result after the fix: 29 clipboard tests passed; `scripts/check-windows.sh` passed.

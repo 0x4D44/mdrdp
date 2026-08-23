@@ -62,7 +62,9 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
     IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 
 use crate::clipboard::TextClipboard;
 
@@ -296,22 +298,28 @@ impl Drop for ClipboardGuard {
 /// must still be open.
 unsafe fn read_utf16_handle(handle: HANDLE) -> Result<String, String> {
     let global = HGLOBAL(handle.0);
+    // GlobalSize is the only trustworthy bound: the system may round a movable
+    // allocation up, but bytes beyond the first NUL are slack, not text.
+    let units = crate::clipboard::utf16_units_for_allocation(unsafe { GlobalSize(global) })?;
     let ptr = unsafe { GlobalLock(global) } as *const u16;
     if ptr.is_null() {
         return Err("the clipboard handle could not be locked".to_owned());
     }
-    // Length is found by scanning for the terminator rather than trusting
-    // GlobalSize: the allocation may be rounded up, and the trailing slack is
-    // not part of the string.
-    let mut len = 0usize;
-    // SAFETY: a CF_UNICODETEXT handle is NUL-terminated by contract.
-    while unsafe { *ptr.add(len) } != 0 {
-        len += 1;
+    let _unlock = GlobalLockGuard(global);
+    // SAFETY: GlobalSize supplied the exact allocation bound, and GlobalLock
+    // returned a pointer to that allocation.
+    let slice = unsafe { std::slice::from_raw_parts(ptr, units) };
+    crate::clipboard::decode_utf16_allocation(slice)
+}
+
+/// Unlock a successful GlobalLock on every return path, including malformed data.
+struct GlobalLockGuard(HGLOBAL);
+
+impl Drop for GlobalLockGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard is created only after GlobalLock returned a pointer.
+        let _ = unsafe { GlobalUnlock(self.0) };
     }
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let text = String::from_utf16_lossy(slice);
-    let _ = unsafe { GlobalUnlock(global) };
-    Ok(text)
 }
 
 /// Copy a UTF-16 string into a freshly allocated moveable handle.
@@ -324,9 +332,9 @@ unsafe fn copy_into_handle(handle: HGLOBAL, wide: &[u16]) -> Result<(), String> 
     if ptr.is_null() {
         return Err("the clipboard allocation could not be locked".to_owned());
     }
+    let _unlock = GlobalLockGuard(handle);
     // SAFETY: the allocation was sized from this same slice.
     unsafe { std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len()) };
-    let _ = unsafe { GlobalUnlock(handle) };
     Ok(())
 }
 

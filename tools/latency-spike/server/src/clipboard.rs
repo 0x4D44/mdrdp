@@ -80,6 +80,30 @@ pub trait TextClipboard: Send {
     fn write_text(&mut self, text: &str) -> Result<(), String>;
 }
 
+/// Turn a `GlobalSize` byte count into a safe UTF-16 unit count.
+#[cfg_attr(not(all(feature = "host", windows)), allow(dead_code))]
+pub(crate) fn utf16_units_for_allocation(size_bytes: usize) -> Result<usize, String> {
+    if size_bytes == 0 {
+        return Err("the clipboard allocation has no bytes".to_owned());
+    }
+    if size_bytes % std::mem::size_of::<u16>() != 0 {
+        return Err(format!(
+            "the clipboard allocation has an odd byte size ({size_bytes})"
+        ));
+    }
+    Ok(size_bytes / std::mem::size_of::<u16>())
+}
+
+/// Decode the UTF-16 units from one bounded `CF_UNICODETEXT` allocation.
+#[cfg_attr(not(all(feature = "host", windows)), allow(dead_code))]
+pub(crate) fn decode_utf16_allocation(units: &[u16]) -> Result<String, String> {
+    let len = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .ok_or_else(|| "the clipboard text is not NUL-terminated".to_owned())?;
+    Ok(String::from_utf16_lossy(&units[..len]))
+}
+
 /// What the session is allowed to do with the clipboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
@@ -422,6 +446,29 @@ mod tests {
     /// exercise the locking shape that ships rather than a simpler one.
     fn bridge() -> Mutex<Bridge> {
         Mutex::new(Bridge::new(Policy::default()))
+    }
+
+    #[test]
+    fn an_unterminated_cf_unicode_text_allocation_is_rejected() {
+        assert!(
+            decode_utf16_allocation(&[u16::from(b'A')]).is_err(),
+            "a malformed allocation without an in-range NUL must not be accepted"
+        );
+    }
+
+    #[test]
+    fn zero_and_odd_sized_utf16_allocations_are_rejected() {
+        assert!(utf16_units_for_allocation(0).is_err());
+        assert!(utf16_units_for_allocation(1).is_err());
+        assert_eq!(utf16_units_for_allocation(4), Ok(2));
+    }
+
+    #[test]
+    fn utf16_text_stops_at_the_first_nul_and_ignores_rounded_slack() {
+        assert_eq!(
+            decode_utf16_allocation(&['A' as u16, 0, 0, 'B' as u16]).unwrap(),
+            "A"
+        );
     }
 
     /// Shorthand for the direct-method tests, which drive the bridge rather
