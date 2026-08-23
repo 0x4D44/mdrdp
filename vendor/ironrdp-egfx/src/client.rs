@@ -75,9 +75,6 @@ use crate::pdu::{
     SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 
-/// Max capacity to keep for decompressed buffer when cleared.
-const MAX_DECOMPRESSED_BUFFER_CAPACITY: usize = 16384; // 16 KiB
-
 // ============================================================================
 // Surface Management
 // ============================================================================
@@ -1454,8 +1451,6 @@ impl DvcProcessor for GraphicsPipelineClient {
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
         // ZGFX decompress
         self.decompressed_buffer.clear();
-        self.decompressed_buffer
-            .shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);
         self.decompressor
             .decompress(payload, &mut self.decompressed_buffer)
             .map_err(|e| decode_err!(e))?;
@@ -1672,6 +1667,16 @@ mod tests {
         client.close(0);
         assert_eq!(client.state, ClientState::Closed);
         assert!(!client.is_active());
+    }
+
+    #[test]
+    fn process_retains_decompression_capacity_after_decode_error() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client.decompressed_buffer.reserve_exact(128 * 1024);
+        let capacity = client.decompressed_buffer.capacity();
+
+        assert!(client.process(0, &[]).is_err());
+        assert_eq!(client.decompressed_buffer.capacity(), capacity);
     }
 
     #[test]
