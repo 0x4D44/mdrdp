@@ -529,9 +529,8 @@ impl GfxHandler {
         let src = rect_from_egfx(&pdu.source_rectangle);
         let result =
             self.with_store(|store| store.surface_to_cache(pdu.surface_id, src, pdu.cache_slot));
-        if result.is_ok() {
-            self.cache_dims
-                .insert(pdu.cache_slot, (src.width(), src.height()));
+        if let Ok(Some((width, height))) = &result {
+            self.cache_dims.insert(pdu.cache_slot, (*width, *height));
             let codec = self
                 .surface_codec
                 .get(&pdu.surface_id)
@@ -539,11 +538,11 @@ impl GfxHandler {
                 .unwrap_or(UNKNOWN_CODEC);
             // The same dimensions `cache_dims` records, so the grid's size and its byte
             // figure can never disagree with each other.
-            let bytes = u64::from(src.width()) * u64::from(src.height()) * BPP as u64;
-            let (w, h, slot) = (src.width(), src.height(), pdu.cache_slot);
+            let bytes = u64::from(*width) * u64::from(*height) * BPP as u64;
+            let (w, h, slot) = (*width, *height, pdu.cache_slot);
             self.slots.update(|s| s.fill(slot, w, h, codec, bytes));
         }
-        self.absorb(result);
+        self.absorb(result.map(|_| ()));
     }
 
     fn apply_cache_to_surface(&mut self, pdu: &CacheToSurfacePdu) {
@@ -1211,6 +1210,65 @@ mod tests {
         assert_eq!(store.lock().unwrap().cache_stats().entries, 0);
         assert!(!handler.cache_dims.contains_key(&7));
         assert_eq!(store.lock().unwrap().cache_stats().evictions, 1);
+    }
+
+    #[test]
+    fn clipped_surface_to_cache_records_the_bitmap_that_was_stored() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 4, 4));
+        handler.on_solid_fill(&SolidFillPdu {
+            surface_id: 1,
+            fill_pixel: Color {
+                b: 0x11,
+                g: 0x22,
+                r: 0x33,
+                xa: 0,
+            },
+            rectangles: vec![rect(0, 0, 4, 4)],
+        });
+
+        handler.on_surface_to_cache(&SurfaceToCachePdu {
+            surface_id: 1,
+            cache_key: 0,
+            cache_slot: 7,
+            source_rectangle: rect(2, 1, 6, 5),
+        });
+
+        assert_eq!(handler.cache_dims.get(&7), Some(&(2, 3)));
+        let slot = *handler.slot_stats().snapshot().get(7).expect("slot 7");
+        assert_eq!((slot.width, slot.height), (2, 3));
+        assert_eq!(slot.bytes_stored, 2 * 3 * BPP as u64);
+
+        handler.on_surface_to_cache(&SurfaceToCachePdu {
+            surface_id: 1,
+            cache_key: 0,
+            cache_slot: 7,
+            source_rectangle: rect(5, 5, 8, 7),
+        });
+        assert_eq!(
+            handler.cache_dims.get(&7),
+            Some(&(2, 3)),
+            "a fully clipped no-op must not replace live cache metadata"
+        );
+
+        handler.on_solid_fill(&SolidFillPdu {
+            surface_id: 1,
+            fill_pixel: Color {
+                b: 0,
+                g: 0,
+                r: 0,
+                xa: 0,
+            },
+            rectangles: vec![rect(0, 0, 4, 4)],
+        });
+        handler.on_cache_to_surface(&CacheToSurfacePdu {
+            cache_slot: 7,
+            surface_id: 1,
+            destination_points: vec![Point { x: 2, y: 1 }],
+        });
+
+        assert_eq!(pixel_at(&store, 1, 2, 1), [0x33, 0x22, 0x11, 0xFF]);
     }
 
     #[test]

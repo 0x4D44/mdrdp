@@ -784,7 +784,7 @@ impl SurfaceStore {
         src_id: u16,
         src_rect: Rect,
         slot: u16,
-    ) -> Result<(), SurfaceError> {
+    ) -> Result<Option<(u16, u16)>, SurfaceError> {
         let surface = self
             .surfaces
             .get(&src_id)
@@ -793,10 +793,10 @@ impl SurfaceStore {
         // width would make every later cache_to_surface ask for more bytes than exist
         // and fail with ShortSource — silently dropping the cached region.
         let Some(clipped) = src_rect.clip_to(surface.width, surface.height) else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(pixels) = surface.extract(clipped) else {
-            return Ok(());
+            return Ok(None);
         };
         self.cache_stats.bytes_stored += pixels.len() as u64;
         let replaced = self.cache.insert(
@@ -813,7 +813,7 @@ impl SurfaceStore {
             self.cache_stats.evictions += 1;
         }
         self.touch();
-        Ok(())
+        Ok(Some((clipped.width(), clipped.height())))
     }
 
     pub fn cache_to_surface(
@@ -1188,7 +1188,10 @@ mod tests {
         store
             .blit_rgba(1, Rect::new(0, 0, 2, 2), &solid(2, 2, BLUE), 2)
             .unwrap();
-        store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 7).unwrap();
+        assert_eq!(
+            store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 7),
+            Ok(Some((2, 2)))
+        );
         store.cache_to_surface(7, 2, &[(2, 2)]).unwrap();
 
         let dest = store.get(2).unwrap();
@@ -1455,7 +1458,10 @@ mod tests {
         store
             .blit_rgba(1, Rect::new(0, 0, 2, 2), &solid(2, 2, RED), 2)
             .unwrap();
-        store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 7).unwrap();
+        assert_eq!(
+            store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 7),
+            Ok(Some((2, 2)))
+        );
         store
     }
 
@@ -1534,10 +1540,16 @@ mod tests {
             "first fill is not an evict"
         );
 
-        store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 7).unwrap();
+        assert_eq!(
+            store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 7),
+            Ok(Some((2, 2)))
+        );
         assert_eq!(store.cache_stats().evictions, 1, "slot 7 was overwritten");
 
-        store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 8).unwrap();
+        assert_eq!(
+            store.surface_to_cache(1, Rect::new(0, 0, 2, 2), 8),
+            Ok(Some((2, 2)))
+        );
         assert_eq!(
             store.cache_stats().evictions,
             1,
