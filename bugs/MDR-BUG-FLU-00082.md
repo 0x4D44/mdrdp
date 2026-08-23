@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00082 — Rhydra cold-starts black when the Windows console is locked
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/secure-desktop
 - **Raised:** 2026-08-23T22:04:30Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T220531Z-aad19780
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00082-run-fix-20260823T220531Z-aad19780
-- **Owner base:** b73b208b8c782092d0a49f8598974b106a7521da
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T22:05:31Z
-- **Owner until:** 2026-08-24T00:05:31Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T22:04:30Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-23T22:04:30Z, raised via `deltic bugs new`) -> Fixed (2026-08-23T22:11:32Z, deltic:auto role=fix run=fix-20260823T220531Z-aad19780 branch=task/bug-MDR-BUG-FLU-00082-run-fix-20260823T220531Z-aad19780 code=39a1844 gate=manual)
 
 ## Observation
 
