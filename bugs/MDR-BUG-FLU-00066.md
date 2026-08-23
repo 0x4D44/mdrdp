@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00066 — Native sessions cannot unlock the Windows PIN desktop and all input is rejected
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/auth-input
 - **Raised:** 2026-08-23T20:27:23Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T205857Z-c8a7b1ba
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00066-run-fix-20260823T205857Z-c8a7b1ba
-- **Owner base:** 7cf4fd06a1b8b11e3d107887b34b903084d4dddf
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T20:58:57Z
-- **Owner until:** 2026-08-23T22:58:57Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T20:27:23Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T20:27:23Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T21:37:56Z, deltic:auto role=fix run=fix-20260823T205857Z-c8a7b1ba branch=task/bug-MDR-BUG-FLU-00066-run-fix-20260823T205857Z-c8a7b1ba code=bae02ec gate=manual)
 
 ## Observation
 
