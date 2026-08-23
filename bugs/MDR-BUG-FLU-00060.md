@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00060 — Malformed ZGFX multipart segment length panics the RDP client
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/zgfx-decoder
 - **Raised:** 2026-08-23T12:35:14Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T123541Z-8d2b0ce0
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00060-run-fix-20260823T123541Z-8d2b0ce0
-- **Owner base:** 965e87e9be7db8adc03fd25bf89cc03e6e7a60b4
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T12:35:41Z
-- **Owner until:** 2026-08-23T14:35:41Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:35:14Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T12:35:14Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T12:39:47Z, deltic:auto role=fix run=fix-20260823T123541Z-8d2b0ce0 branch=task/bug-MDR-BUG-FLU-00060-run-fix-20260823T123541Z-8d2b0ce0 code=0c8f57f gate=manual)
 
 ## Observation
 
