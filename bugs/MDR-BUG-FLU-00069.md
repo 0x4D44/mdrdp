@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00069 — Progressive codec state survives encoding-context deletion and same-ID surface recreation
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** rdp/progressive-rendering
 - **Raised:** 2026-08-23T20:34:24Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T205316Z-c0acb207
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00069-run-fix-20260823T205316Z-c0acb207
-- **Owner base:** 0f75ab213f0d9877cbf9feaab9eb168dcedbf24e
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T20:53:16Z
-- **Owner until:** 2026-08-23T22:53:16Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-23T21:14:16Z, deltic:auto role=fix run=fix-20260823T205316Z-c0acb207 branch=task/bug-MDR-BUG-FLU-00069-run-fix-20260823T205316Z-c0acb207 code=0fe7a684414981355545ad167dd4ace10f8f8e4b gate=manual)
 
 ## Observation
 
