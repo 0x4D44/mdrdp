@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00047 — AVC444 v1 drops chroma on unaligned surface widths
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** gfx/avc444
 - **Raised:** 2026-08-23T12:08:41Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T120917Z-08d8da0e
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00047-run-fix-20260823T120917Z-08d8da0e
-- **Owner base:** 8658495f61bbdf421efca05bfdf13c5c5bc50389
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T12:09:17Z
-- **Owner until:** 2026-08-23T14:09:17Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:08:41Z, raised via `deltic bugs new` model=gpt-5.6-sol@max)
+- **State history:** Open (2026-08-23T12:08:41Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-23T12:14:10Z, deltic:auto role=fix run=fix-20260823T120917Z-08d8da0e branch=task/bug-MDR-BUG-FLU-00047-run-fix-20260823T120917Z-08d8da0e code=e9fd732 gate=manual)
 
 ## Observation
 
