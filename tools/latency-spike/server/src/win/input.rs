@@ -16,10 +16,11 @@
 use super::{qpc, Result};
 use crate::input_proto::{self, KeyKind, MouseButton, Record, WheelAxis};
 use crate::input_state::{HeldInputs, InputTransition};
+use crate::input_stream::{self, ReadRecord};
 use crate::stats::{self, InputEventRecord, MouseEventRecord, MouseMoveSummaryRecord, QpcClock};
-use std::io::Read;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::mpsc::SyncSender;
+use std::time::Duration;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
@@ -32,6 +33,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     XBUTTON1, XBUTTON2,
 };
+
+/// Once a record's kind byte has arrived, its remaining nine bytes at most must
+/// follow promptly. Idle time between complete records remains unlimited.
+const RECORD_BODY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Inject one key transition. Returns the QPC stamp taken immediately after the
 /// call, and an error if the injection was rejected.
@@ -504,34 +509,15 @@ fn serve_one(
     let mut moves = MoveAggregate::default();
     let mut held = HeldInputs::default();
     let result: std::io::Result<()> = loop {
-        // Read the kind byte first — a frameless stream cannot know how many more
-        // bytes belong to this record until it knows the kind (`kind_len`, §5.1).
-        //
-        // A short read here is not a partial record to be retried: `read_exact`
-        // either fills the buffer or the peer closed mid-record, and a stream that
-        // is out of phase can never be resynchronised in a frameless protocol —
-        // exactly the behaviour the original fixed-8-byte reader had, preserved.
-        match stream.read_exact(&mut buf[..1]) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        let len = match input_stream::read_record(&mut stream, &mut buf, RECORD_BODY_TIMEOUT) {
+            Ok(ReadRecord::Complete(len)) => len,
+            Ok(ReadRecord::Eof) => break Ok(()),
+            Ok(ReadRecord::UnknownKind(kind)) => {
+                eprintln!("input: closing connection: unknown record kind {kind}");
                 break Ok(());
             }
             Err(e) => break Err(e),
-        }
-        let kind = buf[0];
-        let Some(len) = input_proto::kind_len(kind) else {
-            eprintln!("input: closing connection: unknown record kind {kind}");
-            break Ok(());
         };
-        if len > 1 {
-            match stream.read_exact(&mut buf[1..len]) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    break Ok(());
-                }
-                Err(e) => break Err(e),
-            }
-        }
         let recv_qpc = qpc::now();
         let record = match input_proto::decode_record(&buf[..len]) {
             Ok(r) => r,

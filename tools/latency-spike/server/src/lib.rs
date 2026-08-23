@@ -26,6 +26,8 @@ pub mod framing;
 pub mod input_proto;
 #[cfg(any(feature = "host", test))]
 pub(crate) mod input_state;
+#[cfg(any(all(feature = "host", windows), test))]
+pub(crate) mod input_stream;
 #[cfg(any(feature = "host", test))]
 pub(crate) mod logical_frame;
 pub mod rects;

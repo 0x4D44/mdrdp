@@ -27,6 +27,14 @@ tools/latency-spike/server/src/win/input.rs:453-505 reads one input record with 
 
 ## Fix
 
-<unfixed — raised only>
+Input record parsing now leaves the socket unlimited while it waits for the next
+kind byte, then applies one absolute one-second deadline to the rest of that record.
+A silent or byte-dribbling partial record therefore ends only that connection;
+`serve_one` still flushes movement telemetry and releases held keys/buttons before
+the listener accepts its replacement.
+
+The socket-boundary logic is portable and tested on loopback. Regression tests
+cover a silent partial body, a byte dribble which cannot extend the deadline,
+healthy idle time between complete records, and the existing unknown-kind close.
 
 ## Notes
