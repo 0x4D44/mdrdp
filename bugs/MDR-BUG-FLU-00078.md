@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00078 — Rhydra service cannot move its worker token into the console session
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** Rhydra service
 - **Raised:** 2026-08-23T21:46:28Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T214751Z-79cfb27f
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00078-run-fix-20260823T214751Z-79cfb27f
-- **Owner base:** 74bcda98be42615e655c10ccb741f97bb474cbcf
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T21:47:51Z
-- **Owner until:** 2026-08-23T23:47:51Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T21:46:28Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T21:46:28Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T21:48:01Z, deltic:auto role=fix run=fix-20260823T214751Z-79cfb27f branch=task/bug-MDR-BUG-FLU-00078-run-fix-20260823T214751Z-79cfb27f code=bcfc91f gate=manual)
 
 ## Observation
 
