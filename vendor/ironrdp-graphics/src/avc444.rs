@@ -19,8 +19,9 @@
 //! LC=1/LC=2 alternation; this module's luma pass preserves delivered chroma (see
 //! [`Yuv444Buffer::apply_luma`]) — and, where a block's average jumped under a
 //! luma-only update (the preserved samples are then one chroma catch-up behind),
-//! paints the flat average until the catch-up lands (see
-//! [`Yuv444Buffer::to_rgba_into`]). Every source read is bounds-checked:
+//! paints the flat average until the catch-up lands or luma returns to the last
+//! aux-confirmed average (see [`Yuv444Buffer::to_rgba_into`]). Every source read
+//! is bounds-checked:
 //! a destination position whose source sample does not exist in the decoded frame is
 //! left unwritten (it keeps its previous or luma-replicated value) rather than
 //! shearing or panicking — wire data is untrusted.
@@ -106,10 +107,13 @@ pub struct Yuv444Buffer {
     /// such a block by reconstruction overshoots (`4*new_avg - 3*stale`) into a
     /// hue that was never on screen — a retreating dark-yellow bar flashed blue
     /// (MDR-BUG-FLUX-00010) — so [`Self::to_rgba_into`] paints stale blocks
-    /// with the flat average until a chroma pass covers the block and clears
-    /// the bit. The chroma passes clear but never set this; the luma pass sets
-    /// but never clears it.
+    /// with the flat average until a chroma pass covers the block or luma returns
+    /// to its last aux-confirmed average and clears the bit.
     chroma_stale: Vec<u64>,
+    /// The last luma-derived chroma average confirmed by an auxiliary pass for
+    /// each 2x2 block. A later luma pass can return to this signature without a
+    /// new aux frame, so it can safely clear [`chroma_stale`].
+    chroma_confirmed_avg: Vec<[u8; 2]>,
 }
 
 /// Chroma-average delta (per channel, on the incoming luma pass) above which a
@@ -134,6 +138,7 @@ impl Yuv444Buffer {
             height: h,
             chroma_seen: vec![0; blocks.div_ceil(64)],
             chroma_stale: vec![0; blocks.div_ceil(64)],
+            chroma_confirmed_avg: vec![[128, 128]; blocks],
         }
     }
 
@@ -170,6 +175,8 @@ impl Yuv444Buffer {
                 let idx = by * blocks_per_row + bx;
                 self.chroma_seen[idx / 64] |= 1 << (idx % 64);
                 self.chroma_stale[idx / 64] &= !(1 << (idx % 64));
+                let i = (by * 2) * self.width + bx * 2;
+                self.chroma_confirmed_avg[idx] = [self.u[i], self.v[i]];
             }
         }
     }
@@ -204,6 +211,7 @@ impl Yuv444Buffer {
             height,
             chroma_seen: vec![0; blocks.div_ceil(64)],
             chroma_stale: vec![0; blocks.div_ceil(64)],
+            chroma_confirmed_avg: vec![[128, 128]; blocks],
         }
     }
 
@@ -235,6 +243,8 @@ impl Yuv444Buffer {
     /// [`STALE_AVG_DELTA`] is additionally marked stale (see `chroma_stale`): its
     /// content changed under a luma-only update, so the preserved odd samples
     /// describe the previous content until the encoder's chroma catch-up lands.
+    /// If the average returns to the last aux-confirmed value within that same
+    /// threshold, the stale mark is cleared without requiring another aux frame.
     pub fn apply_luma(&mut self, main: &Yuv420Frame, rects: &[ExclusiveRectangle]) {
         let uv_row = main.uv_row();
         for rect in rects {
@@ -262,9 +272,19 @@ impl Yuv444Buffer {
                         // are now a chroma catch-up behind — mark the block so
                         // paint falls back to the flat average (see
                         // `chroma_stale`) instead of reconstructing a wrong hue.
-                        let moved = self.u[i].abs_diff(main.u[s]).max(self.v[i].abs_diff(main.v[s]));
-                        if moved > STALE_AVG_DELTA {
-                            let (word, mask) = self.block_bit(dx, dy);
+                        let moved = self.u[i]
+                            .abs_diff(main.u[s])
+                            .max(self.v[i].abs_diff(main.v[s]));
+                        let (word, mask) = self.block_bit(dx, dy);
+                        let block = (dy / 2) * self.width.div_ceil(2) + dx / 2;
+                        let confirmed = self.chroma_confirmed_avg[block];
+                        let returned = confirmed[0]
+                            .abs_diff(main.u[s])
+                            .max(confirmed[1].abs_diff(main.v[s]))
+                            <= STALE_AVG_DELTA;
+                        if returned {
+                            self.chroma_stale[word] &= !mask;
+                        } else if moved > STALE_AVG_DELTA {
                             self.chroma_stale[word] |= mask;
                         }
                     }
@@ -422,7 +442,8 @@ impl Yuv444Buffer {
     /// on screen — renders wrong colours for the whole catch-up gap
     /// (MDR-BUG-FLUX-00010's one-frame blue flash, and whole-window colour
     /// casts on large redraws). The flat average is the correct hue at 4:2:0
-    /// fidelity; full detail returns when the chroma pass clears the mark.
+    /// fidelity; full detail returns when the chroma pass clears the mark or the
+    /// luma average returns to the last aux-confirmed value.
     pub fn to_rgba_into(&self, rect: &ExclusiveRectangle, out: &mut Vec<u8>) {
         let (left, top, right, bottom) = self.clip(rect);
         out.clear();
@@ -654,6 +675,41 @@ mod tests {
         assert_eq!(buf.u[i], aux2.y[3 * 8 + 1], "odd/odd U is aux2 data");
         let expect = yuv_to_rgba(buf.y[i], buf.u[i], buf.v[i]);
         assert_eq!(out[i * 4..][..4], expect, "detail must return after catch-up");
+    }
+
+    /// A transient luma-only change must not permanently hide aux detail when
+    /// the luma average returns to the last aux-confirmed state without aux.
+    #[test]
+    fn a_luma_return_to_last_aux_average_clears_stale_without_aux() {
+        let aux = tagged_420(8, 8, 200);
+        let main_a = tagged_420(8, 8, 7);
+        let mut buf = Yuv444Buffer::new(8, 8);
+        buf.apply_luma(&main_a, &[rect(0, 0, 8, 8)]);
+        buf.apply_chroma_v2(&aux, &[rect(0, 0, 8, 8)]);
+
+        let main_b = tagged_420(8, 8, 107);
+        buf.apply_luma(&main_b, &[rect(0, 0, 8, 8)]);
+        assert!(
+            buf.chroma_stale_at(3, 3),
+            "changed average must mark detail stale"
+        );
+
+        // The encoder omits aux because A is again its last-sent chroma state.
+        buf.apply_luma(&main_a, &[rect(0, 0, 8, 8)]);
+
+        let i = 3 * 8 + 3;
+        assert!(
+            !buf.chroma_stale_at(3, 3),
+            "return to A must clear stale detail"
+        );
+        let mut out = Vec::new();
+        buf.to_rgba_into(&rect(0, 0, 8, 8), &mut out);
+        let expect = yuv_to_rgba(main_a.y[i], aux.y[3 * 8 + 1], aux.y[3 * 8 + 5]);
+        assert_eq!(
+            out[i * 4..][..4],
+            expect,
+            "aux detail must return without another aux"
+        );
     }
 
     /// Steady-state luma refreshes of unchanged content (averages move only by
