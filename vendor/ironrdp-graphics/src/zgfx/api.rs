@@ -30,10 +30,10 @@ pub fn compress_and_wrap_egfx(
         CompressionMode::Auto => {
             let compressed = compressor.compress(data)?;
 
-            // Only use compressed wrapping if it fits a single segment.
-            // Incompressible data can expand beyond the limit; fall back
-            // to uncompressed which handles multipart natively.
-            if compressed.len() <= ZGFX_SEGMENTED_MAXSIZE {
+            // Compressed wrapping is single-segment only. Both the encoded bytes and
+            // their decoded source must fit that segment; uncompressed wrapping handles
+            // multipart framing natively.
+            if data.len() <= ZGFX_SEGMENTED_MAXSIZE && compressed.len() <= ZGFX_SEGMENTED_MAXSIZE {
                 let wrapped_compressed = wrap_compressed(&compressed);
                 let wrapped_uncompressed = wrap_uncompressed(data);
 
@@ -49,11 +49,11 @@ pub fn compress_and_wrap_egfx(
         CompressionMode::Always => {
             let compressed = compressor.compress(data)?;
 
-            if compressed.len() <= ZGFX_SEGMENTED_MAXSIZE {
+            if data.len() <= ZGFX_SEGMENTED_MAXSIZE && compressed.len() <= ZGFX_SEGMENTED_MAXSIZE {
                 Ok(wrap_compressed(&compressed))
             } else {
-                // Compressed output too large for single segment;
-                // send uncompressed to avoid invalid segmentation
+                // Source or compressed output is too large for one segment; send
+                // uncompressed so the wrapper can split it safely.
                 Ok(wrap_uncompressed(data))
             }
         }
@@ -113,5 +113,19 @@ mod tests {
 
             assert_eq!(&output, data, "Round-trip failed for mode {mode:?}");
         }
+    }
+
+    #[test]
+    fn large_repetitive_data_uses_multipart_even_when_compressed_is_small() {
+        use super::super::Decompressor;
+
+        let data = vec![0x41; ZGFX_SEGMENTED_MAXSIZE + 1];
+        let mut compressor = Compressor::new();
+        let wrapped = compress_and_wrap_egfx(&data, &mut compressor, CompressionMode::Always).unwrap();
+
+        assert_eq!(wrapped[0], 0xe1, "an oversized source requires multipart framing");
+        let mut output = Vec::new();
+        Decompressor::new().decompress(&wrapped, &mut output).unwrap();
+        assert_eq!(output, data);
     }
 }

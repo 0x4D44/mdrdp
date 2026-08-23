@@ -20,6 +20,7 @@ pub use wrapper::{wrap_compressed, wrap_uncompressed};
 
 use self::circular_buffer::FixedCircularBuffer;
 use self::control_messages::{BulkEncodedData, CompressionFlags, SegmentedDataPdu};
+use self::wrapper::ZGFX_SEGMENTED_MAXSIZE;
 use crate::utils::Bits;
 
 /// Sliding window size shared by compressor and decompressor.
@@ -66,8 +67,9 @@ impl Decompressor {
     fn handle_segment(&mut self, segment: &BulkEncodedData<'_>, output: &mut Vec<u8>) -> Result<usize, ZgfxError> {
         if !segment.data.is_empty() {
             if segment.compression_flags.contains(CompressionFlags::COMPRESSED) {
-                self.decompress_segment(segment.data, output)
+                self.decompress_segment_with_limit(segment.data, output, Some(ZGFX_SEGMENTED_MAXSIZE))
             } else {
+                ensure_segment_size(0, segment.data.len(), Some(ZGFX_SEGMENTED_MAXSIZE))?;
                 self.history.write_all(segment.data)?;
                 output.extend_from_slice(segment.data);
 
@@ -78,7 +80,17 @@ impl Decompressor {
         }
     }
 
+    #[cfg(test)]
     fn decompress_segment(&mut self, encoded_data: &[u8], output: &mut Vec<u8>) -> Result<usize, ZgfxError> {
+        self.decompress_segment_with_limit(encoded_data, output, None)
+    }
+
+    fn decompress_segment_with_limit(
+        &mut self,
+        encoded_data: &[u8],
+        output: &mut Vec<u8>,
+        output_limit: Option<usize>,
+    ) -> Result<usize, ZgfxError> {
         if encoded_data.is_empty() {
             return Ok(0);
         }
@@ -118,11 +130,13 @@ impl Decompressor {
                         .ok_or(ZgfxError::TruncatedBitstream)?
                         .load_be::<u8>();
 
+                    ensure_segment_size(bytes_written, 1, output_limit)?;
                     self.history.write_u8(value)?;
                     output.push(value);
                     bytes_written += 1;
                 }
                 TokenType::Literal { literal_value } => {
+                    ensure_segment_size(bytes_written, 1, output_limit)?;
                     self.history
                         .write_u8(literal_value)
                         .expect("circular buffer does not fail");
@@ -134,7 +148,15 @@ impl Decompressor {
                     distance_base,
                 } => {
                     let written =
-                        handle_match(&mut bits, distance_value_size, distance_base, &mut self.history, output)?;
+                        handle_match(
+                            &mut bits,
+                            distance_value_size,
+                            distance_base,
+                            bytes_written,
+                            output_limit,
+                            &mut self.history,
+                            output,
+                        )?;
                     bytes_written += written;
                 }
             }
@@ -154,6 +176,8 @@ fn handle_match(
     bits: &mut Bits<'_>,
     distance_value_size: usize,
     distance_base: u32,
+    bytes_written: usize,
+    output_limit: Option<usize>,
     history: &mut FixedCircularBuffer,
     output: &mut Vec<u8>,
 ) -> Result<usize, ZgfxError> {
@@ -168,14 +192,16 @@ fn handle_match(
         .map_err(|_| ZgfxError::InvalidIntegralConversion("token's full distance"))?;
 
     if distance == 0 {
-        read_unencoded_bytes(bits, history, output)
+        read_unencoded_bytes(bits, bytes_written, output_limit, history, output)
     } else {
-        read_encoded_bytes(bits, distance, history, output)
+        read_encoded_bytes(bits, distance, bytes_written, output_limit, history, output)
     }
 }
 
 fn read_unencoded_bytes(
     bits: &mut Bits<'_>,
+    bytes_written: usize,
+    output_limit: Option<usize>,
     history: &mut FixedCircularBuffer,
     output: &mut Vec<u8>,
 ) -> Result<usize, ZgfxError> {
@@ -197,6 +223,7 @@ fn read_unencoded_bytes(
     let unencoded_bits = bits
         .try_split_to(length * 8)
         .ok_or(ZgfxError::TruncatedBitstream)?;
+    ensure_segment_size(bytes_written, length, output_limit)?;
 
     // FIXME: not very efficient, but we need to rework the `Bits` helper and refactor a bit otherwise
     let unencoded_bits = unencoded_bits.to_bitvec();
@@ -210,6 +237,8 @@ fn read_unencoded_bytes(
 fn read_encoded_bytes(
     bits: &mut Bits<'_>,
     distance: usize,
+    bytes_written: usize,
+    output_limit: Option<usize>,
     history: &mut FixedCircularBuffer,
     output: &mut Vec<u8>,
 ) -> Result<usize, ZgfxError> {
@@ -245,6 +274,7 @@ fn read_encoded_bytes(
         base + length
     };
 
+    ensure_segment_size(bytes_written, length, output_limit)?;
     let output_length = output.len();
     history.read_with_offset(distance, length, output)?;
     history
@@ -252,6 +282,22 @@ fn read_encoded_bytes(
         .expect("circular buffer does not fail");
 
     Ok(length)
+}
+
+fn ensure_segment_size(current: usize, additional: usize, limit: Option<usize>) -> Result<(), ZgfxError> {
+    let Some(maximum) = limit else {
+        return Ok(());
+    };
+    let size = current
+        .checked_add(additional)
+        .ok_or(ZgfxError::SegmentTooLarge {
+            size: usize::MAX,
+            maximum,
+        })?;
+    if size > maximum {
+        return Err(ZgfxError::SegmentTooLarge { size, maximum });
+    }
+    Ok(())
 }
 
 struct Token {
@@ -488,6 +534,10 @@ pub enum ZgfxError {
     },
     TokenBitsNotFound,
     TruncatedBitstream,
+    SegmentTooLarge {
+        size: usize,
+        maximum: usize,
+    },
     InvalidIntegralConversion(&'static str),
 }
 
@@ -506,6 +556,9 @@ impl core::fmt::Display for ZgfxError {
             ),
             Self::TokenBitsNotFound => write!(f, "token bits not found"),
             Self::TruncatedBitstream => write!(f, "truncated ZGFX bitstream"),
+            Self::SegmentTooLarge { size, maximum } => {
+                write!(f, "ZGFX segment expands to {size} bytes; maximum is {maximum}")
+            }
             Self::InvalidIntegralConversion(type_name) => {
                 write!(f, "invalid `{type_name}`: out of range integral type conversion")
             }
@@ -522,6 +575,7 @@ impl core::error::Error for ZgfxError {
             Self::InvalidDecompressedSize { .. } => None,
             Self::TokenBitsNotFound => None,
             Self::TruncatedBitstream => None,
+            Self::SegmentTooLarge { .. } => None,
             Self::InvalidIntegralConversion(_) => None,
         }
     }
