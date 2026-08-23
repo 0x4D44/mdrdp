@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00038 — A partial Rhydra input record blocks every later input client indefinitely
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** rhydra/input
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T131759Z-56a2bc45
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00038-run-fix-20260823T131759Z-56a2bc45
-- **Owner base:** f738eeda03d05f36695e7b5aa404aacf1c62078d
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T13:17:59Z
-- **Owner until:** 2026-08-23T15:17:59Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T13:31:35Z, deltic:auto role=fix run=fix-20260823T131759Z-56a2bc45 branch=task/bug-MDR-BUG-FLU-00038-run-fix-20260823T131759Z-56a2bc45 code=34011e7 gate=manual)
 
 ## Observation
 
