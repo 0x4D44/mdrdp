@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00058 — 5K cadence gate copies frames that it immediately discards
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/presentation-latency
 - **Raised:** 2026-08-23T12:21:07Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T122126Z-3e6dc0d9
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00058-run-fix-20260823T122126Z-3e6dc0d9
-- **Owner base:** 096760a9ca3152f1bca1297b5b825df567b9201f
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T12:21:26Z
-- **Owner until:** 2026-08-23T14:21:26Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:21:07Z, raised via `deltic bugs new` model=gpt-5.6-sol@max)
+- **State history:** Open (2026-08-23T12:21:07Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-23T12:27:52Z, deltic:auto role=fix run=fix-20260823T122126Z-3e6dc0d9 branch=task/bug-MDR-BUG-FLU-00058-run-fix-20260823T122126Z-3e6dc0d9 code=66d74b5 gate=manual)
 
 ## Observation
 
