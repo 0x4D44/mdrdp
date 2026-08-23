@@ -17,7 +17,8 @@
 //!
 //! The pool exists because the encoder may still be reading frame *n-1* when frame
 //! *n* is converted. A surface remains leased until the matching encoder output is
-//! returned; if every surface is leased, the pool grows instead of overwriting one.
+//! returned. The budget is fixed: the pipeline pumps the encoder before conversion
+//! and sheds a whole desktop frame if any tile still has no free surface.
 //!
 //! **`VideoProcessorBlt` submits; it does not wait.** `convert_end_us` is when the
 //! call returned, not when the GPU finished. The real cost shows up as back-pressure
@@ -25,6 +26,7 @@
 
 use super::Result;
 use crate::colorspace;
+use crate::surface_pool::LeaseSlots;
 use std::mem::ManuallyDrop;
 use windows::core::Interface;
 use windows::Win32::Foundation::RECT;
@@ -42,14 +44,13 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
 
-/// Initial NV12 surface count. The pool grows if the encoder has more submissions
-/// in flight; correctness must not depend on a guessed transform queue depth.
+/// Maximum NV12 surfaces per tile. Four allows the GPU and encoder to overlap while
+/// bounding 5K surface memory to roughly 88 MiB across the normal two-tile layout.
 pub const POOL_SIZE: usize = 4;
 
 struct Surface {
     texture: ID3D11Texture2D,
     output_view: ID3D11VideoProcessorOutputView,
-    in_use: bool,
 }
 
 pub struct ConvertedSurface {
@@ -58,14 +59,12 @@ pub struct ConvertedSurface {
 }
 
 pub struct Nv12Converter {
-    device: ID3D11Device,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
-    texture_desc: D3D11_TEXTURE2D_DESC,
     surfaces: Vec<Surface>,
-    next: usize,
+    leases: LeaseSlots,
 }
 
 impl Nv12Converter {
@@ -182,14 +181,12 @@ impl Nv12Converter {
         }
 
         Ok(Self {
-            device: device.clone(),
             video_device,
             video_context,
             enumerator,
             processor,
-            texture_desc: desc,
             surfaces,
-            next: 0,
+            leases: LeaseSlots::new(POOL_SIZE),
         })
     }
 
@@ -224,36 +221,15 @@ impl Nv12Converter {
         Ok(Surface {
             texture,
             output_view: output_view.ok_or("CreateVideoProcessorOutputView returned nothing")?,
-            in_use: false,
         })
+    }
+
+    pub fn has_capacity(&self) -> bool {
+        self.leases.available()
     }
 
     /// Convert one captured BGRA texture into a leased NV12 surface.
     pub fn convert(&mut self, source: &ID3D11Texture2D) -> Result<ConvertedSurface> {
-        let slot = (0..self.surfaces.len())
-            .map(|offset| (self.next + offset) % self.surfaces.len())
-            .find(|&slot| !self.surfaces[slot].in_use)
-            .unwrap_or_else(|| {
-                let slot = self.surfaces.len();
-                // Creation failures are handled just below; reserve the index here.
-                slot
-            });
-        if slot == self.surfaces.len() {
-            let surface = Self::create_surface(
-                &self.device,
-                &self.video_device,
-                &self.enumerator,
-                &self.texture_desc,
-            )?;
-            self.surfaces.push(surface);
-            eprintln!(
-                "convert: NV12 pool grew to {} surfaces; encoder submissions are still in flight",
-                self.surfaces.len()
-            );
-        }
-        self.next = (slot + 1) % self.surfaces.len();
-        self.surfaces[slot].in_use = true;
-
         // The captured texture is a different object every frame, so its input view
         // cannot be cached the way the output views are.
         let view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
@@ -276,6 +252,11 @@ impl Nv12Converter {
                 Some(&mut input_view),
             )
         }?;
+
+        let slot = self
+            .leases
+            .acquire()
+            .ok_or("NV12 surface budget exhausted")?;
 
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
@@ -301,7 +282,7 @@ impl Nv12Converter {
         // has no `Drop`, so without this the input view would leak every frame.
         drop(ManuallyDrop::into_inner(stream.pInputSurface));
         if let Err(error) = blt {
-            self.surfaces[slot].in_use = false;
+            self.leases.release(slot)?;
             return Err(error.into());
         }
 
@@ -313,14 +294,6 @@ impl Nv12Converter {
 
     /// Return a surface after the encoder emitted or retired its submission.
     pub fn release(&mut self, slot: usize) -> Result<()> {
-        let surface = self
-            .surfaces
-            .get_mut(slot)
-            .ok_or_else(|| format!("encoder retired unknown NV12 surface {slot}"))?;
-        if !surface.in_use {
-            return Err(format!("encoder retired free NV12 surface {slot}").into());
-        }
-        surface.in_use = false;
-        Ok(())
+        self.leases.release(slot).map_err(Into::into)
     }
 }

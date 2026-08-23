@@ -155,8 +155,9 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
     }]
 }
 
-/// Schema 10: `dropped_frames` counts complete logical desktop frames withheld by
-/// assembly, recovery, or queue admission rather than independently dropped tiles.
+/// Schema 10: `dropped_frames` counts complete logical desktop frames withheld
+/// before the sender — including fixed conversion-budget pressure, assembly,
+/// recovery, or queue admission — rather than independently dropped tiles.
 /// Schema 9: headers advertise the selected codec and exact tile layout, and frame
 /// rows identify the tile whose independently encoded access unit they describe.
 /// Schema 8: frame rows report exact claimed/measured rectangle-union area, the
@@ -266,7 +267,8 @@ pub struct FrameRecord {
     /// Cumulative disagreements between MF's CleanPoint flag and the bitstream IDR.
     pub clean_point_mismatches: u64,
     /// Cumulative count of complete logical desktop frames withheld before the
-    /// sender: incomplete tile sets, recovery-fenced deltas, and full-queue drops.
+    /// sender: conversion-budget pressure, incomplete tile sets, recovery-fenced
+    /// deltas, and full-queue drops.
     /// Every tile row in one admitted frame carries the same value.
     pub dropped_frames: u64,
     /// Cumulative count of rect messages dropped for the same reason. Carried on

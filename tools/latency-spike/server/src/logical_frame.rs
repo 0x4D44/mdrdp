@@ -31,6 +31,12 @@ impl Recovery {
         self.waiting_for_keyframe = true;
     }
 
+    /// Account for a captured frame discarded before any encoder saw it. Decoder
+    /// references remain intact, so this must not enter keyframe recovery.
+    pub(crate) fn drop_before_encode(&mut self) {
+        self.dropped += 1;
+    }
+
     /// Decide whether a complete set may enter the queue. Delta sets produced while
     /// recovering are discarded as whole logical frames.
     pub(crate) fn prepare(&mut self, any_keyframe: bool, all_keyframes: bool) -> RecoveryDecision {
@@ -254,6 +260,10 @@ mod tests {
         );
         assert_eq!(recovery.prepare(true, true), RecoveryDecision::Admit);
         recovery.admitted(true);
+        assert!(!recovery.waiting_for_keyframe());
+        let dropped = recovery.dropped();
+        recovery.drop_before_encode();
+        assert_eq!(recovery.dropped(), dropped + 1);
         assert!(!recovery.waiting_for_keyframe());
         recovery.reset();
         assert!(recovery.waiting_for_keyframe());

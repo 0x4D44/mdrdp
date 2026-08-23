@@ -27,6 +27,18 @@ tools/latency-spike/server/src/win/convert.rs:231-255 allocates another GPU surf
 
 ## Fix
 
-<unfixed — raised only>
+The converter now owns a fixed four-slot lease budget per tile and never allocates
+another NV12 texture after startup. Before each captured frame, the pipeline pumps
+every tile encoder and releases its retired surfaces. If any tile still has no free
+slot, it discards the complete desktop frame before conversion, rect emission, or
+pixel-diff baseline advancement. This preserves tile and decoder coherence while
+bounding the normal 5K two-tile NV12 pool at about 88 MiB. Persistent saturation
+for 500 ms exits explicitly so the session supervisor rebuilds the encoder rather
+than leaving a live process with permanently frozen video.
+
+Portable lease tests prove exhaustion refuses a fifth lease, released slots are
+reused round-robin, and invalid releases fail. The recovery test proves a frame
+discarded before encoding increments loss telemetry without needlessly entering
+keyframe recovery.
 
 ## Notes

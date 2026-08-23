@@ -162,9 +162,8 @@ pub trait Encoder {
         sink: &mut dyn FnMut(EncodedAu) -> Result<()>,
     ) -> Result<()>;
     /// Deliver anything the encoder has finished without feeding it a new frame.
-    /// The async MFT's event queue is pumped only from inside [`Encoder::encode`],
-    /// so on a static desktop the final access unit would otherwise sit inside the
-    /// transform until the next screen change.
+    /// The capture loop calls this before each bounded acquire so a final access
+    /// unit cannot sit inside the transform on a static or pointer-only desktop.
     fn pump(&mut self, sink: &mut dyn FnMut(EncodedAu) -> Result<()>) -> Result<()>;
     /// Bumped whenever the encoder renegotiates its output type mid-stream. A
     /// consumer caching stream-derived state (the in-band SPS/PPS cache) must

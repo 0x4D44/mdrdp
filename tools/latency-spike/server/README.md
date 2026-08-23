@@ -192,10 +192,11 @@ Three caveats a reader must know, because each one will otherwise be misread:
 
 Other per-frame fields: `au_bytes`, `keyframe`, `param_sets_prepended` (below), and
 `dropped_frames` — a cumulative count of complete logical desktop frames withheld
-because a tile set was incomplete, decoder recovery needed a keyframe, or the send
-queue was full. The queue is bounded at two logical frames and **lossy on purpose**:
-a queued frame is a stale frame, and dropping the newest keeps latency honest. A 5K
-frame's two H.264 tiles enter or miss that queue together.
+because the fixed conversion-surface budget was busy, a tile set was incomplete,
+decoder recovery needed a keyframe, or the send queue was full. The queue is bounded
+at two logical frames and **lossy on purpose**: a queued frame is a stale frame, and
+dropping the newest keeps latency honest. A 5K frame's two H.264 tiles enter or miss
+that queue together.
 
 The header line carries the config, the adapter and output description, `source`
 (`dxgi` or `idd` — which capture path produced the run), the selected

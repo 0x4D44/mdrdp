@@ -26,6 +26,7 @@ use crate::stats::{self, FrameRecord, Header, QpcClock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
@@ -38,14 +39,20 @@ const KEYFRAME_RETRY_FRAMES: u32 = DECLARED_FPS;
 /// rather than as growing latency.
 const QUEUE_DEPTH: usize = 2;
 
-/// Async tile encoders may finish a few captures apart. Three incomplete logical
-/// frames cover that skew without letting missing encoder output become backlog.
-const MAX_PENDING_LOGICAL_FRAMES: usize = 3;
+/// Async tile encoders can finish one entire converter budget apart. Matching that
+/// fixed budget lets one tile drain before its peer without evicting a valid set;
+/// no larger skew can be submitted because whole-frame admission stops as soon as
+/// any tile has no free converter surface.
+const MAX_PENDING_LOGICAL_FRAMES: usize = convert::POOL_SIZE;
 
 /// How long one [`FrameSource::acquire`] waits for a frame. Short enough that a
 /// rebuilt source or a newly connected client is noticed promptly, long enough not
 /// to spin.
 const ACQUIRE_TIMEOUT_MS: u32 = 8;
+
+/// A low-latency encoder that retires no submission for this long is unhealthy.
+/// Exit so the session agent rebuilds it instead of leaving the viewer frozen.
+const SURFACE_STALL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 100-nanosecond units per second — Media Foundation's time base.
 const HNS_PER_SECOND: i64 = 10_000_000;
@@ -842,6 +849,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
     let mut last_acquire_qpc: Option<i64> = None;
     let frame_duration_hns = HNS_PER_SECOND / DECLARED_FPS.max(1) as i64;
     let start_qpc = qpc::now();
+    let mut surface_stall = crate::surface_pool::SaturationWatchdog::new(SURFACE_STALL_TIMEOUT);
     let mut contexts: Vec<EmitCtx> = state
         .tiles
         .iter()
@@ -897,13 +905,30 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             was_connected = true;
             want_keyframe = true;
         }
-        if want_keyframe {
-            for (tile, ctx) in state.tiles.iter_mut().zip(&mut contexts) {
-                tile.encoder.request_keyframe();
-                ctx.awaiting_keyframe = Some(0);
-            }
-            want_keyframe = false;
+        // Drain completed output before waiting for another capture. This keeps a
+        // final AU moving on a pointer-only desktop and avoids putting old encode
+        // work in front of a newly captured interaction frame.
+        pump_tiles(
+            &mut state.tiles,
+            &mut contexts,
+            &mut last_epochs,
+            &mut assembler,
+            &state.tx,
+            &mut recovery,
+            &mut want_keyframe,
+        )?;
+        let pool_saturated = state
+            .tiles
+            .iter()
+            .any(|tile| !tile.converter.has_capacity());
+        if surface_stall.expired(pool_saturated, Instant::now()) {
+            return Err(format!(
+                "whole-frame NV12 capacity did not recover for {} ms; restarting instead of freezing",
+                SURFACE_STALL_TIMEOUT.as_millis()
+            )
+            .into());
         }
+        request_keyframes(&mut state.tiles, &mut contexts, &mut want_keyframe);
 
         let acquired = state.capture.acquire(ACQUIRE_TIMEOUT_MS)?;
         let (texture, present_qpc, acquire_qpc, change) = match acquired {
@@ -913,30 +938,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 acquire_qpc,
                 change,
             } => (texture, present_qpc, acquire_qpc, change),
-            Acquired::Timeout => {
-                // No new frame, but the async MFT may be holding a finished AU it
-                // only delivers when pumped — on a static desktop that AU would
-                // otherwise never leave the transform.
-                for ((tile, ctx), last_epoch) in state
-                    .tiles
-                    .iter_mut()
-                    .zip(&mut contexts)
-                    .zip(&mut last_epochs)
-                {
-                    tile.encoder.pump(&mut |au| emit_au(au, ctx))?;
-                    tile.encoder
-                        .release_retired_surfaces(&mut |slot| tile.converter.release(slot))?;
-                    admit_emitted(
-                        ctx,
-                        &mut assembler,
-                        &state.tx,
-                        &mut recovery,
-                        &mut want_keyframe,
-                    )?;
-                    housekeep(tile.encoder.as_ref(), ctx, &mut want_keyframe, last_epoch);
-                }
-                continue;
-            }
+            Acquired::Timeout => continue,
             Acquired::PointerOnly => continue,
             Acquired::Recreated => {
                 eprintln!("capture: frame source lost and rebuilt");
@@ -955,6 +957,15 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         };
 
         frame_seq += 1;
+        if pool_saturated {
+            // No tile has been submitted yet, so shedding here preserves both tile
+            // coherence and every decoder reference. The next captured frame's
+            // damage metadata no longer spans the viewer's baseline, so suppress
+            // its overlay and let the full-frame codec catch up atomically.
+            recovery.drop_before_encode();
+            suppress_rects_once = true;
+            continue;
+        }
 
         let claimed_changed_pixels = change.as_ref().map(|change| {
             let bounds: Vec<_> = change
@@ -1167,6 +1178,40 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             debug_assert_eq!(usize::from(tile.header.id), tile_index);
         }
     }
+}
+
+fn request_keyframes(
+    tiles: &mut [TilePipeline],
+    contexts: &mut [EmitCtx],
+    want_keyframe: &mut bool,
+) {
+    if !*want_keyframe {
+        return;
+    }
+    for (tile, ctx) in tiles.iter_mut().zip(contexts) {
+        tile.encoder.request_keyframe();
+        ctx.awaiting_keyframe = Some(0);
+    }
+    *want_keyframe = false;
+}
+
+fn pump_tiles(
+    tiles: &mut [TilePipeline],
+    contexts: &mut [EmitCtx],
+    last_epochs: &mut [u64],
+    assembler: &mut logical_frame::Assembler<send::FrameTile>,
+    tx: &SyncSender<send::Outbound>,
+    recovery: &mut logical_frame::Recovery,
+    want_keyframe: &mut bool,
+) -> Result<()> {
+    for ((tile, ctx), last_epoch) in tiles.iter_mut().zip(contexts).zip(last_epochs) {
+        tile.encoder.pump(&mut |au| emit_au(au, ctx))?;
+        tile.encoder
+            .release_retired_surfaces(&mut |slot| tile.converter.release(slot))?;
+        admit_emitted(ctx, assembler, tx, recovery, want_keyframe)?;
+        housekeep(tile.encoder.as_ref(), ctx, want_keyframe, last_epoch);
+    }
+    Ok(())
 }
 
 /// Post-emission actions that need the encoder, which the sink cannot borrow.
