@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00071 — EGFX updates can be presented before EndFrame completes the logical frame
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/rendering-atomicity
 - **Raised:** 2026-08-23T20:34:24Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T214405Z-857a448c
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00071-run-fix-20260823T214405Z-857a448c
-- **Owner base:** f6a31f15c24d64b8b5b46a8e4b0cf5924b26deb1
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T21:44:05Z
-- **Owner until:** 2026-08-23T23:44:05Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-23T22:55:51Z, deltic:auto role=fix run=fix-20260823T214405Z-857a448c branch=task/bug-MDR-BUG-FLU-00071-run-fix-20260823T214405Z-857a448c code=a25b787 gate=manual)
 
 ## Observation
 
