@@ -104,35 +104,42 @@ impl std::fmt::Display for PumpEnd {
 /// same packet, so distinguishing them would be inventing precision the transport does
 /// not have.
 ///
-/// Within one read's batch, `MSG_RECTS` is dispatched before the video messages. A
+/// Within each bounded dispatch group, `MSG_RECTS` is dispatched before video. A
 /// rect blit costs ~0.1 ms and an AU decode ~6 ms, so wire order made a rect that
-/// shared a read with an AU wait a decode's length to paint (measured: recv→paint
+/// shared a group with an AU wait a decode's length to paint (measured: recv→paint
 /// p50 9.5 ms on the Increment 1 typing runs). Correctness never depended on wire
 /// order — the sink's exactness gate skips, holds, or paints an update on its `seq`
 /// alone, whatever order it arrives in — so delivery order is purely latency policy.
-/// Relative order *within* each class is preserved.
+/// Relative order *within* each class is preserved. Bounding the group prevents a
+/// large read containing many later rect messages from starving an earlier video.
+const DISPATCH_BATCH_MESSAGES: usize = 16;
+
 pub fn pump<R: Read>(reader: &mut R, clock: &Clock, sink: &mut dyn MessageSink) -> PumpEnd {
     let mut re = Reassembler::default();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut batch: Vec<framing::Message> = Vec::new();
     let mut header_accepted = false;
+    let mut recv_done_us = 0;
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) if header_accepted => return PumpEnd::Eof,
-            Ok(0) => return PumpEnd::Protocol("server closed before its header".to_owned()),
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return PumpEnd::Io(e),
-        };
-        let recv_done_us = clock.now_us();
-        re.push(&buf[..n]);
         batch.clear();
-        loop {
+        while batch.len() < DISPATCH_BATCH_MESSAGES {
             match re.next_message() {
                 Ok(Some(msg)) => batch.push(msg),
                 Ok(None) => break,
                 Err(e) => return PumpEnd::Framing(e),
             }
+        }
+        if batch.is_empty() {
+            let n = match reader.read(&mut buf) {
+                Ok(0) if header_accepted => return PumpEnd::Eof,
+                Ok(0) => return PumpEnd::Protocol("server closed before its header".to_owned()),
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return PumpEnd::Io(e),
+            };
+            recv_done_us = clock.now_us();
+            re.push(&buf[..n]);
+            continue;
         }
         if !header_accepted && !batch.is_empty() {
             let first = &batch[0];
@@ -373,6 +380,27 @@ mod tests {
             (sink.video[0].1, sink.video[1].1),
             (Some(1), Some(2)),
             "video order within the batch is preserved"
+        );
+    }
+
+    #[test]
+    fn rect_priority_cannot_invert_an_unbounded_one_read_batch() {
+        let mut messages = vec![(framing::MSG_VIDEO, vec![0xA1])];
+        messages.extend((0..100).map(|_| (framing::MSG_RECTS, vec![0x01])));
+        let bytes = wire(&messages);
+        let mut sink = Recorder::default();
+
+        let end = pump(&mut bytes.as_slice(), &Clock::new(), &mut sink);
+
+        assert!(matches!(end, PumpEnd::Eof), "{end}");
+        let video_at = sink
+            .order
+            .iter()
+            .position(|kind| *kind == "video")
+            .expect("video was dispatched");
+        assert!(
+            video_at <= DISPATCH_BATCH_MESSAGES,
+            "rect priority delayed one video behind {video_at} callbacks"
         );
     }
 

@@ -706,6 +706,11 @@ fn report(message: &str) {
     eprintln!("native: {message}");
 }
 
+/// Rects may jump ahead of video only within this small window. This preserves
+/// the measured fast-path win without allowing one socket read to invert an
+/// arbitrary number of messages ahead of an earlier frame.
+const VIDEO_DISPATCH_BATCH_MESSAGES: usize = 16;
+
 /// Read and dispatch framed messages until the socket closes, the wire is
 /// violated, or the stop flag is raised.
 fn pump_video(
@@ -716,7 +721,7 @@ fn pump_video(
     stop: &AtomicBool,
 ) -> SessionEnd {
     let mut buf = vec![0u8; 64 * 1024];
-    // Messages completed by one read are dispatched rects-first: a rect update
+    // A bounded group of completed messages is dispatched rects-first: a rect update
     // is the low-latency path and never depends on an AU in the same batch
     // (the exactness gate makes ordering safe either way).
     let mut batch: Vec<framing::Message> = Vec::new();
@@ -724,28 +729,31 @@ fn pump_video(
         if stop.load(Ordering::Relaxed) {
             return SessionEnd::WindowClosed;
         }
-        let n = match video.read(&mut buf) {
-            Ok(0) => {
-                return if stop.load(Ordering::Relaxed) {
-                    SessionEnd::WindowClosed
-                } else {
-                    SessionEnd::TransportFailed(
-                        "the host closed the video channel (tunnel or server died)".to_owned(),
-                    )
-                };
-            }
-            Ok(n) => n,
-            Err(_) if stop.load(Ordering::Relaxed) => return SessionEnd::WindowClosed,
-            Err(e) => return SessionEnd::TransportFailed(format!("video read: {e}")),
-        };
-        reassembler.push(&buf[..n]);
         batch.clear();
-        loop {
+        while batch.len() < VIDEO_DISPATCH_BATCH_MESSAGES {
             match reassembler.next_message() {
                 Ok(Some(m)) => batch.push(m),
                 Ok(None) => break,
                 Err(e) => return SessionEnd::TransportFailed(format!("framing: {e:?}")),
             }
+        }
+        if batch.is_empty() {
+            let n = match video.read(&mut buf) {
+                Ok(0) => {
+                    return if stop.load(Ordering::Relaxed) {
+                        SessionEnd::WindowClosed
+                    } else {
+                        SessionEnd::TransportFailed(
+                            "the host closed the video channel (tunnel or server died)".to_owned(),
+                        )
+                    };
+                }
+                Ok(n) => n,
+                Err(_) if stop.load(Ordering::Relaxed) => return SessionEnd::WindowClosed,
+                Err(e) => return SessionEnd::TransportFailed(format!("video read: {e}")),
+            };
+            reassembler.push(&buf[..n]);
+            continue;
         }
         for m in batch.iter().filter(|m| m.msg_type == framing::MSG_RECTS) {
             if let Err(reason) = sink.on_rects(&m.payload) {
