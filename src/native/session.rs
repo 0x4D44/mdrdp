@@ -484,6 +484,7 @@ fn spawn_aux(
 ) -> std::io::Result<AuxChannel> {
     // Nagle would add up to 40 ms to a small, bursty clipboard message.
     socket.set_nodelay(true)?;
+    socket.set_write_timeout(Some(auxchan::WRITE_TIMEOUT))?;
 
     // **Ask for audio, or none arrives.** The host captures nothing until a
     // client requests it, so a client with a working device has to say so. Sent
@@ -658,9 +659,10 @@ fn spawn_aux(
         std::thread::Builder::new()
             .name("native-aux-tx".to_owned())
             .spawn(move || {
-                let writer = auxchan::pump_writer(tx_socket, &tx_slot, &mut report);
+                let writer = auxchan::pump_writer(&tx_socket, &tx_slot, &mut report);
                 if let auxchan::WriterEnd::Io(reason) = writer.end {
                     report(&format!("clipboard channel write failed: {reason}"));
+                    let _ = tx_socket.shutdown(Shutdown::Both);
                 }
             })?,
     );

@@ -9,18 +9,18 @@
 //! # One client at a time
 //!
 //! Mirrors the video socket's single viewer slot: one session owns the host's
-//! desktop, so one session owns its clipboard. A second connection waits in the
-//! accept backlog rather than being served concurrently, which would give two
-//! clients racing writes to one clipboard and no way to say which won.
+//! desktop, so one session owns its clipboard. A newer connection first shuts down
+//! and joins the old owner, then takes the slot. This keeps clipboard writes serial
+//! while allowing a reconnect to evict a peer that stayed silently connected.
 //!
 //! # Why this is not [`crate::auxchan`]'s job
 //!
 //! `auxchan` owns the loops; this owns the *lifecycle*, and the two ends want
 //! genuinely different ones. The client starts its threads under a session that
-//! outlives them and never waits for the reader. The host waits for exactly
-//! that — the reader returning is how it learns the client went away and the
-//! next `accept` may proceed. Sharing the ~40 lines would mean a flag deciding
-//! which shape to take, which is worse than writing both.
+//! outlives them and never waits for the reader. The host keeps accepting so a new
+//! owner can stop the current reader, then joins every per-connection thread before
+//! starting the replacement. Sharing this would mean a flag deciding which lifecycle
+//! to take, which is worse than writing both.
 
 use std::io::Result;
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
@@ -130,32 +130,19 @@ pub(crate) fn serve_listener(
 ) -> Result<()> {
     let port = listener.local_addr()?.port();
     eprintln!("aux: listening on 127.0.0.1:{port}");
+    let mut active = None;
     loop {
         match listener.accept() {
             Ok((stream, peer)) => {
                 eprintln!("aux: connected {peer}");
-                match serve_one(stream, &mut make_clipboard, &make_audio, policy) {
-                    // ASCII only: this goes to server.log, which is read
-                    // through the Windows console codepage, where an em-dash
-                    // comes out as mojibake.
-                    Ok(report) => eprintln!(
-                        "aux: disconnected - written {}, echo {}, \
-                         write-failed {}, refused-by-policy {}, malformed {}, unknown-type {}, \
-                         audio-produced {}, audio-queued {}, audio-written {}, \
-                         audio-silent {}, audio-dropped {}",
-                        report.applied.written,
-                        report.applied.suppressed,
-                        report.applied.write_failed,
-                        report.reader.refused_by_policy,
-                        report.reader.malformed,
-                        report.reader.unknown_type,
-                        report.audio_produced,
-                        report.audio_queued,
-                        report.audio_written,
-                        report.audio_silent,
-                        report.audio_dropped
-                    ),
-                    Err(e) => eprintln!("aux: connection ended: {e}"),
+                if let Err(e) = replace_active(
+                    &mut active,
+                    stream,
+                    &mut make_clipboard,
+                    Arc::clone(&make_audio),
+                    policy,
+                ) {
+                    eprintln!("aux: connection setup failed: {e}");
                 }
             }
             Err(e) => {
@@ -163,6 +150,85 @@ pub(crate) fn serve_listener(
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
+    }
+}
+
+struct ActiveConnection {
+    shutdown: TcpStream,
+    join: std::thread::JoinHandle<()>,
+}
+
+impl ActiveConnection {
+    fn start(
+        socket: TcpStream,
+        apply_os: Box<dyn TextClipboard>,
+        poll_os: Box<dyn TextClipboard>,
+        make_audio: AudioFactory,
+        policy: Policy,
+    ) -> Result<Self> {
+        let shutdown = socket.try_clone()?;
+        let on_exit = shutdown.try_clone()?;
+        let join = std::thread::Builder::new()
+            .name("aux-session".to_owned())
+            .spawn(move || {
+                let outcome =
+                    serve_one_with_clipboards(socket, apply_os, poll_os, &make_audio, policy);
+                // Also covers setup errors before `serve_one_with_clipboards`
+                // reaches its ordinary teardown.
+                let _ = on_exit.shutdown(Shutdown::Both);
+                log_connection(outcome);
+            })?;
+        Ok(Self { shutdown, join })
+    }
+
+    fn stop(self) {
+        let _ = self.shutdown.shutdown(Shutdown::Both);
+        if self.join.join().is_err() {
+            eprintln!("aux: connection thread panicked");
+        }
+    }
+}
+
+fn replace_active(
+    active: &mut Option<ActiveConnection>,
+    socket: TcpStream,
+    make_clipboard: &mut dyn FnMut() -> Box<dyn TextClipboard>,
+    make_audio: AudioFactory,
+    policy: Policy,
+) -> Result<()> {
+    if let Some(previous) = active.take() {
+        previous.stop();
+    }
+    let apply_os = make_clipboard();
+    let poll_os = make_clipboard();
+    *active = Some(ActiveConnection::start(
+        socket, apply_os, poll_os, make_audio, policy,
+    )?);
+    Ok(())
+}
+
+fn log_connection(outcome: Result<ConnectionReport>) {
+    match outcome {
+        // ASCII only: this goes to server.log, which is read through the Windows
+        // console codepage, where an em-dash comes out as mojibake.
+        Ok(report) => eprintln!(
+            "aux: disconnected - written {}, echo {}, \
+             write-failed {}, refused-by-policy {}, malformed {}, unknown-type {}, \
+             audio-produced {}, audio-queued {}, audio-written {}, \
+             audio-silent {}, audio-dropped {}",
+            report.applied.written,
+            report.applied.suppressed,
+            report.applied.write_failed,
+            report.reader.refused_by_policy,
+            report.reader.malformed,
+            report.reader.unknown_type,
+            report.audio_produced,
+            report.audio_queued,
+            report.audio_written,
+            report.audio_silent,
+            report.audio_dropped
+        ),
+        Err(e) => eprintln!("aux: connection ended: {e}"),
     }
 }
 
@@ -183,8 +249,21 @@ pub fn serve_one(
     make_audio: &AudioFactory,
     policy: Policy,
 ) -> Result<ConnectionReport> {
+    let apply_os = make_clipboard();
+    let poll_os = make_clipboard();
+    serve_one_with_clipboards(socket, apply_os, poll_os, make_audio, policy)
+}
+
+fn serve_one_with_clipboards(
+    socket: TcpStream,
+    apply_clipboard: Box<dyn TextClipboard>,
+    poll_clipboard: Box<dyn TextClipboard>,
+    make_audio: &AudioFactory,
+    policy: Policy,
+) -> Result<ConnectionReport> {
     // Clipboard messages are small and bursty; Nagle would add up to 40 ms.
     socket.set_nodelay(true)?;
+    socket.set_write_timeout(Some(auxchan::WRITE_TIMEOUT))?;
 
     // **One clipboard handle per thread, not one shared behind a mutex.**
     //
@@ -200,8 +279,8 @@ pub fn serve_one(
     // failure deliberately leaves the suppression slot alone so the copy is
     // picked up next time. Found by AC4's unit half, which failed against the
     // shared-handle version.
-    let apply_os = Arc::new(Mutex::new(make_clipboard()));
-    let poll_os = Arc::new(Mutex::new(make_clipboard()));
+    let apply_os = Arc::new(Mutex::new(apply_clipboard));
+    let poll_os = Arc::new(Mutex::new(poll_clipboard));
     let bridge = Arc::new(Mutex::new(Bridge::new(policy)));
 
     // Seed from what the host's clipboard already holds, or the first poll
@@ -227,10 +306,11 @@ pub fn serve_one(
         std::thread::Builder::new()
             .name("aux-tx".to_owned())
             .spawn(move || {
-                let writer = auxchan::pump_writer(tx_socket, &tx_slot, &mut report);
+                let writer = auxchan::pump_writer(&tx_socket, &tx_slot, &mut report);
                 written_counter.store(writer.audio_written, Ordering::Relaxed);
                 if let auxchan::WriterEnd::Io(reason) = writer.end {
                     report(&format!("channel write failed: {reason}"));
+                    let _ = tx_socket.shutdown(Shutdown::Both);
                 }
             })?,
     );
@@ -981,6 +1061,45 @@ mod tests {
         drop(client);
 
         let _ = join_server(server);
+    }
+
+    #[test]
+    fn a_new_client_replaces_a_silent_connection_owner() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = Pasteboard::holding("host content");
+        let audio =
+            Arc::new(|| Box::new(crate::audio_source::UnavailableSource) as Box<dyn AudioSource>)
+                as AudioFactory;
+        let mut active = None;
+
+        let old_client = TcpStream::connect(addr).unwrap();
+        let (old_server, _) = listener.accept().unwrap();
+        let mut make = || Box::new(FakeClipboard(held.clone())) as Box<dyn TextClipboard>;
+        replace_active(
+            &mut active,
+            old_server,
+            &mut make,
+            Arc::clone(&audio),
+            Policy::default(),
+        )
+        .unwrap();
+
+        let mut new_client = TcpStream::connect(addr).unwrap();
+        let (new_server, _) = listener.accept().unwrap();
+        replace_active(&mut active, new_server, &mut make, audio, Policy::default()).unwrap();
+
+        let mut wire = Vec::new();
+        aux_proto::encode_clipboard_text("new owner", &mut wire).unwrap();
+        new_client.write_all(&wire).unwrap();
+        wait_until(
+            || held.get().as_deref() == Some("new owner"),
+            "the replacement client to own the clipboard",
+        );
+
+        drop(old_client);
+        drop(new_client);
+        active.take().unwrap().stop();
     }
 
     #[test]

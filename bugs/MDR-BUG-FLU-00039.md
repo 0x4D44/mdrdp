@@ -27,6 +27,15 @@ tools/latency-spike/server/src/aux_server.rs:169-176 configures only TCP_NODELAY
 
 ## Fix
 
-<unfixed — raised only>
+The auxiliary accept loop now remains available while one connection is served on
+an owned session thread. A newly accepted connection shuts down and joins the old
+owner before creating clipboard handles and starting, so the newest viewer can evict
+a silent peer without ever letting two clients race the host clipboard.
+
+Both host and client auxiliary sockets now bound writes at five seconds. A writer
+failure shuts down the socket and therefore wakes the paired reader, allowing the
+host session thread to tear down its poll and audio workers. The reconnect regression
+uses real loopback sockets: a first client sends nothing, a second replaces it, and
+only the second client's clipboard payload reaches the fake host pasteboard.
 
 ## Notes

@@ -36,6 +36,9 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+/// Bound a peer that stops reading without penalising legitimately idle channels.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 use crate::aux_proto::{self, AudioFrame, AuxMessage};
 use crate::framing::{self, Reassembler};
 
