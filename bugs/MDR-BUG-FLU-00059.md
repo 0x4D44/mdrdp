@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00059 — A split input burst can strand its tail for 250 ms
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/input-latency
 - **Raised:** 2026-08-23T12:28:55Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T122913Z-6b4401de
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00059-run-fix-20260823T122913Z-6b4401de
-- **Owner base:** 86199391392ed3b3c21439eb466983ee06971f7f
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T12:29:13Z
-- **Owner until:** 2026-08-23T14:29:13Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:28:55Z, raised via `deltic bugs new` model=gpt-5.6-sol@max)
+- **State history:** Open (2026-08-23T12:28:55Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-23T12:33:43Z, deltic:auto role=fix run=fix-20260823T122913Z-6b4401de branch=task/bug-MDR-BUG-FLU-00059-run-fix-20260823T122913Z-6b4401de code=96d3821 gate=manual)
 
 ## Observation
 
