@@ -6,15 +6,15 @@
 - **Area:** native/rendering-atomicity
 - **Raised:** 2026-08-23T20:34:24Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T204716Z-15a4fc0c
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00070-run-fix-20260823T204716Z-15a4fc0c
+- **Owner base:** 18b52a579c9d43d860e90fc44b9d4a5ddc60284e
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T20:47:16Z
+- **Owner until:** 2026-08-23T22:47:16Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
