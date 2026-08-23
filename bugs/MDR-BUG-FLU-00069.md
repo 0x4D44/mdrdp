@@ -6,15 +6,15 @@
 - **Area:** rdp/progressive-rendering
 - **Raised:** 2026-08-23T20:34:24Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T205316Z-c0acb207
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00069-run-fix-20260823T205316Z-c0acb207
+- **Owner base:** 0f75ab213f0d9877cbf9feaab9eb168dcedbf24e
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T20:53:16Z
+- **Owner until:** 2026-08-23T22:53:16Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
