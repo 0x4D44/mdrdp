@@ -883,31 +883,28 @@ fn pump_input_with_timeout(
         if ready.bell {
             wake_rx.drain();
         }
-        let written_before = written.0;
+        let mut clock_stamped = false;
         loop {
             match next_native_input(&input_rx, &latest_mouse_move) {
                 Ok(Some(event)) => {
-                    for record in wire_records(&event, &mut seq) {
-                        let (bytes, len) = encode_record(record);
-                        if let Err(e) = writer.write_all(&bytes[..len]) {
-                            return if stop.load(Ordering::Relaxed) {
-                                None
-                            } else {
-                                Some(format!("input write: {e}"))
-                            };
-                        }
-                        written.0 += 1;
+                    if let Err(e) = write_native_records(
+                        &mut writer,
+                        wire_records(&event, &mut seq),
+                        &input_clock,
+                        &mut clock_stamped,
+                        &mut written.0,
+                    ) {
+                        return if stop.load(Ordering::Relaxed) {
+                            None
+                        } else {
+                            Some(format!("input write: {e}"))
+                        };
                     }
                 }
                 Ok(None) => break,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return None,
             }
-        }
-        if written.0 > written_before {
-            // Something reached the host: start the round-trip clock the next
-            // paint on `native-net` will close.
-            input_clock.stamp();
         }
         loop {
             match commands.try_recv() {
@@ -923,6 +920,35 @@ fn pump_input_with_timeout(
             }
         }
     }
+}
+
+/// Write one input event's wire records, stamping after the first successful record.
+///
+/// `clock_stamped` lasts for the current drain burst. `InputClock::stamp` itself preserves
+/// an earlier unanswered sample when a later burst arrives before a paint.
+fn write_native_records<W, I>(
+    writer: &mut W,
+    records: I,
+    input_clock: &InputClock,
+    clock_stamped: &mut bool,
+    written: &mut u64,
+) -> std::io::Result<()>
+where
+    W: Write,
+    I: IntoIterator<Item = Record>,
+{
+    for record in records {
+        let (bytes, len) = encode_record(record);
+        writer.write_all(&bytes[..len])?;
+        if !*clock_stamped {
+            // Something reached the host: start the round-trip clock the next paint on
+            // `native-net` will close.
+            input_clock.stamp();
+            *clock_stamped = true;
+        }
+        *written = (*written).saturating_add(1);
+    }
+    Ok(())
 }
 
 fn next_native_input(
@@ -1620,6 +1646,7 @@ mod tests {
     use ironrdp_egfx::decode::{DecodedFrame, DecoderResult};
     use rhydra::input_proto::decode_record;
     use rhydra::rects::Rect as WireRect;
+    use std::io::{self, Write};
     use std::sync::atomic::AtomicUsize;
 
     /// A decoder whose "AU" is one byte: the fill value of the produced frame.
@@ -2369,6 +2396,77 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         bell.ring();
         let _ = join.join();
+    }
+
+    struct StampProbe {
+        clock: InputClock,
+        writes: usize,
+        stamp_seen_on_first_write: bool,
+        stamp_seen_on_second_write: bool,
+    }
+
+    impl Write for StampProbe {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            let stamped = self.clock.take_us().is_some();
+            match self.writes {
+                1 => self.stamp_seen_on_first_write = stamped,
+                2 => self.stamp_seen_on_second_write = stamped,
+                _ => {}
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn native_input_stamps_before_the_second_record_of_a_burst() {
+        let clock = InputClock::default();
+        let mut probe = StampProbe {
+            clock: clock.clone(),
+            writes: 0,
+            stamp_seen_on_first_write: false,
+            stamp_seen_on_second_write: false,
+        };
+        let event = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            x: 7,
+            y: 9,
+        };
+        let mut seq = 1;
+        let mut clock_stamped = false;
+        let mut written = 0;
+
+        write_native_records(
+            &mut probe,
+            wire_records(&event, &mut seq),
+            &clock,
+            &mut clock_stamped,
+            &mut written,
+        )
+        .unwrap();
+
+        assert_eq!(
+            probe.writes, 2,
+            "a button event has move and button records"
+        );
+        assert!(
+            !probe.stamp_seen_on_first_write,
+            "the stamp must follow the first successful write"
+        );
+        assert!(
+            probe.stamp_seen_on_second_write,
+            "the first record must start the clock before the next write"
+        );
+        assert_eq!(written, 2);
+        assert!(
+            clock.take_us().is_none(),
+            "the controlled writer consumed the single outstanding sample"
+        );
     }
 
     #[test]
