@@ -168,18 +168,17 @@ pub trait AgentOps {
     fn viewer_connected(&mut self) -> Option<bool>;
 }
 
-/// Whether the desktop that would receive injected input is the one the stack is
-/// on (HLD tranche 4 §6 rung 5).
+/// Whether this process can access the desktop that currently receives input
+/// (HLD tranche 4 §6 rung 5).
 ///
 /// This is Incident B: `SendInput` returns success, the injector thread honestly
 /// reports `WinSta0\Default`, and nothing reaches the desktop, because a locked
 /// session's *input* desktop is the secure `Winlogon` one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputDesktopObservation {
-    /// The input desktop is ours: injected input can land.
+    /// The active input desktop is accessible: the input thread can follow it.
     Matches { desktop: String },
-    /// Something else holds the input desktop — a locked console puts it on
-    /// `Winlogon`. Nothing injected will land until that clears.
+    /// A platform implementation observed a desktop it cannot follow.
     Differs { ours: String, input: String },
     /// Could not be judged. **Access-denied lands here, not in `Differs`**: it is
     /// equally what a caller in another session or window station gets, so

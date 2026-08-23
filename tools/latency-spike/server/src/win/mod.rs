@@ -21,6 +21,7 @@ pub mod pipeline;
 pub mod pixel_diff;
 pub mod qpc;
 pub mod send;
+pub mod service;
 pub mod source;
 
 pub use pipeline::{list_outputs, run};

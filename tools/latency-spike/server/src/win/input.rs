@@ -7,20 +7,24 @@
 //! periodic aggregate for mouse motion (§5.2, review S-m5: per-record JSON on the
 //! injection thread at motion rate is a latency bug in waiting).
 //!
-//! `SendInput` posts to the input queue of the **session the process runs in**. The
-//! server therefore has to run in the interactive console session; from a service or
-//! a session-0 context the calls succeed and nothing happens. The README says so, and
-//! a zero return from `SendInput` is reported rather than ignored so the failure is
-//! visible in the log instead of showing up as "the keystrokes do nothing".
+//! `SendInput` posts to the input queue of the **session and desktop the calling
+//! thread runs in**. The server therefore runs in the console session and this thread
+//! follows Windows' current input desktop. A bounded 250 ms resynchronisation covers
+//! lock/unlock transitions where injection into the stale desktop can report success;
+//! a rejected call also synchronises and retries once immediately.
 
 use super::{qpc, Result};
 use crate::input_proto::{self, KeyKind, MouseButton, Record, WheelAxis};
-use crate::input_state::{HeldInputs, InputTransition};
+use crate::input_state::{
+    deliver_with_desktop_sync, trusted_ssh_peer_image, DesktopSyncCadence, HeldInputs,
+    InputTransition,
+};
 use crate::input_stream::{self, ReadRecord};
 use crate::stats::{self, InputEventRecord, MouseEventRecord, MouseMoveSummaryRecord, QpcClock};
+use std::cell::RefCell;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::mpsc::SyncSender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
@@ -38,12 +42,91 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// follow promptly. Idle time between complete records remains unlimited.
 const RECORD_BODY_TIMEOUT: Duration = Duration::from_secs(1);
 
+thread_local! {
+    /// `SetThreadDesktop` makes the selected handle the thread's current
+    /// desktop, so Windows will not let us close it. Retain exactly one handle
+    /// and close the previous one only after a successful switch replaces it.
+    static INPUT_DESKTOP_HANDLE: RefCell<Option<windows::Win32::System::StationsAndDesktops::HDESK>> =
+        const { RefCell::new(None) };
+}
+
+fn sync_input_desktop() -> Result<()> {
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop,
+        SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
+    };
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+
+    let desktop_name = |desktop: windows::Win32::System::StationsAndDesktops::HDESK| {
+        let mut buffer = [0u16; 256];
+        let mut needed = 0u32;
+        unsafe {
+            GetUserObjectInformationW(
+                windows::Win32::Foundation::HANDLE(desktop.0),
+                UOI_NAME,
+                Some(buffer.as_mut_ptr().cast()),
+                (buffer.len() * 2) as u32,
+                Some(&mut needed),
+            )
+        }?;
+        let len = buffer
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(buffer.len());
+        Ok::<_, windows::core::Error>(String::from_utf16_lossy(&buffer[..len]))
+    };
+
+    // GENERIC_ALL is required on the secure Winlogon desktop. The service launcher
+    // gives this process a SYSTEM token in the console session; a per-user task is
+    // deliberately unable to open it.
+    let desktop = unsafe {
+        OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(0x1000_0000),
+        )
+    }?;
+    let input_name = match desktop_name(desktop) {
+        Ok(name) => name,
+        Err(error) => {
+            let _ = unsafe { CloseDesktop(desktop) };
+            return Err(error.into());
+        }
+    };
+    let current = unsafe { GetThreadDesktop(GetCurrentThreadId()) }?;
+    if desktop_name(current).is_ok_and(|name| name == input_name) {
+        let _ = unsafe { CloseDesktop(desktop) };
+        return Ok(());
+    }
+    if let Err(error) = unsafe { SetThreadDesktop(desktop) } {
+        let _ = unsafe { CloseDesktop(desktop) };
+        return Err(error.into());
+    }
+    INPUT_DESKTOP_HANDLE.with(|current| {
+        if let Some(previous) = current.borrow_mut().replace(desktop) {
+            let _ = unsafe { CloseDesktop(previous) };
+        }
+    });
+    Ok(())
+}
+
+fn send_one(input: INPUT, sync_due: bool, failure: impl FnOnce() -> String) -> Result<i64> {
+    let delivered = deliver_with_desktop_sync(sync_due, sync_input_desktop, || unsafe {
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 1
+    })?;
+    let stamp = qpc::now();
+    if !delivered {
+        return Err(failure().into());
+    }
+    Ok(stamp)
+}
+
 /// Inject one key transition. Returns the QPC stamp taken immediately after the
 /// call, and an error if the injection was rejected.
 ///
 /// Unchanged from the latency rig's original shape — the measurement rig depends on
 /// this exact behaviour (§5.1).
-fn inject(vk: u16, kind: KeyKind) -> Result<i64> {
+fn inject(vk: u16, kind: KeyKind, sync_due: bool) -> Result<i64> {
     let flags = match kind {
         KeyKind::Down => KEYBD_EVENT_FLAGS(0),
         KeyKind::Up => KEYEVENTF_KEYUP,
@@ -60,24 +143,15 @@ fn inject(vk: u16, kind: KeyKind) -> Result<i64> {
             },
         },
     };
-    // SAFETY: one fully initialised INPUT, and the size argument is the size of the
-    // very type being passed — the classic SendInput failure is a mismatched cbSize.
-    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-    let stamp = qpc::now();
-    if sent != 1 {
-        return Err(format!(
-            "SendInput injected {sent} of 1 events for vk {vk:#04x}; \
-             the process is probably not in the interactive session"
-        )
-        .into());
-    }
-    Ok(stamp)
+    send_one(input, sync_due, || {
+        format!("SendInput rejected an event for vk {vk:#04x} after desktop resynchronisation")
+    })
 }
 
 /// Inject one scancode transition, layout-independent by construction
 /// (`KEYEVENTF_SCANCODE`). `scancode` is the wire convention (§5.1): low byte the
 /// set-1 code, high byte `0xE0` when extended, 0x00 otherwise.
-fn inject_scan(scancode: u16, down: bool) -> Result<i64> {
+fn inject_scan(scancode: u16, down: bool, sync_due: bool) -> Result<i64> {
     let extended = (scancode >> 8) as u8 == 0xE0;
     let mut flags = KEYEVENTF_SCANCODE;
     if extended {
@@ -98,17 +172,9 @@ fn inject_scan(scancode: u16, down: bool) -> Result<i64> {
             },
         },
     };
-    // SAFETY: as `inject` above.
-    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-    let stamp = qpc::now();
-    if sent != 1 {
-        return Err(format!(
-            "SendInput injected {sent} of 1 events for scancode {scancode:#06x}; \
-             the process is probably not in the interactive session"
-        )
-        .into());
-    }
-    Ok(stamp)
+    send_one(input, sync_due, || {
+        format!("SendInput rejected scancode {scancode:#06x} after desktop resynchronisation")
+    })
 }
 
 /// Inject one absolute mouse move. `local` is the wire's capture-display-local
@@ -116,7 +182,12 @@ fn inject_scan(scancode: u16, down: bool) -> Result<i64> {
 /// ([`super::source::FrameSource::origin`]). Maps through
 /// [`input_proto::map_to_virtual_desk`] into `SendInput`'s
 /// `ABSOLUTE|VIRTUALDESK` space (§5.2).
-fn inject_mouse_move(local_x: u16, local_y: u16, origin: (i32, i32)) -> Result<i64> {
+fn inject_mouse_move(
+    local_x: u16,
+    local_y: u16,
+    origin: (i32, i32),
+    sync_due: bool,
+) -> Result<i64> {
     // SAFETY: plain syscalls, no pointers cross the FFI boundary.
     let (vx, vy, vw, vh) = unsafe {
         (
@@ -141,23 +212,15 @@ fn inject_mouse_move(local_x: u16, local_y: u16, origin: (i32, i32)) -> Result<i
             },
         },
     };
-    // SAFETY: as `inject` above.
-    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-    let stamp = qpc::now();
-    if sent != 1 {
-        return Err(format!(
-            "SendInput injected {sent} of 1 mouse-move events; \
-             the process is probably not in the interactive session"
-        )
-        .into());
-    }
-    Ok(stamp)
+    send_one(input, sync_due, || {
+        "SendInput rejected a mouse move after desktop resynchronisation".to_owned()
+    })
 }
 
 /// Inject one mouse-button transition. X1/X2 carry their button ordinal in
 /// `mouseData` (`XBUTTON1`/`XBUTTON2`); the other three encode the transition in
 /// `dwFlags` alone.
-fn inject_mouse_button(button: MouseButton, down: bool) -> Result<i64> {
+fn inject_mouse_button(button: MouseButton, down: bool, sync_due: bool) -> Result<i64> {
     let (flags, mouse_data) = match (button, down) {
         (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0u32),
         (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
@@ -183,22 +246,14 @@ fn inject_mouse_button(button: MouseButton, down: bool) -> Result<i64> {
             },
         },
     };
-    // SAFETY: as `inject` above.
-    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-    let stamp = qpc::now();
-    if sent != 1 {
-        return Err(format!(
-            "SendInput injected {sent} of 1 mouse-button events; \
-             the process is probably not in the interactive session"
-        )
-        .into());
-    }
-    Ok(stamp)
+    send_one(input, sync_due, || {
+        "SendInput rejected a mouse button after desktop resynchronisation".to_owned()
+    })
 }
 
 /// Inject one wheel notch. `delta120` is already validated a nonzero multiple of
 /// 120 by [`input_proto::decode_record`].
-fn inject_wheel(axis: WheelAxis, delta120: i16) -> Result<i64> {
+fn inject_wheel(axis: WheelAxis, delta120: i16, sync_due: bool) -> Result<i64> {
     let flags = match axis {
         WheelAxis::Vertical => MOUSEEVENTF_WHEEL,
         WheelAxis::Horizontal => MOUSEEVENTF_HWHEEL,
@@ -216,17 +271,9 @@ fn inject_wheel(axis: WheelAxis, delta120: i16) -> Result<i64> {
             },
         },
     };
-    // SAFETY: as `inject` above.
-    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-    let stamp = qpc::now();
-    if sent != 1 {
-        return Err(format!(
-            "SendInput injected {sent} of 1 wheel events; \
-             the process is probably not in the interactive session"
-        )
-        .into());
-    }
-    Ok(stamp)
+    send_one(input, sync_due, || {
+        "SendInput rejected a wheel event after desktop resynchronisation".to_owned()
+    })
 }
 
 fn mouse_button_kind(button: MouseButton, down: bool) -> &'static str {
@@ -346,14 +393,15 @@ fn emit_mouse_line(
 /// Handle one decoded record: inject it, then account for it in stats (per-record
 /// for everything except `MouseMove`, which only counts — see [`MoveAggregate`]).
 fn handle_record(
-    record: Record,
-    recv_qpc: i64,
+    received: (Record, i64),
+    sync_due: bool,
     origin: (i32, i32),
     clock: QpcClock,
     lines: &SyncSender<String>,
     moves: &mut MoveAggregate,
     held: &mut HeldInputs,
 ) {
+    let (record, recv_qpc) = received;
     let injection = |result: Result<i64>| match result {
         Ok(stamp) => (stamp, true),
         Err(e) => {
@@ -371,7 +419,7 @@ fn handle_record(
     match record {
         Record::VkDown { vk, seq } => {
             let (injected_qpc, injected) = tracked_injection(
-                inject(vk, KeyKind::Down),
+                inject(vk, KeyKind::Down, sync_due),
                 InputTransition::VirtualKey { vk, down: true },
             );
             emit_key_line(
@@ -387,7 +435,7 @@ fn handle_record(
         }
         Record::VkUp { vk, seq } => {
             let (injected_qpc, injected) = tracked_injection(
-                inject(vk, KeyKind::Up),
+                inject(vk, KeyKind::Up, sync_due),
                 InputTransition::VirtualKey { vk, down: false },
             );
             emit_key_line(
@@ -403,7 +451,7 @@ fn handle_record(
         }
         Record::ScanDown { scancode, seq } => {
             let (injected_qpc, injected) = tracked_injection(
-                inject_scan(scancode, true),
+                inject_scan(scancode, true, sync_due),
                 InputTransition::Scancode {
                     scancode,
                     down: true,
@@ -422,7 +470,7 @@ fn handle_record(
         }
         Record::ScanUp { scancode, seq } => {
             let (injected_qpc, injected) = tracked_injection(
-                inject_scan(scancode, false),
+                inject_scan(scancode, false, sync_due),
                 InputTransition::Scancode {
                     scancode,
                     down: false,
@@ -440,14 +488,14 @@ fn handle_record(
             );
         }
         Record::MouseMove { x, y, .. } => {
-            let (_, injected) = injection(inject_mouse_move(x, y, origin));
+            let (_, injected) = injection(inject_mouse_move(x, y, origin, sync_due));
             // No per-record stats line — see `MoveAggregate` and the module docs.
             moves.record(recv_qpc, injected, clock, lines);
         }
         Record::MouseButton { button, down, seq } => {
             let kind = mouse_button_kind(button, down);
             let (injected_qpc, injected) = tracked_injection(
-                inject_mouse_button(button, down),
+                inject_mouse_button(button, down, sync_due),
                 InputTransition::MouseButton { button, down },
             );
             emit_mouse_line(
@@ -470,7 +518,7 @@ fn handle_record(
                 WheelAxis::Vertical => "wheel_v",
                 WheelAxis::Horizontal => "wheel_h",
             };
-            let (injected_qpc, injected) = injection(inject_wheel(axis, delta120));
+            let (injected_qpc, injected) = injection(inject_wheel(axis, delta120, sync_due));
             emit_mouse_line(
                 lines,
                 clock,
@@ -486,12 +534,16 @@ fn handle_record(
 }
 
 fn release_held(held: &mut HeldInputs) {
+    let mut sync_due = true;
     for transition in held.release_plan() {
         let result = match transition {
-            InputTransition::VirtualKey { vk, .. } => inject(vk, KeyKind::Up),
-            InputTransition::Scancode { scancode, .. } => inject_scan(scancode, false),
-            InputTransition::MouseButton { button, .. } => inject_mouse_button(button, false),
+            InputTransition::VirtualKey { vk, .. } => inject(vk, KeyKind::Up, sync_due),
+            InputTransition::Scancode { scancode, .. } => inject_scan(scancode, false, sync_due),
+            InputTransition::MouseButton { button, .. } => {
+                inject_mouse_button(button, false, sync_due)
+            }
         };
+        sync_due = false;
         if let Err(e) = result {
             eprintln!("input: disconnect release failed: {e}");
         }
@@ -508,6 +560,8 @@ fn serve_one(
     let mut buf = [0u8; input_proto::MAX_RECORD_LEN];
     let mut moves = MoveAggregate::default();
     let mut held = HeldInputs::default();
+    let desktop_started = Instant::now();
+    let mut desktop_sync = DesktopSyncCadence::default();
     let result: std::io::Result<()> = loop {
         let len = match input_stream::read_record(&mut stream, &mut buf, RECORD_BODY_TIMEOUT) {
             Ok(ReadRecord::Complete(len)) => len,
@@ -526,8 +580,15 @@ fn serve_one(
                 break Ok(());
             }
         };
+        let sync_due = desktop_sync.due(desktop_started.elapsed());
         handle_record(
-            record, recv_qpc, origin, clock, lines, &mut moves, &mut held,
+            (record, recv_qpc),
+            sync_due,
+            origin,
+            clock,
+            lines,
+            &mut moves,
+            &mut held,
         );
     };
     moves.flush(clock, lines);
@@ -535,12 +596,10 @@ fn serve_one(
     result
 }
 
-/// Log this thread's window station and desktop names, and whether that desktop is
-/// the one currently receiving input. Read-only: it queries, it never switches.
+/// Log this thread's window station and desktop names after synchronisation.
 ///
-/// The diagnostic for "SendInput succeeds and nothing happens": a process launched
-/// by a scheduled task can land on a non-interactive station (`Service-0x…-…$`) or a
-/// desktop other than the console's input desktop, where injection goes nowhere.
+/// The diagnostic for "SendInput succeeds and nothing happens": the input desktop
+/// can change between Winlogon and Default while this thread remains on the stale one.
 fn log_input_desktop() {
     use windows::Win32::System::StationsAndDesktops::{
         GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, UOI_NAME,
@@ -586,11 +645,88 @@ fn log_input_desktop() {
     }
 }
 
+fn trusted_input_peer(stream: &TcpStream) -> Result<String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let local_port = stream.local_addr()?.port();
+    let peer_port = stream.peer_addr()?.port();
+    let mut size = 0u32;
+    let _ = unsafe { GetExtendedTcpTable(None, &mut size, false, 2, TCP_TABLE_OWNER_PID_ALL, 0) };
+    if size == 0 {
+        return Err("Windows returned no TCP owner table size".into());
+    }
+    let mut buffer = vec![0u8; size as usize];
+    let result = unsafe {
+        GetExtendedTcpTable(
+            Some(buffer.as_mut_ptr().cast()),
+            &mut size,
+            false,
+            2,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(format!("GetExtendedTcpTable failed with {result}").into());
+    }
+    let table = unsafe { &*buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>() };
+    let rows =
+        unsafe { std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize) };
+    const ESTABLISHED: u32 = 5;
+    let peer_pid = rows
+        .iter()
+        .find(|row| {
+            row.dwState == ESTABLISHED
+                && row.dwLocalPort == u32::from(peer_port.to_be())
+                && row.dwRemotePort == u32::from(local_port.to_be())
+        })
+        .map(|row| row.dwOwningPid)
+        .ok_or_else(|| "could not identify the reverse loopback connection owner".to_owned())?;
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, peer_pid) }
+        .map_err(|error| format!("OpenProcess({peer_pid}) failed: {error}"))?;
+    struct ProcessHandle(HANDLE);
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+    let process = ProcessHandle(process);
+    let mut image = vec![0u16; 32_768];
+    let mut len = image.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            process.0,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(image.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .map_err(|error| format!("QueryFullProcessImageNameW({peer_pid}) failed: {error}"))?;
+    image.truncate(len as usize);
+    let image = String::from_utf16_lossy(&image);
+    let windows_root = std::env::var("SystemRoot")
+        .map_err(|_| "SystemRoot is missing from the service environment".to_owned())?;
+    if !trusted_ssh_peer_image(&image, &windows_root) {
+        return Err(format!("input peer process is not Windows OpenSSH: {image:?}").into());
+    }
+    Ok(image)
+}
+
 /// Run the input listener until the process exits. Intended for its own thread.
 ///
 /// Binds loopback only. That is a hard requirement, not a default: the transport to
 /// the Mac is an SSH tunnel, and a keystroke injector reachable from the LAN is a
-/// remote-control channel for anyone on it.
+/// remote-control channel for anyone on it. Because this process can follow secure
+/// desktops as SYSTEM, accepted peers must also resolve to Windows' protected
+/// `sshd.exe`; loopback alone is not an authorisation boundary.
 ///
 /// `origin` is the capture display's own offset into the virtual desktop
 /// ([`super::source::FrameSource::origin`]) — fixed for the process's lifetime,
@@ -612,16 +748,25 @@ pub(crate) fn serve_listener(
     lines: SyncSender<String>,
     origin: (i32, i32),
 ) -> Result<()> {
-    // `SendInput` reaches a desktop only if this thread is on the input desktop of
-    // the console window station. On a headless IddCx host the injection can succeed
-    // (returns 1) yet reach nothing — this line names the station+desktop we are
-    // actually on, so "keys do nothing" stops being a mystery (see module docs).
+    // Start on the live input desktop so the first PIN event is never sacrificed
+    // to discovering a desktop transition. A failed sync remains visible and each
+    // rejected SendInput will retry it.
+    if let Err(error) = sync_input_desktop() {
+        eprintln!("input: initial desktop synchronisation failed: {error}");
+    }
     log_input_desktop();
     let port = listener.local_addr()?.port();
     eprintln!("input: listening on 127.0.0.1:{port}");
     loop {
         match listener.accept() {
             Ok((stream, peer)) => {
+                match trusted_input_peer(&stream) {
+                    Ok(image) => eprintln!("input: authorised tunnel peer {image:?}"),
+                    Err(error) => {
+                        eprintln!("input: rejected unauthorised peer {peer}: {error}");
+                        continue;
+                    }
+                }
                 eprintln!("input: connected {peer}");
                 if let Err(e) = serve_one(stream, clock, &lines, origin) {
                     eprintln!("input: connection ended: {e}");

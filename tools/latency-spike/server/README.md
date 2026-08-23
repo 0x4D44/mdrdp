@@ -295,13 +295,19 @@ and automatic startup fallback selection still need a live host/client run.
 
 ## `rhydra-agent` — the session agent
 
-The second binary in this crate: the logon-task supervisor that keeps the whole
+The second binary in this crate: a LocalSystem Windows service that launches its
+worker in the active console session and keeps the whole
 capture stack up (IDD creator → client-requested 2560x1440 or 5120x2880 at 240 Hz →
 `rhydra-server`), with a
 loopback JSON control port on 9502 (`{"cmd":"status"}`, `{"cmd":"restart-server"}`,
 `{"cmd":"shutdown"}` — one object per line, same shape back). `rhydra-agent install`
-registers the onlogon scheduled task and starts it; `rhydra-agent uninstall` shuts
-the running agent down over the control port (killing its children) and deletes the
-task. Stopping it any other way orphans the children; the sweep at the next agent
-start repairs that. Design and rationale:
+hardens the deployment directory against non-administrator writes, registers and
+starts the service, and removes the retired on-logon task. `rhydra-agent uninstall`
+stops the service and its worker before deleting both registrations. The service
+restarts its worker when the active console session changes. Design and rationale:
 `wrk_docs/2026.08.18 - HLD - rhydra tranche 1 - session agent and rename.md`.
+
+The privileged input port accepts only connections whose reverse loopback socket is
+owned by `%SystemRoot%\System32\OpenSSH\sshd.exe`. Use the normal SSH tunnel; a
+direct local connection is rejected so an ordinary local process cannot broker SYSTEM
+input into UAC or Winlogon.

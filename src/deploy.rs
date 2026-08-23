@@ -475,22 +475,10 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
                 .to_owned(),
         );
     }
-    let console_user = evidence.console_user.as_deref().ok_or(
-        "no interactive console session: the agent's onlogon task cannot run without one. \
+    evidence.console_user.as_deref().ok_or(
+        "no interactive console session: the Rhydra service has no console session to start. \
          Log the host on at the console (or via auto-logon) and re-run",
     )?;
-    let console_bare = console_user
-        .rsplit('\\')
-        .next()
-        .unwrap_or(console_user)
-        .to_ascii_lowercase();
-    if console_bare != evidence.ssh_user.to_ascii_lowercase() {
-        return Err(format!(
-            "console user {console_user:?} is not the SSH user {:?}: the onlogon task binds to \
-             the installing principal and would never fire. Deploy as the console user",
-            evidence.ssh_user
-        ));
-    }
     // A foreign holder of our ports is a stop-and-say, never a silent kill: the
     // rig era proved a stray server here is usually someone's measurement.
     for (port, owner) in [
@@ -2128,9 +2116,8 @@ mod tests {
         let mut ev = healthy_evidence();
         ev.console_user = Some(r"QUENCH\someoneelse".to_owned());
         assert!(
-            decide(&cfg(), &art, &ev)
-                .unwrap_err()
-                .contains("console user")
+            decide(&cfg(), &art, &ev).is_ok(),
+            "the LocalSystem service must target the active console independently of the SSH user"
         );
 
         let mut ev = healthy_evidence();

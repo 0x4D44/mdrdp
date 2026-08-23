@@ -222,20 +222,16 @@ fn tcp_video_port_states() -> Option<(bool, bool)> {
     Some((listening, established))
 }
 
-/// Whether the desktop that would receive injected input is the one this stack
-/// is on (HLD tranche 4 §6 rung 5).
+/// Whether this SYSTEM console-session process can open the desktop that would
+/// receive injected input (HLD tranche 4 §6 rung 5).
 ///
-/// Compares the **agent's own** thread desktop against `OpenInputDesktop`. It
-/// deliberately does not claim to inspect the injector: that thread lives in the
-/// *server* process and Windows offers no way to read another process's thread
-/// desktop. The agent spawns the server with an inherited station and desktop, so
-/// its own is a sound proxy — stated here rather than implied.
+/// The server performs the actual switch on its dedicated input thread. This
+/// check asks for the same access rights without disturbing the reconcile thread.
 fn observe_input_desktop() -> InputDesktopObservation {
     use windows::Win32::System::StationsAndDesktops::{
-        CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop,
-        DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
+        CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_ACCESS_FLAGS,
+        DESKTOP_CONTROL_FLAGS, UOI_NAME,
     };
-    use windows::Win32::System::Threading::GetCurrentThreadId;
 
     // SAFETY: `handle` is a live desktop handle; the buffer is caller-sized and
     // `GetUserObjectInformationW` writes at most what it is told.
@@ -258,27 +254,13 @@ fn observe_input_desktop() -> InputDesktopObservation {
         Some(String::from_utf16_lossy(&buf[..len]))
     };
 
-    // SAFETY: a plain query for this thread's desktop; the handle is owned by
-    // the thread and must not be closed.
-    let ours = match unsafe { GetThreadDesktop(GetCurrentThreadId()) } {
-        Ok(d) => match name_of(windows::Win32::Foundation::HANDLE(d.0)) {
-            Some(n) => n,
-            None => {
-                return InputDesktopObservation::Unknown(
-                    "could not read this thread's desktop name".to_owned(),
-                )
-            }
-        },
-        Err(e) => return InputDesktopObservation::Unknown(format!("GetThreadDesktop failed: {e}")),
-    };
-
     // SAFETY: opens a handle we close below. Access-denied is expected and
     // handled rather than treated as evidence of anything.
     let input = match unsafe {
         OpenInputDesktop(
             DESKTOP_CONTROL_FLAGS(0),
             false,
-            DESKTOP_ACCESS_FLAGS(0x0001),
+            DESKTOP_ACCESS_FLAGS(0x1000_0000),
         )
     } {
         Ok(d) => d,
@@ -293,16 +275,13 @@ fn observe_input_desktop() -> InputDesktopObservation {
         }
     };
     let input_name = name_of(windows::Win32::Foundation::HANDLE(input.0));
-    // SAFETY: `input` came from `OpenInputDesktop` and is not used again.
+    let result = input_name.map_or_else(
+        || InputDesktopObservation::Unknown("could not read the input desktop's name".to_owned()),
+        |desktop| InputDesktopObservation::Matches { desktop },
+    );
+    // SAFETY: this diagnostic never associates its thread with the handle.
     let _ = unsafe { CloseDesktop(input) };
-
-    match input_name {
-        None => {
-            InputDesktopObservation::Unknown("could not read the input desktop's name".to_owned())
-        }
-        Some(name) if name == ours => InputDesktopObservation::Matches { desktop: ours },
-        Some(name) => InputDesktopObservation::Differs { ours, input: name },
-    }
+    result
 }
 
 /// The images the agent owns on the box. Swept at start, killed at shutdown.

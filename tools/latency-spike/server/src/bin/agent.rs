@@ -1,15 +1,11 @@
-//! `rhydra-agent` — the logon-task session agent.
+//! `rhydra-agent` — the Windows service and console-session agent.
 //!
-//! `run` is the scheduled task's target: it sweeps orphans, then reconciles the
+//! `service` runs as LocalSystem and launches `run` in the active console
+//! session. `run` sweeps orphans, then reconciles the
 //! stack (IDD creator → device → 240 Hz mode → capture server) every tick,
 //! serving status and restart/shutdown commands on the loopback control port.
-//! `install` registers the onlogon task and starts it now; `uninstall` shuts a
-//! running agent down over the control port and deletes the task.
-//!
-//! Stopping the agent any other way than `shutdown` (or `uninstall`) orphans the
-//! children — `schtasks /end` in particular kills only the task process. The
-//! orphan sweep at the next start repairs it, but the sanctioned stop is
-//! `{"cmd":"shutdown"}`.
+//! `install` hardens the deployment ACL, registers the service, removes the old
+//! on-logon task, and starts it. `uninstall` removes both launch paths.
 
 use std::process::ExitCode;
 
@@ -57,12 +53,27 @@ fn format_display_args(display: Option<DisplayArgs>) -> String {
     })
 }
 
+fn windows_service_command(exe: &std::path::Path, display: Option<DisplayArgs>) -> String {
+    format!(
+        "\"{}\" service{}",
+        exe.display(),
+        format_display_args(display)
+    )
+}
+
 #[cfg(windows)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("run") => match parse_display(&args[1..]) {
             Ok(display) => win::run(display),
+            Err(e) => {
+                eprintln!("agent: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Some("service") => match parse_display(&args[1..]) {
+            Ok(display) => win::service(display),
             Err(e) => {
                 eprintln!("agent: {e}");
                 ExitCode::from(2)
@@ -87,7 +98,7 @@ fn main() -> ExitCode {
         },
         _ => {
             eprintln!(
-                "usage: rhydra-agent run|install [--display <width> <height> <hz> <scale>]\n       rhydra-agent uninstall|configure-audio|check-audio|status [--wait <secs>]"
+                "usage: rhydra-agent run|service|install [--display <width> <height> <hz> <scale>]\n       rhydra-agent uninstall|configure-audio|check-audio|status [--wait <secs>]"
             );
             ExitCode::from(2)
         }
@@ -115,7 +126,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_display_args, parse_display, DisplayArgs};
+    use super::{format_display_args, parse_display, windows_service_command, DisplayArgs};
 
     #[test]
     fn parse_display_preserves_the_native_mode_tuple() {
@@ -139,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn format_display_args_is_suitable_for_the_scheduled_task_command() {
+    fn format_display_args_is_suitable_for_the_worker_command() {
         assert_eq!(
             format_display_args(Some(DisplayArgs {
                 width: 5120,
@@ -151,11 +162,27 @@ mod tests {
         );
         assert_eq!(format_display_args(None), "");
     }
+
+    #[test]
+    fn service_command_quotes_the_exact_versioned_executable() {
+        assert_eq!(
+            windows_service_command(
+                std::path::Path::new(r"C:\Program Files\mdrdp\v0.5.0\rhydra-agent.exe"),
+                Some(DisplayArgs {
+                    width: 5120,
+                    height: 2880,
+                    hz: 240,
+                    scale: 200,
+                }),
+            ),
+            r#""C:\Program Files\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 240 200"#
+        );
+    }
 }
 
 #[cfg(windows)]
 mod win {
-    use super::{format_display_args, DisplayArgs};
+    use super::{windows_service_command, DisplayArgs};
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::process::{Command, ExitCode};
@@ -166,7 +193,8 @@ mod win {
     use rhydra::control::{self, Request, CONTROL_PORT};
     use rhydra::win::agent_ops::{exe_root, terminate_owned_processes, WinOps, OWNED_IMAGES};
 
-    const TASK_NAME: &str = "rhydra-agent";
+    const LEGACY_TASK_NAME: &str = "rhydra-agent";
+    const SERVICE_NAME: &str = rhydra::win::service::SERVICE_NAME;
 
     /// What the control thread hands the reconcile loop, and vice versa.
     struct Shared {
@@ -356,6 +384,26 @@ mod win {
         ExitCode::SUCCESS
     }
 
+    pub fn service(display: Option<DisplayArgs>) -> ExitCode {
+        let mut arguments = Vec::new();
+        if let Some(display) = display {
+            arguments.extend([
+                "--display".to_owned(),
+                display.width.to_string(),
+                display.height.to_string(),
+                display.hz.to_string(),
+                display.scale.to_string(),
+            ]);
+        }
+        match rhydra::win::service::run(arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("agent: service failed: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+
     /// One client at a time, short read timeout: a silent client cannot wedge us.
     fn serve_control(listener: TcpListener, shared: &Mutex<Shared>) {
         for stream in listener.incoming() {
@@ -487,42 +535,204 @@ mod win {
                 return ExitCode::FAILURE;
             }
         };
-        // onlogon alone would not fire until the NEXT logon, so start it now too.
-        let task_command = format!("\"{}\" run{}", exe.display(), format_display_args(display));
-        let create = Command::new("schtasks")
-            .args([
-                "/create",
-                "/tn",
-                TASK_NAME,
-                "/sc",
-                "onlogon",
-                "/rl",
-                "highest",
-                "/f",
-                "/tr",
-                &task_command,
-            ])
-            .status();
-        match create {
-            Ok(s) if s.success() => {}
-            other => {
-                eprintln!("agent: schtasks /create failed: {other:?}");
+        let root = match installation_root(&exe) {
+            Ok(root) => root,
+            Err(error) => {
+                eprintln!("agent: cannot identify installation root: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(error) = harden_installation_acl(&root) {
+            eprintln!("agent: refusing to register a SYSTEM service: {error}");
+            return ExitCode::FAILURE;
+        }
+        let command = windows_service_command(&exe, display);
+        let existing_service = service_registered();
+        if existing_service {
+            let _ = Command::new("sc.exe").args(["stop", SERVICE_NAME]).status();
+            if !wait_for_service_stopped(Duration::from_secs(20)) {
+                eprintln!("agent: service {SERVICE_NAME} did not stop within 20 s");
+                return ExitCode::FAILURE;
+            }
+        } else if let Err(error) = request_worker_shutdown() {
+            eprintln!("agent: legacy worker shutdown failed: {error}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(error) = delete_legacy_task() {
+            eprintln!("agent: {error}");
+            return ExitCode::FAILURE;
+        }
+
+        if existing_service {
+            let configured = Command::new("sc.exe")
+                .args([
+                    "config",
+                    SERVICE_NAME,
+                    "binPath=",
+                    &command,
+                    "start=",
+                    "auto",
+                    "obj=",
+                    "LocalSystem",
+                ])
+                .status();
+            if !matches!(configured, Ok(status) if status.success()) {
+                eprintln!("agent: sc.exe config failed: {configured:?}");
+                return ExitCode::FAILURE;
+            }
+        } else {
+            let created = Command::new("sc.exe")
+                .args([
+                    "create",
+                    SERVICE_NAME,
+                    "binPath=",
+                    &command,
+                    "start=",
+                    "auto",
+                    "obj=",
+                    "LocalSystem",
+                    "DisplayName=",
+                    "Rhydra Agent",
+                ])
+                .status();
+            if !matches!(created, Ok(status) if status.success()) {
+                eprintln!("agent: sc.exe create failed: {created:?}");
                 return ExitCode::FAILURE;
             }
         }
-        match Command::new("schtasks")
-            .args(["/run", "/tn", TASK_NAME])
+        let _ = Command::new("sc.exe")
+            .args([
+                "description",
+                SERVICE_NAME,
+                "Runs Rhydra capture and input in the active console session",
+            ])
+            .status();
+        match Command::new("sc.exe")
+            .args(["start", SERVICE_NAME])
             .status()
         {
-            Ok(s) if s.success() => {
-                println!("installed and started: task {TASK_NAME}");
+            Ok(status) if status.success() => {
+                println!("installed and started: service {SERVICE_NAME}");
                 ExitCode::SUCCESS
             }
             other => {
-                eprintln!("agent: task registered but /run failed: {other:?}");
+                eprintln!("agent: service registered but start failed: {other:?}");
                 ExitCode::FAILURE
             }
         }
+    }
+
+    fn installation_root(exe: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        let version_dir = exe
+            .parent()
+            .ok_or_else(|| "agent executable has no parent".to_owned())?;
+        match version_dir.file_name().and_then(|name| name.to_str()) {
+            Some(name) if name.starts_with('v') => version_dir
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .ok_or_else(|| "version directory has no parent".to_owned()),
+            _ => Ok(version_dir.to_path_buf()),
+        }
+    }
+
+    fn harden_installation_acl(root: &std::path::Path) -> Result<(), String> {
+        let root = root
+            .to_str()
+            .ok_or_else(|| "installation root is not valid Unicode".to_owned())?;
+        let owner = Command::new("icacls.exe")
+            .args([root, "/setowner", "*S-1-5-32-544", "/T", "/Q"])
+            .status()
+            .map_err(|error| format!("icacls /setowner failed to start: {error}"))?;
+        if !owner.success() {
+            return Err(format!("icacls /setowner exited with {owner}"));
+        }
+        let permissions = Command::new("icacls.exe")
+            .args([
+                root,
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "/T",
+                "/Q",
+            ])
+            .status()
+            .map_err(|error| format!("icacls failed to start: {error}"))?;
+        if permissions.success() {
+            Ok(())
+        } else {
+            Err(format!("icacls exited with {permissions}"))
+        }
+    }
+
+    fn service_registered() -> bool {
+        Command::new("sc.exe")
+            .args(["query", SERVICE_NAME])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_for_service_stopped(timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let output = Command::new("sc.exe")
+                .args(["query", SERVICE_NAME])
+                .output();
+            match output {
+                Ok(output) if !output.status.success() => return true,
+                Ok(output) if String::from_utf8_lossy(&output.stdout).contains("STOPPED") => {
+                    return true
+                }
+                _ if Instant::now() >= deadline => return false,
+                _ => std::thread::sleep(Duration::from_millis(250)),
+            }
+        }
+    }
+
+    fn delete_legacy_task() -> Result<(), String> {
+        let registered = Command::new("schtasks")
+            .args(["/query", "/tn", LEGACY_TASK_NAME])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if registered {
+            let _ = Command::new("schtasks")
+                .args(["/end", "/tn", LEGACY_TASK_NAME])
+                .status();
+            let deleted = Command::new("schtasks")
+                .args(["/delete", "/tn", LEGACY_TASK_NAME, "/f"])
+                .status();
+            if !matches!(deleted, Ok(status) if status.success()) {
+                return Err(format!("schtasks /delete failed: {deleted:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn request_worker_shutdown() -> Result<(), String> {
+        let Ok(mut stream) = TcpStream::connect(("127.0.0.1", CONTROL_PORT)) else {
+            return Ok(());
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| format!("set timeout failed: {error}"))?;
+        writeln!(stream, "{{\"cmd\":\"shutdown\"}}")
+            .map_err(|error| format!("shutdown request failed: {error}"))?;
+        let mut reply = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut reply)
+            .map_err(|error| format!("shutdown response failed: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if TcpStream::connect(("127.0.0.1", CONTROL_PORT)).is_err() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Err(format!(
+            "worker still answered on {CONTROL_PORT} 15 s after shutdown"
+        ))
     }
 
     /// Forward the request to the already-running interactive agent.  This
@@ -608,76 +818,43 @@ mod win {
     }
 
     pub fn uninstall() -> ExitCode {
-        // The sanctioned stop: ask the running agent to kill its children and exit.
-        match TcpStream::connect(("127.0.0.1", CONTROL_PORT)) {
-            Ok(mut stream) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let _ = writeln!(stream, "{{\"cmd\":\"shutdown\"}}");
-                let mut reply = String::new();
-                let _ = BufReader::new(&stream).read_line(&mut reply);
-                println!("agent shutdown acknowledged: {}", reply.trim());
-                // The agent notices shutdown at the top of its loop (up to a full
-                // tick plus a reconcile away), then still has to reap children.
-                // Poll until the port actually refuses — a fixed sleep raced the
-                // exit and handed deploy a still-locked exe (review finding).
-                let deadline = Instant::now() + Duration::from_secs(15);
-                loop {
-                    std::thread::sleep(Duration::from_millis(500));
-                    if TcpStream::connect(("127.0.0.1", CONTROL_PORT)).is_err() {
-                        break;
-                    }
-                    if Instant::now() >= deadline {
-                        eprintln!("agent: still answering {CONTROL_PORT} 15 s after shutdown ack");
-                        return ExitCode::FAILURE;
-                    }
-                }
-                // Port closed; give image unmap a beat.
-                std::thread::sleep(Duration::from_millis(500));
+        if service_registered() {
+            let stop = Command::new("sc.exe").args(["stop", SERVICE_NAME]).status();
+            if !matches!(stop, Ok(status) if status.success()) {
+                eprintln!("agent: sc.exe stop failed: {stop:?}");
             }
-            Err(_) => {
-                // No listener. Either no agent, or one that is wedged/starting with
-                // its port down. Terminate only executables from this installation;
-                // another user's same-named test process is not ours to kill.
-                let root = match exe_root() {
-                    Ok(root) => root,
-                    Err(error) => {
-                        eprintln!("agent: cannot identify installation: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let images = ["rhydra-agent.exe", OWNED_IMAGES[0], OWNED_IMAGES[1]];
-                if let Err(error) =
-                    terminate_owned_processes(&root, &images, Some(std::process::id()))
-                {
-                    eprintln!("agent: fallback shutdown failed: {error}");
-                    return ExitCode::FAILURE;
-                }
+            if !wait_for_service_stopped(Duration::from_secs(20)) {
+                eprintln!("agent: service {SERVICE_NAME} did not stop within 20 s");
+                return ExitCode::FAILURE;
             }
         }
-        // A clean host has no task registered; "not found" is success, not failure
-        // (review finding: uninstall used to fail every fresh deploy's quiesce).
-        let registered = Command::new("schtasks")
-            .args(["/query", "/tn", TASK_NAME])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !registered {
-            println!("task {TASK_NAME} not registered; nothing to delete");
-            return ExitCode::SUCCESS;
-        }
-        match Command::new("schtasks")
-            .args(["/delete", "/tn", TASK_NAME, "/f"])
-            .status()
-        {
-            Ok(s) if s.success() => {
-                println!("task {TASK_NAME} deleted");
-                ExitCode::SUCCESS
+        let root = match exe_root() {
+            Ok(root) => root,
+            Err(error) => {
+                eprintln!("agent: cannot identify installation: {error}");
+                return ExitCode::FAILURE;
             }
-            other => {
-                eprintln!("agent: schtasks /delete failed: {other:?}");
-                ExitCode::FAILURE
+        };
+        let images = ["rhydra-agent.exe", OWNED_IMAGES[0], OWNED_IMAGES[1]];
+        if let Err(error) = terminate_owned_processes(&root, &images, Some(std::process::id())) {
+            eprintln!("agent: fallback shutdown failed: {error}");
+            return ExitCode::FAILURE;
+        }
+        if service_registered() {
+            let deleted = Command::new("sc.exe")
+                .args(["delete", SERVICE_NAME])
+                .status();
+            if !matches!(deleted, Ok(status) if status.success()) {
+                eprintln!("agent: sc.exe delete failed: {deleted:?}");
+                return ExitCode::FAILURE;
             }
         }
+        if let Err(error) = delete_legacy_task() {
+            eprintln!("agent: {error}");
+            return ExitCode::FAILURE;
+        }
+        println!("uninstalled service {SERVICE_NAME} and legacy task {LEGACY_TASK_NAME}");
+        ExitCode::SUCCESS
     }
 
     /// One status sample (or a stable-green wait) against the local control port.

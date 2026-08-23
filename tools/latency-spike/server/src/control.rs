@@ -7,9 +7,8 @@
 //! a peer that keeps dribbling without a newline cannot grow the agent indefinitely.
 //!
 //! `shutdown` is the sanctioned way to stop the agent: it kills the supervised
-//! children before exiting. Ending the scheduled task instead (`schtasks /end`)
-//! provably orphans them (2026-08-18 post-mortem), leaving the device and ports
-//! held by processes nothing supervises.
+//! children before exiting. The Windows service uses it for graceful worker
+//! shutdown and keeps a bounded process-termination fallback for a wedged child.
 
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Read};
