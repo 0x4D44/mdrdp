@@ -99,16 +99,16 @@ pub struct Yuv444Buffer {
     /// RGB units at every LC transition — the deliberate FreeRDP divergence here).
     chroma_seen: Vec<u64>,
     /// One bit per 2x2 block (same indexing as `chroma_seen`): set when a luma
-    /// pass delivers a block average that differs from the stored one by more
-    /// than [`STALE_AVG_DELTA`] in a chroma'd block — i.e. the block's colour
-    /// genuinely changed under a luma-only update, so its preserved odd-position
-    /// samples are one chroma catch-up behind (the encoder ships the matching
-    /// aux frame later; observed next-frame to ~1.4 s against temper). Painting
-    /// such a block by reconstruction overshoots (`4*new_avg - 3*stale`) into a
-    /// hue that was never on screen — a retreating dark-yellow bar flashed blue
-    /// (MDR-BUG-FLUX-00010) — so [`Self::to_rgba_into`] paints stale blocks
+    /// pass delivers a block average that differs from the last aux-confirmed
+    /// average by more than [`STALE_AVG_DELTA`] in a chroma'd block — i.e. the
+    /// block's colour genuinely changed under a luma-only update, so its preserved
+    /// odd-position samples are one chroma catch-up behind (the encoder ships the
+    /// matching aux frame later; observed next-frame to ~1.4 s against temper).
+    /// Painting such a block by reconstruction overshoots (`4*new_avg - 3*stale`)
+    /// into a hue that was never on screen — a retreating dark-yellow bar flashed
+    /// blue (MDR-BUG-FLUX-00010) — so [`Self::to_rgba_into`] paints stale blocks
     /// with the flat average until a chroma pass covers the block or luma returns
-    /// to its last aux-confirmed average and clears the bit.
+    /// within the last aux-confirmed average's threshold and clears the bit.
     chroma_stale: Vec<u64>,
     /// The last luma-derived chroma average confirmed by an auxiliary pass for
     /// each 2x2 block. A later luma pass can return to this signature without a
@@ -116,8 +116,8 @@ pub struct Yuv444Buffer {
     chroma_confirmed_avg: Vec<[u8; 2]>,
 }
 
-/// Chroma-average delta (per channel, on the incoming luma pass) above which a
-/// chroma'd block's preserved odd samples are treated as stale.
+/// Chroma-average delta (per channel, from the last aux-confirmed average) above
+/// which a chroma'd block's preserved odd samples are treated as stale.
 ///
 /// Sized from the 32 captured temper payloads behind MDR-BUG-FLUX-00007/00010
 /// (`examples/avcreplay.rs`, `avgd` stats): steady-state re-encodes of unchanged
@@ -239,12 +239,12 @@ impl Yuv444Buffer {
     /// RGB conversion reconstructs the even/even sample from the average either
     /// way (see [`Self::to_rgba_into`]).
     ///
-    /// A chroma'd block whose incoming average jumps by more than
-    /// [`STALE_AVG_DELTA`] is additionally marked stale (see `chroma_stale`): its
-    /// content changed under a luma-only update, so the preserved odd samples
-    /// describe the previous content until the encoder's chroma catch-up lands.
-    /// If the average returns to the last aux-confirmed value within that same
-    /// threshold, the stale mark is cleared without requiring another aux frame.
+    /// A chroma'd block whose incoming average differs from the last aux-confirmed
+    /// average by more than [`STALE_AVG_DELTA`] is additionally marked stale (see
+    /// `chroma_stale`): its content changed under a luma-only update, so the
+    /// preserved odd samples describe the previous content until the encoder's
+    /// chroma catch-up lands. If the average returns within that same threshold,
+    /// the stale mark is cleared without requiring another aux frame.
     pub fn apply_luma(&mut self, main: &Yuv420Frame, rects: &[ExclusiveRectangle]) {
         let uv_row = main.uv_row();
         for rect in rects {
@@ -267,24 +267,21 @@ impl Yuv444Buffer {
                     let s = sy * uv_row + dx / 2;
                     let i = dy * self.width + dx;
                     if seen {
-                        // Even/even of a chroma'd block: an average that jumped
-                        // means the content changed and the preserved odd samples
-                        // are now a chroma catch-up behind — mark the block so
-                        // paint falls back to the flat average (see
-                        // `chroma_stale`) instead of reconstructing a wrong hue.
-                        let moved = self.u[i]
-                            .abs_diff(main.u[s])
-                            .max(self.v[i].abs_diff(main.v[s]));
+                        // Even/even of a chroma'd block: an average that differs
+                        // from the aux-confirmed state means the content changed
+                        // and the preserved odd samples are now a chroma catch-up
+                        // behind — mark the block so paint falls back to the flat
+                        // average (see `chroma_stale`) instead of reconstructing a
+                        // wrong hue.
                         let (word, mask) = self.block_bit(dx, dy);
                         let block = (dy / 2) * self.width.div_ceil(2) + dx / 2;
                         let confirmed = self.chroma_confirmed_avg[block];
-                        let returned = confirmed[0]
+                        let confirmed_delta = confirmed[0]
                             .abs_diff(main.u[s])
-                            .max(confirmed[1].abs_diff(main.v[s]))
-                            <= STALE_AVG_DELTA;
-                        if returned {
+                            .max(confirmed[1].abs_diff(main.v[s]));
+                        if confirmed_delta <= STALE_AVG_DELTA {
                             self.chroma_stale[word] &= !mask;
-                        } else if moved > STALE_AVG_DELTA {
+                        } else {
                             self.chroma_stale[word] |= mask;
                         }
                     }
@@ -558,6 +555,17 @@ mod tests {
         }
     }
 
+    fn uniform_420(width: usize, height: usize, u: u8, v: u8) -> Yuv420Frame {
+        let uv_len = width.div_ceil(2) * height.div_ceil(2);
+        Yuv420Frame {
+            y: vec![128; width * height],
+            u: vec![u; uv_len],
+            v: vec![v; uv_len],
+            width,
+            height,
+        }
+    }
+
     #[test]
     fn the_luma_pass_copies_y_and_replicates_the_averaged_chroma() {
         let main = tagged_420(4, 4, 0);
@@ -709,6 +717,51 @@ mod tests {
             out[i * 4..][..4],
             expect,
             "aux detail must return without another aux"
+        );
+    }
+
+    #[test]
+    fn gradual_luma_drift_marks_chroma_stale_until_return_within_threshold() {
+        let aux = tagged_420(8, 8, 200);
+        let main_a = uniform_420(8, 8, 100, 100);
+        let mut buf = Yuv444Buffer::new(8, 8);
+        buf.apply_luma(&main_a, &[rect(0, 0, 8, 8)]);
+        buf.apply_chroma_v2(&aux, &[rect(0, 0, 8, 8)]);
+
+        // Each step is within the noise threshold, but the current average has
+        // drifted far enough from the last aux-confirmed state to make detail stale.
+        for average in [105, 110, 115] {
+            let main = uniform_420(8, 8, average, average);
+            buf.apply_luma(&main, &[rect(0, 0, 8, 8)]);
+        }
+
+        assert!(
+            buf.chroma_stale_at(3, 3),
+            "gradual drift beyond the confirmed average must mark detail stale"
+        );
+        let mut out = Vec::new();
+        buf.to_rgba_into(&rect(0, 0, 8, 8), &mut out);
+        let i = 3 * 8 + 3;
+        assert_eq!(
+            out[i * 4..][..4],
+            yuv_to_rgba(128, 115, 115),
+            "stale detail must paint the current flat average"
+        );
+
+        // Returning within the same threshold as the confirmed average restores
+        // the previously delivered detail without requiring another aux frame.
+        let main_return = uniform_420(8, 8, 109, 109);
+        buf.apply_luma(&main_return, &[rect(0, 0, 8, 8)]);
+        assert!(
+            !buf.chroma_stale_at(3, 3),
+            "return within the confirmed threshold must clear stale detail"
+        );
+        let expect = yuv_to_rgba(128, aux.y[3 * 8 + 1], aux.y[3 * 8 + 5]);
+        buf.to_rgba_into(&rect(0, 0, 8, 8), &mut out);
+        assert_eq!(
+            out[i * 4..][..4],
+            expect,
+            "aux detail must return without another aux frame"
         );
     }
 
