@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00088 — ClearCodec counts unwritten coverage as painted telemetry
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** rdp/clearcodec-telemetry
 - **Raised:** 2026-08-23T23:16:08Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T231638Z-d27cebf9
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00088-run-fix-20260823T231638Z-d27cebf9
-- **Owner base:** 4b1aac5fdcbd1e0351f5bfd5a6c5f42d673c175a
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T23:16:38Z
-- **Owner until:** 2026-08-24T01:16:38Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T23:16:08Z, raised via `deltic bugs new` model=gpt-5.6-sol@max)
+- **State history:** Open (2026-08-23T23:16:08Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-23T23:20:40Z, deltic:auto role=fix run=fix-20260823T231638Z-d27cebf9 branch=task/bug-MDR-BUG-FLU-00088-run-fix-20260823T231638Z-d27cebf9 code=5210024fa35983ad03b5d0d57ca661c59b86f9a6 gate=manual)
 
 ## Observation
 
