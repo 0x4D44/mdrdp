@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00050 — Per-message Rhydra stats writes block the sole video sender
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/server-latency
 - **Raised:** 2026-08-23T12:09:37Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T123736Z-f215bfb8
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00050-run-fix-20260823T123736Z-f215bfb8
-- **Owner base:** 8ad942b2c958d6cc573e0ca2efbda8b141a74233
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T12:37:36Z
-- **Owner until:** 2026-08-23T14:37:36Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T12:53:08Z, deltic:auto role=fix run=fix-20260823T123736Z-f215bfb8 branch=task/bug-MDR-BUG-FLU-00050-run-fix-20260823T123736Z-f215bfb8 code=0e362ef gate=manual)
 
 ## Observation
 
