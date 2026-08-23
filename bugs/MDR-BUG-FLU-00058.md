@@ -6,15 +6,15 @@
 - **Area:** rhydra/presentation-latency
 - **Raised:** 2026-08-23T12:21:07Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T122126Z-3e6dc0d9
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00058-run-fix-20260823T122126Z-3e6dc0d9
+- **Owner base:** 096760a9ca3152f1bca1297b5b825df567b9201f
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T12:21:26Z
+- **Owner until:** 2026-08-23T14:21:26Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
