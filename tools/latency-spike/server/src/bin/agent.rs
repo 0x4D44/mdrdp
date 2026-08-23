@@ -61,6 +61,34 @@ fn windows_service_command(exe: &std::path::Path, display: Option<DisplayArgs>) 
     )
 }
 
+fn windows_acl_commands(root: &str) -> Vec<Vec<String>> {
+    let descendants = format!("{}\\*", root.trim_end_matches(['\\', '/']));
+    vec![
+        vec![
+            root.to_owned(),
+            "/setowner".to_owned(),
+            "*S-1-5-32-544".to_owned(),
+            "/T".to_owned(),
+            "/Q".to_owned(),
+        ],
+        vec![root.to_owned(), "/reset".to_owned(), "/Q".to_owned()],
+        vec![
+            root.to_owned(),
+            "/inheritance:r".to_owned(),
+            "/grant:r".to_owned(),
+            "*S-1-5-18:(OI)(CI)F".to_owned(),
+            "*S-1-5-32-544:(OI)(CI)F".to_owned(),
+            "/Q".to_owned(),
+        ],
+        vec![
+            descendants,
+            "/reset".to_owned(),
+            "/T".to_owned(),
+            "/Q".to_owned(),
+        ],
+    ]
+}
+
 #[cfg(windows)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -126,7 +154,10 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_display_args, parse_display, windows_service_command, DisplayArgs};
+    use super::{
+        format_display_args, parse_display, windows_acl_commands, windows_service_command,
+        DisplayArgs,
+    };
 
     #[test]
     fn parse_display_preserves_the_native_mode_tuple() {
@@ -178,11 +209,30 @@ mod tests {
             r#""C:\Program Files\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 240 200"#
         );
     }
+
+    #[test]
+    fn acl_plan_protects_the_root_then_reenables_descendant_inheritance() {
+        let commands = windows_acl_commands(r"C:\mdrdp");
+        assert_eq!(commands.len(), 4);
+        assert_eq!(commands[1], vec![r"C:\mdrdp", "/reset", "/Q"]);
+        assert_eq!(
+            commands[2],
+            vec![
+                r"C:\mdrdp",
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "/Q",
+            ]
+        );
+        assert_eq!(commands[3], vec![r"C:\mdrdp\*", "/reset", "/T", "/Q"]);
+    }
 }
 
 #[cfg(windows)]
 mod win {
-    use super::{windows_service_command, DisplayArgs};
+    use super::{windows_acl_commands, windows_service_command, DisplayArgs};
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::process::{Command, ExitCode};
@@ -639,30 +689,16 @@ mod win {
         let root = root
             .to_str()
             .ok_or_else(|| "installation root is not valid Unicode".to_owned())?;
-        let owner = Command::new("icacls.exe")
-            .args([root, "/setowner", "*S-1-5-32-544", "/T", "/Q"])
-            .status()
-            .map_err(|error| format!("icacls /setowner failed to start: {error}"))?;
-        if !owner.success() {
-            return Err(format!("icacls /setowner exited with {owner}"));
+        for (step, arguments) in windows_acl_commands(root).into_iter().enumerate() {
+            let status = Command::new("icacls.exe")
+                .args(&arguments)
+                .status()
+                .map_err(|error| format!("icacls step {} failed to start: {error}", step + 1))?;
+            if !status.success() {
+                return Err(format!("icacls step {} exited with {status}", step + 1));
+            }
         }
-        let permissions = Command::new("icacls.exe")
-            .args([
-                root,
-                "/inheritance:r",
-                "/grant:r",
-                "*S-1-5-18:(OI)(CI)F",
-                "*S-1-5-32-544:(OI)(CI)F",
-                "/T",
-                "/Q",
-            ])
-            .status()
-            .map_err(|error| format!("icacls failed to start: {error}"))?;
-        if permissions.success() {
-            Ok(())
-        } else {
-            Err(format!("icacls exited with {permissions}"))
-        }
+        Ok(())
     }
 
     fn service_registered() -> bool {
