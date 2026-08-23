@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00037 — Rhydra advertises input and auxiliary ports even when their listeners fail to bind
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** rhydra/server-lifecycle
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T133202Z-ba991e4f
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00037-run-fix-20260823T133202Z-ba991e4f
-- **Owner base:** 223f13661944d5eb3a3ea85f5c1825cddfc2f20c
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T13:32:02Z
-- **Owner until:** 2026-08-23T15:32:02Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-22T19:40:40Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T13:38:12Z, deltic:auto role=fix run=fix-20260823T133202Z-ba991e4f branch=task/bug-MDR-BUG-FLU-00037-run-fix-20260823T133202Z-ba991e4f code=e21cada gate=manual)
 
 ## Observation
 
