@@ -6,15 +6,15 @@
 - **Area:** rhydra/server-latency
 - **Raised:** 2026-08-23T12:09:37Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260823T123736Z-f215bfb8
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00050-run-fix-20260823T123736Z-f215bfb8
+- **Owner base:** 8ad942b2c958d6cc573e0ca2efbda8b141a74233
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-23T12:37:36Z
+- **Owner until:** 2026-08-23T14:37:36Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
