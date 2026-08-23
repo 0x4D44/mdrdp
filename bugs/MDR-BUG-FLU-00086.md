@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00086 — Overhanging sparse ClearCodec tiles replace untouched edge pixels with black
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/clearcodec-rendering
 - **Raised:** 2026-08-23T22:33:58Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260823T225616Z-2e30450d
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00086-run-fix-20260823T225616Z-2e30450d
-- **Owner base:** f8b646eed0596f360b6b1f604769af1189644505
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-23T22:56:16Z
-- **Owner until:** 2026-08-24T00:56:16Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T22:33:58Z, raised via `deltic bugs new` model=gpt-5.6-sol@max)
+- **State history:** Open (2026-08-23T22:33:58Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-23T23:07:06Z, deltic:auto role=fix run=fix-20260823T225616Z-2e30450d branch=task/bug-MDR-BUG-FLU-00086-run-fix-20260823T225616Z-2e30450d code=590720469adb8f852fbaa04c1ff16e6d3077185c gate=manual)
 
 ## Observation
 
