@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00100 — Damage cadence uses stale snapshot dimensions after output shrinks
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** Medium
 - **Area:** window/presentation-latency
 - **Raised:** 2026-08-24T11:32:42Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T113301Z-709a42a8
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00100-run-fix-20260824T113301Z-709a42a8
-- **Owner base:** d3df99f230ab6fe9e12e377b936ed24c3b9afc71
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T11:33:01Z
-- **Owner until:** 2026-08-24T13:33:01Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T11:32:42Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-24T11:32:42Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T11:42:11Z, deltic:auto role=fix run=fix-20260824T113301Z-709a42a8 branch=task/bug-MDR-BUG-FLU-00100-run-fix-20260824T113301Z-709a42a8 code=bb6a329 gate=manual)
 
 ## Observation
 
