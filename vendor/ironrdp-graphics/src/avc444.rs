@@ -27,6 +27,7 @@
 //! shearing or panicking — wire data is untrusted.
 
 use ironrdp_pdu::geometry::ExclusiveRectangle;
+use std::collections::HashMap;
 
 /// A decoded H.264 4:2:0 frame as tightly packed planes.
 ///
@@ -165,26 +166,89 @@ impl Yuv444Buffer {
         self.chroma_stale[word] & mask != 0
     }
 
-    /// Mark every 2x2 block *fully covered* by the clipped rect as chroma'd, and
-    /// clear any stale mark — freshly delivered chroma supersedes it.
+    /// Record a block whose three auxiliary samples were delivered in this pass.
+    fn promote_chroma_block(&mut self, idx: usize, bx: usize, by: usize) {
+        let word_mask = 1 << (idx % 64);
+        self.chroma_seen[idx / 64] |= word_mask;
+        self.chroma_stale[idx / 64] &= !word_mask;
+        if self.luma_avg_seen[idx / 64] & word_mask != 0 {
+            let i = (by * 2) * self.width + bx * 2;
+            self.chroma_confirmed_avg[idx] = [self.u[i], self.v[i]];
+        }
+    }
+
+    fn record_partial_chroma(
+        &mut self,
+        bx: usize,
+        by: usize,
+        bounds: (usize, usize, usize, usize),
+        partial: &mut HashMap<usize, u8>,
+    ) {
+        let (left, top, right, bottom) = bounds;
+        let idx = by * self.width.div_ceil(2) + bx;
+        let x = bx * 2;
+        let y = by * 2;
+        let mut samples = partial.get(&idx).copied().unwrap_or_default();
+        for (bit, dx, dy) in [(1, x + 1, y), (2, x, y + 1), (4, x + 1, y + 1)] {
+            if dx >= left && dx < right && dy >= top && dy < bottom {
+                samples |= bit;
+            }
+        }
+        if samples == 0b111 {
+            partial.remove(&idx);
+            self.promote_chroma_block(idx, bx, by);
+        } else {
+            partial.insert(idx, samples);
+        }
+    }
+
+    /// Add one clipped rectangle's three auxiliary samples per 2x2 block to this
+    /// chroma pass's coverage, promoting blocks once the union is complete.
     ///
-    /// Partially covered edge blocks stay unmarked (their uncovered positions were
-    /// not written), so the luma pass keeps replicating there — fail-safe. Windows
-    /// sends even-aligned rects, for which every block in range is fully covered.
-    fn mark_chroma_seen(&mut self, left: usize, top: usize, right: usize, bottom: usize) {
+    /// Keeping partial coverage local to one pass matters: adjacent rectangles in
+    /// one PDU may split a block and still deliver all its samples, while a later
+    /// partial update must not clear a stale mark using samples from an old frame.
+    fn mark_chroma_seen(
+        &mut self,
+        left: usize,
+        top: usize,
+        right: usize,
+        bottom: usize,
+        partial: &mut HashMap<usize, u8>,
+    ) {
+        if left >= right || top >= bottom {
+            return;
+        }
         let blocks_per_row = self.width.div_ceil(2);
-        let (bx0, by0) = (left.div_ceil(2), top.div_ceil(2));
-        let (bx1, by1) = (right / 2, bottom / 2);
-        for by in by0..by1 {
-            for bx in bx0..bx1 {
-                let idx = by * blocks_per_row + bx;
-                self.chroma_seen[idx / 64] |= 1 << (idx % 64);
-                self.chroma_stale[idx / 64] &= !(1 << (idx % 64));
-                let mask = 1 << (idx % 64);
-                if self.luma_avg_seen[idx / 64] & mask != 0 {
-                    let i = (by * 2) * self.width + bx * 2;
-                    self.chroma_confirmed_avg[idx] = [self.u[i], self.v[i]];
-                }
+        let (first_full_col, first_full_row) = (left.div_ceil(2), top.div_ceil(2));
+        let (past_full_col, past_full_row) = (right / 2, bottom / 2);
+        for by in first_full_row..past_full_row {
+            for bx in first_full_col..past_full_col {
+                self.promote_chroma_block(by * blocks_per_row + bx, bx, by);
+            }
+        }
+
+        let (first_partial_col, first_partial_row) = (left / 2, top / 2);
+        let (past_partial_col, past_partial_row) = (right.div_ceil(2), bottom.div_ceil(2));
+        let bounds = (left, top, right, bottom);
+        if !top.is_multiple_of(2) {
+            for bx in first_partial_col..past_partial_col {
+                self.record_partial_chroma(bx, first_partial_row, bounds, partial);
+            }
+        }
+        if !bottom.is_multiple_of(2) {
+            for bx in first_partial_col..past_partial_col {
+                self.record_partial_chroma(bx, past_partial_row - 1, bounds, partial);
+            }
+        }
+        if !left.is_multiple_of(2) {
+            for by in first_partial_row..past_partial_row {
+                self.record_partial_chroma(first_partial_col, by, bounds, partial);
+            }
+        }
+        if !right.is_multiple_of(2) {
+            for by in first_partial_row..past_partial_row {
+                self.record_partial_chroma(past_partial_col - 1, by, bounds, partial);
             }
         }
     }
@@ -322,6 +386,7 @@ impl Yuv444Buffer {
     pub fn apply_chroma_v1(&mut self, aux: &Yuv420Frame, rects: &[ExclusiveRectangle]) {
         let uv_row = aux.uv_row();
         let uv_height = aux.uv_height();
+        let mut partial = HashMap::new();
         for rect in rects {
             let (left, top, right, bottom) = self.clip(rect);
             // Mark only rows whose aux sources exist: under SPS cropping the last
@@ -339,7 +404,13 @@ impl Yuv444Buffer {
                 }
                 dy += 2;
             }
-            self.mark_chroma_seen(left, top, right.min(aux.width), mark_bottom);
+            self.mark_chroma_seen(
+                left,
+                top,
+                right.min(aux.width),
+                mark_bottom,
+                &mut partial,
+            );
             for dy in top..bottom {
                 if dy % 2 == 1 {
                     let k = (dy - 1) / 2;
@@ -392,11 +463,18 @@ impl Yuv444Buffer {
         let w = align32(self.width).min(aux.width);
         let uv_row = aux.uv_row();
         let uv_height = aux.uv_height();
+        let mut partial = HashMap::new();
         for rect in rects {
             let (left, top, right, bottom) = self.clip(rect);
             // Rows at or past the aux height get no odd-column samples (bounds
             // check below), so only blocks above it are truly chroma'd.
-            self.mark_chroma_seen(left, top, right.min(aux.width), bottom.min(aux.height));
+            self.mark_chroma_seen(
+                left,
+                top,
+                right.min(aux.width),
+                bottom.min(aux.height),
+                &mut partial,
+            );
             for dy in top..bottom {
                 // Odd columns, every row: from the aux Y plane's two halves.
                 if dy < aux.height {
@@ -635,6 +713,48 @@ mod tests {
                     assert_eq!(buf.v[i], v_before[i], "delivered V clobbered at ({x},{y})");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn v1_split_rectangles_collectively_preserve_a_complete_chroma_block() {
+        let aux = tagged_420(8, 16, 200);
+        for (regions, axis) in [
+            ([rect(0, 0, 1, 2), rect(1, 0, 2, 2)], "vertical"),
+            ([rect(0, 0, 2, 1), rect(0, 1, 2, 2)], "horizontal"),
+        ] {
+            let mut buf = Yuv444Buffer::new(8, 16);
+            buf.apply_chroma_v1(&aux, &regions);
+            let before = [buf.u[1], buf.u[8], buf.u[9], buf.v[1], buf.v[8], buf.v[9]];
+
+            buf.apply_luma(&uniform_420(8, 16, 100, 100), &[rect(0, 0, 2, 2)]);
+
+            assert_eq!(
+                [buf.u[1], buf.u[8], buf.u[9], buf.v[1], buf.v[8], buf.v[9]],
+                before,
+                "{axis} regions must retain their combined 4:4:4 detail"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_split_rectangles_collectively_preserve_a_complete_chroma_block() {
+        let aux = tagged_420(8, 8, 200);
+        for (regions, axis) in [
+            ([rect(0, 0, 1, 2), rect(1, 0, 2, 2)], "vertical"),
+            ([rect(0, 0, 2, 1), rect(0, 1, 2, 2)], "horizontal"),
+        ] {
+            let mut buf = Yuv444Buffer::new(8, 8);
+            buf.apply_chroma_v2(&aux, &regions);
+            let before = [buf.u[1], buf.u[8], buf.u[9], buf.v[1], buf.v[8], buf.v[9]];
+
+            buf.apply_luma(&uniform_420(8, 8, 100, 100), &[rect(0, 0, 2, 2)]);
+
+            assert_eq!(
+                [buf.u[1], buf.u[8], buf.u[9], buf.v[1], buf.v[8], buf.v[9]],
+                before,
+                "{axis} regions must retain their combined 4:4:4 detail"
+            );
         }
     }
 

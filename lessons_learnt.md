@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Union unaligned AVC444 rect coverage within one PDU before preserving detail (`avc444.rs:mark_chroma_seen`).
+  A per-rectangle full-block test loses valid samples when adjacent regions split a 2x2 block.
+  Keep partial coverage PDU-local so a later partial frame cannot falsely clear stale chroma.
+
 - Drive activation states with no PDU hint; they emit output, not stalls (`session.rs:drive_reactivation`).
   Connection finalization sends Synchronize and control PDUs through `step_no_input`. During the
   later server wait, poll the input doorbell and keep the session thread as the sole socket writer.
