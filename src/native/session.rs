@@ -419,11 +419,12 @@ pub fn spawn(
     );
     let mut video_sock = conn.video;
     let mut reassembler = conn.reassembler;
+    let video_waker = waker.clone();
     let video_join = std::thread::Builder::new()
         .name("native-net".to_owned())
         .spawn(move || {
             let mut on_cursor = |update| {
-                let _ = waker.cursor(update);
+                let _ = video_waker.cursor(update);
             };
             let end = pump_video(
                 &mut video_sock,
@@ -432,9 +433,11 @@ pub fn spawn(
                 &mut on_cursor,
                 &net_stop,
             );
-            let _ = waker.cursor(CursorUpdate::Default);
+            let end = finish_video_worker(end, &net_stop, || {
+                let _ = video_waker.close();
+            });
+            let _ = video_waker.cursor(CursorUpdate::Default);
             // Either side's death tears the whole session down (HLD §6).
-            net_stop.store(true, Ordering::Relaxed);
             let _ = net_input_sock.shutdown(Shutdown::Both);
             end
         })?;
@@ -442,6 +445,7 @@ pub fn spawn(
     let input_stop = Arc::clone(&stop);
     let input_video_sock = video.try_clone()?;
     let input_sock = conn.input;
+    let input_waker = waker.clone();
     let input_join = std::thread::Builder::new()
         .name("native-input".to_owned())
         .spawn(move || {
@@ -455,8 +459,10 @@ pub fn spawn(
                 &input_stop,
                 input_clock,
             );
+            let failure = finish_input_worker(failure, &input_stop, || {
+                let _ = input_waker.close();
+            });
             moves.close();
-            input_stop.store(true, Ordering::Relaxed);
             let _ = input_video_sock.shutdown(Shutdown::Both);
             failure
         })?;
@@ -715,6 +721,37 @@ fn report(message: &str) {
 /// the measured fast-path win without allowing one socket read to invert an
 /// arbitrary number of messages ahead of an earlier frame.
 const VIDEO_DISPATCH_BATCH_MESSAGES: usize = 16;
+
+/// Turn a failed video worker into a window close, but leave an intentional shutdown alone.
+///
+/// The worker owns the transport and can be the first party to discover that the session has
+/// died. Setting `stop` only tells its sibling to stop; without the close event the window
+/// keeps presenting its last frame forever and nobody calls [`NativeHandle::shutdown`].
+fn finish_video_worker(
+    end: SessionEnd,
+    stop: &AtomicBool,
+    close_window: impl FnOnce(),
+) -> SessionEnd {
+    if matches!(&end, SessionEnd::TransportFailed(_)) && !stop.load(Ordering::Relaxed) {
+        close_window();
+    }
+    stop.store(true, Ordering::Relaxed);
+    end
+}
+
+/// The input worker reports transport failures as `Some(reason)` rather than a `SessionEnd`.
+/// Keep the same terminal-window contract as the video worker.
+fn finish_input_worker(
+    failure: Option<String>,
+    stop: &AtomicBool,
+    close_window: impl FnOnce(),
+) -> Option<String> {
+    if failure.is_some() && !stop.load(Ordering::Relaxed) {
+        close_window();
+    }
+    stop.store(true, Ordering::Relaxed);
+    failure
+}
 
 /// Read and dispatch framed messages until the socket closes, the wire is
 /// violated, or the stop flag is raised.
@@ -1742,6 +1779,106 @@ mod tests {
         .unwrap();
 
         assert_eq!(updates, [CursorUpdate::Hidden, CursorUpdate::Default]);
+    }
+
+    #[test]
+    fn remote_video_eof_closes_the_window_signal() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut video = TcpStream::connect(addr).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        drop(peer);
+
+        let (mut sink, _) = sink_with_store((1, 1));
+        let mut reassembler = Reassembler::default();
+        let mut on_cursor = |_| {};
+        let stop = AtomicBool::new(false);
+        let end = pump_video(
+            &mut video,
+            &mut reassembler,
+            &mut sink,
+            &mut on_cursor,
+            &stop,
+        );
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        let end = finish_video_worker(end, &stop, || closed_tx.send(()).unwrap());
+
+        assert!(
+            matches!(end, SessionEnd::TransportFailed(reason) if reason.contains("closed the video channel"))
+        );
+        assert_eq!(closed_rx.try_recv(), Ok(()));
+        assert!(stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn malformed_video_framing_closes_the_window_signal() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut video = TcpStream::connect(addr).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+
+        let (mut sink, _) = sink_with_store((1, 1));
+        let mut reassembler = Reassembler::default();
+        reassembler.push(&0u32.to_le_bytes());
+        let mut on_cursor = |_| {};
+        let stop = AtomicBool::new(false);
+        let end = pump_video(
+            &mut video,
+            &mut reassembler,
+            &mut sink,
+            &mut on_cursor,
+            &stop,
+        );
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        let end = finish_video_worker(end, &stop, || closed_tx.send(()).unwrap());
+
+        assert!(
+            matches!(end, SessionEnd::TransportFailed(reason) if reason.starts_with("framing:"))
+        );
+        assert_eq!(closed_rx.try_recv(), Ok(()));
+        assert!(stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn remote_input_eof_closes_the_window_signal() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sock = TcpStream::connect(addr).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        drop(peer);
+
+        let (_bell, wake_rx) = crate::wake::doorbell().unwrap();
+        let (_input_tx, input_rx) = std::sync::mpsc::channel();
+        let (_commands_tx, commands) = std::sync::mpsc::channel();
+        let stop = AtomicBool::new(false);
+        let failure = pump_input(
+            sock,
+            Arc::new(LatestMouseMove::default()),
+            input_rx,
+            commands,
+            wake_rx,
+            &stop,
+            InputClock::default(),
+        );
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        let failure = finish_input_worker(failure, &stop, || closed_tx.send(()).unwrap());
+
+        assert!(failure.is_some_and(|reason| reason.contains("closed the input channel")));
+        assert_eq!(closed_rx.try_recv(), Ok(()));
+        assert!(stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn intentional_native_shutdown_does_not_send_a_second_close() {
+        let stop = AtomicBool::new(true);
+        let _ = finish_video_worker(
+            SessionEnd::TransportFailed("late video error".to_owned()),
+            &stop,
+            || panic!("intentional shutdown must not close the window again"),
+        );
+        let _ = finish_input_worker(Some("late input error".to_owned()), &stop, || {
+            panic!("intentional shutdown must not close the window again")
+        });
     }
 
     #[test]
