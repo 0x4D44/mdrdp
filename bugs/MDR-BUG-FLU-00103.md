@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00103 — Odd-sized AVC444 edge chroma is discarded by later luma
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/avc444
 - **Raised:** 2026-08-24T12:03:48Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T120414Z-824ae691
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00103-run-fix-20260824T120414Z-824ae691
-- **Owner base:** eca70f39f6f7a48282ccb8c6c45dda5662e45876
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T12:04:14Z
-- **Owner until:** 2026-08-24T14:04:14Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T12:13:16Z, deltic:auto role=fix run=fix-20260824T120414Z-824ae691 branch=task/bug-MDR-BUG-FLU-00103-run-fix-20260824T120414Z-824ae691 code=404b723 gate=manual)
 
 ## Observation
 
