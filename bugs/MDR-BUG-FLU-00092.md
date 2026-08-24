@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00092 — Scaled EGFX surface mappings discard origin and target geometry
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/surface-mapping
 - **Raised:** 2026-08-24T09:37:41Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T095906Z-db220a0e
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00092-run-fix-20260824T095906Z-db220a0e
-- **Owner base:** 02b2e7154be2bae947cded02b17349eed37e7f03
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T09:59:06Z
-- **Owner until:** 2026-08-24T11:59:06Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T09:37:41Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-24T09:37:41Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T10:36:22Z, deltic:auto role=fix run=fix-20260824T095906Z-db220a0e branch=task/bug-MDR-BUG-FLU-00092-run-fix-20260824T095906Z-db220a0e code=4e797b3 gate=manual)
 
 ## Observation
 
