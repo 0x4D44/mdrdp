@@ -4,8 +4,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatchKind {
-    Rects,
-    Frame,
+    Payload,
     Line,
 }
 
@@ -14,11 +13,10 @@ pub(crate) enum BatchKind {
 pub(crate) const STATS_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
 pub(crate) fn payload_first<T>(items: &mut [T], classify: impl Fn(&T) -> BatchKind) {
-    // Stable: messages retain arrival order within rect, frame, and stats classes.
+    // Stable: pixel payloads retain arrival order; stats move behind them.
     items.sort_by_key(|item| match classify(item) {
-        BatchKind::Rects => 0,
-        BatchKind::Frame => 1,
-        BatchKind::Line => 2,
+        BatchKind::Payload => 0,
+        BatchKind::Line => 1,
     });
 }
 
@@ -37,11 +35,11 @@ mod tests {
     #[test]
     fn payloads_are_delivered_before_stats_lines() {
         let mut actual = vec![
-            Item(BatchKind::Frame, 1),
+            Item(BatchKind::Payload, 1),
             Item(BatchKind::Line, 2),
-            Item(BatchKind::Rects, 3),
-            Item(BatchKind::Frame, 4),
-            Item(BatchKind::Rects, 5),
+            Item(BatchKind::Payload, 3),
+            Item(BatchKind::Payload, 4),
+            Item(BatchKind::Payload, 5),
             Item(BatchKind::Line, 6),
         ];
         payload_first(&mut actual, |item| item.0);
@@ -49,10 +47,10 @@ mod tests {
         assert_eq!(
             actual,
             vec![
-                Item(BatchKind::Rects, 3),
-                Item(BatchKind::Rects, 5),
-                Item(BatchKind::Frame, 1),
-                Item(BatchKind::Frame, 4),
+                Item(BatchKind::Payload, 1),
+                Item(BatchKind::Payload, 3),
+                Item(BatchKind::Payload, 4),
+                Item(BatchKind::Payload, 5),
                 Item(BatchKind::Line, 2),
                 Item(BatchKind::Line, 6),
             ]

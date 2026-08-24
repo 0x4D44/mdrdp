@@ -16,7 +16,7 @@
 
 use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource};
 use super::{convert, dxgi, encode, idd_source, input, pixel_diff, qpc, send, Result};
-use crate::adaptive::Region;
+use crate::adaptive::{self, Region, UpdatePlan};
 use crate::annexb::{self, AvcParameterSets, ParameterSets};
 use crate::bootstrap::ViewerBootstrap;
 use crate::channel_listeners::BoundChannels;
@@ -59,6 +59,7 @@ const SURFACE_STALL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 100-nanosecond units per second — Media Foundation's time base.
 const HNS_PER_SECOND: i64 = 10_000_000;
+const CODEC_BLOCK_SIZE: u32 = 16;
 
 /// Most dirty rects a frame may carry and still take the raw fast path.
 ///
@@ -530,7 +531,7 @@ fn full_video_plan(
         kind,
         frame_width,
         frame_height,
-        block_size: 16,
+        block_size: CODEC_BLOCK_SIZE as u16,
         coverage: tiles
             .iter()
             .map(|tile| {
@@ -546,6 +547,96 @@ fn full_video_plan(
             })
             .collect(),
     }
+}
+
+fn select_video_plan(
+    codec: encode::Codec,
+    recovery: bool,
+    force_full: bool,
+    frame_width: u32,
+    frame_height: u32,
+    changed: Option<&ChangeInfo>,
+    tiles: &[TilePipeline],
+) -> Result<Option<VideoPlan>> {
+    if recovery || force_full || codec == encode::Codec::Hevc || changed.is_none() {
+        return Ok(Some(full_video_plan(
+            codec,
+            if recovery {
+                VideoKind::Recovery
+            } else {
+                VideoKind::Full
+            },
+            frame_width,
+            frame_height,
+            tiles,
+        )));
+    }
+    let changed = changed.expect("absence returned full above");
+    if changed.rects.is_empty() {
+        return Ok(None);
+    }
+    let changed_regions: Vec<_> = changed
+        .rects
+        .iter()
+        .map(|rect| Region {
+            x: rect.x,
+            y: rect.y,
+            width: rect.w,
+            height: rect.h,
+        })
+        .collect();
+    let UpdatePlan::Incremental(plan) = adaptive::partition_blocks(
+        frame_width,
+        frame_height,
+        CODEC_BLOCK_SIZE,
+        &changed_regions,
+        &[],
+        &[],
+        false,
+    )?
+    else {
+        unreachable!("force_full was false")
+    };
+    if plan.video.is_empty() {
+        return Ok(None);
+    }
+    let total_blocks = u64::from(frame_width.div_ceil(CODEC_BLOCK_SIZE))
+        * u64::from(frame_height.div_ceil(CODEC_BLOCK_SIZE));
+    if (plan.video.len() as u64).saturating_mul(4) >= total_blocks.saturating_mul(3) {
+        return Ok(Some(full_video_plan(
+            codec,
+            VideoKind::Full,
+            frame_width,
+            frame_height,
+            tiles,
+        )));
+    }
+    let regions =
+        adaptive::blocks_to_regions(&plan.video, frame_width, frame_height, CODEC_BLOCK_SIZE)?;
+    let coverage: Vec<_> = tiles
+        .iter()
+        .filter_map(|tile| {
+            let bounds = Region {
+                x: tile.header.x,
+                y: tile.header.y,
+                width: tile.header.width,
+                height: tile.header.height,
+            };
+            let tile_regions: Vec<_> = regions
+                .iter()
+                .filter_map(|region| adaptive::intersect(*region, bounds))
+                .collect();
+            (!tile_regions.is_empty()).then_some((tile.header.id, tile_regions))
+        })
+        .collect();
+    Ok(Some(VideoPlan {
+        atomic_avc: true,
+        kind: VideoKind::Regional,
+        frame_width,
+        frame_height,
+        block_size: CODEC_BLOCK_SIZE as u16,
+        coverage,
+    }))
 }
 
 enum CodecEmitState {
@@ -840,8 +931,7 @@ fn claimed_bounds(rects: &[DirtyRect], width: u32, height: u32) -> diff::Region 
     }
 }
 
-/// Read one frame's dirty rects back raw and hand them to the sender, ahead of the
-/// access unit for the same frame.
+/// Read one frame's dirty rects back raw and hand the complete update to the sender.
 ///
 /// This runs inside the source's frame-validity window and *before* the converter
 /// touches it: not waiting for convert+encode is the entire latency win.
@@ -911,9 +1001,8 @@ fn send_rects(
         .try_send(send::Outbound::Rects(Box::new(record), payload))
     {
         Ok(()) => Ok(true),
-        // Full means the socket is behind. Unlike a dropped access unit this costs
-        // no correctness and needs no keyframe: the same frame's AU is still on its
-        // way down the ordinary path and repaints exactly this content.
+        // Full means the complete logical update was lost. The caller enters
+        // recovery; no dependent sparse/regional traffic may follow it.
         Err(TrySendError::Full(_)) => {
             ctx.dropped_rects += 1;
             Ok(false)
@@ -1084,7 +1173,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             // No tile has been submitted yet, so shedding here preserves both tile
             // coherence and every decoder reference. The next captured frame's
             // damage metadata no longer spans the viewer's baseline, so suppress
-            // its overlay and let the full-frame codec catch up atomically.
+            // sparse use and let the full-frame codec catch up atomically.
             recovery.drop_before_encode();
             suppress_rects_once = true;
             continue;
@@ -1102,12 +1191,12 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         let mut measured_changed_pixels = None;
         let mut raw_rect_attempted = false;
         let mut raw_rect_sent = false;
-        let overlays_allowed = recovery.allows_overlays();
+        let sparse_allowed = recovery.allows_overlays();
 
-        // The fast path is an overlay, not a branch: whatever happens here, the
-        // frame still goes on to convert, encode and send as H.264 below.
+        // Small trustworthy final pixels are the complete representation. The
+        // loop returns after retaining the frame; these pixels never enter H.264.
         let mut metadata_took_fast_path = false;
-        if state.rects_enabled && overlays_allowed && !suppress_rects_once {
+        if state.rects_enabled && sparse_allowed && !suppress_rects_once {
             if let Some(change) = change.as_ref().filter(|c| takes_fast_path(c)) {
                 raw_rect_attempted = true;
                 raw_rect_sent =
@@ -1137,7 +1226,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         };
         let metadata_claims_no_change = change.as_ref().is_some_and(|c| c.rects.is_empty());
         if state.diff_enabled
-            && overlays_allowed
+            && sparse_allowed
             && !suppress_rects_once
             && !metadata_took_fast_path
             && pixel_diff.valid()
@@ -1207,6 +1296,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 }
             }
         }
+        let force_full_once = suppress_rects_once;
         suppress_rects_once = false;
 
         // Still inside the frame's validity window, and before the converter touches
@@ -1217,6 +1307,18 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         let context = state.capture.context();
         pixel_diff.retain(device, context, &texture)?;
         last_acquire_qpc = Some(acquire_qpc);
+
+        // Raw final pixels are a complete representation, not an H.264 overlay.
+        // A queue rejection loses that logical update and enters recovery; it must
+        // never fall through and encode the same pixels a second way.
+        if raw_rect_attempted {
+            if !raw_rect_sent {
+                recovery.queue_full();
+                want_keyframe = true;
+                suppress_rects_once = true;
+            }
+            continue;
+        }
 
         let time_hns = state
             .clock
@@ -1240,18 +1342,19 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             ) = shared;
         }
 
-        let plan_kind = if recovery.allows_overlays() {
-            VideoKind::Full
-        } else {
-            VideoKind::Recovery
-        };
-        let plan = full_video_plan(
+        let Some(plan) = select_video_plan(
             state.codec,
-            plan_kind,
+            !recovery.allows_overlays(),
+            force_full_once,
             state.capture.width(),
             state.capture.height(),
+            change.as_ref(),
             &state.tiles,
-        );
+        )?
+        else {
+            continue;
+        };
+        let planned_coverage = plan.coverage.clone();
         let expected_tiles: Vec<_> = plan.coverage.iter().map(|(tile_id, _)| *tile_id).collect();
         let dropped = assembler.begin(frame_seq, plan, &expected_tiles);
         if dropped != 0 {
@@ -1266,18 +1369,16 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             .zip(&mut last_epochs)
             .zip(0usize..)
         {
+            let Some((_, tile_coverage)) = planned_coverage
+                .iter()
+                .find(|(tile_id, _)| *tile_id == tile.header.id)
+            else {
+                continue;
+            };
             let convert_source = match tile.codec_canvas.as_ref() {
                 Some(canvas) => {
-                    let copied = canvas.update(
-                        &texture,
-                        &[Region {
-                            x: tile.header.x,
-                            y: tile.header.y,
-                            width: tile.header.width,
-                            height: tile.header.height,
-                        }],
-                    );
-                    debug_assert!(copied, "whole-tile coverage must update its codec canvas");
+                    let copied = canvas.update(&texture, tile_coverage);
+                    debug_assert!(copied, "selected tile must own codec coverage");
                     canvas.texture()
                 }
                 None => &texture,

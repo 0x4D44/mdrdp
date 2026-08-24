@@ -260,13 +260,9 @@ impl Sender {
 
     /// Consume the channel until the producers are gone.
     ///
-    /// Each wakeup drains a small batch and writes every **rect** message in it
-    /// before any access unit: a queued rect update waiting behind a queued AU is
-    /// precisely the latency the fast path exists to remove, and the AU is a hundred
-    /// times its size. (An AU already mid-write is head-of-line cost this cannot
-    /// touch — the HLD accepts it and measures it rather than fixing it.) The batch
-    /// is bounded so a flooded channel cannot starve the stats lines behind an
-    /// endless reordering pass; both passes keep arrival order within themselves.
+    /// Each wakeup drains a small bounded batch. Pixel-bearing messages retain
+    /// arrival order; only stats lines move behind them. Cross-update reordering is
+    /// unsafe until the dedicated sparse channel carries per-block precedence.
     pub fn run(mut self, rx: Receiver<Outbound>) {
         let mut batch: Vec<Outbound> = Vec::with_capacity(DRAIN_BATCH + 1);
         let mut stats_lines: Vec<String> = Vec::with_capacity(DRAIN_BATCH + 1);
@@ -293,8 +289,8 @@ impl Sender {
             // so stats may follow payloads that arrived later in this bounded batch
             // rather than delaying those payloads.
             send_schedule::payload_first(&mut batch, |msg| match msg {
-                Outbound::Rects(..) => BatchKind::Rects,
-                Outbound::Video(..) | Outbound::FrameSet(..) => BatchKind::Frame,
+                Outbound::Rects(..) => BatchKind::Payload,
+                Outbound::Video(..) | Outbound::FrameSet(..) => BatchKind::Payload,
                 Outbound::Line(..) => BatchKind::Line,
             });
             for msg in batch.drain(..) {

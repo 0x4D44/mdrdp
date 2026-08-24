@@ -780,9 +780,8 @@ fn pump_video(
     stop: &AtomicBool,
 ) -> SessionEnd {
     let mut buf = vec![0u8; 64 * 1024];
-    // A bounded group of completed messages is dispatched rects-first: a rect update
-    // is the low-latency path and never depends on an AU in the same batch
-    // (the exactness gate makes ordering safe either way).
+    // A bounded group of completed messages retains pixel-update arrival order.
+    // Cross-update precedence becomes explicit only with the dedicated sparse wire.
     let mut batch: Vec<framing::Message> = Vec::new();
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -814,12 +813,7 @@ fn pump_video(
             reassembler.push(&buf[..n]);
             continue;
         }
-        for m in batch.iter().filter(|m| m.msg_type == framing::MSG_RECTS) {
-            if let Err(reason) = sink.on_rects(&m.payload) {
-                return SessionEnd::TransportFailed(reason);
-            }
-        }
-        for m in batch.iter().filter(|m| m.msg_type != framing::MSG_RECTS) {
+        for m in &batch {
             let outcome = dispatch_video_message(m, sink, on_cursor);
             if let Err(reason) = outcome {
                 return SessionEnd::TransportFailed(reason);
@@ -834,6 +828,7 @@ fn dispatch_video_message(
     on_cursor: &mut dyn FnMut(CursorUpdate),
 ) -> Result<(), String> {
     match message.msg_type {
+        framing::MSG_RECTS => sink.on_rects(&message.payload),
         framing::MSG_VIDEO_SEQ => {
             if message.payload.len() < 8 {
                 Err("MSG_VIDEO_SEQ shorter than its sequence prefix".to_owned())
@@ -1223,11 +1218,6 @@ fn wire_records(event: &InputEvent, seq: &mut u32) -> Vec<Record> {
     }
 }
 
-/// A rect update held because its seq is ahead of the canvas's exactness.
-struct PendingRects {
-    update: RectUpdate,
-}
-
 /// The first input still waiting for a paint, shared across the session's two
 /// threads.
 ///
@@ -1275,7 +1265,6 @@ pub(crate) struct NativeSink {
     /// lands (rects before a base frame have nothing to composite onto).
     exact_through: Option<u64>,
     has_base: bool,
-    pending: Option<PendingRects>,
     wake: Box<dyn Fn() + Send>,
     stats: StatsHandle,
     /// Shared with `native-input`; a paint closes whatever it holds.
@@ -1285,7 +1274,6 @@ pub(crate) struct NativeSink {
     pub(crate) skipped_stale: u64,
     pub(crate) skipped_empty: u64,
     pub(crate) skipped_before_base: u64,
-    pub(crate) held: u64,
 }
 
 struct TileDecodeState {
@@ -1333,7 +1321,6 @@ impl NativeSink {
             wire_size,
             exact_through: None,
             has_base: false,
-            pending: None,
             wake,
             stats,
             input_clock,
@@ -1341,7 +1328,6 @@ impl NativeSink {
             skipped_stale: 0,
             skipped_empty: 0,
             skipped_before_base: 0,
-            held: 0,
         }
     }
 
@@ -1382,7 +1368,6 @@ impl NativeSink {
             wire_size,
             exact_through: None,
             has_base: false,
-            pending: None,
             wake,
             stats,
             input_clock,
@@ -1390,7 +1375,6 @@ impl NativeSink {
             skipped_stale: 0,
             skipped_empty: 0,
             skipped_before_base: 0,
-            held: 0,
         }
     }
 
@@ -1476,7 +1460,6 @@ impl NativeSink {
         self.exact_through = seq;
         self.has_base = true;
         (self.wake)();
-        self.try_apply_pending();
         Ok(())
     }
 
@@ -1610,7 +1593,6 @@ impl NativeSink {
         };
         if generation.is_some() {
             (self.wake)();
-            self.try_apply_pending();
         }
         Ok(())
     }
@@ -1627,11 +1609,9 @@ impl NativeSink {
         let stale = self
             .exact_through
             .is_some_and(|exact| update.frame_seq <= exact);
-        let adjacent =
-            self.exact_through.and_then(|exact| exact.checked_add(1)) == Some(update.frame_seq);
-        if !stale && update.kind != VideoKind::Recovery && (!self.has_base || !adjacent) {
+        if !stale && update.kind != VideoKind::Recovery && !self.has_base {
             return Err(format!(
-                "video update {} cannot follow {:?} without recovery",
+                "video update {} cannot bootstrap {:?} without recovery",
                 update.frame_seq, self.exact_through
             ));
         }
@@ -1762,7 +1742,6 @@ impl NativeSink {
             );
         }
         (self.wake)();
-        self.try_apply_pending();
         Ok(())
     }
 
@@ -1811,26 +1790,14 @@ impl NativeSink {
                 update.frame_width, update.frame_height, self.wire_size.0, self.wire_size.1
             ));
         }
-        match self.exact_through {
-            Some(e) if update.frame_seq == e + 1 => {}
-            Some(e) if update.frame_seq <= e => {
-                self.skipped_stale += 1;
-                return Ok(());
-            }
-            _ => {
-                // A gap: hold it (one slot, newest wins). Painting over the hole
-                // would lose the missing frame's content forever; skipping alone
-                // starves the fast path at rect cadence (decisions 13/16).
-                self.held += 1;
-                match &self.pending {
-                    Some(old) if old.update.frame_seq >= update.frame_seq => {}
-                    _ => self.pending = Some(PendingRects { update }),
-                }
-                return Ok(());
-            }
+        if self
+            .exact_through
+            .is_some_and(|exact| update.frame_seq <= exact)
+        {
+            self.skipped_stale += 1;
+            return Ok(());
         }
         self.paint(&update)?;
-        self.try_apply_pending();
         Ok(())
     }
 
@@ -1880,14 +1847,6 @@ impl NativeSink {
         }
         (self.wake)();
         Ok(())
-    }
-
-    fn try_apply_pending(&mut self) {
-        if let Some(held) = self.pending.take() {
-            // Re-enters the gate: applies if now adjacent, drops as stale if an
-            // AU jumped past it, or goes back on hold.
-            let _ = self.apply_update(held.update);
-        }
     }
 }
 
@@ -2828,22 +2787,15 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_rect_update_is_held_and_applies_when_the_au_closes_the_gap() {
+    fn a_raw_final_pixel_update_may_jump_sequences_the_server_did_not_encode() {
         let (mut sink, store) = sink_with_store((4, 2));
         sink.on_au(&[7], Some(10)).unwrap();
-        // Seq 12 is ahead of adjacency (11 is missing): held, nothing painted.
+        // A raw update carries final pixels and does not depend on an H.264 AU for
+        // an omitted/no-change sequence.
         sink.apply_update(one_rect_update((4, 2), 12, 200)).unwrap();
-        assert_eq!(surface_fill(&store), 7, "a gap update must not paint");
-        assert_eq!(sink.held, 1);
-        // The AU for seq 11 closes the gap; the held update applies on its heels.
-        sink.on_au(&[8], Some(11)).unwrap();
         let guard = store.lock().unwrap();
         let px = &guard.get(OUTPUT_SURFACE).unwrap().pixels()[0..4];
-        assert_eq!(
-            px,
-            [0, 0, 200, 255],
-            "held rects must apply after the gap closes"
-        );
+        assert_eq!(px, [0, 0, 200, 255]);
         drop(guard);
         assert_eq!(sink.exact_through, Some(12));
     }
@@ -2899,10 +2851,10 @@ mod tests {
 
         // An update that paints nothing must not inflate the count.
         sink.apply_update(one_rect_update((4, 2), 9, 202)).unwrap(); // stale
-        sink.apply_update(one_rect_update((4, 2), 99, 203)).unwrap(); // held: a gap
+        sink.apply_update(one_rect_update((4, 2), 99, 203)).unwrap(); // independent final pixels
         let s = sink.stats.snapshot();
-        assert_eq!(s.frames, 3, "a skipped or held update painted nothing");
-        assert_eq!(s.codecs.get(CODEC_LABEL), Some(&3));
+        assert_eq!(s.frames, 4, "only the stale update painted nothing");
+        assert_eq!(s.codecs.get(CODEC_LABEL), Some(&4));
     }
 
     /// The blank P50 column: nothing on the native path ever recorded the
