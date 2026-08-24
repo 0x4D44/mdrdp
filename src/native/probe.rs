@@ -15,7 +15,7 @@
 //!    desktop size the window needs. Read synchronously, on this path.
 //! 4. **Input connect** — brief retry; the server binds 9501 just after 9500.
 //!
-//! Only after all four does the caller commit to native; the sockets returned
+//! Only after all five required steps does the caller commit to native; the sockets returned
 //! here ARE the session sockets. Every failure is a classified [`ProbeFailure`]
 //! the caller maps to fallback (Auto) or a remedy-naming error (`Always`).
 
@@ -29,8 +29,8 @@ use super::ssh::{self, ForwardPorts, ProbeFailure, Tunnel, TunnelSpec};
 
 /// The wire dialects this client speaks. A range, not an equality, so the day a
 /// compatible v5 exists the gate loosens without a format break (review S-m4).
-pub const WIRE_VERSION_MIN: u32 = 6;
-pub const WIRE_VERSION_MAX: u32 = 6;
+pub const WIRE_VERSION_MIN: u32 = 7;
+pub const WIRE_VERSION_MAX: u32 = 7;
 
 /// The IDD backing-pixel mode and Windows UI scale selected by the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +150,7 @@ pub struct ProbeSuccess {
     pub reassembler: Reassembler,
     pub header: ServerHeader,
     pub input: TcpStream,
+    pub sparse: TcpStream,
     /// The auxiliary channel, or `None` when the host does not advertise it or
     /// the connect failed. **Never a session failure** — a session without a
     /// clipboard is a working session, and degrading to one is the whole point
@@ -239,7 +240,7 @@ pub const STAGE_TUNNEL_UP: &str = "tunnel-up";
 pub const STAGE_PROBE: &str = "probe";
 pub const STAGE_HANDSHAKE: &str = "handshake";
 
-/// The four probe steps against already-decided local ports. Split from
+/// The probe steps against already-decided local ports. Split from
 /// [`establish`] so tests drive it against local listeners with no ssh at all;
 /// `tunnel_exited` reports the ssh child's death (with its stderr) and is polled
 /// at every step boundary. `stage` fires as each visible milestone completes.
@@ -259,8 +260,16 @@ fn probe_over_with_display(
     mut tunnel_exited: impl FnMut() -> Option<String>,
     mut stage: impl FnMut(&'static str, Option<String>),
 ) -> Result<ProbeSuccess, ProbeFailure> {
-    // Step 1: the control forward accepting proves ssh has bound its listeners.
+    // Step 1: one control forward on each SSH transport proves both children
+    // authenticated and bound every local listener before either session lane
+    // is used.
     let readiness = ssh::await_forward_ready(ports.control_addr(), deadline, &mut tunnel_exited)?;
+    drop(readiness);
+    let readiness = ssh::await_forward_ready(
+        ports.interactive_control_addr(),
+        deadline,
+        &mut tunnel_exited,
+    )?;
     drop(readiness);
     stage(STAGE_TUNNEL_UP, None);
 
@@ -337,6 +346,7 @@ fn probe_over_with_display(
 
     // Step 4: the input channel, which the server binds moments after video.
     let input = connect_input(ports, deadline)?;
+    let sparse = connect_sparse(ports, deadline)?;
 
     // Step 5: the auxiliary channel, gated on the host advertising it.
     //
@@ -366,6 +376,7 @@ fn probe_over_with_display(
         reassembler,
         header,
         input,
+        sparse,
         aux,
     })
 }
@@ -438,6 +449,26 @@ fn connect_input(ports: ForwardPorts, deadline: Instant) -> Result<TcpStream, Pr
             Err(e) => {
                 return Err(ProbeFailure::Io(format!(
                     "input channel refused after the video channel was up: {e}"
+                )));
+            }
+        }
+    }
+}
+
+fn connect_sparse(ports: ForwardPorts, deadline: Instant) -> Result<TcpStream, ProbeFailure> {
+    let window_end = (Instant::now() + INPUT_RETRY_WINDOW).min(deadline);
+    loop {
+        match TcpStream::connect_timeout(&ports.sparse_addr(), Duration::from_millis(250)) {
+            Ok(stream) => {
+                stream
+                    .set_nodelay(true)
+                    .map_err(|e| ProbeFailure::Io(e.to_string()))?;
+                return Ok(stream);
+            }
+            Err(_) if Instant::now() < window_end => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                return Err(ProbeFailure::Io(format!(
+                    "sparse channel refused after the video channel was up: {error}"
                 )));
             }
         }
@@ -556,7 +587,7 @@ mod tests {
         Dead,
     }
 
-    /// Bind the four roles on loopback and return the ports, a counter of
+    /// Bind the session roles on loopback and return the ports, a counter of
     /// auxiliary-port connections, and join guards.
     ///
     /// `agent_reply`: what the fake agent answers a status request with, or None
@@ -590,12 +621,15 @@ mod tests {
         let control = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let video = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let input = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sparse = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let aux = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let ports = ForwardPorts {
             video: video.local_addr().unwrap().port(),
             input: input.local_addr().unwrap().port(),
             control: control.local_addr().unwrap().port(),
+            interactive_control: control.local_addr().unwrap().port(),
             aux: aux.local_addr().unwrap().port(),
+            sparse: sparse.local_addr().unwrap().port(),
         };
         let aux_accepts = Arc::new(AtomicUsize::new(0));
         let mut joins = Vec::new();
@@ -615,8 +649,8 @@ mod tests {
             AuxHost::Dead => drop(aux),
         }
         joins.push(std::thread::spawn(move || {
-            // First accept: the readiness poke (dropped unread). Then the query.
-            for _ in 0..2 {
+            // Two readiness pokes (one per SSH transport), then the query.
+            for _ in 0..3 {
                 let Ok((stream, _)) = control.accept() else {
                     return;
                 };
@@ -645,6 +679,9 @@ mod tests {
         joins.push(std::thread::spawn(move || {
             let _ = input.accept();
         }));
+        joins.push(std::thread::spawn(move || {
+            let _ = sparse.accept();
+        }));
         (ports, aux_accepts, joins)
     }
 
@@ -655,7 +692,7 @@ mod tests {
     #[test]
     fn a_green_host_probes_through_to_connected_sockets_and_a_parsed_header() {
         // Extra bytes after the header must survive inside the reassembler.
-        let mut payload = header_bytes(6);
+        let mut payload = header_bytes(7);
         let mut second = Vec::new();
         framing::encode(framing::MSG_VIDEO_SEQ, &[0u8; 12], &mut second);
         payload.extend_from_slice(&second[..7]); // a partial second message
@@ -671,7 +708,7 @@ mod tests {
             },
         )
         .expect("probe should succeed");
-        assert_eq!(ok.header.wire_version, 6);
+        assert_eq!(ok.header.wire_version, 7);
         assert_eq!((ok.header.width, ok.header.height), (2560, 1440));
         assert!(
             ok.reassembler.buffered() > 0,
@@ -683,7 +720,7 @@ mod tests {
             vec![
                 (STAGE_TUNNEL_UP, None),
                 (STAGE_PROBE, None),
-                (STAGE_HANDSHAKE, Some("wire v6".to_owned())),
+                (STAGE_HANDSHAKE, Some("wire v7".to_owned())),
             ]
         );
     }
@@ -718,7 +755,7 @@ mod tests {
     fn a_single_full_frame_hevc_stream_is_an_explicitly_supported_fallback() {
         let header: ServerHeader = serde_json::from_value(serde_json::json!({
             "schema": rhydra::stats::SCHEMA,
-            "wire_version": 6,
+            "wire_version": 7,
             "width": 5120,
             "height": 2880,
             "codec": "hevc-420",
@@ -734,7 +771,7 @@ mod tests {
         let (ports, _aux, _joins) =
             fake_host(Some(status_line(&green_report())), Some(header_bytes(3)));
         let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
-        assert_eq!(err, ProbeFailure::VersionMismatch { host: 3, client: 6 });
+        assert_eq!(err, ProbeFailure::VersionMismatch { host: 3, client: 7 });
     }
 
     /// Poll the counter rather than sleeping a guessed interval.
@@ -762,7 +799,7 @@ mod tests {
         // That is the shape a deployed 0.4.0 host sends: the field is missing,
         // not false.
         let (ports, aux_accepts, _joins) =
-            fake_host(Some(status_line(&green_report())), Some(header_bytes(6)));
+            fake_host(Some(status_line(&green_report())), Some(header_bytes(7)));
         let ok =
             probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
         assert!(!ok.header.clipboard, "an absent flag must read as false");
@@ -784,7 +821,7 @@ mod tests {
         // covering for a gate that only works by accident.
         let (ports, aux_accepts, _joins) = fake_host(
             Some(status_line(&green_report())),
-            Some(header_bytes_advertising(6, false)),
+            Some(header_bytes_advertising(7, false)),
         );
         let ok =
             probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
@@ -797,7 +834,7 @@ mod tests {
     fn a_host_that_advertises_the_channel_is_connected_to_exactly_once() {
         let (ports, aux_accepts, _joins) = fake_host(
             Some(status_line(&green_report())),
-            Some(header_bytes_advertising(6, true)),
+            Some(header_bytes_advertising(7, true)),
         );
         let ok =
             probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
@@ -817,7 +854,7 @@ mod tests {
         // connect would make an optional feature able to break the product.
         let (ports, _aux_accepts, _joins) = fake_host_with(
             Some(status_line(&green_report())),
-            Some(header_bytes_advertising(6, true)),
+            Some(header_bytes_advertising(7, true)),
             AuxHost::Dead,
         );
         let ok = probe_over(ports, far_deadline(), || None, |_, _| {})
@@ -855,11 +892,13 @@ mod tests {
             video: video_port,
             input: video_port,
             control: control.local_addr().unwrap().port(),
+            interactive_control: control.local_addr().unwrap().port(),
             aux: video_port,
+            sparse: video_port,
         };
         let reply = status_line(&green_report());
         let _agent = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let Ok((stream, _)) = control.accept() else {
                     return;
                 };

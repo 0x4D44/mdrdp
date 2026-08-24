@@ -1,8 +1,9 @@
 //! The ssh child that carries a native session.
 //!
-//! One `ssh -N` child serves both the probe and the session: three `-L` forwards
-//! (video, input, control), spawned before the transport decision and killed the
-//! moment the decision is "not native". Everything here is deliberately testable
+//! Two `ssh -N` children serve the probe and session. Bulk carries video,
+//! control and auxiliary traffic; interactive carries input and sparse pixels.
+//! Both are spawned before the transport decision and killed the moment the
+//! decision is "not native". Everything here is deliberately testable
 //! without ssh: argument construction and stderr classification are pure, and
 //! readiness polling takes the child's liveness as a closure.
 //!
@@ -26,8 +27,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The rhydra server's loopback ports on the host (video, input), and the agent's
-/// control port. The remote ends of the three forwards.
+/// The Rhydra server's loopback ports and the agent's control port. These are the
+/// remote ends of the session forwards; control is forwarded once per SSH
+/// transport so readiness can be proved without consuming a session socket.
 pub const REMOTE_VIDEO_PORT: u16 = 9500;
 pub const REMOTE_INPUT_PORT: u16 = 9501;
 pub const REMOTE_CONTROL_PORT: u16 = 9502;
@@ -36,17 +38,20 @@ pub const REMOTE_CONTROL_PORT: u16 = 9502;
 /// lower-priority may back it up; kept off the input port because that dialect
 /// is frameless and an unknown record kind there is terminal.
 pub const REMOTE_AUX_PORT: u16 = 9503;
+pub const REMOTE_SPARSE_PORT: u16 = 9504;
 
 /// How long ssh itself gets to establish TCP to the host.
 const SSH_CONNECT_TIMEOUT_SECS: u32 = 4;
 
-/// The local (Mac-side) ports the four forwards bind.
+/// The local (Mac-side) ports the six forwards bind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardPorts {
     pub video: u16,
     pub input: u16,
     pub control: u16,
+    pub interactive_control: u16,
     pub aux: u16,
+    pub sparse: u16,
 }
 
 impl ForwardPorts {
@@ -56,15 +61,21 @@ impl ForwardPorts {
     pub fn video_addr(&self) -> SocketAddr {
         (Ipv4Addr::LOCALHOST, self.video).into()
     }
+    pub fn sparse_addr(&self) -> SocketAddr {
+        (Ipv4Addr::LOCALHOST, self.sparse).into()
+    }
     pub fn input_addr(&self) -> SocketAddr {
         (Ipv4Addr::LOCALHOST, self.input).into()
     }
     pub fn control_addr(&self) -> SocketAddr {
         (Ipv4Addr::LOCALHOST, self.control).into()
     }
+    pub fn interactive_control_addr(&self) -> SocketAddr {
+        (Ipv4Addr::LOCALHOST, self.interactive_control).into()
+    }
 }
 
-/// Pick four free loopback ports by bind-and-drop.
+/// Pick six free loopback ports by bind-and-drop.
 ///
 /// The race window between the drop and ssh's own bind spans ssh's whole
 /// connect+auth phase — real, not theoretical. `ExitOnForwardFailure` turns a lost
@@ -76,17 +87,21 @@ pub fn allocate_ports() -> std::io::Result<ForwardPorts> {
         let port = l.local_addr()?.port();
         Ok((l, port))
     };
-    // Hold all four listeners until every port is chosen, so they are distinct.
+    // Hold every listener until all ports are chosen, so they are distinct.
     let (a, video) = bind()?;
     let (b, input) = bind()?;
     let (c, control) = bind()?;
     let (d, aux) = bind()?;
-    drop((a, b, c, d));
+    let (e, sparse) = bind()?;
+    let (f, interactive_control) = bind()?;
+    drop((a, b, c, d, e, f));
     Ok(ForwardPorts {
         video,
         input,
         control,
+        interactive_control,
         aux,
+        sparse,
     })
 }
 
@@ -99,14 +114,12 @@ pub struct TunnelSpec {
     pub local: ForwardPorts,
 }
 
-/// The exact ssh argument vector. Pure so the safety-bearing flags are testable.
-pub fn ssh_args(spec: &TunnelSpec) -> Vec<String> {
+fn common_ssh_args(spec: &TunnelSpec) -> Vec<String> {
     let dest = match &spec.ssh_user {
         Some(user) => format!("{user}@{}", spec.host),
         None => spec.host.clone(),
     };
-    let fwd = |local: u16, remote: u16| format!("127.0.0.1:{local}:127.0.0.1:{remote}");
-    vec![
+    let mut args = vec![
         "-N".into(),
         "-o".into(),
         "BatchMode=yes".into(),
@@ -122,16 +135,45 @@ pub fn ssh_args(spec: &TunnelSpec) -> Vec<String> {
         "ServerAliveInterval=5".into(),
         "-o".into(),
         "ServerAliveCountMax=3".into(),
-        "-L".into(),
-        fwd(spec.local.video, REMOTE_VIDEO_PORT),
-        "-L".into(),
-        fwd(spec.local.input, REMOTE_INPUT_PORT),
-        "-L".into(),
-        fwd(spec.local.control, REMOTE_CONTROL_PORT),
-        "-L".into(),
-        fwd(spec.local.aux, REMOTE_AUX_PORT),
-        dest,
-    ]
+    ];
+    args.push(dest);
+    args
+}
+
+fn lane_ssh_args(spec: &TunnelSpec, forwards: &[(u16, u16)]) -> Vec<String> {
+    let mut args = common_ssh_args(spec);
+    let dest = args.pop().expect("common ssh args end with destination");
+    for &(local, remote) in forwards {
+        args.push("-L".into());
+        args.push(format!("127.0.0.1:{local}:127.0.0.1:{remote}"));
+    }
+    args.push(dest);
+    args
+}
+
+/// Bulk traffic is deliberately absent from the interactive SSH transport.
+pub fn bulk_ssh_args(spec: &TunnelSpec) -> Vec<String> {
+    lane_ssh_args(
+        spec,
+        &[
+            (spec.local.video, REMOTE_VIDEO_PORT),
+            (spec.local.control, REMOTE_CONTROL_PORT),
+            (spec.local.aux, REMOTE_AUX_PORT),
+        ],
+    )
+}
+
+/// Input and raw final pixels share the small interactive transport. Neither can
+/// be queued behind a video access unit inside SSH's encrypted TCP stream.
+pub fn interactive_ssh_args(spec: &TunnelSpec) -> Vec<String> {
+    lane_ssh_args(
+        spec,
+        &[
+            (spec.local.input, REMOTE_INPUT_PORT),
+            (spec.local.sparse, REMOTE_SPARSE_PORT),
+            (spec.local.interactive_control, REMOTE_CONTROL_PORT),
+        ],
+    )
 }
 
 /// Why the native connect could not proceed. Each variant maps to a stage-json
@@ -261,16 +303,38 @@ pub fn classify_ssh_stderr(stderr: &str) -> ProbeFailure {
     }
 }
 
-/// A running ssh tunnel. Killed on drop so no `ssh -N` outlives its session.
-pub struct Tunnel {
+struct TunnelChild {
     child: Child,
     stderr: Arc<Mutex<String>>,
 }
 
+/// The bulk and interactive SSH transports. Killed on drop so neither child
+/// outlives its session.
+pub struct Tunnel {
+    children: Vec<TunnelChild>,
+}
+
 impl Tunnel {
     pub fn spawn(spec: &TunnelSpec) -> std::io::Result<Tunnel> {
+        let bulk = Self::spawn_child(bulk_ssh_args(spec), "ssh-bulk-stderr")?;
+        let interactive =
+            match Self::spawn_child(interactive_ssh_args(spec), "ssh-interactive-stderr") {
+                Ok(child) => child,
+                Err(error) => {
+                    let mut child = bulk;
+                    let _ = child.child.kill();
+                    let _ = child.child.wait();
+                    return Err(error);
+                }
+            };
+        Ok(Tunnel {
+            children: vec![bulk, interactive],
+        })
+    }
+
+    fn spawn_child(args: Vec<String>, stderr_thread: &str) -> std::io::Result<TunnelChild> {
         let mut child = Command::new("ssh")
-            .args(ssh_args(spec))
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -278,8 +342,8 @@ impl Tunnel {
         let stderr = Arc::new(Mutex::new(String::new()));
         if let Some(pipe) = child.stderr.take() {
             let sink = Arc::clone(&stderr);
-            std::thread::Builder::new()
-                .name("ssh-stderr".into())
+            let reader = std::thread::Builder::new()
+                .name(stderr_thread.into())
                 .spawn(move || {
                     let mut pipe = pipe;
                     let mut buf = [0u8; 4096];
@@ -291,27 +355,43 @@ impl Tunnel {
                             s.push_str(&String::from_utf8_lossy(&buf[..n]));
                         }
                     }
-                })?;
+                });
+            if let Err(error) = reader {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
         }
-        Ok(Tunnel { child, stderr })
+        Ok(TunnelChild { child, stderr })
     }
 
     /// `Some(stderr so far)` if the child has exited.
     pub fn poll_exit(&mut self) -> Option<String> {
-        match self.child.try_wait() {
-            Ok(Some(_status)) => Some(self.stderr_snapshot()),
-            _ => None,
+        for child in &mut self.children {
+            if matches!(child.child.try_wait(), Ok(Some(_))) {
+                return Some(child.stderr.lock().map(|s| s.clone()).unwrap_or_default());
+            }
         }
+        None
     }
 
     pub fn stderr_snapshot(&self) -> String {
-        self.stderr.lock().map(|s| s.clone()).unwrap_or_default()
+        self.children
+            .iter()
+            .filter_map(|child| child.stderr.lock().ok().map(|stderr| stderr.clone()))
+            .filter(|stderr| !stderr.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Kill and reap. Safe to call more than once.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        for child in &mut self.children {
+            let _ = child.child.kill();
+        }
+        for child in &mut self.children {
+            let _ = child.child.wait();
+        }
     }
 }
 
@@ -367,15 +447,23 @@ mod tests {
                 video: 50001,
                 input: 50002,
                 control: 50003,
+                interactive_control: 50006,
                 aux: 50004,
+                sparse: 50005,
             },
         }
     }
 
     #[test]
     fn ssh_args_carry_every_safety_flag_and_explicit_loopback_binds() {
-        let args = ssh_args(&spec());
-        let joined = args.join(" ");
+        let bulk = bulk_ssh_args(&spec());
+        let interactive = interactive_ssh_args(&spec());
+        let joined = bulk
+            .iter()
+            .chain(&interactive)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
         // The safety-bearing flags, each load-bearing per HLD §4.2.
         for required in [
             "-N",
@@ -396,21 +484,38 @@ mod tests {
         // The auxiliary channel. Loopback on both ends like the rest: ssh is
         // the security boundary, and nothing here may be reachable off-host.
         assert!(joined.contains("127.0.0.1:50004:127.0.0.1:9503"));
-        // Destination is last, with the user applied.
-        assert_eq!(args.last().unwrap(), "ano@quench.lan.example");
+        assert!(joined.contains("127.0.0.1:50005:127.0.0.1:9504"));
+        assert!(joined.contains("127.0.0.1:50006:127.0.0.1:9502"));
+        let bulk_joined = bulk.join(" ");
+        let interactive_joined = interactive.join(" ");
+        assert!(!bulk_joined.contains(":9501"));
+        assert!(!bulk_joined.contains(":9504"));
+        assert!(!interactive_joined.contains(":9500"));
+        assert!(!interactive_joined.contains(":9503"));
+        // Both independent transports use the same destination and account.
+        assert_eq!(bulk.last().unwrap(), "ano@quench.lan.example");
+        assert_eq!(interactive.last().unwrap(), "ano@quench.lan.example");
     }
 
     #[test]
     fn ssh_dest_without_user_lets_ssh_config_decide() {
         let mut s = spec();
         s.ssh_user = None;
-        assert_eq!(ssh_args(&s).last().unwrap(), "quench.lan.example");
+        assert_eq!(bulk_ssh_args(&s).last().unwrap(), "quench.lan.example");
+        assert_eq!(interactive_ssh_args(&s).last().unwrap(), "quench.lan.example");
     }
 
     #[test]
     fn allocated_ports_are_distinct_and_nonzero() {
         let p = allocate_ports().unwrap();
-        let all = [p.video, p.input, p.control, p.aux];
+        let all = [
+            p.video,
+            p.input,
+            p.control,
+            p.interactive_control,
+            p.aux,
+            p.sparse,
+        ];
         assert!(all.iter().all(|&port| port != 0));
         // Set-based rather than a hand-written chain of pairs: with four ports a
         // chain is easy to write with a pair missing, and it would still pass.

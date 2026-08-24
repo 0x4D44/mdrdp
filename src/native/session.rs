@@ -27,11 +27,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ironrdp_egfx::decode::{DecodedFrame, DecoderResult, H264Decoder};
+use rhydra::adaptive::{self, Block, Region};
 use rhydra::aux_proto::AudioFrame;
 use rhydra::auxchan::{self, Outbox};
 use rhydra::framing::{self, Reassembler};
 use rhydra::input_proto::{MouseButton as WireButton, Record, WheelAxis, encode_record};
-use rhydra::rects::{self, RectUpdate};
+use rhydra::rects;
+#[cfg(test)]
+use rhydra::rects::RectUpdate;
 use rhydra::video_update::{self, VideoKind, VideoUpdate};
 
 use crate::audio::{AudioFormatSummary, AudioRing};
@@ -51,6 +54,7 @@ use rhydra::clipboard::{self as clip, Bridge, Policy, TextClipboard};
 
 /// The surface id the native session paints. There is only ever one.
 pub const OUTPUT_SURFACE: u16 = 0;
+const UPDATE_BLOCK_SIZE: u32 = 16;
 
 /// Decoder selected by the server header. H.264 remains primary; HEVC is kept
 /// as a full-frame fallback when the host cannot construct the tiled AVC path.
@@ -77,6 +81,7 @@ impl NativeDecoder {
 
 /// The codec label the title bar and HUD show for native frames.
 const CODEC_LABEL: &str = "AVC (rhydra)";
+const SPARSE_CODEC_LABEL: &str = "raw BGRA (rhydra)";
 
 /// How often the local clipboard is read. Matches the RDP bridge's cadence:
 /// macOS has no change notification worth using, so this is a poll.
@@ -311,8 +316,10 @@ pub struct NativeHandle {
     stop: Arc<AtomicBool>,
     video: TcpStream,
     input: TcpStream,
+    sparse: TcpStream,
     video_join: JoinHandle<SessionEnd>,
     input_join: JoinHandle<Option<String>>,
+    sparse_join: JoinHandle<SessionEnd>,
     aux: Option<AuxChannel>,
     tunnel: Tunnel,
 }
@@ -323,6 +330,7 @@ impl NativeHandle {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.video.shutdown(Shutdown::Both);
         let _ = self.input.shutdown(Shutdown::Both);
+        let _ = self.sparse.shutdown(Shutdown::Both);
         // The clipboard goes first and its result is discarded: it is the one
         // part of a session whose failure must never change how the session is
         // reported to have ended.
@@ -330,15 +338,13 @@ impl NativeHandle {
             aux.shutdown();
         }
         let input_end = self.input_join.join().unwrap_or(None);
+        let sparse_end = self.sparse_join.join().unwrap_or(SessionEnd::WindowClosed);
         let end = self.video_join.join().unwrap_or(SessionEnd::WindowClosed);
         self.tunnel.kill();
         match end {
             // The window closing is the normal path; an input-side failure only
             // matters when the video side did not already explain the end.
-            SessionEnd::WindowClosed => match input_end {
-                Some(reason) => SessionEnd::TransportFailed(reason),
-                None => SessionEnd::WindowClosed,
-            },
+            SessionEnd::WindowClosed => input_end.map_or(sparse_end, SessionEnd::TransportFailed),
             other => other,
         }
     }
@@ -411,6 +417,7 @@ pub fn spawn(
 
     let video = conn.video.try_clone()?;
     let input = conn.input.try_clone()?;
+    let sparse = conn.sparse.try_clone()?;
 
     // A previous native session may have ended while the host cursor was hidden.
     // Reset immediately; the host's initial cursor message then states the truth.
@@ -419,11 +426,16 @@ pub fn spawn(
     // One clock, both threads: `native-input` stamps it, `native-net` closes it
     // on the next paint. That is the session's input round trip.
     let input_clock = InputClock::default();
+    let fences = Arc::new(Mutex::new(BlockFences::new(
+        conn.header.width,
+        conn.header.height,
+    )));
+    let base_ready = Arc::new(AtomicBool::new(false));
 
     let net_stop = Arc::clone(&stop);
     let net_input_sock = conn.input.try_clone()?;
     let damage_waker = waker.clone();
-    let mut sink = NativeSink::new_tiled(
+    let mut sink = NativeSink::new_tiled_shared(
         decoders,
         conn.header.tiles.clone(),
         store,
@@ -433,7 +445,39 @@ pub fn spawn(
         }),
         stats,
         input_clock.clone(),
+        Arc::clone(&fences),
+        Arc::clone(&base_ready),
     );
+    let sparse_stop = Arc::clone(&stop);
+    let sparse_video_sock = conn.video.try_clone()?;
+    let sparse_input_sock = conn.input.try_clone()?;
+    let sparse_waker = waker.clone();
+    let mut sparse_sock = conn.sparse.try_clone()?;
+    let mut sparse_sink = SparseSink {
+        store: Arc::clone(&sink.store),
+        wire_size: (conn.header.width, conn.header.height),
+        fences,
+        base_ready,
+        wake: Box::new({
+            let sparse_waker = sparse_waker.clone();
+            move || {
+                let _ = sparse_waker.damaged();
+            }
+        }),
+        stats: sink.stats.clone(),
+        input_clock: input_clock.clone(),
+    };
+    let sparse_join = std::thread::Builder::new()
+        .name("native-sparse".to_owned())
+        .spawn(move || {
+            let end = pump_sparse(&mut sparse_sock, &mut sparse_sink, &sparse_stop);
+            let end = finish_video_worker(end, &sparse_stop, || {
+                let _ = sparse_waker.close();
+            });
+            let _ = sparse_video_sock.shutdown(Shutdown::Both);
+            let _ = sparse_input_sock.shutdown(Shutdown::Both);
+            end
+        })?;
     let mut video_sock = conn.video;
     let mut reassembler = conn.reassembler;
     let video_waker = waker.clone();
@@ -488,8 +532,10 @@ pub fn spawn(
         stop,
         video,
         input,
+        sparse,
         video_join,
         input_join,
+        sparse_join,
         aux,
         tunnel,
     })
@@ -822,13 +868,63 @@ fn pump_video(
     }
 }
 
+/// Read the low-latency sparse-pixel channel. This connection intentionally
+/// accepts only raw rectangle messages; widening its dialect would let bulk
+/// traffic recreate the head-of-line blocking the connection removes.
+fn pump_sparse(sparse: &mut TcpStream, sink: &mut SparseSink, stop: &AtomicBool) -> SessionEnd {
+    let mut reassembler = Reassembler::new(framing::DEFAULT_MAX_PAYLOAD);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return SessionEnd::WindowClosed;
+        }
+        match reassembler.next_message() {
+            Ok(Some(message)) if message.msg_type == framing::MSG_RECTS => {
+                if let Err(reason) = sink.on_rects(&message.payload) {
+                    return SessionEnd::TransportFailed(reason);
+                }
+                continue;
+            }
+            Ok(Some(message)) => {
+                return SessionEnd::TransportFailed(format!(
+                    "sparse channel received message type {}",
+                    message.msg_type
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return SessionEnd::TransportFailed(format!("sparse framing: {error:?}"));
+            }
+        }
+        let n = match sparse.read(&mut buf) {
+            Ok(0) => {
+                return if stop.load(Ordering::Relaxed) {
+                    SessionEnd::WindowClosed
+                } else {
+                    SessionEnd::TransportFailed(
+                        "the host closed the sparse channel (tunnel or server died)".to_owned(),
+                    )
+                };
+            }
+            Ok(n) => n,
+            Err(_) if stop.load(Ordering::Relaxed) => return SessionEnd::WindowClosed,
+            Err(error) => {
+                return SessionEnd::TransportFailed(format!("sparse read: {error}"));
+            }
+        };
+        reassembler.push(&buf[..n]);
+    }
+}
+
 fn dispatch_video_message(
     message: &framing::Message,
     sink: &mut NativeSink,
     on_cursor: &mut dyn FnMut(CursorUpdate),
 ) -> Result<(), String> {
     match message.msg_type {
-        framing::MSG_RECTS => sink.on_rects(&message.payload),
+        framing::MSG_RECTS => {
+            Err("raw rectangles arrived on the bulk video channel under wire v7".to_owned())
+        }
         framing::MSG_VIDEO_SEQ => {
             if message.payload.len() < 8 {
                 Err("MSG_VIDEO_SEQ shorter than its sequence prefix".to_owned())
@@ -1269,10 +1365,15 @@ pub(crate) struct NativeSink {
     stats: StatsHandle,
     /// Shared with `native-input`; a paint closes whatever it holds.
     input_clock: InputClock,
+    fences: Arc<Mutex<BlockFences>>,
+    base_ready: Arc<AtomicBool>,
     // Visible-behaviour counters (tests and debugging; not user-facing yet).
     pub(crate) suppressed: u64,
+    #[cfg(test)]
     pub(crate) skipped_stale: u64,
+    #[cfg(test)]
     pub(crate) skipped_empty: u64,
+    #[cfg(test)]
     pub(crate) skipped_before_base: u64,
 }
 
@@ -1291,6 +1392,185 @@ struct StagedTile {
 struct StagedVideoRegion {
     dest: Rect,
     pixels: Vec<u8>,
+}
+
+struct DecodedVideoTile {
+    header: TileHeader,
+    coverage: Vec<Region>,
+    pixels: Vec<u8>,
+}
+
+struct BlockFences {
+    width: u32,
+    height: u32,
+    seqs: Vec<u64>,
+}
+
+struct SparseSink {
+    store: Arc<Mutex<SurfaceStore>>,
+    wire_size: (u32, u32),
+    fences: Arc<Mutex<BlockFences>>,
+    base_ready: Arc<AtomicBool>,
+    wake: Box<dyn Fn() + Send>,
+    stats: StatsHandle,
+    input_clock: InputClock,
+}
+
+impl SparseSink {
+    fn on_rects(&mut self, payload: &[u8]) -> Result<(), String> {
+        let wire_bytes = payload.len() as u64;
+        let update = rects::decode(payload).map_err(|error| format!("rects payload: {error}"))?;
+        if update.rects.is_empty() || !self.base_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if (update.frame_width, update.frame_height) != self.wire_size {
+            return Err("sparse update geometry changed; reconnect".into());
+        }
+        let coverage: Vec<_> = update
+            .rects
+            .iter()
+            .map(|rect| Region {
+                x: u32::from(rect.x),
+                y: u32::from(rect.y),
+                width: u32::from(rect.w),
+                height: u32::from(rect.h),
+            })
+            .collect();
+        let mut fences = self
+            .fences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // One global pass rejects overlaps and out-of-order block coverage before
+        // any source buffer is sliced or the surface is touched.
+        let _ = fences.visible(update.frame_seq, &coverage)?;
+        let mut staged = Vec::new();
+        for (wire_rect, region) in update.rects.iter().zip(&coverage) {
+            for visible in fences.visible(update.frame_seq, &[*region])? {
+                let width = visible.width as usize;
+                let height = visible.height as usize;
+                let local_x = (visible.x - region.x) as usize;
+                let local_y = (visible.y - region.y) as usize;
+                let source_width = region.width as usize;
+                let mut packed = Vec::with_capacity(width * height * 4);
+                for row in local_y..local_y + height {
+                    let start = (row * source_width + local_x) * 4;
+                    packed.extend_from_slice(&wire_rect.pixels[start..start + width * 4]);
+                }
+                staged.push((
+                    Rect::new(
+                        visible.x as u16,
+                        visible.y as u16,
+                        (visible.x + visible.width) as u16,
+                        (visible.y + visible.height) as u16,
+                    ),
+                    packed,
+                ));
+            }
+        }
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let updates: Vec<_> = staged
+            .iter()
+            .map(|(dest, pixels)| (*dest, pixels.as_slice()))
+            .collect();
+        let generation = {
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store
+                .blit_bgra_strict_batch(OUTPUT_SURFACE, updates.iter().copied())
+                .map_err(|error| format!("sparse batch: {error}"))?
+        };
+        fences.commit(update.frame_seq, &coverage);
+        drop(fences);
+        let input_us = self.input_clock.take_us();
+        self.stats.update(|stats| {
+            stats.frames += 1;
+            stats.bytes_in = stats.bytes_in.saturating_add(wire_bytes);
+            *stats
+                .codecs
+                .entry(SPARSE_CODEC_LABEL.to_owned())
+                .or_insert(0) += 1;
+            *stats
+                .codec_painted
+                .entry(SPARSE_CODEC_LABEL.to_owned())
+                .or_insert(0) += wire_bytes;
+            if let Some(us) = input_us {
+                stats.latency.record(us);
+            }
+            stats.mark_painted(generation);
+        });
+        (self.wake)();
+        Ok(())
+    }
+}
+
+impl BlockFences {
+    fn new(width: u32, height: u32) -> Self {
+        let count = width.div_ceil(UPDATE_BLOCK_SIZE) * height.div_ceil(UPDATE_BLOCK_SIZE);
+        Self {
+            width,
+            height,
+            seqs: vec![0; count as usize],
+        }
+    }
+
+    fn visible(&self, seq: u64, coverage: &[Region]) -> Result<Vec<Region>, String> {
+        let blocks_w = self.width.div_ceil(UPDATE_BLOCK_SIZE);
+        let blocks_h = self.height.div_ceil(UPDATE_BLOCK_SIZE);
+        let mut covered = vec![false; (blocks_w * blocks_h) as usize];
+        for region in coverage {
+            let right = region.x.saturating_add(region.width);
+            let bottom = region.y.saturating_add(region.height);
+            if region.width == 0
+                || region.height == 0
+                || right > self.width
+                || bottom > self.height
+                || region.x % UPDATE_BLOCK_SIZE != 0
+                || region.y % UPDATE_BLOCK_SIZE != 0
+                || (right != self.width && right % UPDATE_BLOCK_SIZE != 0)
+                || (bottom != self.height && bottom % UPDATE_BLOCK_SIZE != 0)
+            {
+                return Err("update coverage is not aligned to the negotiated codec grid".into());
+            }
+            for y in region.y / UPDATE_BLOCK_SIZE..bottom.div_ceil(UPDATE_BLOCK_SIZE) {
+                for x in region.x / UPDATE_BLOCK_SIZE..right.div_ceil(UPDATE_BLOCK_SIZE) {
+                    let index = (y * blocks_w + x) as usize;
+                    if std::mem::replace(&mut covered[index], true) {
+                        return Err("update coverage overlaps on the codec grid".into());
+                    }
+                }
+            }
+        }
+        let blocks = covered
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, covered)| {
+                (covered && self.seqs[index] < seq).then_some(Block {
+                    x: index as u32 % blocks_w,
+                    y: index as u32 / blocks_w,
+                })
+            })
+            .collect::<Vec<_>>();
+        adaptive::blocks_to_regions(&blocks, self.width, self.height, UPDATE_BLOCK_SIZE)
+            .map_err(|error| error.to_string())
+    }
+
+    fn commit(&mut self, seq: u64, coverage: &[Region]) {
+        let blocks_w = self.width.div_ceil(UPDATE_BLOCK_SIZE);
+        for region in coverage {
+            let right = region.x + region.width;
+            let bottom = region.y + region.height;
+            for y in region.y / UPDATE_BLOCK_SIZE..bottom.div_ceil(UPDATE_BLOCK_SIZE) {
+                for x in region.x / UPDATE_BLOCK_SIZE..right.div_ceil(UPDATE_BLOCK_SIZE) {
+                    let slot = &mut self.seqs[(y * blocks_w + x) as usize];
+                    *slot = (*slot).max(seq);
+                }
+            }
+        }
+    }
 }
 
 struct TileFrameProgress {
@@ -1324,13 +1604,19 @@ impl NativeSink {
             wake,
             stats,
             input_clock,
+            fences: Arc::new(Mutex::new(BlockFences::new(wire_size.0, wire_size.1))),
+            base_ready: Arc::new(AtomicBool::new(false)),
             suppressed: 0,
+            #[cfg(test)]
             skipped_stale: 0,
+            #[cfg(test)]
             skipped_empty: 0,
+            #[cfg(test)]
             skipped_before_base: 0,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_tiled(
         decoders: Vec<NativeDecoder>,
         headers: Vec<TileHeader>,
@@ -1339,6 +1625,33 @@ impl NativeSink {
         wake: Box<dyn Fn() + Send>,
         stats: StatsHandle,
         input_clock: InputClock,
+    ) -> Self {
+        let fences = Arc::new(Mutex::new(BlockFences::new(wire_size.0, wire_size.1)));
+        let base_ready = Arc::new(AtomicBool::new(false));
+        Self::new_tiled_shared(
+            decoders,
+            headers,
+            store,
+            wire_size,
+            wake,
+            stats,
+            input_clock,
+            fences,
+            base_ready,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_tiled_shared(
+        decoders: Vec<NativeDecoder>,
+        headers: Vec<TileHeader>,
+        store: Arc<Mutex<SurfaceStore>>,
+        wire_size: (u32, u32),
+        wake: Box<dyn Fn() + Send>,
+        stats: StatsHandle,
+        input_clock: InputClock,
+        fences: Arc<Mutex<BlockFences>>,
+        base_ready: Arc<AtomicBool>,
     ) -> Self {
         assert_eq!(
             decoders.len(),
@@ -1371,9 +1684,14 @@ impl NativeSink {
             wake,
             stats,
             input_clock,
+            fences,
+            base_ready,
             suppressed: 0,
+            #[cfg(test)]
             skipped_stale: 0,
+            #[cfg(test)]
             skipped_empty: 0,
+            #[cfg(test)]
             skipped_before_base: 0,
         }
     }
@@ -1459,6 +1777,7 @@ impl NativeSink {
         }
         self.exact_through = seq;
         self.has_base = true;
+        self.base_ready.store(true, Ordering::Release);
         (self.wake)();
         Ok(())
     }
@@ -1570,6 +1889,7 @@ impl NativeSink {
                 self.tile_decoders[tile_index].has_base = true;
             }
             self.has_base = true;
+            self.base_ready.store(true, Ordering::Release);
             self.exact_through = self
                 .tile_decoders
                 .iter()
@@ -1606,10 +1926,13 @@ impl NativeSink {
                 update.frame_width, update.frame_height, self.wire_size.0, self.wire_size.1
             ));
         }
-        let stale = self
-            .exact_through
-            .is_some_and(|exact| update.frame_seq <= exact);
-        if !stale && update.kind != VideoKind::Recovery && !self.has_base {
+        if u32::from(update.block_size) != UPDATE_BLOCK_SIZE {
+            return Err(format!(
+                "host video block size {} differs from negotiated {}",
+                update.block_size, UPDATE_BLOCK_SIZE
+            ));
+        }
+        if update.kind != VideoKind::Recovery && !self.has_base {
             return Err(format!(
                 "video update {} cannot bootstrap {:?} without recovery",
                 update.frame_seq, self.exact_through
@@ -1649,10 +1972,19 @@ impl NativeSink {
             }
             selected.push(tile_index);
         }
+        let advertised_coverage = update
+            .tiles
+            .iter()
+            .flat_map(|tile| tile.coverage.iter().copied())
+            .collect::<Vec<_>>();
+        self.fences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .visible(update.frame_seq, &advertised_coverage)?;
 
         let started = Instant::now();
         let mut bytes = 0u64;
-        let mut staged = Vec::new();
+        let mut decoded_tiles = Vec::with_capacity(update.tiles.len());
         for (wire_tile, tile_index) in update.tiles.iter().zip(selected.iter().copied()) {
             let tile = &mut self.tile_decoders[tile_index];
             let decoded = match tile.decoder.decode(&wire_tile.au) {
@@ -1673,32 +2005,49 @@ impl NativeSink {
                 ));
             }
             bytes = bytes.saturating_add(wire_tile.au.len() as u64);
-            let pixels = decoded.into_data();
-            if wire_tile.coverage.as_slice()
-                == [rhydra::adaptive::Region {
-                    x: tile.header.x,
-                    y: tile.header.y,
-                    width: tile.header.width,
-                    height: tile.header.height,
+            decoded_tiles.push(DecodedVideoTile {
+                header: tile.header,
+                coverage: wire_tile.coverage.clone(),
+                pixels: decoded.into_data(),
+            });
+            tile.has_base = true;
+        }
+
+        // Hold the precedence grid from selection through visible commit. A raw
+        // thread may otherwise land a newer block between the check and this blit.
+        let mut fences = self
+            .fences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut staged = Vec::new();
+        let mut committed_coverage = Vec::with_capacity(decoded_tiles.len());
+        for decoded in decoded_tiles {
+            let visible = fences.visible(update.frame_seq, &decoded.coverage)?;
+            if visible.as_slice()
+                == [Region {
+                    x: decoded.header.x,
+                    y: decoded.header.y,
+                    width: decoded.header.width,
+                    height: decoded.header.height,
                 }]
             {
                 staged.push(StagedVideoRegion {
-                    dest: Self::tile_dest(tile.header.id, tile.header)?,
-                    pixels,
+                    dest: Self::tile_dest(decoded.header.id, decoded.header)?,
+                    pixels: decoded.pixels,
                 });
-                tile.has_base = true;
+                committed_coverage.push(decoded.coverage);
                 continue;
             }
-            for region in &wire_tile.coverage {
+            for region in &visible {
                 let width = region.width as usize;
                 let height = region.height as usize;
-                let local_x = (region.x - tile.header.x) as usize;
-                let local_y = (region.y - tile.header.y) as usize;
-                let source_width = tile.header.width as usize;
+                let local_x = (region.x - decoded.header.x) as usize;
+                let local_y = (region.y - decoded.header.y) as usize;
+                let source_width = decoded.header.width as usize;
                 let mut packed = Vec::with_capacity(width * height * 4);
                 for row in local_y..local_y + height {
                     let start = (row * source_width + local_x) * 4;
-                    packed.extend_from_slice(&pixels[start..start + width * 4]);
+                    packed.extend_from_slice(&decoded.pixels[start..start + width * 4]);
                 }
                 staged.push(StagedVideoRegion {
                     dest: Rect::new(
@@ -1710,11 +2059,24 @@ impl NativeSink {
                     pixels: packed,
                 });
             }
-            tile.has_base = true;
+            committed_coverage.push(decoded.coverage);
         }
 
-        if stale {
+        if staged.is_empty() {
             self.suppressed += 1;
+            self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
+            self.base_ready.store(self.has_base, Ordering::Release);
+            self.exact_through = Some(
+                self.exact_through
+                    .map_or(update.frame_seq, |seq| seq.max(update.frame_seq)),
+            );
+            for tile_index in selected {
+                let tile = &mut self.tile_decoders[tile_index];
+                tile.exact_through = Some(
+                    tile.exact_through
+                        .map_or(update.frame_seq, |seq| seq.max(update.frame_seq)),
+                );
+            }
             return Ok(());
         }
         let updates: Vec<_> = staged
@@ -1732,8 +2094,16 @@ impl NativeSink {
                 .map_err(|error| format!("video update batch: {error}"))?;
             self.record_paint(bytes, generation, Some(decode_us));
         }
+        for coverage in &committed_coverage {
+            fences.commit(update.frame_seq, coverage);
+        }
+        drop(fences);
         self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
-        self.exact_through = Some(update.frame_seq);
+        self.base_ready.store(self.has_base, Ordering::Release);
+        self.exact_through = Some(
+            self.exact_through
+                .map_or(update.frame_seq, |seq| seq.max(update.frame_seq)),
+        );
         for tile_index in selected {
             let tile = &mut self.tile_decoders[tile_index];
             tile.exact_through = Some(
@@ -1766,11 +2136,7 @@ impl NativeSink {
         ))
     }
 
-    pub(crate) fn on_rects(&mut self, payload: &[u8]) -> Result<(), String> {
-        let update = rects::decode(payload).map_err(|e| format!("rects payload: {e}"))?;
-        self.apply_update(update)
-    }
-
+    #[cfg(test)]
     fn apply_update(&mut self, update: RectUpdate) -> Result<(), String> {
         // An empty update must not advance exactness: it would claim a frame's
         // content on the word of a message that carried none.
@@ -1803,6 +2169,7 @@ impl NativeSink {
 
     /// Blit every rect of an already-gated update; exactness advances only when
     /// every blit succeeded (review S-m9).
+    #[cfg(test)]
     fn paint(&mut self, update: &RectUpdate) -> Result<(), String> {
         let painted_bytes = update.rects.iter().fold(0u64, |total, rect| {
             total.saturating_add(rect.pixels.len() as u64)
@@ -2534,7 +2901,7 @@ mod tests {
         use rhydra::adaptive::Region;
         use rhydra::video_update::{VideoKind, VideoTile, VideoUpdate};
 
-        let size = (4, 2);
+        let size = (32, 16);
         let store = Arc::new(Mutex::new(SurfaceStore::new()));
         {
             let mut surface = store.lock().unwrap();
@@ -2542,26 +2909,14 @@ mod tests {
             surface.map_to_output(OUTPUT_SURFACE);
         }
         let mut sink = NativeSink::new_tiled(
-            vec![
-                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
-                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
-            ],
-            vec![
-                super::super::probe::TileHeader {
-                    id: 0,
-                    x: 0,
-                    y: 0,
-                    width: 2,
-                    height: 2,
-                },
-                super::super::probe::TileHeader {
-                    id: 1,
-                    x: 2,
-                    y: 0,
-                    width: 2,
-                    height: 2,
-                },
-            ],
+            vec![NativeDecoder::H264(Box::new(FakeDecoder { size }))],
+            vec![super::super::probe::TileHeader {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: size.0,
+                height: size.1,
+            }],
             Arc::clone(&store),
             size,
             Box::new(|| {}),
@@ -2571,47 +2926,35 @@ mod tests {
 
         sink.on_video_update(VideoUpdate {
             frame_seq: 1,
-            frame_width: 4,
-            frame_height: 2,
-            block_size: 1,
+            frame_width: size.0,
+            frame_height: size.1,
+            block_size: UPDATE_BLOCK_SIZE as u16,
             kind: VideoKind::Recovery,
-            tiles: vec![
-                VideoTile {
-                    tile_id: 0,
-                    coverage: vec![Region {
-                        x: 0,
-                        y: 0,
-                        width: 2,
-                        height: 2,
-                    }],
-                    au: vec![0x10],
-                },
-                VideoTile {
-                    tile_id: 1,
-                    coverage: vec![Region {
-                        x: 2,
-                        y: 0,
-                        width: 2,
-                        height: 2,
-                    }],
-                    au: vec![0x20],
-                },
-            ],
+            tiles: vec![VideoTile {
+                tile_id: 0,
+                coverage: vec![Region {
+                    x: 0,
+                    y: 0,
+                    width: size.0,
+                    height: size.1,
+                }],
+                au: vec![0x10],
+            }],
         })
         .unwrap();
         sink.on_video_update(VideoUpdate {
             frame_seq: 2,
-            frame_width: 4,
-            frame_height: 2,
-            block_size: 1,
+            frame_width: size.0,
+            frame_height: size.1,
+            block_size: UPDATE_BLOCK_SIZE as u16,
             kind: VideoKind::Regional,
             tiles: vec![VideoTile {
                 tile_id: 0,
                 coverage: vec![Region {
-                    x: 1,
+                    x: 16,
                     y: 0,
-                    width: 1,
-                    height: 1,
+                    width: 16,
+                    height: 16,
                 }],
                 au: vec![0x77],
             }],
@@ -2620,12 +2963,116 @@ mod tests {
 
         let guard = store.lock().unwrap();
         let pixels = guard.get(OUTPUT_SURFACE).unwrap().pixels();
-        let first = |x: usize, y: usize| pixels[(y * 4 + x) * 4];
+        let first = |x: usize, y: usize| pixels[(y * size.0 as usize + x) * 4];
         assert_eq!(first(0, 0), 0x10);
-        assert_eq!(first(1, 0), 0x77);
-        assert_eq!(first(0, 1), 0x10);
-        assert_eq!(first(2, 0), 0x20);
-        assert_eq!(first(3, 1), 0x20);
+        assert_eq!(first(15, 15), 0x10);
+        assert_eq!(first(16, 0), 0x77);
+        assert_eq!(first(31, 15), 0x77);
+    }
+
+    #[test]
+    fn newer_sparse_blocks_survive_an_older_regional_video_arrival() {
+        use rhydra::adaptive::Region;
+        use rhydra::video_update::{VideoKind, VideoTile, VideoUpdate};
+
+        let size = (32, 16);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let fences = Arc::new(Mutex::new(BlockFences::new(size.0, size.1)));
+        let base_ready = Arc::new(AtomicBool::new(false));
+        let stats = StatsHandle::new();
+        let input_clock = InputClock::default();
+        let mut video = NativeSink::new_tiled_shared(
+            vec![NativeDecoder::H264(Box::new(FakeDecoder { size }))],
+            vec![super::super::probe::TileHeader {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: size.0,
+                height: size.1,
+            }],
+            Arc::clone(&store),
+            size,
+            Box::new(|| {}),
+            stats.clone(),
+            input_clock.clone(),
+            Arc::clone(&fences),
+            Arc::clone(&base_ready),
+        );
+        let mut sparse = SparseSink {
+            store: Arc::clone(&store),
+            wire_size: size,
+            fences,
+            base_ready,
+            wake: Box::new(|| {}),
+            stats,
+            input_clock,
+        };
+
+        video
+            .on_video_update(VideoUpdate {
+                frame_seq: 1,
+                frame_width: size.0,
+                frame_height: size.1,
+                block_size: UPDATE_BLOCK_SIZE as u16,
+                kind: VideoKind::Recovery,
+                tiles: vec![VideoTile {
+                    tile_id: 0,
+                    coverage: vec![Region {
+                        x: 0,
+                        y: 0,
+                        width: size.0,
+                        height: size.1,
+                    }],
+                    au: vec![0x10],
+                }],
+            })
+            .unwrap();
+        let raw = RectUpdate {
+            frame_seq: 3,
+            frame_width: size.0,
+            frame_height: size.1,
+            rects: vec![WireRect {
+                x: 0,
+                y: 0,
+                w: UPDATE_BLOCK_SIZE as u16,
+                h: UPDATE_BLOCK_SIZE as u16,
+                pixels: [0x33, 0x22, 0x11, 0xff].repeat((16 * 16) as usize),
+            }],
+        };
+        let mut payload = Vec::new();
+        rects::encode(&raw, &mut payload);
+        sparse.on_rects(&payload).unwrap();
+
+        video
+            .on_video_update(VideoUpdate {
+                frame_seq: 2,
+                frame_width: size.0,
+                frame_height: size.1,
+                block_size: UPDATE_BLOCK_SIZE as u16,
+                kind: VideoKind::Regional,
+                tiles: vec![VideoTile {
+                    tile_id: 0,
+                    coverage: vec![Region {
+                        x: 0,
+                        y: 0,
+                        width: size.0,
+                        height: size.1,
+                    }],
+                    au: vec![0x77],
+                }],
+            })
+            .unwrap();
+
+        let guard = store.lock().unwrap();
+        let pixels = guard.get(OUTPUT_SURFACE).unwrap().pixels();
+        let pixel = |x: usize| &pixels[x * 4..x * 4 + 4];
+        assert_eq!(pixel(0), [0x11, 0x22, 0x33, 0xff]);
+        assert_eq!(pixel(16), [0x77; 4]);
     }
 
     #[test]

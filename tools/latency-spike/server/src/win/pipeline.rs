@@ -1,4 +1,5 @@
-//! Wiring: three threads, one bounded queue, one stats writer.
+//! Wiring: capture plus video, sparse, and input workers; each pixel lane has a
+//! shallow bounded queue and the video worker owns the stats file.
 //!
 //! * **Main thread** — capture, convert, encode. It owns every D3D11 and Media
 //!   Foundation object, which is why it is the main thread rather than a spawned
@@ -6,6 +7,7 @@
 //!   created them, and keeping that thread the one the process started on removes a
 //!   whole class of "works until it doesn't" threading bugs.
 //! * **Sender thread** — the video socket and the stats file ([`super::send`]).
+//! * **Sparse sender thread** — raw final pixels on their own socket.
 //! * **Input thread** — the keystroke channel ([`super::input`]).
 //!
 //! The queue between capture and sender is bounded and **lossy on purpose**. When
@@ -41,6 +43,7 @@ const KEYFRAME_RETRY_FRAMES: u32 = DECLARED_FPS;
 /// write with the next encode and small enough that a stall shows up as a drop
 /// rather than as growing latency.
 const QUEUE_DEPTH: usize = 2;
+const SPARSE_QUEUE_DEPTH: usize = 2;
 
 /// Async tile encoders can finish one entire converter budget apart. Matching that
 /// fixed budget lets one tile drain before its peer without evicting a valid set;
@@ -184,8 +187,13 @@ pub fn run(cfg: &Config) -> Result<()> {
     // cannot be addressed by the fast path at all. Decided once here rather than
     // re-tested per frame, and announced when it silently costs the operator the
     // path they asked for.
-    let rects_enabled =
-        cfg.rects && source.width() <= u16::MAX as u32 && source.height() <= u16::MAX as u32;
+    let rects_enabled = cfg.rects
+        && codec == encode::Codec::H264
+        && source.width() <= u16::MAX as u32
+        && source.height() <= u16::MAX as u32;
+    if cfg.rects && codec == encode::Codec::Hevc {
+        eprintln!("capture: raw sparse updates require the H.264 precedence grid; HEVC fallback remains full-frame");
+    }
     if cfg.rects && !rects_enabled {
         eprintln!(
             "capture: {}x{} exceeds the u16 rect coordinates on the wire; \
@@ -204,8 +212,9 @@ pub fn run(cfg: &Config) -> Result<()> {
     // channels here makes startup fail before a viewer can receive a dead contract.
     let BoundChannels {
         input: input_listener,
+        sparse: sparse_listener,
         aux: aux_listener,
-    } = BoundChannels::bind(cfg.input_port, cfg.aux_port)?;
+    } = BoundChannels::bind(cfg.input_port, cfg.sparse_port, cfg.aux_port)?;
     let aux_enabled = aux_listener.is_some();
 
     let header = build_header(
@@ -221,6 +230,8 @@ pub fn run(cfg: &Config) -> Result<()> {
     let header_line = stats::to_line(&header);
 
     let connected = Arc::new(AtomicBool::new(false));
+    let sparse_connected = Arc::new(AtomicBool::new(false));
+    let session_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cursor_hidden = Arc::new(AtomicBool::new(source.hide_local_cursor()));
     let (tx, rx) = sync_channel::<send::Outbound>(QUEUE_DEPTH);
     let sender = send::Sender::new(
@@ -229,11 +240,25 @@ pub fn run(cfg: &Config) -> Result<()> {
         header_line,
         clock,
         Arc::clone(&connected),
+        Arc::clone(&sparse_connected),
+        Arc::clone(&session_epoch),
         Arc::clone(&cursor_hidden),
     )?;
     std::thread::Builder::new()
         .name("spike-send".into())
         .spawn(move || sender.run(rx))?;
+
+    let (sparse_tx, sparse_rx) = sync_channel::<send::SparseOutbound>(SPARSE_QUEUE_DEPTH);
+    let sparse_sender = send::SparseSender::new(
+        sparse_listener,
+        Arc::clone(&sparse_connected),
+        Arc::clone(&session_epoch),
+        tx.clone(),
+        clock,
+    )?;
+    std::thread::Builder::new()
+        .name("spike-sparse".into())
+        .spawn(move || sparse_sender.run(sparse_rx))?;
 
     let input_tx = tx.clone();
     std::thread::Builder::new()
@@ -306,6 +331,8 @@ pub fn run(cfg: &Config) -> Result<()> {
         cursor_hidden,
         rects_enabled,
         diff_enabled,
+        sparse_tx,
+        sparse_connected,
     });
     // Only reached when the loop fails; the happy path never returns. Draining the
     // MFT before `MFShutdown` runs (via `_mf`'s Drop) keeps the driver's own logs
@@ -420,6 +447,8 @@ struct CaptureState<'a> {
     /// Whether the Increment 3 pixel diff may run at all. Implies `rects_enabled`:
     /// the diff emits through the rect path or not at all.
     diff_enabled: bool,
+    sparse_tx: SyncSender<send::SparseOutbound>,
+    sparse_connected: Arc<AtomicBool>,
 }
 
 fn build_header(
@@ -436,6 +465,7 @@ fn build_header(
     h.qpc_frequency = clock.freq();
     h.video_port = cfg.video_port;
     h.input_port = cfg.input_port;
+    h.sparse_port = cfg.sparse_port;
     // Advertised only when the channel is actually being served. The client's
     // whole safety gate is this flag: it opens 9503 if and only if this says
     // true, and a host that advertises a port nothing is listening on would
@@ -484,7 +514,8 @@ fn build_header(
 /// `CaptureState`) is itself mutably borrowed by `encode`/`pump`.
 struct EmitCtx {
     clock: QpcClock,
-    tx: SyncSender<send::Outbound>,
+    sparse_tx: SyncSender<send::SparseOutbound>,
+    sparse_connected: Arc<AtomicBool>,
     tile_id: u8,
     /// Cumulative rect messages dropped for the same reason. Counted separately so
     /// fast-path pressure is visible on its own.
@@ -897,6 +928,53 @@ fn takes_fast_path(change: &ChangeInfo) -> bool {
         && change.dirty_bytes() <= RECT_MAX_BYTES
 }
 
+fn block_aligned_raw_change(
+    change: &ChangeInfo,
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<Option<ChangeInfo>> {
+    let changed: Vec<_> = change
+        .rects
+        .iter()
+        .map(|rect| Region {
+            x: rect.x,
+            y: rect.y,
+            width: rect.w,
+            height: rect.h,
+        })
+        .collect();
+    let UpdatePlan::Incremental(plan) = adaptive::partition_blocks(
+        frame_width,
+        frame_height,
+        CODEC_BLOCK_SIZE,
+        &changed,
+        &[],
+        &changed,
+        false,
+    )?
+    else {
+        unreachable!("full fallback was not requested")
+    };
+    let regions =
+        adaptive::blocks_to_regions(&plan.raw, frame_width, frame_height, CODEC_BLOCK_SIZE)?;
+    let aligned = ChangeInfo {
+        rects: regions
+            .into_iter()
+            .map(|region| DirtyRect {
+                x: region.x,
+                y: region.y,
+                w: region.width,
+                h: region.height,
+            })
+            .collect(),
+        move_rects: 0,
+    };
+    Ok(
+        (aligned.rects.len() <= RECT_MAX_COUNT && aligned.dirty_bytes() <= RECT_MAX_BYTES)
+            .then_some(aligned),
+    )
+}
+
 /// The bounding box of a change claim, clipped to the desktop — where the
 /// Increment 3 diff scans when there is a claim to verify.
 ///
@@ -996,10 +1074,14 @@ fn send_rects(
     record.dropped_rects = ctx.dropped_rects;
     record.from_diff = from_diff;
 
-    match ctx
-        .tx
-        .try_send(send::Outbound::Rects(Box::new(record), payload))
-    {
+    if !ctx.sparse_connected.load(Ordering::Acquire) {
+        ctx.dropped_rects += 1;
+        return Ok(false);
+    }
+    match ctx.sparse_tx.try_send(send::SparseOutbound {
+        record: Box::new(record),
+        payload,
+    }) {
         Ok(()) => Ok(true),
         // Full means the complete logical update was lost. The caller enters
         // recovery; no dependent sparse/regional traffic may follow it.
@@ -1046,7 +1128,8 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         .zip(last_epochs.iter().copied())
         .map(|(tile, epoch)| EmitCtx {
             clock: state.clock,
-            tx: state.tx.clone(),
+            sparse_tx: state.sparse_tx.clone(),
+            sparse_connected: Arc::clone(&state.sparse_connected),
             tile_id: tile.header.id,
             dropped_rects: 0,
             diff_runs: 0,
@@ -1191,17 +1274,27 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         let mut measured_changed_pixels = None;
         let mut raw_rect_attempted = false;
         let mut raw_rect_sent = false;
-        let sparse_allowed = recovery.allows_overlays();
+        let sparse_allowed =
+            recovery.allows_overlays() && state.sparse_connected.load(Ordering::Acquire);
 
         // Small trustworthy final pixels are the complete representation. The
         // loop returns after retaining the frame; these pixels never enter H.264.
         let mut metadata_took_fast_path = false;
         if state.rects_enabled && sparse_allowed && !suppress_rects_once {
             if let Some(change) = change.as_ref().filter(|c| takes_fast_path(c)) {
-                raw_rect_attempted = true;
-                raw_rect_sent =
-                    emit_rects(state.capture, &texture, change, frame_seq, &mut contexts[0])?;
-                metadata_took_fast_path = true;
+                if let Some(aligned) =
+                    block_aligned_raw_change(change, state.capture.width(), state.capture.height())?
+                {
+                    raw_rect_attempted = true;
+                    raw_rect_sent = emit_rects(
+                        state.capture,
+                        &texture,
+                        &aligned,
+                        frame_seq,
+                        &mut contexts[0],
+                    )?;
+                    metadata_took_fast_path = true;
+                }
             }
         }
 
@@ -1283,16 +1376,35 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                         state.capture.width(),
                         state.capture.height(),
                     ));
-                    raw_rect_attempted = true;
-                    raw_rect_sent = send_rects(
-                        rect_pixels,
-                        frame_seq,
+                    let measured_change = ChangeInfo {
+                        rects: rect_pixels
+                            .iter()
+                            .map(|rect| DirtyRect {
+                                x: u32::from(rect.x),
+                                y: u32::from(rect.y),
+                                w: u32::from(rect.w),
+                                h: u32::from(rect.h),
+                            })
+                            .collect(),
+                        move_rects: 0,
+                    };
+                    if let Some(aligned) = block_aligned_raw_change(
+                        &measured_change,
                         state.capture.width(),
                         state.capture.height(),
-                        diff_start,
-                        true,
-                        &mut contexts[0],
-                    )?;
+                    )? {
+                        raw_rect_attempted = true;
+                        let rect_pixels = state.capture.read_rects(&texture, &aligned)?;
+                        raw_rect_sent = send_rects(
+                            rect_pixels,
+                            frame_seq,
+                            state.capture.width(),
+                            state.capture.height(),
+                            diff_start,
+                            true,
+                            &mut contexts[0],
+                        )?;
+                    }
                 }
             }
         }

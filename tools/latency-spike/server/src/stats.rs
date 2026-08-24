@@ -41,11 +41,13 @@ pub struct Header {
     /// Bumped whenever a field changes meaning, so an archived file stays readable.
     pub schema: u32,
     /// Wire dialect this server speaks. 2 = video rides `MSG_VIDEO_SEQ` (sequence
-    /// prefix) and `MSG_RECTS` may appear.
+    /// prefix) and `MSG_RECTS` may appear. Wire 7 adds the mandatory dedicated
+    /// sparse-pixel connection.
     pub wire_version: u32,
     pub qpc_frequency: i64,
     pub video_port: u16,
     pub input_port: u16,
+    pub sparse_port: u16,
     pub bitrate_kbps: u32,
     pub gop: u32,
     pub fps: u32,
@@ -155,6 +157,7 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
     }]
 }
 
+/// Schema 11: headers name the dedicated sparse-pixel listener.
 /// Schema 10: `dropped_frames` counts complete logical desktop frames withheld
 /// before the sender — including fixed conversion-budget pressure, assembly,
 /// recovery, or queue admission — rather than independently dropped tiles.
@@ -176,7 +179,8 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
 /// (Schema 4: the header gained `source`, naming which capture path the run used.
 /// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
-pub const SCHEMA: u32 = 10;
+pub const SCHEMA: u32 = 11;
+/// Bumped 6 → 7 by the mandatory dedicated sparse-pixel connection.
 /// Bumped 5 → 6 by the atomic coverage-bearing `MSG_VIDEO_UPDATE` envelope.
 /// (Bumped 4 → 5 by the return to H.264 and the tiled `MSG_VIDEO_TILE` envelope.
 /// (Bumped 3 → 4 by tranche 6b's H.264 → HEVC bitstream change.
@@ -184,7 +188,7 @@ pub const SCHEMA: u32 = 10;
 /// kinds beside the original VK down/up) — the video/rects wire itself is
 /// unchanged, but the header's `wire_version` couples both dialects together so a
 /// client's video-header gate also gates which input records it may send.
-pub const WIRE_VERSION: u32 = 6;
+pub const WIRE_VERSION: u32 = 7;
 
 impl Header {
     pub fn new() -> Self {
@@ -195,6 +199,7 @@ impl Header {
             qpc_frequency: 0,
             video_port: 0,
             input_port: 0,
+            sparse_port: 0,
             bitrate_kbps: 0,
             gop: 0,
             fps: 0,
@@ -783,6 +788,7 @@ mod tests {
     fn the_header_publishes_the_frequency_the_encoder_choice_and_the_source() {
         let mut h = Header::new();
         h.qpc_frequency = 10_000_000;
+        h.sparse_port = 9504;
         h.width = 5120;
         h.height = 2880;
         h.tiles = tile_layout(h.width, h.height);
@@ -806,6 +812,7 @@ mod tests {
         assert_eq!(v["schema"], SCHEMA);
         assert_eq!(v["wire_version"], WIRE_VERSION);
         assert_eq!(v["qpc_frequency"], 10_000_000);
+        assert_eq!(v["sparse_port"], 9504);
         assert_eq!(v["codec"], "h264-420");
         assert_eq!(v["tiles"][0]["width"], 2560);
         assert_eq!(v["tiles"][1]["x"], 2560);
@@ -823,6 +830,6 @@ mod tests {
         assert_eq!(v["clipboard"], true);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 27, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 28, "unexpected field count: {keys:?}");
     }
 }

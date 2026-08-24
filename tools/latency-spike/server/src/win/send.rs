@@ -1,6 +1,7 @@
-//! Stage 4 — the video socket and the stats file, both owned by one thread.
+//! Stage 4 — independent video and sparse-pixel writers; the video writer also
+//! owns the stats file.
 //!
-//! One writer, on purpose. The capture thread and the input thread both produce
+//! One bulk writer, on purpose. The capture thread and the input thread both produce
 //! stats lines, and the video socket has to interleave them with the access units;
 //! funnelling everything through a single [`Outbound`] channel means neither a mutex
 //! nor an interleaving question exists.
@@ -15,7 +16,8 @@ use crate::stats::{FrameRecord, QpcClock, RectRecord};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,10 +40,6 @@ pub enum Outbound {
     /// HEVC remains the explicit full-frame fallback and retains its existing
     /// per-tile envelope; it never claims the AVC regional-update contract.
     FrameSet(Vec<FrameTile>),
-    /// One captured frame's raw dirty rects — a complete `MSG_RECTS` payload as
-    /// `crate::rects::encode` produced it — plus its stats row. `send_done_us` is
-    /// filled in here because only this thread knows when the write returned.
-    Rects(Box<RectRecord>, Vec<u8>),
     /// A pre-serialised JSONL line (the header, or an input event).
     Line(String),
 }
@@ -53,10 +51,118 @@ pub struct FrameTile {
     pub au: Vec<u8>,
 }
 
+pub struct SparseOutbound {
+    pub record: Box<RectRecord>,
+    pub payload: Vec<u8>,
+}
+
+/// Dedicated raw-final-pixel writer. It has its own socket, queue and thread, so
+/// no video write can hold its bytes behind an access unit.
+pub struct SparseSender {
+    listener: TcpListener,
+    client: Option<TcpStream>,
+    connected: Arc<AtomicBool>,
+    session_epoch: Arc<AtomicU64>,
+    accepted_epoch: u64,
+    stats_tx: SyncSender<Outbound>,
+    clock: QpcClock,
+    scratch: Vec<u8>,
+}
+
+impl SparseSender {
+    pub fn new(
+        listener: TcpListener,
+        connected: Arc<AtomicBool>,
+        session_epoch: Arc<AtomicU64>,
+        stats_tx: SyncSender<Outbound>,
+        clock: QpcClock,
+    ) -> Result<Self> {
+        listener.set_nonblocking(true)?;
+        eprintln!("sparse: listening on {}", listener.local_addr()?);
+        Ok(Self {
+            listener,
+            client: None,
+            connected,
+            session_epoch,
+            accepted_epoch: 0,
+            stats_tx,
+            clock,
+            scratch: Vec::new(),
+        })
+    }
+
+    fn poll_accept(&mut self) {
+        let current_epoch = self.session_epoch.load(Ordering::Acquire);
+        if self.client.is_some() && self.accepted_epoch != current_epoch {
+            self.client = None;
+            self.connected.store(false, Ordering::Release);
+        }
+        if self.client.is_some() {
+            return;
+        }
+        if current_epoch == 0 {
+            return;
+        }
+        match self.listener.accept() {
+            Ok((stream, peer)) => {
+                if stream
+                    .set_nodelay(true)
+                    .and_then(|()| stream.set_write_timeout(Some(WRITE_TIMEOUT)))
+                    .is_ok()
+                {
+                    eprintln!("sparse: connected {peer}");
+                    self.client = Some(stream);
+                    self.accepted_epoch = current_epoch;
+                    self.connected.store(true, Ordering::Release);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => eprintln!("sparse: accept failed: {error}"),
+        }
+    }
+
+    fn write(&mut self, update: SparseOutbound) {
+        let Some(client) = self.client.as_mut() else {
+            self.connected.store(false, Ordering::Release);
+            return;
+        };
+        self.scratch.clear();
+        framing::encode(framing::MSG_RECTS, &update.payload, &mut self.scratch);
+        if let Err(error) = client
+            .write_all(&self.scratch)
+            .and_then(|()| client.flush())
+        {
+            eprintln!("sparse: disconnected ({error})");
+            self.client = None;
+            self.connected.store(false, Ordering::Release);
+            return;
+        }
+        let mut record = update.record;
+        record.send_done_us = self.clock.micros(qpc::now());
+        let _ = self
+            .stats_tx
+            .try_send(Outbound::Line(crate::stats::to_line(&*record)));
+    }
+
+    pub fn run(mut self, rx: Receiver<SparseOutbound>) {
+        loop {
+            self.poll_accept();
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(update) => self.write(update),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        self.connected.store(false, Ordering::Release);
+    }
+}
+
 pub struct Sender {
     listener: TcpListener,
     client: Option<TcpStream>,
     connected: Arc<AtomicBool>,
+    sparse_connected: Arc<AtomicBool>,
+    session_epoch: Arc<AtomicU64>,
     cursor_hidden: Arc<AtomicBool>,
     sent_cursor_hidden: Option<bool>,
     stats: Option<BufWriter<File>>,
@@ -76,6 +182,8 @@ impl Sender {
         header_line: String,
         clock: QpcClock,
         connected: Arc<AtomicBool>,
+        sparse_connected: Arc<AtomicBool>,
+        session_epoch: Arc<AtomicU64>,
         cursor_hidden: Arc<AtomicBool>,
     ) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
@@ -93,6 +201,8 @@ impl Sender {
             listener,
             client: None,
             connected,
+            sparse_connected,
+            session_epoch,
             cursor_hidden,
             sent_cursor_hidden: None,
             stats,
@@ -120,6 +230,8 @@ impl Sender {
                 }
                 eprintln!("video: connected {peer}");
                 self.client = Some(stream);
+                self.session_epoch.fetch_add(1, Ordering::AcqRel);
+                self.sparse_connected.store(false, Ordering::Release);
                 self.connected.store(true, Ordering::Release);
                 // The header goes first so a viewer knows the QPC frequency before
                 // it sees a single stamp.
@@ -249,11 +361,6 @@ impl Sender {
                     stats_lines.push(crate::stats::to_line(&*tile.record));
                 }
             }
-            Outbound::Rects(mut record, payload) => {
-                self.write_message(framing::MSG_RECTS, &payload);
-                record.send_done_us = self.clock.micros(qpc::now());
-                stats_lines.push(crate::stats::to_line(&*record));
-            }
             Outbound::Line(line) => stats_lines.push(line),
         }
     }
@@ -289,7 +396,6 @@ impl Sender {
             // so stats may follow payloads that arrived later in this bounded batch
             // rather than delaying those payloads.
             send_schedule::payload_first(&mut batch, |msg| match msg {
-                Outbound::Rects(..) => BatchKind::Payload,
                 Outbound::Video(..) | Outbound::FrameSet(..) => BatchKind::Payload,
                 Outbound::Line(..) => BatchKind::Line,
             });

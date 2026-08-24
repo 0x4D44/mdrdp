@@ -62,6 +62,8 @@ pub struct Config {
     pub output: usize,
     pub video_port: u16,
     pub input_port: u16,
+    /// Dedicated downstream raw-final-pixel channel.
+    pub sparse_port: u16,
     /// The auxiliary channel's port: clipboard now, audio in tranche 6.
     ///
     /// `0` means "do not serve it", which is how a run can opt out without a
@@ -87,6 +89,7 @@ pub struct Config {
 
 pub const DEFAULT_VIDEO_PORT: u16 = 9500;
 pub const DEFAULT_INPUT_PORT: u16 = 9501;
+pub const DEFAULT_SPARSE_PORT: u16 = 9504;
 pub const DEFAULT_BITRATE_KBPS: u32 = 20_000;
 pub const DEFAULT_GOP: u32 = 120;
 
@@ -106,6 +109,7 @@ impl Default for Config {
             output: 0,
             video_port: DEFAULT_VIDEO_PORT,
             input_port: DEFAULT_INPUT_PORT,
+            sparse_port: DEFAULT_SPARSE_PORT,
             aux_port: DEFAULT_AUX_PORT,
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             gop: DEFAULT_GOP,
@@ -125,6 +129,7 @@ impl Default for Config {
 pub fn usage() -> &'static str {
     "usage:\n  \
      rhydra-server --output N [--video-port 9500] [--input-port 9501]\n               \
+     [--sparse-port 9504]\n               \
      [--aux-port 9503 | --aux-port 0 to disable]\n               \
                   [--bitrate-kbps 20000] [--gop 120] [--out FILE.jsonl]\n               \
                   [--no-rects] [--no-diff] [--source dxgi|idd]\n  \
@@ -141,8 +146,8 @@ pub fn usage() -> &'static str {
      Desktop Duplication, removing duplication's present-to-acquire gap. It needs\n  \
      the driver installed and started, and it takes no --output: the pool is found\n  \
      by name. --source dxgi is the default and the fallback.\n\n\
-     Both listeners bind 127.0.0.1 only. Reach them over an SSH tunnel:\n  \
-     ssh -L 9500:127.0.0.1:9500 -L 9501:127.0.0.1:9501 user@host"
+     Session listeners bind 127.0.0.1 only. Reach them over an SSH tunnel; the\n  \
+     mdrdp client forwards video, input, control, auxiliary and sparse ports."
 }
 
 pub fn parse(args: &[String]) -> Result<Config, String> {
@@ -190,6 +195,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                 cfg.input_port = value
                     .parse()
                     .map_err(|e| format!("--input-port {value:?}: {e}"))?
+            }
+            "--sparse-port" => {
+                cfg.sparse_port = value
+                    .parse()
+                    .map_err(|e| format!("--sparse-port {value:?}: {e}"))?
             }
             "--aux-port" => {
                 cfg.aux_port = value
@@ -240,20 +250,26 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             usage()
         ));
     }
-    if cfg.video_port == 0 || cfg.input_port == 0 {
+    if cfg.video_port == 0 || cfg.input_port == 0 || cfg.sparse_port == 0 {
         return Err("ports must be non-zero: an ephemeral port cannot be tunnelled".to_owned());
     }
-    if cfg.video_port == cfg.input_port {
+    if cfg.video_port == cfg.input_port
+        || cfg.video_port == cfg.sparse_port
+        || cfg.input_port == cfg.sparse_port
+    {
         return Err(format!(
-            "--video-port and --input-port are both {}; they are separate connections",
-            cfg.video_port
+            "video, input and sparse ports must be distinct ({}, {}, {})",
+            cfg.video_port, cfg.input_port, cfg.sparse_port
         ));
     }
     // No `aux_port != 0` guard: the check above has already refused a zero video
     // or input port, so the documented "off" value cannot collide with either.
-    if cfg.aux_port == cfg.video_port || cfg.aux_port == cfg.input_port {
+    if cfg.aux_port == cfg.video_port
+        || cfg.aux_port == cfg.input_port
+        || cfg.aux_port == cfg.sparse_port
+    {
         return Err(format!(
-            "--aux-port {} collides with the video or input port; they are separate connections",
+            "--aux-port {} collides with another session port",
             cfg.aux_port
         ));
     }
@@ -281,6 +297,7 @@ mod tests {
         let cfg = parse(&args(&["--output", "0"])).unwrap();
         assert_eq!(cfg.video_port, 9500);
         assert_eq!(cfg.input_port, 9501);
+        assert_eq!(cfg.sparse_port, 9504);
         assert_eq!(cfg.bitrate_kbps, 20_000);
         assert_eq!(cfg.gop, 120);
         assert_eq!(cfg.out, None);
@@ -308,6 +325,8 @@ mod tests {
             "19500",
             "--input-port",
             "19501",
+            "--sparse-port",
+            "19504",
             "--no-rects",
             "--bitrate-kbps",
             "8000",
@@ -323,6 +342,7 @@ mod tests {
         assert_eq!(cfg.output, 2);
         assert_eq!(cfg.video_port, 19500);
         assert_eq!(cfg.input_port, 19501);
+        assert_eq!(cfg.sparse_port, 19504);
         assert_eq!(cfg.bitrate_kbps, 8000);
         assert_eq!(cfg.gop, 30);
         assert_eq!(cfg.out.as_deref(), Some("/tmp/x.jsonl"));
@@ -455,7 +475,7 @@ mod tests {
 
     #[test]
     fn an_aux_port_colliding_with_another_channel_is_refused() {
-        for other in ["--video-port", "--input-port"] {
+        for other in ["--video-port", "--input-port", "--sparse-port"] {
             let cfg = parse(&args(&[
                 "--source",
                 "idd",
@@ -485,7 +505,7 @@ mod tests {
             "9500",
         ]))
         .unwrap_err();
-        assert!(err.contains("separate connections"), "{err}");
+        assert!(err.contains("must be distinct"), "{err}");
     }
 
     #[test]

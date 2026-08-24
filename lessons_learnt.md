@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Separate SSH forwards still share head-of-line blocking; split processes (`native/ssh.rs:interactive_ssh_args`).
+  `-L` creates an independent channel, not an independent encrypted TCP transport. Keep bulk video
+  in one SSH child and latency-sensitive input/raw pixels in another, and prove both are ready.
+
 - Invalidate AVC444 on destination writes; LC2 needs a live luma baseline (`client.rs:invalidate_avc444`).
   Otherwise stale chroma survives ClearCodec, fills, copies, or progressive updates and repaints over newer content.
 
