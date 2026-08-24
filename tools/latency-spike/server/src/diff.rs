@@ -251,6 +251,328 @@ fn tile_differs(cur: Mapped<'_>, prev: Mapped<'_>, x0: u32, x1: u32, y0: u32, y1
     false
 }
 
+/// One copy inferred from the previous frame plus exact final-pixel coverage for
+/// everything that copy cannot reproduce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferredMove {
+    pub movement: MoveRegion,
+    pub remainder: Vec<Region>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveRegion {
+    pub source: Region,
+    pub destination: Region,
+}
+
+const MOVE_SAMPLE_AXIS: u32 = 8;
+const MAX_INFERENCE_REGIONS: usize = 8;
+
+/// Infer one useful vertical translation from complete damage coverage.
+///
+/// Sampling chooses exactly one displacement. The full pass then proves what that
+/// copy reproduces and returns coverage for every mismatch, so a false sample hit
+/// costs an optimization opportunity or extra remainder bytes, never stale pixels.
+#[allow(clippy::too_many_arguments)]
+pub fn infer_vertical_move(
+    cur: &[u8],
+    cur_pitch: usize,
+    prev: &[u8],
+    prev_pitch: usize,
+    width: u32,
+    height: u32,
+    damage: &[Region],
+    max_shift: u32,
+) -> Option<InferredMove> {
+    let cur = Mapped {
+        bytes: cur,
+        pitch: cur_pitch,
+    };
+    let prev = Mapped {
+        bytes: prev,
+        pitch: prev_pitch,
+    };
+    if width == 0
+        || height == 0
+        || max_shift == 0
+        || !covers(cur, width, height)
+        || !covers(prev, width, height)
+    {
+        return None;
+    }
+
+    let mut candidates: Vec<_> = damage
+        .iter()
+        .filter_map(|region| clip_region(*region, width, height))
+        .filter(|region| region.w >= TILE_W && region.h >= TILE_H * 2)
+        .collect();
+    candidates.sort_unstable_by_key(|region| std::cmp::Reverse(region_area(*region)));
+    candidates.truncate(MAX_INFERENCE_REGIONS);
+
+    let mut best: Option<(u32, u32, u64, u32, MoveRegion, Region)> = None;
+    for candidate in candidates {
+        // A move smaller than its exposed strip cannot save pixel work. The strict
+        // half-height bound also caps the candidate loop independently of input.
+        let shift_limit = max_shift.min((candidate.h - 1) / 2);
+        for shift in 1..=shift_limit {
+            for downward in [false, true] {
+                let movement = vertical_movement(candidate, shift, downward);
+                let (matches, samples) = sample_movement(cur, prev, movement);
+                let moved = region_area(movement.destination);
+                let key = (matches, samples, moved, shift, movement, candidate);
+                let replace = best.as_ref().is_none_or(
+                    |(best_matches, best_samples, best_moved, best_shift, _, _)| {
+                        u64::from(matches) * u64::from(*best_samples)
+                            > u64::from(*best_matches) * u64::from(samples)
+                            || (u64::from(matches) * u64::from(*best_samples)
+                                == u64::from(*best_matches) * u64::from(samples)
+                                && (moved > *best_moved
+                                    || (moved == *best_moved && shift < *best_shift)))
+                    },
+                );
+                if replace {
+                    best = Some(key);
+                }
+            }
+        }
+    }
+
+    let (_, _, _, shift, movement, candidate) = best?;
+    let mismatches = shifted_diff_rects(cur, prev, movement);
+    let mismatch_pixels: u64 = mismatches.iter().map(|region| region_area(*region)).sum();
+    let moved_pixels = region_area(movement.destination);
+    let matched_pixels = moved_pixels.saturating_sub(mismatch_pixels);
+    if matched_pixels.saturating_mul(4) < moved_pixels.saturating_mul(3) {
+        return None;
+    }
+
+    let mut remainder = Vec::new();
+    for region in damage.iter().filter_map(|r| clip_region(*r, width, height)) {
+        remainder.extend(subtract_region(region, candidate));
+    }
+    remainder.extend(mismatches);
+    remainder.push(if movement.destination.y == candidate.y {
+        Region {
+            x: candidate.x,
+            y: candidate.y + candidate.h - shift,
+            w: candidate.w,
+            h: shift,
+        }
+    } else {
+        Region {
+            x: candidate.x,
+            y: candidate.y,
+            w: candidate.w,
+            h: shift,
+        }
+    });
+    remainder.sort_unstable_by_key(|region| (region.y, region.x));
+    Some(InferredMove {
+        movement,
+        remainder,
+    })
+}
+
+fn vertical_movement(region: Region, shift: u32, downward: bool) -> MoveRegion {
+    let moved_height = region.h - shift;
+    if downward {
+        MoveRegion {
+            source: Region {
+                h: moved_height,
+                ..region
+            },
+            destination: Region {
+                y: region.y + shift,
+                h: moved_height,
+                ..region
+            },
+        }
+    } else {
+        MoveRegion {
+            source: Region {
+                y: region.y + shift,
+                h: moved_height,
+                ..region
+            },
+            destination: Region {
+                h: moved_height,
+                ..region
+            },
+        }
+    }
+}
+
+fn sample_movement(cur: Mapped<'_>, prev: Mapped<'_>, movement: MoveRegion) -> (u32, u32) {
+    let mut matches = 0;
+    let mut samples = 0;
+    for yi in 0..MOVE_SAMPLE_AXIS {
+        let local_y = yi * (movement.destination.h - 1) / (MOVE_SAMPLE_AXIS - 1);
+        for xi in 0..MOVE_SAMPLE_AXIS {
+            let local_x = xi * (movement.destination.w - 1) / (MOVE_SAMPLE_AXIS - 1);
+            let cur_offset = (movement.destination.y + local_y) as usize * cur.pitch
+                + (movement.destination.x + local_x) as usize * BPP;
+            let prev_offset = (movement.source.y + local_y) as usize * prev.pitch
+                + (movement.source.x + local_x) as usize * BPP;
+            matches += u32::from(
+                cur.bytes[cur_offset..cur_offset + BPP]
+                    == prev.bytes[prev_offset..prev_offset + BPP],
+            );
+            samples += 1;
+        }
+    }
+    (matches, samples)
+}
+
+fn shifted_diff_rects(cur: Mapped<'_>, prev: Mapped<'_>, movement: MoveRegion) -> Vec<Region> {
+    let destination = movement.destination;
+    let col0 = destination.x / TILE_W;
+    let col1 = (destination.x + destination.w - 1) / TILE_W;
+    let row0 = destination.y / TILE_H;
+    let row1 = (destination.y + destination.h - 1) / TILE_H;
+    let mut out = Vec::new();
+    let mut open: Vec<Region> = Vec::new();
+    let mut runs: Vec<Region> = Vec::new();
+
+    for tile_row in row0..=row1 {
+        let y0 = (tile_row * TILE_H).max(destination.y);
+        let y1 = ((tile_row + 1) * TILE_H).min(destination.y + destination.h);
+        let mut run: Option<(u32, u32)> = None;
+        for tile_col in col0..=col1 {
+            let x0 = (tile_col * TILE_W).max(destination.x);
+            let x1 = ((tile_col + 1) * TILE_W).min(destination.x + destination.w);
+            if shifted_tile_differs(cur, prev, movement, x0, x1, y0, y1) {
+                match run.as_mut() {
+                    Some(run) => run.1 = x1,
+                    None => run = Some((x0, x1)),
+                }
+            } else if let Some((start, end)) = run.take() {
+                runs.push(Region {
+                    x: start,
+                    y: y0,
+                    w: end - start,
+                    h: y1 - y0,
+                });
+            }
+        }
+        if let Some((start, end)) = run.take() {
+            runs.push(Region {
+                x: start,
+                y: y0,
+                w: end - start,
+                h: y1 - y0,
+            });
+        }
+
+        let mut next_open = Vec::with_capacity(runs.len());
+        for region in runs.drain(..) {
+            match open.iter().position(|prior| {
+                prior.x == region.x && prior.w == region.w && prior.y + prior.h == region.y
+            }) {
+                Some(index) => {
+                    let mut merged = open.swap_remove(index);
+                    merged.h += region.h;
+                    next_open.push(merged);
+                }
+                None => next_open.push(region),
+            }
+        }
+        out.append(&mut open);
+        open = next_open;
+    }
+    out.append(&mut open);
+    out.sort_unstable_by_key(|region| (region.y, region.x));
+    out
+}
+
+fn shifted_tile_differs(
+    cur: Mapped<'_>,
+    prev: Mapped<'_>,
+    movement: MoveRegion,
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+) -> bool {
+    let x_delta = i64::from(movement.source.x) - i64::from(movement.destination.x);
+    let y_delta = i64::from(movement.source.y) - i64::from(movement.destination.y);
+    let cur_first = x0 as usize * BPP;
+    let cur_last = x1 as usize * BPP;
+    let prev_first = (i64::from(x0) + x_delta) as usize * BPP;
+    let prev_last = (i64::from(x1) + x_delta) as usize * BPP;
+    for y in y0..y1 {
+        let cur_row = y as usize * cur.pitch;
+        let prev_row = (i64::from(y) + y_delta) as usize * prev.pitch;
+        if cur.bytes[cur_row + cur_first..cur_row + cur_last]
+            != prev.bytes[prev_row + prev_first..prev_row + prev_last]
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn clip_region(region: Region, width: u32, height: u32) -> Option<Region> {
+    let x0 = region.x.min(width);
+    let y0 = region.y.min(height);
+    let x1 = region.x.saturating_add(region.w).min(width);
+    let y1 = region.y.saturating_add(region.h).min(height);
+    (x1 > x0 && y1 > y0).then_some(Region {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
+fn region_area(region: Region) -> u64 {
+    u64::from(region.w) * u64::from(region.h)
+}
+
+/// `region - cut` as up to four non-overlapping rectangles.
+fn subtract_region(region: Region, cut: Region) -> Vec<Region> {
+    let left = region.x.max(cut.x);
+    let top = region.y.max(cut.y);
+    let right = (region.x + region.w).min(cut.x + cut.w);
+    let bottom = (region.y + region.h).min(cut.y + cut.h);
+    if right <= left || bottom <= top {
+        return vec![region];
+    }
+    let mut out = Vec::with_capacity(4);
+    if top > region.y {
+        out.push(Region {
+            x: region.x,
+            y: region.y,
+            w: region.w,
+            h: top - region.y,
+        });
+    }
+    if bottom < region.y + region.h {
+        out.push(Region {
+            x: region.x,
+            y: bottom,
+            w: region.w,
+            h: region.y + region.h - bottom,
+        });
+    }
+    if left > region.x {
+        out.push(Region {
+            x: region.x,
+            y: top,
+            w: left - region.x,
+            h: bottom - top,
+        });
+    }
+    if right < region.x + region.w {
+        out.push(Region {
+            x: right,
+            y: top,
+            w: region.x + region.w - right,
+            h: bottom - top,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,6 +864,120 @@ mod tests {
                 whole_desktop(),
                 64
             ),
+            None
+        );
+    }
+
+    fn scroll_up(prev: &[u8], shift: u32) -> Vec<u8> {
+        let mut cur = vec![0xCC; PITCH * H as usize];
+        let row_bytes = W as usize * BPP;
+        for y in 0..H - shift {
+            let src = (y + shift) as usize * PITCH;
+            let dst = y as usize * PITCH;
+            cur[dst..dst + row_bytes].copy_from_slice(&prev[src..src + row_bytes]);
+        }
+        cur
+    }
+
+    fn scroll_down(prev: &[u8], shift: u32) -> Vec<u8> {
+        let mut cur = vec![0xDD; PITCH * H as usize];
+        let row_bytes = W as usize * BPP;
+        for y in shift..H {
+            let src = (y - shift) as usize * PITCH;
+            let dst = y as usize * PITCH;
+            cur[dst..dst + row_bytes].copy_from_slice(&prev[src..src + row_bytes]);
+        }
+        cur
+    }
+
+    #[test]
+    fn vertical_move_inference_finds_upward_scroll_and_exposed_rows() {
+        let prev = surface(W, H, PITCH, 0x11);
+        let cur = scroll_up(&prev, 16);
+        let inferred = infer_vertical_move(&cur, PITCH, &prev, PITCH, W, H, &[whole_desktop()], 24)
+            .expect("one exact upward translation");
+        assert_eq!(
+            inferred.movement,
+            MoveRegion {
+                source: Region {
+                    x: 0,
+                    y: 16,
+                    w: W,
+                    h: H - 16,
+                },
+                destination: Region {
+                    x: 0,
+                    y: 0,
+                    w: W,
+                    h: H - 16,
+                },
+            }
+        );
+        assert_eq!(
+            inferred.remainder,
+            vec![Region {
+                x: 0,
+                y: H - 16,
+                w: W,
+                h: 16,
+            }]
+        );
+    }
+
+    #[test]
+    fn vertical_move_inference_finds_downward_scroll() {
+        let prev = surface(W, H, PITCH, 0x22);
+        let cur = scroll_down(&prev, 8);
+        let inferred = infer_vertical_move(&cur, PITCH, &prev, PITCH, W, H, &[whole_desktop()], 24)
+            .expect("one exact downward translation");
+        assert_eq!(inferred.movement.source.y, 0);
+        assert_eq!(inferred.movement.destination.y, 8);
+        assert_eq!(inferred.movement.destination.h, H - 8);
+        assert_eq!(
+            inferred.remainder,
+            vec![Region {
+                x: 0,
+                y: 0,
+                w: W,
+                h: 8,
+            }]
+        );
+    }
+
+    #[test]
+    fn vertical_move_inference_covers_scattered_changes_inside_the_move() {
+        let prev = surface(W, H, PITCH, 0x33);
+        let mut cur = scroll_up(&prev, 16);
+        flip(&mut cur, PITCH, 70, 20);
+        let inferred = infer_vertical_move(&cur, PITCH, &prev, PITCH, W, H, &[whole_desktop()], 24)
+            .expect("mostly translated pixels remain worthwhile");
+        assert!(inferred
+            .remainder
+            .iter()
+            .any(|region| contains(*region, 70, 20)));
+        assert!(inferred
+            .remainder
+            .iter()
+            .any(|region| contains(*region, 70, H - 1)));
+    }
+
+    #[test]
+    fn unrelated_pixels_are_not_invented_into_a_move() {
+        let prev = surface(W, H, PITCH, 0x44);
+        let mut cur = vec![0u8; PITCH * H as usize];
+        for y in 0..H {
+            for x in 0..W {
+                let offset = y as usize * PITCH + x as usize * BPP;
+                cur[offset..offset + BPP].copy_from_slice(&[
+                    (x.wrapping_mul(17) ^ y.wrapping_mul(29)) as u8,
+                    (x.wrapping_mul(31).wrapping_add(y)) as u8,
+                    0x5A,
+                    0xFF,
+                ]);
+            }
+        }
+        assert_eq!(
+            infer_vertical_move(&cur, PITCH, &prev, PITCH, W, H, &[whole_desktop()], 24,),
             None
         );
     }

@@ -308,6 +308,125 @@ impl PixelDiff {
         }
         Ok(outcome)
     }
+
+    /// Test one bounded vertical translation against the retained frame.
+    ///
+    /// This uses the same lazy staging pair as [`Self::diff`]. The returned
+    /// remainder is coverage only; the normal routing planner decides raw versus
+    /// video after the mapping is released.
+    #[allow(clippy::too_many_arguments)]
+    pub fn infer_vertical_move(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        texture: &ID3D11Texture2D,
+        region: diff::Region,
+        damage: &[diff::Region],
+        max_shift: u32,
+    ) -> Result<Option<diff::InferredMove>> {
+        if !self.prev_valid || region.w == 0 || region.h == 0 || max_shift == 0 {
+            return Ok(None);
+        }
+        if self.staging_cur.is_none() {
+            self.staging_cur = Some(create_texture(
+                device,
+                self.width,
+                self.height,
+                Usage::Read,
+            )?);
+        }
+        if self.staging_prev.is_none() {
+            self.staging_prev = Some(create_texture(
+                device,
+                self.width,
+                self.height,
+                Usage::Read,
+            )?);
+        }
+        let prev = self.prev.as_ref().ok_or("previous-frame texture missing")?;
+        let staging_cur = self
+            .staging_cur
+            .as_ref()
+            .ok_or("current staging texture missing")?;
+        let staging_prev = self
+            .staging_prev
+            .as_ref()
+            .ok_or("previous staging texture missing")?;
+        let box_ = D3D11_BOX {
+            left: region.x,
+            top: region.y,
+            front: 0,
+            right: region.x + region.w,
+            bottom: region.y + region.h,
+            back: 1,
+        };
+        // SAFETY: the region is clipped to all four equal-sized BGRA textures.
+        unsafe {
+            context.CopySubresourceRegion(
+                staging_cur,
+                0,
+                region.x,
+                region.y,
+                0,
+                texture,
+                0,
+                Some(&box_ as *const D3D11_BOX),
+            );
+            context.CopySubresourceRegion(
+                staging_prev,
+                0,
+                region.x,
+                region.y,
+                0,
+                prev,
+                0,
+                Some(&box_ as *const D3D11_BOX),
+            );
+        }
+
+        let mut cur_map = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: live staging subresource 0, mapped read-only exactly once.
+        unsafe { context.Map(staging_cur, 0, D3D11_MAP_READ, 0, Some(&mut cur_map)) }?;
+        let mut prev_map = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: as above, for the other staging texture.
+        if let Err(error) =
+            unsafe { context.Map(staging_prev, 0, D3D11_MAP_READ, 0, Some(&mut prev_map)) }
+        {
+            // SAFETY: balances the successful current map before returning.
+            unsafe { context.Unmap(staging_cur, 0) };
+            return Err(error.into());
+        }
+
+        let cur_pitch = cur_map.RowPitch as usize;
+        let prev_pitch = prev_map.RowPitch as usize;
+        // SAFETY: each mapping covers `height` rows at its reported row pitch.
+        let cur = unsafe {
+            std::slice::from_raw_parts(cur_map.pData as *const u8, cur_pitch * self.height as usize)
+        };
+        // SAFETY: as above, for the previous-frame staging map.
+        let prev_pixels = unsafe {
+            std::slice::from_raw_parts(
+                prev_map.pData as *const u8,
+                prev_pitch * self.height as usize,
+            )
+        };
+        let inferred = diff::infer_vertical_move(
+            cur,
+            cur_pitch,
+            prev_pixels,
+            prev_pitch,
+            self.width,
+            self.height,
+            damage,
+            max_shift,
+        );
+        // SAFETY: exactly one unmap for each successful map above.
+        unsafe {
+            context.Unmap(staging_prev, 0);
+            context.Unmap(staging_cur, 0);
+        }
+        Ok(inferred)
+    }
 }
 
 /// Which of the two texture roles [`create_texture`] is making.
