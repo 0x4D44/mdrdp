@@ -32,9 +32,11 @@ const DRAIN_BATCH: usize = 8;
 
 /// What the sender thread consumes.
 pub enum Outbound {
-    /// Every independently encoded tile for one captured desktop frame. The set is
-    /// one queue item, so backpressure can drop a logical frame but never strand
-    /// half of a 5K frame at the viewer.
+    /// One complete logical video update. Coverage and all selected tile AUs share
+    /// one framed payload, so the socket cannot expose a partial 5K update.
+    Video(Vec<FrameTile>, Vec<u8>),
+    /// HEVC remains the explicit full-frame fallback and retains its existing
+    /// per-tile envelope; it never claims the AVC regional-update contract.
     FrameSet(Vec<FrameTile>),
     /// One captured frame's raw dirty rects — a complete `MSG_RECTS` payload as
     /// `crate::rects::encode` produced it — plus its stats row. `send_done_us` is
@@ -168,25 +170,9 @@ impl Sender {
         }
     }
 
-    /// One H.264 tile access unit with its tile id and capture sequence.
     fn write_video(&mut self, tile_id: u8, seq: u64, au: &[u8]) {
-        let Some(client) = self.client.as_mut() else {
-            return;
-        };
-        self.scratch.clear();
-        let length = (framing::TILE_AU_PREFIX + au.len() + 1) as u32;
-        self.scratch.extend_from_slice(&length.to_le_bytes());
-        self.scratch.push(framing::MSG_VIDEO_TILE);
-        self.scratch.push(tile_id);
-        self.scratch.extend_from_slice(&[0; 3]);
-        self.scratch.extend_from_slice(&seq.to_le_bytes());
-        self.scratch.extend_from_slice(au);
-        let outcome = client
-            .write_all(&self.scratch)
-            .and_then(|()| client.flush());
-        if let Err(e) = outcome {
-            self.drop_client(&e.to_string());
-        }
+        let payload = framing::encode_tile_au(tile_id, seq, au);
+        self.write_message(framing::MSG_VIDEO_TILE, &payload);
     }
 
     /// Notice a viewer that closed its end without waiting for a write to fail.
@@ -249,6 +235,13 @@ impl Sender {
     /// Write one payload and append its rows for the batch's telemetry pass.
     fn handle(&mut self, msg: Outbound, stats_lines: &mut Vec<String>) {
         match msg {
+            Outbound::Video(tiles, payload) => {
+                self.write_message(framing::MSG_VIDEO_UPDATE, &payload);
+                for mut tile in tiles {
+                    tile.record.send_done_us = self.clock.micros(qpc::now());
+                    stats_lines.push(crate::stats::to_line(&*tile.record));
+                }
+            }
             Outbound::FrameSet(tiles) => {
                 for mut tile in tiles {
                     self.write_video(tile.tile_id, tile.seq, &tile.au);
@@ -301,7 +294,7 @@ impl Sender {
             // rather than delaying those payloads.
             send_schedule::payload_first(&mut batch, |msg| match msg {
                 Outbound::Rects(..) => BatchKind::Rects,
-                Outbound::FrameSet(..) => BatchKind::Frame,
+                Outbound::Video(..) | Outbound::FrameSet(..) => BatchKind::Frame,
                 Outbound::Line(..) => BatchKind::Line,
             });
             for msg in batch.drain(..) {

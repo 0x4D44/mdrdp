@@ -177,13 +177,14 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
 /// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
 pub const SCHEMA: u32 = 10;
-/// Bumped 4 → 5 by the return to H.264 and the tiled `MSG_VIDEO_TILE` envelope.
+/// Bumped 5 → 6 by the atomic coverage-bearing `MSG_VIDEO_UPDATE` envelope.
+/// (Bumped 4 → 5 by the return to H.264 and the tiled `MSG_VIDEO_TILE` envelope.
 /// (Bumped 3 → 4 by tranche 6b's H.264 → HEVC bitstream change.
 /// (Bumped 2 → 3 by tranche 3's input dialect (input-channel v2: scan/mouse/wheel
 /// kinds beside the original VK down/up) — the video/rects wire itself is
 /// unchanged, but the header's `wire_version` couples both dialects together so a
 /// client's video-header gate also gates which input records it may send.
-pub const WIRE_VERSION: u32 = 5;
+pub const WIRE_VERSION: u32 = 6;
 
 impl Header {
     pub fn new() -> Self {
@@ -247,7 +248,7 @@ pub struct FrameRecord {
     /// value the wire carries on `MSG_VIDEO_SEQ`/`MSG_RECTS`, so client and server
     /// rows join exactly. (Schema 1 counted emitted access units instead.)
     pub frame: u64,
-    /// Which independently encoded tile this row describes (wire v5).
+    /// Which independently encoded tile this row describes (wire v5+).
     pub tile_id: u8,
     pub present_qpc_us: i64,
     pub acquire_qpc_us: i64,

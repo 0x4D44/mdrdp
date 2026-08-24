@@ -88,20 +88,24 @@ impl Recovery {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct Complete<T> {
     pub(crate) seq: u64,
     pub(crate) tiles: Vec<T>,
 }
 
+#[cfg(test)]
 pub(crate) struct Push<T> {
     pub(crate) ready: Vec<Complete<T>>,
     pub(crate) dropped: u64,
 }
 
+#[cfg(test)]
 struct Partial<T> {
     tiles: Vec<Option<T>>,
 }
 
+#[cfg(test)]
 pub(crate) struct Assembler<T> {
     tile_count: usize,
     max_pending: usize,
@@ -109,6 +113,7 @@ pub(crate) struct Assembler<T> {
     retired_through: Option<u64>,
 }
 
+#[cfg(test)]
 impl<T> Assembler<T> {
     pub(crate) fn new(tile_count: usize, max_pending: usize) -> Self {
         assert!(tile_count > 0);

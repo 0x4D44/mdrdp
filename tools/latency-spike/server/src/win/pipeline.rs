@@ -25,6 +25,7 @@ use crate::diff;
 use crate::logical_frame;
 use crate::rects;
 use crate::stats::{self, FrameRecord, Header, QpcClock};
+use crate::video_update::{self, VideoKind, VideoTile, VideoUpdate};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -508,6 +509,45 @@ struct EmitCtx {
     emitted: Vec<send::FrameTile>,
 }
 
+struct VideoPlan {
+    atomic_avc: bool,
+    kind: VideoKind,
+    frame_width: u32,
+    frame_height: u32,
+    block_size: u16,
+    coverage: Vec<(u8, Vec<Region>)>,
+}
+
+fn full_video_plan(
+    codec: encode::Codec,
+    kind: VideoKind,
+    frame_width: u32,
+    frame_height: u32,
+    tiles: &[TilePipeline],
+) -> VideoPlan {
+    VideoPlan {
+        atomic_avc: codec == encode::Codec::H264,
+        kind,
+        frame_width,
+        frame_height,
+        block_size: 16,
+        coverage: tiles
+            .iter()
+            .map(|tile| {
+                (
+                    tile.header.id,
+                    vec![Region {
+                        x: tile.header.x,
+                        y: tile.header.y,
+                        width: tile.header.width,
+                        height: tile.header.height,
+                    }],
+                )
+            })
+            .collect(),
+    }
+}
+
 enum CodecEmitState {
     H264 {
         stream_sets: Option<AvcParameterSets>,
@@ -681,21 +721,18 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
 
 fn admit_emitted(
     ctx: &mut EmitCtx,
-    assembler: &mut logical_frame::Assembler<send::FrameTile>,
+    assembler: &mut logical_frame::PlannedAssembler<VideoPlan, send::FrameTile>,
     tx: &SyncSender<send::Outbound>,
     recovery: &mut logical_frame::Recovery,
     want_keyframe: &mut bool,
 ) -> Result<()> {
     for tile in ctx.emitted.drain(..) {
         let assembled = assembler.push(tile.seq, tile.tile_id, tile);
-        if assembled.dropped != 0 {
-            recovery.drop_incomplete(assembled.dropped);
-            *want_keyframe = true;
-        }
-        for mut frame in assembled.ready {
-            debug_assert!(frame.tiles.iter().all(|tile| tile.seq == frame.seq));
-            let has_keyframe = frame.tiles.iter().any(|tile| tile.record.keyframe);
-            let is_recovery = frame.tiles.iter().all(|tile| tile.record.keyframe);
+        for frame in assembled.ready {
+            debug_assert!(frame.tiles.iter().all(|(_, tile)| tile.seq == frame.seq));
+            let has_keyframe = frame.tiles.iter().any(|(_, tile)| tile.record.keyframe);
+            let all_keyframes = frame.tiles.iter().all(|(_, tile)| tile.record.keyframe);
+            let is_recovery = frame.plan.kind == VideoKind::Recovery && all_keyframes;
             match recovery.prepare(has_keyframe, is_recovery) {
                 logical_frame::RecoveryDecision::Admit => {}
                 logical_frame::RecoveryDecision::Suppress => continue,
@@ -704,10 +741,41 @@ fn admit_emitted(
                     continue;
                 }
             }
-            for tile in &mut frame.tiles {
+            let mut records = Vec::with_capacity(frame.tiles.len());
+            let mut wire_tiles = Vec::with_capacity(frame.tiles.len());
+            for (tile_id, mut tile) in frame.tiles {
                 tile.record.dropped_frames = recovery.dropped();
+                let coverage = frame
+                    .plan
+                    .coverage
+                    .iter()
+                    .find(|(planned_id, _)| *planned_id == tile_id)
+                    .map(|(_, coverage)| coverage.clone())
+                    .expect("assembler returned only planned tile ids");
+                wire_tiles.push(VideoTile {
+                    tile_id,
+                    coverage,
+                    au: std::mem::take(&mut tile.au),
+                });
+                records.push(tile);
             }
-            match tx.try_send(send::Outbound::FrameSet(frame.tiles)) {
+            let outbound = if frame.plan.atomic_avc {
+                let update = VideoUpdate {
+                    frame_seq: frame.seq,
+                    frame_width: frame.plan.frame_width,
+                    frame_height: frame.plan.frame_height,
+                    block_size: frame.plan.block_size,
+                    kind: frame.plan.kind,
+                    tiles: wire_tiles,
+                };
+                let mut payload = Vec::with_capacity(video_update::encoded_len(&update));
+                video_update::encode(&update, &mut payload);
+                send::Outbound::Video(records, payload)
+            } else {
+                debug_assert_eq!(records.len(), 1, "HEVC fallback is one full-frame tile");
+                send::Outbound::FrameSet(records)
+            };
+            match tx.try_send(outbound) {
                 Ok(()) => recovery.admitted(is_recovery),
                 Err(TrySendError::Full(_)) => {
                     // Even a complete recovery frame may be the item rejected by
@@ -860,7 +928,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
     let mut want_keyframe = true;
     let mut recovery = logical_frame::Recovery::waiting();
     let mut assembler =
-        logical_frame::Assembler::new(state.tiles.len(), MAX_PENDING_LOGICAL_FRAMES);
+        logical_frame::PlannedAssembler::new(state.tiles.len(), MAX_PENDING_LOGICAL_FRAMES);
     // HLD §5: the first frame after a rebuilt duplication is forced down the
     // full-frame path. Its dirty metadata describes change since the *new*
     // duplication's baseline, and whatever changed between the last delivered
@@ -1172,6 +1240,25 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             ) = shared;
         }
 
+        let plan_kind = if recovery.allows_overlays() {
+            VideoKind::Full
+        } else {
+            VideoKind::Recovery
+        };
+        let plan = full_video_plan(
+            state.codec,
+            plan_kind,
+            state.capture.width(),
+            state.capture.height(),
+            &state.tiles,
+        );
+        let expected_tiles: Vec<_> = plan.coverage.iter().map(|(tile_id, _)| *tile_id).collect();
+        let dropped = assembler.begin(frame_seq, plan, &expected_tiles);
+        if dropped != 0 {
+            recovery.drop_incomplete(dropped);
+            want_keyframe = true;
+        }
+
         for (((tile, ctx), last_epoch), tile_index) in state
             .tiles
             .iter_mut()
@@ -1272,7 +1359,7 @@ fn pump_tiles(
     tiles: &mut [TilePipeline],
     contexts: &mut [EmitCtx],
     last_epochs: &mut [u64],
-    assembler: &mut logical_frame::Assembler<send::FrameTile>,
+    assembler: &mut logical_frame::PlannedAssembler<VideoPlan, send::FrameTile>,
     tx: &SyncSender<send::Outbound>,
     recovery: &mut logical_frame::Recovery,
     want_keyframe: &mut bool,
