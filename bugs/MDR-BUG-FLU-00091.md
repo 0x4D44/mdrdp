@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00091 — EGFX CreateSurface can force a multi-gigabyte client allocation
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/surface-limits
 - **Raised:** 2026-08-24T09:25:48Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T092607Z-207318fd
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00091-run-fix-20260824T092607Z-207318fd
-- **Owner base:** 30c02e27543c0a729028b945a61f45334e9792b3
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T09:26:07Z
-- **Owner until:** 2026-08-24T11:26:07Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T09:25:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-24T09:25:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T09:43:53Z, deltic:auto role=fix run=fix-20260824T092607Z-207318fd branch=task/bug-MDR-BUG-FLU-00091-run-fix-20260824T092607Z-207318fd code=d37f299 gate=manual)
 
 ## Observation
 
