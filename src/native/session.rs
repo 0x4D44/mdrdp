@@ -56,6 +56,7 @@ use rhydra::clipboard::{self as clip, Bridge, Policy, TextClipboard};
 pub const OUTPUT_SURFACE: u16 = 0;
 const UPDATE_BLOCK_SIZE: u32 = 16;
 const MOVE_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
+const BASE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Decoder selected by the server header. H.264 remains primary; HEVC is kept
 /// as a full-frame fallback when the host cannot construct the tiled AVC path.
@@ -316,6 +317,7 @@ impl AuxChannel {
 /// the tunnel is kill-on-drop and the threads exit on the closed sockets.
 pub struct NativeHandle {
     stop: Arc<AtomicBool>,
+    base_ready: Arc<BaseReady>,
     video: TcpStream,
     input: TcpStream,
     sparse: TcpStream,
@@ -330,6 +332,7 @@ impl NativeHandle {
     /// Stop both threads, kill the tunnel, and report how the session ended.
     pub fn shutdown(mut self) -> SessionEnd {
         self.stop.store(true, Ordering::Relaxed);
+        self.base_ready.cancel();
         let _ = self.video.shutdown(Shutdown::Both);
         let _ = self.input.shutdown(Shutdown::Both);
         let _ = self.sparse.shutdown(Shutdown::Both);
@@ -432,7 +435,8 @@ pub fn spawn(
         conn.header.width,
         conn.header.height,
     )));
-    let base_ready = Arc::new(AtomicBool::new(false));
+    let base_ready = Arc::new(BaseReady::default());
+    let handle_base_ready = Arc::clone(&base_ready);
     let move_rendezvous = Arc::new(MoveRendezvous::default());
 
     let net_stop = Arc::clone(&stop);
@@ -461,7 +465,7 @@ pub fn spawn(
         store: Arc::clone(&sink.store),
         wire_size: (conn.header.width, conn.header.height),
         fences,
-        base_ready,
+        base_ready: Arc::clone(&base_ready),
         move_rendezvous,
         wake: Box::new({
             let sparse_waker = sparse_waker.clone();
@@ -486,6 +490,7 @@ pub fn spawn(
     let mut video_sock = conn.video;
     let mut reassembler = conn.reassembler;
     let video_waker = waker.clone();
+    let video_base_ready = Arc::clone(&base_ready);
     let video_join = std::thread::Builder::new()
         .name("native-net".to_owned())
         .spawn(move || {
@@ -499,6 +504,7 @@ pub fn spawn(
                 &mut on_cursor,
                 &net_stop,
             );
+            video_base_ready.cancel();
             let end = finish_video_worker(end, &net_stop, || {
                 let _ = video_waker.close();
             });
@@ -535,6 +541,7 @@ pub fn spawn(
 
     Ok(NativeHandle {
         stop,
+        base_ready: handle_base_ready,
         video,
         input,
         sparse,
@@ -884,7 +891,7 @@ fn pump_sparse(sparse: &mut TcpStream, sink: &mut SparseSink, stop: &AtomicBool)
         }
         match reassembler.next_message() {
             Ok(Some(message)) if message.msg_type == framing::MSG_RECTS => {
-                if let Err(reason) = sink.on_rects(&message.payload) {
+                if let Err(reason) = sink.on_rects(&message.payload, stop) {
                     return SessionEnd::TransportFailed(reason);
                 }
                 continue;
@@ -1383,7 +1390,7 @@ pub(crate) struct NativeSink {
     /// Shared with `native-input`; a paint closes whatever it holds.
     input_clock: InputClock,
     fences: Arc<Mutex<BlockFences>>,
-    base_ready: Arc<AtomicBool>,
+    base_ready: Arc<BaseReady>,
     move_rendezvous: Arc<MoveRendezvous>,
     // Visible-behaviour counters (tests and debugging; not user-facing yet).
     pub(crate) suppressed: u64,
@@ -1430,6 +1437,90 @@ struct BlockFences {
 struct MoveRendezvous {
     state: Mutex<MoveRendezvousState>,
     changed: Condvar,
+}
+
+/// One-way gate between the recovery/video reader and the sparse reader.
+///
+/// Once a complete base is visible, sparse updates take only the atomic fast
+/// path. Before then, the reader holds its decoded update behind this condition
+/// instead of discarding content that may be newer than the recovery frame.
+#[derive(Default)]
+struct BaseReady {
+    ready: AtomicBool,
+    wait: Mutex<BaseReadyWait>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct BaseReadyWait {
+    cancelled: bool,
+}
+
+impl BaseReady {
+    fn signal(&self) {
+        if self.ready.load(Ordering::Acquire) {
+            return;
+        }
+        let state = self
+            .wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.cancelled {
+            return;
+        }
+        self.ready.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    fn cancel(&self) {
+        let mut state = self
+            .wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.cancelled = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self, stop: &AtomicBool) -> Result<bool, String> {
+        self.wait_until(stop, Instant::now() + BASE_READY_TIMEOUT)
+    }
+
+    fn wait_until(&self, stop: &AtomicBool, deadline: Instant) -> Result<bool, String> {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        if self.ready.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        let mut state = self
+            .wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if state.cancelled || stop.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            if self.ready.load(Ordering::Acquire) {
+                return Ok(true);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("initial recovery frame did not arrive within 5 seconds".into());
+            }
+            let (next, result) = self
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if result.timed_out()
+                && !self.ready.load(Ordering::Acquire)
+                && !state.cancelled
+                && !stop.load(Ordering::Relaxed)
+            {
+                return Err("initial recovery frame did not arrive within 5 seconds".into());
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1559,7 +1650,7 @@ struct SparseSink {
     store: Arc<Mutex<SurfaceStore>>,
     wire_size: (u32, u32),
     fences: Arc<Mutex<BlockFences>>,
-    base_ready: Arc<AtomicBool>,
+    base_ready: Arc<BaseReady>,
     move_rendezvous: Arc<MoveRendezvous>,
     wake: Box<dyn Fn() + Send>,
     stats: StatsHandle,
@@ -1567,10 +1658,10 @@ struct SparseSink {
 }
 
 impl SparseSink {
-    fn on_rects(&mut self, payload: &[u8]) -> Result<(), String> {
+    fn on_rects(&mut self, payload: &[u8], stop: &AtomicBool) -> Result<(), String> {
         let wire_bytes = payload.len() as u64;
         let update = rects::decode(payload).map_err(|error| format!("rects payload: {error}"))?;
-        if update.rects.is_empty() || !self.base_ready.load(Ordering::Acquire) {
+        if update.rects.is_empty() || !self.base_ready.wait(stop)? {
             return Ok(());
         }
         if (update.frame_width, update.frame_height) != self.wire_size {
@@ -1799,7 +1890,7 @@ impl NativeSink {
             stats,
             input_clock,
             fences: Arc::new(Mutex::new(BlockFences::new(wire_size.0, wire_size.1))),
-            base_ready: Arc::new(AtomicBool::new(false)),
+            base_ready: Arc::new(BaseReady::default()),
             move_rendezvous: Arc::new(MoveRendezvous::default()),
             suppressed: 0,
             #[cfg(test)]
@@ -1822,7 +1913,7 @@ impl NativeSink {
         input_clock: InputClock,
     ) -> Self {
         let fences = Arc::new(Mutex::new(BlockFences::new(wire_size.0, wire_size.1)));
-        let base_ready = Arc::new(AtomicBool::new(false));
+        let base_ready = Arc::new(BaseReady::default());
         let move_rendezvous = Arc::new(MoveRendezvous::default());
         Self::new_tiled_shared(
             decoders,
@@ -1848,7 +1939,7 @@ impl NativeSink {
         stats: StatsHandle,
         input_clock: InputClock,
         fences: Arc<Mutex<BlockFences>>,
-        base_ready: Arc<AtomicBool>,
+        base_ready: Arc<BaseReady>,
         move_rendezvous: Arc<MoveRendezvous>,
     ) -> Self {
         assert_eq!(
@@ -1976,7 +2067,7 @@ impl NativeSink {
         }
         self.exact_through = seq;
         self.has_base = true;
-        self.base_ready.store(true, Ordering::Release);
+        self.base_ready.signal();
         (self.wake)();
         Ok(())
     }
@@ -2088,7 +2179,7 @@ impl NativeSink {
                 self.tile_decoders[tile_index].has_base = true;
             }
             self.has_base = true;
-            self.base_ready.store(true, Ordering::Release);
+            self.base_ready.signal();
             self.exact_through = self
                 .tile_decoders
                 .iter()
@@ -2264,7 +2355,9 @@ impl NativeSink {
         if staged.is_empty() {
             self.suppressed += 1;
             self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
-            self.base_ready.store(self.has_base, Ordering::Release);
+            if self.has_base {
+                self.base_ready.signal();
+            }
             self.exact_through = Some(
                 self.exact_through
                     .map_or(update.frame_seq, |seq| seq.max(update.frame_seq)),
@@ -2298,7 +2391,9 @@ impl NativeSink {
         }
         drop(fences);
         self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
-        self.base_ready.store(self.has_base, Ordering::Release);
+        if self.has_base {
+            self.base_ready.signal();
+        }
         self.exact_through = Some(
             self.exact_through
                 .map_or(update.frame_seq, |seq| seq.max(update.frame_seq)),
@@ -3354,6 +3449,119 @@ mod tests {
     }
 
     #[test]
+    fn sparse_update_waits_for_recovery_and_base_wait_is_bounded_and_cancellable() {
+        use rhydra::adaptive::Region;
+        use rhydra::video_update::{VideoKind, VideoTile, VideoUpdate};
+
+        let size = (16, 16);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let fences = Arc::new(Mutex::new(BlockFences::new(size.0, size.1)));
+        let base_ready = Arc::new(BaseReady::default());
+        let move_rendezvous = Arc::new(MoveRendezvous::default());
+        let stats = StatsHandle::new();
+        let input_clock = InputClock::default();
+        let mut video = NativeSink::new_tiled_shared(
+            vec![NativeDecoder::H264(Box::new(FakeDecoder { size }))],
+            vec![super::super::probe::TileHeader {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: size.0,
+                height: size.1,
+            }],
+            Arc::clone(&store),
+            size,
+            Box::new(|| {}),
+            stats.clone(),
+            input_clock.clone(),
+            Arc::clone(&fences),
+            Arc::clone(&base_ready),
+            Arc::clone(&move_rendezvous),
+        );
+        let mut sparse = SparseSink {
+            store: Arc::clone(&store),
+            wire_size: size,
+            fences,
+            base_ready,
+            move_rendezvous,
+            wake: Box::new(|| {}),
+            stats,
+            input_clock,
+        };
+        let raw = RectUpdate {
+            frame_seq: 2,
+            frame_width: size.0,
+            frame_height: size.1,
+            rects: vec![WireRect {
+                x: 0,
+                y: 0,
+                w: size.0 as u16,
+                h: size.1 as u16,
+                pixels: [0x33, 0x22, 0x11, 0xff].repeat((size.0 * size.1) as usize),
+            }],
+        };
+        let mut payload = Vec::new();
+        rects::encode(&raw, &mut payload);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let sparse_join = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = sparse.on_rects(&payload, &worker_stop);
+            done_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "the sparse update returned instead of waiting for its recovery base"
+        );
+        video
+            .on_video_update(VideoUpdate {
+                frame_seq: 1,
+                frame_width: size.0,
+                frame_height: size.1,
+                block_size: UPDATE_BLOCK_SIZE as u16,
+                kind: VideoKind::Recovery,
+                tiles: vec![VideoTile {
+                    tile_id: 0,
+                    coverage: vec![Region {
+                        x: 0,
+                        y: 0,
+                        width: size.0,
+                        height: size.1,
+                    }],
+                    au: vec![0x10],
+                }],
+            })
+            .unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recovery did not release the sparse update")
+            .unwrap();
+        sparse_join.join().unwrap();
+        let guard = store.lock().unwrap();
+        assert_eq!(
+            &guard.get(OUTPUT_SURFACE).unwrap().pixels()[..4],
+            &[0x11, 0x22, 0x33, 0xff],
+            "the held sequence 2 damage must paint after recovery sequence 1"
+        );
+        drop(guard);
+
+        let cancelled = Arc::new(BaseReady::default());
+        cancelled.cancel();
+        assert!(!cancelled.wait(&stop).unwrap());
+        let timed_out = BaseReady::default();
+        assert!(timed_out.wait_until(&stop, Instant::now()).is_err());
+    }
+
+    #[test]
     fn newer_sparse_blocks_survive_an_older_regional_video_arrival() {
         use rhydra::adaptive::Region;
         use rhydra::video_update::{VideoKind, VideoTile, VideoUpdate};
@@ -3366,7 +3574,7 @@ mod tests {
             surface.map_to_output(OUTPUT_SURFACE);
         }
         let fences = Arc::new(Mutex::new(BlockFences::new(size.0, size.1)));
-        let base_ready = Arc::new(AtomicBool::new(false));
+        let base_ready = Arc::new(BaseReady::default());
         let move_rendezvous = Arc::new(MoveRendezvous::default());
         let stats = StatsHandle::new();
         let input_clock = InputClock::default();
@@ -3432,7 +3640,7 @@ mod tests {
         };
         let mut payload = Vec::new();
         rects::encode(&raw, &mut payload);
-        sparse.on_rects(&payload).unwrap();
+        sparse.on_rects(&payload, &AtomicBool::new(false)).unwrap();
 
         video
             .on_video_update(VideoUpdate {
