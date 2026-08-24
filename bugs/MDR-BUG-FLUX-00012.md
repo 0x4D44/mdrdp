@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00012 — Native sessions publish no stats samples: latency, decode, present and frame_gap are all empty in the metrics report
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** native-transport
 - **Raised:** 2026-08-19T11:18:36Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T083231Z-1af22f05
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00012-run-fix-20260824T083231Z-1af22f05
-- **Owner base:** 5765c0a0780415ea49f37873d0fbaaf366e62faa
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T08:32:31Z
-- **Owner until:** 2026-08-24T10:32:31Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T11:18:36Z, raised via `deltic bugs new` model=claude-fable-5@high)
+- **State history:** Open (2026-08-19T11:18:36Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-24T08:32:47Z, deltic:auto role=fix run=fix-20260824T083231Z-1af22f05 branch=task/bug-MDR-BUG-FLUX-00012-run-fix-20260824T083231Z-1af22f05 code=58d238c82eb86a3240138ed71073232fc33e3d38 gate=manual)
 
 ## Observation
 
