@@ -1282,7 +1282,7 @@ struct SessionApp {
     /// The About window's icon texture, loaded on its first frame. Belongs to that
     /// window's egui context, so it is dropped with the window.
     about_icon: Option<egui::TextureHandle>,
-    /// The native session menu bar; dropping it removes the menu.
+    /// The native session menu bar; its guard detaches the menu before freeing its items.
     menu: Option<session_menu::SessionMenuBar>,
     /// Last 1 Hz diagnostics refresh, used with `ControlFlow::WaitUntil`.
     last_diag_refresh: Instant,
@@ -2130,6 +2130,9 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
     /// calls `exit(0)` for a Cmd+Q, so the disconnect has to happen here rather than
     /// after `run_app` returns — for a Cmd+Q, it never returns.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(menu) = self.menu.as_mut() {
+            menu.detach();
+        }
         if let Some(f) = self.on_exit.as_mut() {
             f();
         }
@@ -2523,9 +2526,33 @@ mod session_menu {
     pub const HELP_SHORTCUTS: &str = "help.shortcuts";
     pub const HELP_ABOUT: &str = "help.about";
 
-    /// Holds the muda objects alive; dropping this removes the native menu.
+    /// Holds the muda objects alive and detaches AppKit's non-owning menu reference before
+    /// those objects drop.
     pub struct SessionMenuBar {
         _menu: Menu,
+        #[cfg(target_os = "macos")]
+        installed_for_nsapp: bool,
+    }
+
+    impl SessionMenuBar {
+        /// Stop the native application from reaching menu items owned by this guard.
+        ///
+        /// `muda::Menu::drop` clears only muda's child maps on macOS; it does not clear
+        /// `NSApp.mainMenu`. The explicit detach must therefore precede both the session
+        /// exit hook and destruction of the Rust menu objects (MDR-BUG-FLUX-00003).
+        pub(super) fn detach(&mut self) {
+            #[cfg(target_os = "macos")]
+            if std::mem::take(&mut self.installed_for_nsapp) {
+                self._menu.remove_for_nsapp();
+            }
+        }
+    }
+
+    impl Drop for SessionMenuBar {
+        fn drop(&mut self) {
+            // Covers construction/event-loop failures that do not reach `exiting`.
+            self.detach();
+        }
     }
 
     pub fn install(window: &winit::window::Window) -> SessionMenuBar {
@@ -2607,7 +2634,11 @@ mod session_menu {
             }
         }
 
-        SessionMenuBar { _menu: menu }
+        SessionMenuBar {
+            _menu: menu,
+            #[cfg(target_os = "macos")]
+            installed_for_nsapp: true,
+        }
     }
 }
 

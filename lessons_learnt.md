@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A dropped muda menu can stay installed in AppKit; detach first (`window.rs:SessionMenuBar::detach`).
+  `muda::Menu::drop` frees its Rust child bookkeeping but does not clear `NSApp.mainMenu`.
+  Remove the menu explicitly while its items are live, including a drop fallback for error paths.
+
 - Sparse auxiliary writes need explicit coverage, not seeded-pixel differences (`clearcodec::decode_over_with_coverage`).
   A decoded chroma or ClearCodec buffer starts with retained pixels, so comparing final colours
   cannot distinguish an explicit same-colour write from an untouched seed. Carry exact decoder
