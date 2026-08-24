@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00117 — Native clipboard calls can block first paint and shutdown indefinitely
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/clipboard-lifecycle
 - **Raised:** 2026-08-24T18:18:02Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T181823Z-ef1fd76d
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00117-run-fix-20260824T181823Z-ef1fd76d
-- **Owner base:** 50e8fb2054e93a8531fae5cc5054323d46b1ae69
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T18:18:23Z
-- **Owner until:** 2026-08-24T20:18:23Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T18:18:02Z, raised via `deltic bugs new` model=gpt-5.6-sol@max)
+- **State history:** Open (2026-08-24T18:18:02Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-24T18:36:56Z, deltic:auto role=fix run=fix-20260824T181823Z-ef1fd76d branch=task/bug-MDR-BUG-FLU-00117-run-fix-20260824T181823Z-ef1fd76d code=ac72260 gate=manual)
 
 ## Observation
 
