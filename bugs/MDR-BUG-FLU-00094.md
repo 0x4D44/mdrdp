@@ -6,15 +6,15 @@
 - **Area:** window/presentation-latency
 - **Raised:** 2026-08-24T09:51:00Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260824T095120Z-a12ed09b
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00094-run-fix-20260824T095120Z-a12ed09b
+- **Owner base:** daa48320cdcfe59bd0a8a6ca9853f601f19eeff3
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-24T09:51:20Z
+- **Owner until:** 2026-08-24T11:51:20Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
