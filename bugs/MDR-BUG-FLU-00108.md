@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00108 — Native reliable input can starve resize and visibility commands
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/input-latency
 - **Raised:** 2026-08-24T12:24:25Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T123646Z-570c4a3a
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00108-run-fix-20260824T123646Z-570c4a3a
-- **Owner base:** f61afa141bffd5dfde0fc6e62d21d7238687bd55
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T12:36:46Z
-- **Owner until:** 2026-08-24T14:36:46Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T12:24:25Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-24T12:24:25Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T12:45:29Z, deltic:auto role=fix run=fix-20260824T123646Z-570c4a3a branch=task/bug-MDR-BUG-FLU-00108-run-fix-20260824T123646Z-570c4a3a code=303bb5a gate=manual)
 
 ## Observation
 
