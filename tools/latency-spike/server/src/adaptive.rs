@@ -42,6 +42,7 @@ pub enum PlanError {
     ZeroArea { set: &'static str, index: usize },
     OutOfFrame { set: &'static str, index: usize },
     CandidateOutsideDamage { set: &'static str, block: Block },
+    InvalidBlock { index: usize },
 }
 
 impl std::fmt::Display for PlanError {
@@ -68,8 +69,93 @@ impl std::fmt::Display for PlanError {
                 "adaptive plan: {set} candidate block {},{} is not damaged",
                 block.x, block.y
             ),
+            Self::InvalidBlock { index } => write!(
+                f,
+                "adaptive plan: block {index} is out of frame, duplicated, or out of order"
+            ),
         }
     }
+}
+
+/// Coalesce row-major, unique codec blocks into exact pixel rectangles.
+pub fn blocks_to_regions(
+    blocks: &[Block],
+    frame_width: u32,
+    frame_height: u32,
+    block_size: u32,
+) -> Result<Vec<Region>, PlanError> {
+    if frame_width == 0 || frame_height == 0 || block_size == 0 {
+        return Err(PlanError::InvalidGeometry);
+    }
+    let blocks_w = frame_width.div_ceil(block_size);
+    let blocks_h = frame_height.div_ceil(block_size);
+    let mut regions: Vec<Region> = Vec::new();
+    let mut previous_runs = std::collections::BTreeMap::<(u32, u32), usize>::new();
+    let mut previous_y = None;
+    let mut index = 0;
+
+    while index < blocks.len() {
+        let row_y = blocks[index].y;
+        if row_y >= blocks_h || previous_y.is_some_and(|y| row_y <= y) {
+            return Err(PlanError::InvalidBlock { index });
+        }
+        if previous_y.is_some_and(|y| row_y != y + 1) {
+            previous_runs.clear();
+        }
+        let mut current_runs = std::collections::BTreeMap::new();
+        while index < blocks.len() && blocks[index].y == row_y {
+            let start = blocks[index].x;
+            if start >= blocks_w
+                || (index > 0 && blocks[index - 1].y == row_y && blocks[index - 1].x >= start)
+            {
+                return Err(PlanError::InvalidBlock { index });
+            }
+            let mut end = start + 1;
+            index += 1;
+            while index < blocks.len() && blocks[index].y == row_y && blocks[index].x == end {
+                if blocks[index].x >= blocks_w {
+                    return Err(PlanError::InvalidBlock { index });
+                }
+                end += 1;
+                index += 1;
+            }
+
+            let row_height = (frame_height - row_y * block_size).min(block_size);
+            let region_index = if let Some(region_index) = previous_runs.remove(&(start, end)) {
+                regions[region_index].height += row_height;
+                region_index
+            } else {
+                let x = start * block_size;
+                regions.push(Region {
+                    x,
+                    y: row_y * block_size,
+                    width: (frame_width - x).min((end - start) * block_size),
+                    height: row_height,
+                });
+                regions.len() - 1
+            };
+            current_runs.insert((start, end), region_index);
+        }
+        previous_runs = current_runs;
+        previous_y = Some(row_y);
+    }
+    Ok(regions)
+}
+
+/// Intersect two global-coordinate regions without translating the result.
+pub fn intersect(a: Region, b: Region) -> Option<Region> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = a.x.saturating_add(a.width).min(b.x.saturating_add(b.width));
+    let bottom =
+        a.y.saturating_add(a.height)
+            .min(b.y.saturating_add(b.height));
+    (right > left && bottom > top).then_some(Region {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
 }
 
 impl std::error::Error for PlanError {}
@@ -394,5 +480,98 @@ mod tests {
                 index: 0
             })
         ));
+    }
+
+    #[test]
+    fn adjacent_blocks_coalesce_without_claiming_unchanged_pixels() {
+        let regions = blocks_to_regions(
+            &[
+                Block { x: 0, y: 0 },
+                Block { x: 1, y: 0 },
+                Block { x: 0, y: 1 },
+                Block { x: 1, y: 1 },
+                Block { x: 3, y: 1 },
+            ],
+            64,
+            32,
+            16,
+        )
+        .unwrap();
+
+        assert_eq!(
+            regions,
+            [
+                Region {
+                    x: 0,
+                    y: 0,
+                    width: 32,
+                    height: 32
+                },
+                Region {
+                    x: 48,
+                    y: 16,
+                    width: 16,
+                    height: 16
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_edge_blocks_stop_at_the_real_frame_edge() {
+        assert_eq!(
+            blocks_to_regions(&[Block { x: 3, y: 1 }], 63, 17, 16).unwrap(),
+            [Region {
+                x: 48,
+                y: 16,
+                width: 15,
+                height: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn coalescing_refuses_an_out_of_frame_block_hidden_after_a_valid_run() {
+        assert_eq!(
+            blocks_to_regions(&[Block { x: 3, y: 0 }, Block { x: 4, y: 0 }], 63, 16, 16),
+            Err(PlanError::InvalidBlock { index: 1 })
+        );
+    }
+
+    #[test]
+    fn global_coverage_intersects_a_tile_without_changing_coordinates() {
+        let coverage = Region {
+            x: 16,
+            y: 0,
+            width: 32,
+            height: 16,
+        };
+        let tile = Region {
+            x: 32,
+            y: 0,
+            width: 32,
+            height: 32,
+        };
+        assert_eq!(
+            intersect(coverage, tile),
+            Some(Region {
+                x: 32,
+                y: 0,
+                width: 16,
+                height: 16
+            })
+        );
+        assert_eq!(
+            intersect(
+                coverage,
+                Region {
+                    x: 48,
+                    y: 0,
+                    width: 16,
+                    height: 32
+                }
+            ),
+            None
+        );
     }
 }
