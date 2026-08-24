@@ -53,6 +53,18 @@ pub struct Rect {
     pub pixels: Vec<u8>,
 }
 
+/// A screen-to-screen copy. Every source is read from the canvas as it stood
+/// before any move in the batch was applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveRect {
+    pub src_x: u16,
+    pub src_y: u16,
+    pub dst_x: u16,
+    pub dst_y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
 /// Raw BGRA8, top-down, tightly packed. The only encoding v1 emits or accepts.
 ///
 /// The byte exists so a compressed encoding (LZ4 = 1) can slot in later without a
@@ -110,6 +122,16 @@ pub enum RectsError {
     RectPixelCount { expected: usize, actual: usize },
     /// The canvas slice is shorter than the dimensions it was described with.
     CanvasTooSmall { needed: usize, actual: usize },
+    /// Canvas dimensions overflow the addressable byte count.
+    CanvasGeometryOverflow,
+    /// A move with no area cannot advance the displayed baseline.
+    MoveZeroArea { move_index: usize },
+    /// A move's source or destination does not fit in the canvas.
+    MoveOutOfCanvas { move_index: usize },
+    /// Staging more than one canvas of source pixels is refused.
+    MoveAreaLimit { pixels: u64, limit: u64 },
+    /// Raw remainder pixels are cumulatively bounded to one canvas.
+    RawAreaLimit { pixels: u64, limit: u64 },
 }
 
 impl std::fmt::Display for RectsError {
@@ -171,6 +193,23 @@ impl std::fmt::Display for RectsError {
             RectsError::CanvasTooSmall { needed, actual } => write!(
                 f,
                 "rects: canvas of {actual} bytes is short of the {needed} its dimensions require"
+            ),
+            RectsError::CanvasGeometryOverflow => {
+                write!(f, "rects: canvas geometry overflows its byte count")
+            }
+            RectsError::MoveZeroArea { move_index } => {
+                write!(f, "rects: move {move_index} has zero area")
+            }
+            RectsError::MoveOutOfCanvas { move_index } => {
+                write!(f, "rects: move {move_index} falls outside the canvas")
+            }
+            RectsError::MoveAreaLimit { pixels, limit } => write!(
+                f,
+                "rects: moves stage {pixels} pixels, exceeding the {limit}-pixel canvas"
+            ),
+            RectsError::RawAreaLimit { pixels, limit } => write!(
+                f,
+                "rects: raw remainder holds {pixels} pixels, exceeding the {limit}-pixel canvas"
             ),
         }
     }
@@ -367,18 +406,119 @@ pub fn blit_bgra_to_rgba(
     canvas_width: u32,
     canvas_height: u32,
 ) -> Result<(), RectsError> {
+    validate_canvas(canvas, canvas_width, canvas_height)?;
+    validate_rect_for_canvas(rect, canvas_width, canvas_height)?;
+    blit_validated(rect, canvas, canvas_width);
+    Ok(())
+}
+
+/// Apply one ordered move batch atomically, then paint its raw final pixels.
+///
+/// Validation and source staging finish before the first canvas write. This makes
+/// overlapping copies deterministic and leaves the canvas unchanged on refusal.
+pub fn apply_move_update(
+    moves: &[MoveRect],
+    raw: &[Rect],
+    canvas: &mut [u8],
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Result<(), RectsError> {
+    validate_canvas(canvas, canvas_width, canvas_height)?;
+    let canvas_pixels = u64::from(canvas_width) * u64::from(canvas_height);
+    let mut move_pixels = 0u64;
+    for (move_index, movement) in moves.iter().enumerate() {
+        if movement.w == 0 || movement.h == 0 {
+            return Err(RectsError::MoveZeroArea { move_index });
+        }
+        let source_fits = u64::from(movement.src_x) + u64::from(movement.w)
+            <= u64::from(canvas_width)
+            && u64::from(movement.src_y) + u64::from(movement.h) <= u64::from(canvas_height);
+        let destination_fits = u64::from(movement.dst_x) + u64::from(movement.w)
+            <= u64::from(canvas_width)
+            && u64::from(movement.dst_y) + u64::from(movement.h) <= u64::from(canvas_height);
+        if !source_fits || !destination_fits {
+            return Err(RectsError::MoveOutOfCanvas { move_index });
+        }
+        move_pixels = move_pixels.saturating_add(u64::from(movement.w) * u64::from(movement.h));
+        if move_pixels > canvas_pixels {
+            return Err(RectsError::MoveAreaLimit {
+                pixels: move_pixels,
+                limit: canvas_pixels,
+            });
+        }
+    }
+
+    let mut raw_pixels = 0u64;
+    for (rect_index, rect) in raw.iter().enumerate() {
+        if rect.w == 0 || rect.h == 0 {
+            return Err(RectsError::ZeroArea {
+                rect_index,
+                w: rect.w,
+                h: rect.h,
+            });
+        }
+        validate_rect_for_canvas(rect, canvas_width, canvas_height)?;
+        raw_pixels = raw_pixels.saturating_add(u64::from(rect.w) * u64::from(rect.h));
+        if raw_pixels > canvas_pixels {
+            return Err(RectsError::RawAreaLimit {
+                pixels: raw_pixels,
+                limit: canvas_pixels,
+            });
+        }
+    }
+
+    let canvas_stride = canvas_width as usize * BPP;
+    let mut staged = Vec::with_capacity(move_pixels as usize * BPP);
+    for movement in moves {
+        let row_bytes = movement.w as usize * BPP;
+        let source_x = movement.src_x as usize * BPP;
+        for row in 0..movement.h as usize {
+            let start = (movement.src_y as usize + row) * canvas_stride + source_x;
+            staged.extend_from_slice(&canvas[start..start + row_bytes]);
+        }
+    }
+
+    let mut staged_offset = 0;
+    for movement in moves {
+        let row_bytes = movement.w as usize * BPP;
+        let destination_x = movement.dst_x as usize * BPP;
+        for row in 0..movement.h as usize {
+            let destination = (movement.dst_y as usize + row) * canvas_stride + destination_x;
+            canvas[destination..destination + row_bytes]
+                .copy_from_slice(&staged[staged_offset..staged_offset + row_bytes]);
+            staged_offset += row_bytes;
+        }
+    }
+    for rect in raw {
+        blit_validated(rect, canvas, canvas_width);
+    }
+    Ok(())
+}
+
+fn validate_canvas(canvas: &[u8], canvas_width: u32, canvas_height: u32) -> Result<(), RectsError> {
+    let needed = (canvas_width as usize)
+        .checked_mul(canvas_height as usize)
+        .and_then(|pixels| pixels.checked_mul(BPP))
+        .ok_or(RectsError::CanvasGeometryOverflow)?;
+    if canvas.len() < needed {
+        return Err(RectsError::CanvasTooSmall {
+            needed,
+            actual: canvas.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_rect_for_canvas(
+    rect: &Rect,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Result<(), RectsError> {
     let expected = rect.w as usize * rect.h as usize * BPP;
     if rect.pixels.len() != expected {
         return Err(RectsError::RectPixelCount {
             expected,
             actual: rect.pixels.len(),
-        });
-    }
-    let needed = canvas_width as usize * canvas_height as usize * BPP;
-    if canvas.len() < needed {
-        return Err(RectsError::CanvasTooSmall {
-            needed,
-            actual: canvas.len(),
         });
     }
     // Widened, for the same reason as in `decode`.
@@ -395,6 +535,10 @@ pub fn blit_bgra_to_rgba(
         });
     }
 
+    Ok(())
+}
+
+fn blit_validated(rect: &Rect, canvas: &mut [u8], canvas_width: u32) {
     let canvas_stride = canvas_width as usize * BPP;
     let row_bytes = rect.w as usize * BPP;
     let x_off = rect.x as usize * BPP;
@@ -410,7 +554,6 @@ pub fn blit_bgra_to_rgba(
             d[3] = 0xFF;
         }
     }
-    Ok(())
 }
 
 /// Exact pixel area covered by a set of rectangles, after clipping to the frame.
@@ -805,6 +948,162 @@ mod tests {
         let second = update.rects[1].pixels.clone();
         let d = (2 * 8 + 5) * BPP;
         assert_eq!(&canvas[d..d + 4], &[second[2], second[1], second[0], 0xFF]);
+    }
+
+    #[test]
+    fn move_sources_are_staged_from_the_same_pre_update_canvas() {
+        let mut canvas = vec![1, 0, 0, 0xFF, 2, 0, 0, 0xFF, 3, 0, 0, 0xFF, 4, 0, 0, 0xFF];
+        let moves = [
+            MoveRect {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 2,
+                dst_y: 0,
+                w: 2,
+                h: 1,
+            },
+            MoveRect {
+                src_x: 2,
+                src_y: 0,
+                dst_x: 0,
+                dst_y: 0,
+                w: 2,
+                h: 1,
+            },
+        ];
+
+        apply_move_update(&moves, &[], &mut canvas, 4, 1).unwrap();
+
+        assert_eq!(
+            canvas
+                .chunks_exact(BPP)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            [3, 4, 1, 2]
+        );
+    }
+
+    #[test]
+    fn raw_pixels_are_applied_after_moves() {
+        let mut canvas = vec![1, 0, 0, 0xFF, 2, 0, 0, 0xFF, 3, 0, 0, 0xFF, 4, 0, 0, 0xFF];
+        let moves = [MoveRect {
+            src_x: 0,
+            src_y: 0,
+            dst_x: 1,
+            dst_y: 0,
+            w: 3,
+            h: 1,
+        }];
+        let raw = [Rect {
+            x: 3,
+            y: 0,
+            w: 1,
+            h: 1,
+            pixels: vec![9, 8, 7, 6],
+        }];
+
+        apply_move_update(&moves, &raw, &mut canvas, 4, 1).unwrap();
+
+        assert_eq!(
+            canvas,
+            [1, 0, 0, 0xFF, 1, 0, 0, 0xFF, 2, 0, 0, 0xFF, 7, 8, 9, 0xFF]
+        );
+    }
+
+    #[test]
+    fn invalid_move_batch_leaves_the_canvas_untouched() {
+        let mut canvas = canvas_8x4();
+        let before = canvas.clone();
+        let moves = [MoveRect {
+            src_x: 0,
+            src_y: 0,
+            dst_x: 7,
+            dst_y: 0,
+            w: 2,
+            h: 1,
+        }];
+
+        assert!(matches!(
+            apply_move_update(&moves, &[], &mut canvas, 8, 4),
+            Err(RectsError::MoveOutOfCanvas { move_index: 0, .. })
+        ));
+        assert_eq!(canvas, before);
+    }
+
+    #[test]
+    fn invalid_raw_remainder_leaves_moves_unapplied() {
+        let mut canvas = canvas_8x4();
+        let before = canvas.clone();
+        let moves = [MoveRect {
+            src_x: 0,
+            src_y: 0,
+            dst_x: 2,
+            dst_y: 0,
+            w: 2,
+            h: 1,
+        }];
+        let raw = [Rect {
+            x: 7,
+            y: 0,
+            w: 2,
+            h: 1,
+            pixels: vec![0; 8],
+        }];
+
+        assert!(matches!(
+            apply_move_update(&moves, &raw, &mut canvas, 8, 4),
+            Err(RectsError::OutOfCanvas { .. })
+        ));
+        assert_eq!(canvas, before);
+    }
+
+    #[test]
+    fn cumulative_move_staging_is_bounded_by_one_canvas() {
+        let mut canvas = canvas_8x4();
+        let before = canvas.clone();
+        let moves = [
+            MoveRect {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 0,
+                dst_y: 0,
+                w: 8,
+                h: 4,
+            },
+            MoveRect {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 0,
+                dst_y: 0,
+                w: 1,
+                h: 1,
+            },
+        ];
+
+        assert_eq!(
+            apply_move_update(&moves, &[], &mut canvas, 8, 4),
+            Err(RectsError::MoveAreaLimit {
+                pixels: 33,
+                limit: 32
+            })
+        );
+        assert_eq!(canvas, before);
+    }
+
+    #[test]
+    fn cumulative_raw_remainder_is_bounded_by_one_canvas() {
+        let mut canvas = canvas_8x4();
+        let before = canvas.clone();
+        let raw = [rect(0, 0, 8, 4, 1), rect(0, 0, 1, 1, 2)];
+
+        assert_eq!(
+            apply_move_update(&[], &raw, &mut canvas, 8, 4),
+            Err(RectsError::RawAreaLimit {
+                pixels: 33,
+                limit: 32
+            })
+        );
+        assert_eq!(canvas, before);
     }
 
     #[test]
