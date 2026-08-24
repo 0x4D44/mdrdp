@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00020 — ironrdp-graphics and ironrdp-pdu tests never run: cargo refuses to test a path dep with dev-dependencies
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** testing
 - **Raised:** 2026-08-19T23:06:09Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T191841Z-ef9a618c
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00020-run-fix-20260824T191841Z-ef9a618c
-- **Owner base:** d30ebff901be8142dd6777381f0ad741e126316b
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T19:18:41Z
-- **Owner until:** 2026-08-24T21:18:41Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T23:06:09Z, raised via `deltic bugs new` model=claude-opus-5@high)
+- **State history:** Open (2026-08-19T23:06:09Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-24T19:32:28Z, deltic:auto role=fix run=fix-20260824T191841Z-ef9a618c branch=task/bug-MDR-BUG-FLUX-00020-run-fix-20260824T191841Z-ef9a618c code=0f6c16a0d933e1e2d126c2d8d79f97ea2a2a2ed5 gate=manual)
 
 ## Observation
 
