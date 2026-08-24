@@ -573,6 +573,9 @@ pub struct SurfaceStore {
     surfaces: HashMap<u16, Surface>,
     cache: HashMap<u16, CacheEntry>,
     output: Option<OutputMapping>,
+    /// The mapped numeric ID was recreated, so its geometry belongs to the prior
+    /// incarnation until a fresh MapSurface PDU validates the replacement.
+    output_mapping_stale: bool,
     graphics_output_size: Option<(u16, u16)>,
     /// Last painted output retained while a newly mapped surface is still empty.
     ///
@@ -719,7 +722,8 @@ impl SurfaceStore {
         // A partial replacement may already be mapped while the old output is retained.
         // Never replace that known-good fallback with the partial replacement during a
         // second handoff.
-        if self.presentation_fallback.is_some()
+        if self.output_mapping_stale
+            || self.presentation_fallback.is_some()
             || self.presentation_suppressed
             || !matches!(self.frame_state, FrameState::Idle)
         {
@@ -741,14 +745,16 @@ impl SurfaceStore {
 
     fn finish_surface_mutation(&mut self, id: u16) {
         if !matches!(self.frame_state, FrameState::Idle) {
-            let is_current_output = self.output.is_some_and(|mapping| mapping.surface_id == id);
+            let is_current_output = !self.output_mapping_stale
+                && self.output.is_some_and(|mapping| mapping.surface_id == id);
             let is_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
             if is_current_output && (self.presentation_fallback.is_none() || is_complete) {
                 self.frame_visible_dirty = true;
             }
             return;
         }
-        let is_current_output = self.output.is_some_and(|mapping| mapping.surface_id == id);
+        let is_current_output = !self.output_mapping_stale
+            && self.output.is_some_and(|mapping| mapping.surface_id == id);
         if !is_current_output {
             return;
         }
@@ -776,6 +782,7 @@ impl SurfaceStore {
         if self.output.is_some_and(|mapping| mapping.surface_id == id) {
             self.mark_frame_visible_dirty();
             self.retain_painted_output();
+            self.output_mapping_stale = true;
         }
         self.surfaces.insert(id, Surface::new(width, height));
     }
@@ -796,6 +803,7 @@ impl SurfaceStore {
         self.surfaces.remove(&id);
         if deleting_output {
             self.output = None;
+            self.output_mapping_stale = false;
             if matches!(self.frame_state, FrameState::Idle) {
                 self.presentation_fallback = None;
                 self.presentation_suppressed = false;
@@ -910,12 +918,13 @@ impl SurfaceStore {
         if self.presentation_mapping_for(mapping).is_none() {
             return false;
         }
-        let mapping_changed = self.output != Some(mapping);
+        let mapping_changed = self.output_mapping_stale || self.output != Some(mapping);
         if mapping_changed {
             self.mark_frame_visible_dirty();
             self.retain_painted_output();
         }
         self.output = Some(mapping);
+        self.output_mapping_stale = false;
         let output_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
         let released_suppressed_presentation = if matches!(self.frame_state, FrameState::Idle)
             && output_complete
@@ -950,6 +959,9 @@ impl SurfaceStore {
 
     /// The surface currently mapped to output in protocol state.
     pub fn output_surface(&self) -> Option<&Surface> {
+        if self.output_mapping_stale {
+            return None;
+        }
         self.output
             .and_then(|mapping| self.surfaces.get(&mapping.surface_id))
     }
@@ -984,7 +996,8 @@ impl SurfaceStore {
                 .map(|fallback| (&fallback.surface, fallback.mapping));
         }
         if let Some(fallback) = self.presentation_fallback.as_ref() {
-            if let Some(mapping) = self.output
+            if !self.output_mapping_stale
+                && let Some(mapping) = self.output
                 && let Some(surface) = self
                     .surfaces
                     .get(&mapping.surface_id)
@@ -994,6 +1007,9 @@ impl SurfaceStore {
                 return Some((surface, presentation_mapping));
             }
             return Some((&fallback.surface, fallback.mapping));
+        }
+        if self.output_mapping_stale {
+            return None;
         }
         let output_mapping = self.output?;
         let surface = self
@@ -2070,6 +2086,7 @@ mod tests {
         );
         assert_eq!(snapshot.pixels, solid(2, 1, RED));
 
+        store.map_to_output(2);
         store.begin_frame(10);
         store
             .blit_rgba_strict(2, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE))
@@ -2339,14 +2356,112 @@ mod tests {
         assert_eq!(
             store.presentation_surface().unwrap().pixels(),
             solid(2, 2, BLUE),
-            "same-id recreation must retain the old incarnation until paint"
+            "same-id recreation must retain the old incarnation until remap"
         );
+        store.map_to_output(2);
         store.solid_fill(2, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
         assert_eq!(
             store.presentation_surface().unwrap().pixels(),
             solid(2, 2, RED),
             "the recreated incarnation takes over when it is painted"
         );
+    }
+
+    #[test]
+    fn same_id_recreation_waits_for_fresh_mapping_geometry() {
+        let mut store = SurfaceStore::new();
+        assert!(store.set_graphics_output_size(8, 2));
+        store.create(1, 2, 2);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        assert!(store.map_to_output_geometry(1, 2, 2, 1, 0, 2, 2));
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let before = store.generation();
+
+        store.create(1, 4, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 4, 1)], BLUE).unwrap();
+        assert_eq!(
+            store.generation(),
+            before,
+            "new pixels have no valid output geometry before remapping"
+        );
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, solid(2, 2, RED));
+        assert_eq!(
+            (snapshot.mapping.dest_x, snapshot.mapping.dest_width),
+            (1, 2)
+        );
+
+        assert!(!store.map_to_output_geometry(1, 5, 1, 2, 1, 4, 1));
+        assert_eq!(
+            store.generation(),
+            before,
+            "an invalid remap changes nothing"
+        );
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, solid(2, 2, RED));
+
+        assert!(store.map_to_output_geometry(1, 4, 1, 2, 1, 4, 1));
+        assert_eq!(store.generation(), before + 1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, solid(4, 1, BLUE));
+        assert_eq!(
+            (snapshot.mapping.dest_x, snapshot.mapping.dest_width),
+            (2, 4)
+        );
+
+        store.create(1, 1, 1);
+        store.delete(1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Empty
+        );
+    }
+
+    #[test]
+    fn end_frame_cannot_publish_a_recreated_surface_before_remap() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let before = store.generation();
+
+        store.begin_frame(41);
+        store.create(1, 4, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 4, 1)], BLUE).unwrap();
+        assert!(store.commit_frame(41));
+
+        assert_eq!(store.generation(), before);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+        assert!(store.map_to_output_geometry(1, 4, 1, 0, 0, 4, 1));
+        assert_eq!(store.generation(), before + 1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, solid(4, 1, BLUE));
     }
 
     #[test]

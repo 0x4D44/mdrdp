@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A recreated surface ID invalidates its old geometry until remapped (`surface.rs:output_mapping_stale`).
+  Retain the last pixels and mapping atomically, but keep the numeric ID association so delete and
+  EndFrame can retire the fallback correctly before the replacement receives a fresh MapSurface PDU.
+
 - Union unaligned AVC444 rect coverage within one PDU before preserving detail (`avc444.rs:mark_chroma_seen`).
   A per-rectangle full-block test loses valid samples when adjacent regions split a 2x2 block.
   Keep partial coverage PDU-local so a later partial frame cannot falsely clear stale chroma.

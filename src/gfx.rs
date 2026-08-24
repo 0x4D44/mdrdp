@@ -1678,6 +1678,7 @@ mod tests {
         // A same-size CreateSurface starts a new zero-filled incarnation while the
         // old, fully painted output remains the presentation fallback.
         handler.on_surface_created(&egfx_surface(1, 4, 4));
+        handler.on_surface_mapped(1, 0, 0);
 
         for (x, y, bgr) in [
             (0, 0, [0x01, 0x02, 0x03]),
