@@ -87,6 +87,12 @@ const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// disconnect.
 const NATIVE_INPUT_WRITE_TIMEOUT: Duration = auxchan::WRITE_TIMEOUT;
 
+/// Give the command channel a turn after a small reliable-input batch. The RDP fast-path
+/// permits 255 events in one PDU, but native input writes each rhydra record separately (and
+/// a button or wheel can emit two records), so 32 logical events bounds command latency
+/// without making a keyboard burst pay a sleep between batches.
+const NATIVE_INPUT_BATCH_MAX: usize = 32;
+
 /// Everything one session's auxiliary channel owns, so [`NativeHandle`] carries
 /// one optional field rather than five.
 ///
@@ -899,11 +905,12 @@ fn pump_input_with_timeout(
     let mut written = WrittenReport(0);
     let mut seq: u32 = 1;
     let mut resize_noted = false;
+    let mut wait_timeout = Duration::from_millis(250);
     loop {
         if stop.load(Ordering::Relaxed) {
             return None;
         }
-        let ready = match wake::wait_readable(&sock, &wake_rx, Duration::from_millis(250)) {
+        let ready = match wake::wait_readable(&sock, &wake_rx, wait_timeout) {
             Ok(r) => r,
             Err(e) => return Some(format!("input wait: {e}")),
         };
@@ -921,41 +928,101 @@ fn pump_input_with_timeout(
             wake_rx.drain();
         }
         let mut clock_stamped = false;
-        loop {
-            match next_native_input(&input_rx, &latest_mouse_move) {
-                Ok(Some(event)) => {
-                    if let Err(e) = write_native_records(
-                        &mut writer,
-                        wire_records(&event, &mut seq),
-                        &input_clock,
-                        &mut clock_stamped,
-                        &mut written.0,
-                    ) {
-                        return if stop.load(Ordering::Relaxed) {
-                            None
-                        } else {
-                            Some(format!("input write: {e}"))
-                        };
-                    }
-                }
-                Ok(None) => break,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return None,
+        let batch = match drain_native_input_batch(
+            &mut writer,
+            &input_rx,
+            &latest_mouse_move,
+            &input_clock,
+            &mut clock_stamped,
+            &mut seq,
+            &mut written.0,
+        ) {
+            Ok(batch) => batch,
+            Err(e) => {
+                return if stop.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    Some(format!("input write: {e}"))
+                };
             }
+        };
+        if matches!(batch, NativeInputBatch::Closed) {
+            return None;
         }
-        loop {
-            match commands.try_recv() {
-                Ok(SessionCommand::Resize { .. }) => {
-                    // MVP: the host owns its resolution; the window letterboxes.
-                    if !resize_noted {
-                        resize_noted = true;
-                        eprintln!("native: resize requests are letterbox-only in this build");
-                    }
-                }
-                Ok(SessionCommand::SetVisibility { .. }) => {} // no suppress notion yet
-                Err(_) => break,
+        service_native_commands(&commands, &mut resize_noted);
+        wait_timeout = native_input_wait_after_batch(batch);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeInputBatch {
+    Idle,
+    Sent { full: bool },
+    Closed,
+}
+
+/// Drain at most one reliable-input batch, leaving the rest for the next pump turn.
+fn drain_native_input_batch<W: Write>(
+    writer: &mut W,
+    input_rx: &Receiver<InputEvent>,
+    latest_mouse_move: &LatestMouseMove,
+    input_clock: &InputClock,
+    clock_stamped: &mut bool,
+    seq: &mut u32,
+    written: &mut u64,
+) -> std::io::Result<NativeInputBatch> {
+    let mut drained = 0;
+    while drained < NATIVE_INPUT_BATCH_MAX {
+        match next_native_input(input_rx, latest_mouse_move) {
+            Ok(Some(event)) => {
+                write_native_records(
+                    writer,
+                    wire_records(&event, seq),
+                    input_clock,
+                    clock_stamped,
+                    written,
+                )?;
+                drained += 1;
             }
+            Ok(None) | Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => return Ok(NativeInputBatch::Closed),
         }
+    }
+    if drained == 0 {
+        Ok(NativeInputBatch::Idle)
+    } else {
+        Ok(NativeInputBatch::Sent {
+            full: drained == NATIVE_INPUT_BATCH_MAX,
+        })
+    }
+}
+
+/// Keep resize/visibility service between reliable-input batches.
+fn service_native_commands(commands: &Receiver<SessionCommand>, resize_noted: &mut bool) -> usize {
+    let mut serviced = 0;
+    while let Ok(command) = commands.try_recv() {
+        serviced += 1;
+        match command {
+            SessionCommand::Resize { .. } => {
+                // MVP: the host owns its resolution; the window letterboxes.
+                if !*resize_noted {
+                    *resize_noted = true;
+                    eprintln!("native: resize requests are letterbox-only in this build");
+                }
+            }
+            SessionCommand::SetVisibility { .. } => {} // no suppress notion yet
+        }
+    }
+    serviced
+}
+
+/// A full batch means reliable input is still likely queued. Poll without sleeping so the
+/// next batch follows immediately; an idle or partial batch keeps the existing 250 ms cadence.
+fn native_input_wait_after_batch(batch: NativeInputBatch) -> Duration {
+    if matches!(batch, NativeInputBatch::Sent { full: true }) {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(250)
     }
 }
 
@@ -2604,6 +2671,52 @@ mod tests {
             clock.take_us().is_none(),
             "the controlled writer consumed the single outstanding sample"
         );
+    }
+
+    #[test]
+    fn native_reliable_input_batch_yields_to_commands() {
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        for code in 0..=NATIVE_INPUT_BATCH_MAX {
+            input_tx
+                .send(InputEvent::Key {
+                    scancode: crate::input::Scancode::plain(u8::try_from(code).unwrap()),
+                    down: true,
+                })
+                .unwrap();
+        }
+        let (command_tx, commands) = std::sync::mpsc::channel();
+        command_tx
+            .send(SessionCommand::SetVisibility { visible: false })
+            .unwrap();
+
+        let mut writer = Vec::new();
+        let mut clock_stamped = false;
+        let mut seq = 1;
+        let mut written = 0;
+        let batch = drain_native_input_batch(
+            &mut writer,
+            &input_rx,
+            &LatestMouseMove::default(),
+            &InputClock::default(),
+            &mut clock_stamped,
+            &mut seq,
+            &mut written,
+        )
+        .unwrap();
+
+        assert_eq!(batch, NativeInputBatch::Sent { full: true });
+        assert_eq!(written, NATIVE_INPUT_BATCH_MAX as u64);
+        assert!(
+            input_rx.try_recv().is_ok(),
+            "reliable input beyond one batch must remain for the next turn"
+        );
+        let mut resize_noted = false;
+        assert_eq!(
+            service_native_commands(&commands, &mut resize_noted),
+            1,
+            "a queued command must be serviced after the bounded input turn"
+        );
+        assert_eq!(native_input_wait_after_batch(batch), Duration::ZERO);
     }
 
     #[test]
