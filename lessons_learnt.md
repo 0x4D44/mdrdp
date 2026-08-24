@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- AVC region structs are inclusive but stream masks are exclusive (`pdu/avc.rs:Avc420Region::to_rectangle`).
+  Convert right and bottom only when building the wire rectangle. Copying the stored bounds omits
+  the final row and column from AVC420, both AVC444 substreams, and mixed-tile updates.
+
 - Instrumentation must drop visibly before it blocks decode (`viewer/stats.rs:StatsLog::enqueue`).
   Put durable per-line writes on their own thread behind a bounded non-blocking queue. If storage
   cannot keep up, emit an explicit loss count when it recovers instead of distorting the measured path.

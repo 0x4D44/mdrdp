@@ -342,14 +342,18 @@ impl Avc420Region {
         }
     }
 
-    /// Convert to `InclusiveRectangle` for PDU encoding
+    /// Convert inclusive region bounds to the exclusive wire `RDPGFX_RECT16`.
+    ///
+    /// The PDU model calls this type `InclusiveRectangle`, but MS-RDPEGFX and
+    /// interoperable clients interpret AVC stream right/bottom coordinates as
+    /// exclusive. Keep the public region model inclusive and convert only here.
     #[must_use]
     pub fn to_rectangle(&self) -> InclusiveRectangle {
         InclusiveRectangle {
             left: self.left,
             top: self.top,
-            right: self.right,
-            bottom: self.bottom,
+            right: self.right.saturating_add(1),
+            bottom: self.bottom.saturating_add(1),
         }
     }
 
@@ -595,5 +599,34 @@ mod tests {
         assert_eq!(decoded.rectangles.len(), 1);
         assert_eq!(decoded.quant_qual_vals.len(), 1);
         assert_eq!(decoded.data, &h264_data);
+    }
+
+    #[test]
+    fn encoded_stream_rectangles_convert_inclusive_regions_to_exclusive_wire_bounds() {
+        let regions = [
+            Avc420Region::full_frame(4, 4, 22),
+            Avc420Region::new(2, 3, 5, 7, 24, 90),
+        ];
+        let encoded = encode_avc420_bitmap_stream(&regions, &[]);
+        let mut cursor = ReadCursor::new(&encoded);
+        let decoded = Avc420BitmapStream::decode(&mut cursor).expect("decode stream");
+
+        assert_eq!(
+            decoded.rectangles,
+            vec![
+                InclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 4,
+                    bottom: 4,
+                },
+                InclusiveRectangle {
+                    left: 2,
+                    top: 3,
+                    right: 6,
+                    bottom: 8,
+                },
+            ]
+        );
     }
 }
