@@ -32,6 +32,9 @@ pub const MSG_VIDEO_TILE: u8 = 5;
 /// Host cursor visibility. The pointer pixels themselves stay out of the video
 /// surfaces so the viewer can draw its local cursor without capture latency.
 pub const MSG_CURSOR: u8 = 6;
+/// One atomic regional/full H.264 update. The payload carries every selected
+/// tile AU and the exact desktop coverage those decoded pixels may replace.
+pub const MSG_VIDEO_UPDATE: u8 = 7;
 
 /// `[hidden: u8][reserved for later cursor metadata: 11]`.
 pub const CURSOR_PAYLOAD_BYTES: usize = 12;

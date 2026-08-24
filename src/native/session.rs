@@ -32,6 +32,7 @@ use rhydra::auxchan::{self, Outbox};
 use rhydra::framing::{self, Reassembler};
 use rhydra::input_proto::{MouseButton as WireButton, Record, WheelAxis, encode_record};
 use rhydra::rects::{self, RectUpdate};
+use rhydra::video_update::{self, VideoKind, VideoUpdate};
 
 use crate::audio::{AudioFormatSummary, AudioRing};
 use crate::clipboard::ArboardClipboard;
@@ -845,6 +846,10 @@ fn dispatch_video_message(
             Ok(tile) => sink.on_tile_au(tile.tile_id, tile.au, tile.capture_seq),
             Err(e) => Err(format!("MSG_VIDEO_TILE: {e}")),
         },
+        framing::MSG_VIDEO_UPDATE => match video_update::decode(&message.payload) {
+            Ok(update) => sink.on_video_update(update),
+            Err(error) => Err(format!("MSG_VIDEO_UPDATE: {error}")),
+        },
         framing::MSG_VIDEO => sink.on_au(&message.payload, None),
         framing::MSG_CURSOR => match framing::decode_cursor(&message.payload) {
             Ok(true) => {
@@ -1295,6 +1300,11 @@ struct StagedTile {
     pixels: Vec<u8>,
 }
 
+struct StagedVideoRegion {
+    dest: Rect,
+    pixels: Vec<u8>,
+}
+
 struct TileFrameProgress {
     seen: Vec<bool>,
     changed: bool,
@@ -1602,6 +1612,157 @@ impl NativeSink {
             (self.wake)();
             self.try_apply_pending();
         }
+        Ok(())
+    }
+
+    /// Decode one complete regional/full video update, then publish only its
+    /// declared coverage as one visible mutation.
+    pub(crate) fn on_video_update(&mut self, update: VideoUpdate) -> Result<(), String> {
+        if (update.frame_width, update.frame_height) != self.wire_size {
+            return Err(format!(
+                "host display mode changed ({}x{} vs session {}x{}); reconnect",
+                update.frame_width, update.frame_height, self.wire_size.0, self.wire_size.1
+            ));
+        }
+        let stale = self
+            .exact_through
+            .is_some_and(|exact| update.frame_seq <= exact);
+        let adjacent =
+            self.exact_through.and_then(|exact| exact.checked_add(1)) == Some(update.frame_seq);
+        if !stale && update.kind != VideoKind::Recovery && (!self.has_base || !adjacent) {
+            return Err(format!(
+                "video update {} cannot follow {:?} without recovery",
+                update.frame_seq, self.exact_through
+            ));
+        }
+
+        // Validate the advertised layout before advancing any decoder reference.
+        let mut selected = Vec::with_capacity(update.tiles.len());
+        let mut seen = vec![false; self.tile_decoders.len()];
+        for wire_tile in &update.tiles {
+            let Some(tile_index) = self
+                .tile_decoders
+                .iter()
+                .position(|tile| tile.header.id == wire_tile.tile_id)
+            else {
+                return Err(format!("host sent unadvertised tile {}", wire_tile.tile_id));
+            };
+            if std::mem::replace(&mut seen[tile_index], true) {
+                return Err(format!("host repeated tile {}", wire_tile.tile_id));
+            }
+            let header = self.tile_decoders[tile_index].header;
+            let tile_right = header.x.saturating_add(header.width);
+            let tile_bottom = header.y.saturating_add(header.height);
+            for region in &wire_tile.coverage {
+                let right = region.x.saturating_add(region.width);
+                let bottom = region.y.saturating_add(region.height);
+                if region.x < header.x
+                    || region.y < header.y
+                    || right > tile_right
+                    || bottom > tile_bottom
+                {
+                    return Err(format!(
+                        "tile {} coverage {},{} {}x{} is outside its advertised bounds",
+                        wire_tile.tile_id, region.x, region.y, region.width, region.height
+                    ));
+                }
+            }
+            selected.push(tile_index);
+        }
+
+        let started = Instant::now();
+        let mut bytes = 0u64;
+        let mut staged = Vec::new();
+        for (wire_tile, tile_index) in update.tiles.iter().zip(selected.iter().copied()) {
+            let tile = &mut self.tile_decoders[tile_index];
+            let decoded = match tile.decoder.decode(&wire_tile.au) {
+                Ok(decoded) => decoded,
+                Err(_) => {
+                    self.stats.update(|stats| stats.decode_errors += 1);
+                    return Ok(());
+                }
+            };
+            if (decoded.width(), decoded.height()) != (tile.header.width, tile.header.height) {
+                return Err(format!(
+                    "tile {} decoded at {}x{}, expected {}x{}",
+                    tile.header.id,
+                    decoded.width(),
+                    decoded.height(),
+                    tile.header.width,
+                    tile.header.height
+                ));
+            }
+            bytes = bytes.saturating_add(wire_tile.au.len() as u64);
+            let pixels = decoded.into_data();
+            if wire_tile.coverage.as_slice()
+                == [rhydra::adaptive::Region {
+                    x: tile.header.x,
+                    y: tile.header.y,
+                    width: tile.header.width,
+                    height: tile.header.height,
+                }]
+            {
+                staged.push(StagedVideoRegion {
+                    dest: Self::tile_dest(tile.header.id, tile.header)?,
+                    pixels,
+                });
+                tile.has_base = true;
+                continue;
+            }
+            for region in &wire_tile.coverage {
+                let width = region.width as usize;
+                let height = region.height as usize;
+                let local_x = (region.x - tile.header.x) as usize;
+                let local_y = (region.y - tile.header.y) as usize;
+                let source_width = tile.header.width as usize;
+                let mut packed = Vec::with_capacity(width * height * 4);
+                for row in local_y..local_y + height {
+                    let start = (row * source_width + local_x) * 4;
+                    packed.extend_from_slice(&pixels[start..start + width * 4]);
+                }
+                staged.push(StagedVideoRegion {
+                    dest: Rect::new(
+                        region.x as u16,
+                        region.y as u16,
+                        (region.x + region.width) as u16,
+                        (region.y + region.height) as u16,
+                    ),
+                    pixels: packed,
+                });
+            }
+            tile.has_base = true;
+        }
+
+        if stale {
+            self.suppressed += 1;
+            return Ok(());
+        }
+        let updates: Vec<_> = staged
+            .iter()
+            .map(|region| (region.dest, region.pixels.as_slice()))
+            .collect();
+        let decode_us = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+        {
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let generation = store
+                .blit_rgba_strict_batch(OUTPUT_SURFACE, &updates)
+                .map_err(|error| format!("video update batch: {error}"))?;
+            self.record_paint(bytes, generation, Some(decode_us));
+        }
+        self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
+        self.exact_through = Some(update.frame_seq);
+        for tile_index in selected {
+            let tile = &mut self.tile_decoders[tile_index];
+            tile.exact_through = Some(
+                tile.exact_through
+                    .map_or(update.frame_seq, |seq| seq.max(update.frame_seq)),
+            );
+        }
+        (self.wake)();
+        self.try_apply_pending();
         Ok(())
     }
 
@@ -2407,6 +2568,105 @@ mod tests {
 
         let guard = store.lock().unwrap();
         assert_eq!(guard.get(OUTPUT_SURFACE).unwrap().pixels(), rgba);
+    }
+
+    #[test]
+    fn regional_video_paints_only_declared_coverage() {
+        use rhydra::adaptive::Region;
+        use rhydra::video_update::{VideoKind, VideoTile, VideoUpdate};
+
+        let size = (4, 2);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let mut sink = NativeSink::new_tiled(
+            vec![
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (2, 2) })),
+            ],
+            vec![
+                super::super::probe::TileHeader {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                super::super::probe::TileHeader {
+                    id: 1,
+                    x: 2,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+            ],
+            Arc::clone(&store),
+            size,
+            Box::new(|| {}),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+
+        sink.on_video_update(VideoUpdate {
+            frame_seq: 1,
+            frame_width: 4,
+            frame_height: 2,
+            block_size: 1,
+            kind: VideoKind::Recovery,
+            tiles: vec![
+                VideoTile {
+                    tile_id: 0,
+                    coverage: vec![Region {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    }],
+                    au: vec![0x10],
+                },
+                VideoTile {
+                    tile_id: 1,
+                    coverage: vec![Region {
+                        x: 2,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    }],
+                    au: vec![0x20],
+                },
+            ],
+        })
+        .unwrap();
+        sink.on_video_update(VideoUpdate {
+            frame_seq: 2,
+            frame_width: 4,
+            frame_height: 2,
+            block_size: 1,
+            kind: VideoKind::Regional,
+            tiles: vec![VideoTile {
+                tile_id: 0,
+                coverage: vec![Region {
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                }],
+                au: vec![0x77],
+            }],
+        })
+        .unwrap();
+
+        let guard = store.lock().unwrap();
+        let pixels = guard.get(OUTPUT_SURFACE).unwrap().pixels();
+        let first = |x: usize, y: usize| pixels[(y * 4 + x) * 4];
+        assert_eq!(first(0, 0), 0x10);
+        assert_eq!(first(1, 0), 0x77);
+        assert_eq!(first(0, 1), 0x10);
+        assert_eq!(first(2, 0), 0x20);
+        assert_eq!(first(3, 1), 0x20);
     }
 
     #[test]
