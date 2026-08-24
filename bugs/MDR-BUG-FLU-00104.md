@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00104 — Non-AVC surface updates leave stale AVC444 detail attached
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/codec-switch
 - **Raised:** 2026-08-24T12:03:48Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T121141Z-3afa245c
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00104-run-fix-20260824T121141Z-3afa245c
-- **Owner base:** c9a3c46d685b1a86bcc857e3b888202fc70e4962
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T12:11:41Z
-- **Owner until:** 2026-08-24T14:11:41Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T12:22:44Z, deltic:auto role=fix run=fix-20260824T121141Z-3afa245c branch=task/bug-MDR-BUG-FLU-00104-run-fix-20260824T121141Z-3afa245c code=0db0fa9 gate=manual)
 
 ## Observation
 
