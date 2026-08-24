@@ -1676,20 +1676,28 @@ impl NativeSink {
     /// Blit every rect of an already-gated update; exactness advances only when
     /// every blit succeeded (review S-m9).
     fn paint(&mut self, update: &RectUpdate) -> Result<(), String> {
-        let mut painted_bytes: u64 = 0;
+        let painted_bytes = update.rects.iter().fold(0u64, |total, rect| {
+            total.saturating_add(rect.pixels.len() as u64)
+        });
+        let updates = update.rects.iter().map(|rect| {
+            (
+                Rect::new(
+                    rect.x,
+                    rect.y,
+                    rect.x.saturating_add(rect.w),
+                    rect.y.saturating_add(rect.h),
+                ),
+                rect.pixels.as_slice(),
+            )
+        });
         {
             let mut store = self
                 .store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for r in &update.rects {
-                let dest = Rect::new(r.x, r.y, r.x.saturating_add(r.w), r.y.saturating_add(r.h));
-                store
-                    .blit_bgra_strict(OUTPUT_SURFACE, dest, &r.pixels)
-                    .map_err(|e| format!("rect blit: {e}"))?;
-                painted_bytes += r.pixels.len() as u64;
-            }
-            let generation = store.generation();
+            let generation = store
+                .blit_bgra_strict_batch(OUTPUT_SURFACE, updates)
+                .map_err(|e| format!("rect batch: {e}"))?;
             self.record_paint(painted_bytes, generation, None);
         }
         self.exact_through = Some(update.frame_seq);
@@ -2513,6 +2521,50 @@ mod tests {
         assert_eq!(px, [0, 0, 200, 255]);
         drop(guard);
         assert_eq!(sink.exact_through, Some(11));
+    }
+
+    #[test]
+    fn a_malformed_later_rect_cannot_partially_paint_the_batch() {
+        let size = (4, 2);
+        let (mut sink, store) = sink_with_store(size);
+        sink.on_au(&[7], Some(10)).unwrap();
+        let before_generation = store.lock().unwrap().generation();
+        let before_stats = sink.stats.snapshot();
+        let update = RectUpdate {
+            frame_seq: 11,
+            frame_width: size.0,
+            frame_height: size.1,
+            rects: vec![
+                WireRect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                    pixels: vec![200, 0, 0, 255],
+                },
+                WireRect {
+                    x: 4,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                    pixels: vec![201, 0, 0, 255],
+                },
+            ],
+        };
+
+        let error = sink.apply_update(update).unwrap_err();
+        assert!(error.contains("rect batch"), "unexpected failure: {error}");
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.generation(), before_generation);
+        assert_eq!(
+            guard.get(OUTPUT_SURFACE).unwrap().pixels(),
+            vec![7; 4 * 2 * 4],
+            "the valid first rectangle must remain hidden when a later rectangle fails"
+        );
+        drop(guard);
+        assert_eq!(sink.exact_through, Some(10));
+        assert_eq!(sink.stats.snapshot().frames, before_stats.frames);
+        assert_eq!(sink.stats.snapshot().bytes_in, before_stats.bytes_in);
     }
 
     #[test]

@@ -355,7 +355,7 @@ impl Surface {
     /// Decoded native tiles have an exact advertised extent. Clipping one would
     /// hide a decoder or protocol mismatch, so both the rectangle and payload
     /// must match exactly.
-    fn validate_rgba_strict(&self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
+    fn validate_strict(&self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
         if dest.right > self.width || dest.bottom > self.height || dest.is_empty() {
             return Err(SurfaceError::OutOfBounds {
                 rect: dest,
@@ -375,7 +375,7 @@ impl Surface {
     }
 
     pub fn blit_rgba_strict(&mut self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
-        self.validate_rgba_strict(dest, src)?;
+        self.validate_strict(dest, src)?;
         let row_bytes = dest.width() as usize * BPP;
         for row in 0..dest.height() {
             let src_off = row as usize * row_bytes;
@@ -396,21 +396,8 @@ impl Surface {
     /// are validated against the advertised frame size before they get here, so an
     /// overhanging rectangle is a protocol violation, not tile-grid slack.
     pub fn blit_bgra_strict(&mut self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
-        if dest.right > self.width || dest.bottom > self.height || dest.is_empty() {
-            return Err(SurfaceError::OutOfBounds {
-                rect: dest,
-                width: self.width,
-                height: self.height,
-            });
-        }
+        self.validate_strict(dest, src)?;
         let row_px = dest.width() as usize;
-        let expected = row_px * dest.height() as usize * BPP;
-        if src.len() != expected {
-            return Err(SurfaceError::SizeMismatch {
-                expected,
-                got: src.len(),
-            });
-        }
         for row in 0..dest.height() {
             let src_off = row as usize * row_px * BPP;
             let dst_off = self.row_start(dest.top + row) + dest.left as usize * BPP;
@@ -1195,7 +1182,7 @@ impl SurfaceStore {
                 .get(&id)
                 .ok_or(SurfaceError::NoSuchSurface(id))?;
             for (dest, src) in updates {
-                surface.validate_rgba_strict(*dest, src)?;
+                surface.validate_strict(*dest, src)?;
             }
         }
 
@@ -1208,6 +1195,47 @@ impl SurfaceStore {
             // Every update was validated above while the store was still
             // unchanged, so these writes cannot fail part-way through.
             surface.blit_rgba_strict(*dest, src)?;
+            bytes = bytes.saturating_add(src.len() as u64);
+        }
+        self.cache_stats.bytes_from_wire = self.cache_stats.bytes_from_wire.saturating_add(bytes);
+        self.finish_surface_mutation(id);
+        Ok(self.generation)
+    }
+
+    /// Apply several tightly packed BGRA rectangles as one visible mutation.
+    ///
+    /// Native dirty rectangles arrive in BGRA order. Validate the complete batch before
+    /// swizzling any pixel so a malformed later rectangle cannot expose an earlier one.
+    pub(crate) fn blit_bgra_strict_batch<'a, I>(
+        &mut self,
+        id: u16,
+        updates: I,
+    ) -> Result<u64, SurfaceError>
+    where
+        I: Iterator<Item = (Rect, &'a [u8])> + Clone,
+    {
+        if updates.clone().next().is_none() {
+            return Ok(self.generation);
+        }
+
+        {
+            let surface = self
+                .surfaces
+                .get(&id)
+                .ok_or(SurfaceError::NoSuchSurface(id))?;
+            for (dest, src) in updates.clone() {
+                surface.validate_strict(dest, src)?;
+            }
+        }
+
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(SurfaceError::NoSuchSurface(id))?;
+        let mut bytes = 0u64;
+        for (dest, src) in updates {
+            // Preflight above makes every swizzle infallible while this store remains locked.
+            surface.blit_bgra_strict(dest, src)?;
             bytes = bytes.saturating_add(src.len() as u64);
         }
         self.cache_stats.bytes_from_wire = self.cache_stats.bytes_from_wire.saturating_add(bytes);
@@ -2554,6 +2582,32 @@ mod tests {
             store.presentation_fallback.is_none(),
             "a committed replacement must retire its old presentation"
         );
+    }
+
+    #[test]
+    fn a_bgra_batch_swizzles_every_rect_and_publishes_once() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.map_to_output(1);
+        let before_generation = store.generation();
+        let before_bytes = store.cache_stats().bytes_from_wire;
+        let left = [1, 2, 3, 4];
+        let right = [10, 20, 30, 40];
+
+        let generation = store
+            .blit_bgra_strict_batch(
+                1,
+                [
+                    (Rect::new(0, 0, 1, 1), left.as_slice()),
+                    (Rect::new(1, 0, 2, 1), right.as_slice()),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+
+        assert_eq!(generation, before_generation + 1);
+        assert_eq!(store.get(1).unwrap().pixels(), [3, 2, 1, 4, 30, 20, 10, 40]);
+        assert_eq!(store.cache_stats().bytes_from_wire, before_bytes + 8);
     }
 
     #[test]
