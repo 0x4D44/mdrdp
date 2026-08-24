@@ -88,6 +88,18 @@ impl Presenter {
         }
     }
 
+    /// Whether expensive frame construction is worth starting now.
+    ///
+    /// This is only a hint for the IOSurface backend: compositor ownership can change
+    /// immediately after the check, so [`FrameBuf::present`] always checks again.
+    pub fn can_start_frame(&self, width: NonZeroU32, height: NonZeroU32) -> bool {
+        match self {
+            Self::Soft { .. } => true,
+            #[cfg(target_os = "macos")]
+            Self::Layer(layer) => layer.can_start_frame(width.get(), height.get()),
+        }
+    }
+
     /// Borrow this frame's pixel buffer. Present it with [`FrameBuf::present`].
     pub fn frame(&mut self) -> Result<FrameBuf<'_>, String> {
         match self {
@@ -193,9 +205,21 @@ fn pick_surface_for_write(
         .find(|i| !is_in_use(*i))
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn iosurface_frame_available(
+    dimensions_match: bool,
+    pool_len: usize,
+    last: Option<usize>,
+    mut is_in_use: impl FnMut(usize) -> bool,
+) -> bool {
+    !dimensions_match
+        || pool_len == 0
+        || pick_surface_for_write(pool_len, last, &mut is_in_use).is_some()
+}
+
 #[cfg(target_os = "macos")]
 pub mod macos {
-    use super::{PresentStatus, copy_rows_bgra, pick_surface_for_write};
+    use super::{PresentStatus, copy_rows_bgra, iosurface_frame_available, pick_surface_for_write};
     use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool};
@@ -293,6 +317,15 @@ pub mod macos {
 
         pub fn staging_mut(&mut self) -> &mut [u32] {
             &mut self.staging
+        }
+
+        pub fn can_start_frame(&self, width: u32, height: u32) -> bool {
+            iosurface_frame_available(
+                (width, height) == (self.width, self.height),
+                self.surfaces.len(),
+                self.last,
+                |i| self.surfaces[i].is_in_use(),
+            )
         }
 
         /// Copy the staging frame into a free surface and put it on glass.
@@ -458,5 +491,33 @@ mod tests {
             pick_surface_for_write(in_use.len(), Some(0), |i| in_use[i]),
             None
         );
+    }
+
+    #[test]
+    fn an_unchanged_busy_pool_defers_before_rendering() {
+        let in_use = [true, true, true];
+        assert!(!iosurface_frame_available(
+            true,
+            in_use.len(),
+            Some(0),
+            |i| in_use[i]
+        ));
+    }
+
+    #[test]
+    fn an_empty_or_resized_pool_allows_lazy_rebuild() {
+        assert!(iosurface_frame_available(true, 0, None, |_| true));
+        assert!(iosurface_frame_available(false, 3, Some(0), |_| true));
+    }
+
+    #[test]
+    fn a_free_non_displayed_surface_allows_rendering() {
+        let in_use = [true, false, true];
+        assert!(iosurface_frame_available(
+            true,
+            in_use.len(),
+            Some(0),
+            |i| in_use[i]
+        ));
     }
 }

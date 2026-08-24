@@ -1957,6 +1957,20 @@ impl SessionApp {
             return; // Minimised. Nothing to draw into.
         };
 
+        // CoreAnimation can retain every IOSurface while it composites prior frames.
+        // Check before copying the 5K snapshot or converting/drawing the staging frame;
+        // present() checks again because compositor ownership can race this hint.
+        if !self
+            .presenter
+            .as_ref()
+            .is_some_and(|presenter| presenter.can_start_frame(width, height))
+        {
+            let deadline = Instant::now() + PRESENT_BACKPRESSURE_RETRY;
+            self.redraw_deadline = Some(deadline);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            return;
+        }
+
         // Gate large-canvas work while holding the same lock that makes the generation,
         // dimensions, and eventual snapshot coherent. A platform expose inside the
         // cadence window must not copy tens of MiB only to discard them afterward.
