@@ -6,15 +6,15 @@
 - **Area:** graphics/AVC
 - **Raised:** 2026-08-24T09:17:01Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260824T091738Z-b26417bf
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00090-run-fix-20260824T091738Z-b26417bf
+- **Owner base:** 819fb324b8e984f53004d55529a583d984478aca
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-24T09:17:38Z
+- **Owner until:** 2026-08-24T11:17:38Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
