@@ -6,15 +6,15 @@
 - **Area:** graphics/surface-lifecycle
 - **Raised:** 2026-08-24T11:19:50Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260824T112015Z-908a96a3
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00098-run-fix-20260824T112015Z-908a96a3
+- **Owner base:** a942cc0c0f477b04fd2c07f0e1aaaf072dba6de1
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-24T11:20:15Z
+- **Owner until:** 2026-08-24T13:20:15Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
