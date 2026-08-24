@@ -1,6 +1,6 @@
 # MDR-BUG-FLUX-00011 — rhydra native: a fresh viewer gets no frame until the desktop changes, so connecting to an idle desktop paints nothing
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** native-transport
@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T11:18:15Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-23T19:42:03Z, deltic:auto role=fix run=fix-20260823T193534Z-bc7d638d branch=task/bug-MDR-BUG-FLUX-00011-run-fix-20260823T193534Z-bc7d638d code=787740f gate=manual) -> Open (2026-08-24T16:50:34Z, reopened after human report reproduced the original static first-frame symptom on mdrdp 0.1.211 against Kiln)
+- **State history:** Open (2026-08-19T11:18:15Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-23T19:42:03Z, deltic:auto role=fix run=fix-20260823T193534Z-bc7d638d branch=task/bug-MDR-BUG-FLUX-00011-run-fix-20260823T193534Z-bc7d638d code=787740f gate=manual) -> Open (2026-08-24T16:50:34Z, reopened after human report reproduced the original static first-frame symptom on mdrdp 0.1.211 against Kiln) -> Fixed (2026-08-24T16:53:19Z, provisional recurrence attribution withdrawn after live presence proved Kiln used RDP/Avc444v2 rather than the native transport; original fix remains code=787740f)
 
 ## Observation
 
@@ -44,9 +44,9 @@ cannot freeze merely because its first recovery frame met a full outbound queue.
 Portable state tests cover cold missing state, reconnect, rebuild invalidation,
 successful admission, and recovery retry.
 
-The symptom recurred on mdrdp 0.1.211 against Kiln: the desktop took a long time to
-appear, then only a command-prompt cursor flashed until switching Windows desktops
-forced a full refresh. The existing fix therefore does not cover every cold/static
-viewer state and must be reverified against that exact sequence.
-
 ## Notes
+
+The superficially similar 0.1.211 Kiln report was provisionally attributed here, then
+live session presence identified its transport as RDP with AVC444v2. It does not
+reproduce or refute this native-transport defect; the RDP repaint path is tracked
+separately.
