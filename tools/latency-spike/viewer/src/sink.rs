@@ -419,6 +419,30 @@ impl DecodeSink {
         ));
     }
 
+    /// Hold the newest update while the canvas cannot safely accept it yet.
+    fn hold_rects(
+        &mut self,
+        update: rects::RectUpdate,
+        recv_done_us: u64,
+        displaced_reason: &'static str,
+    ) {
+        match self.pending_rects.take() {
+            Some(old) if old.update.frame_seq >= update.frame_seq => {
+                self.record_rect_skip(&update, recv_done_us, displaced_reason);
+                self.pending_rects = Some(old);
+            }
+            old => {
+                if let Some(old) = old {
+                    self.record_rect_skip(&old.update, old.recv_done_us, displaced_reason);
+                }
+                self.pending_rects = Some(PendingRects {
+                    update,
+                    recv_done_us,
+                });
+            }
+        }
+    }
+
     /// Resolve the held rect update, if the canvas has moved far enough.
     ///
     /// Called after every exactness advance (an accepted AU, a rebase, a painted
@@ -588,8 +612,9 @@ impl MessageSink for DecodeSink {
         let Some((canvas_width, canvas_height)) = self.canvas.as_ref().map(|c| (c.width, c.height))
         else {
             // Rects can legitimately beat the first decodable keyframe onto the wire.
-            // There is nothing to composite onto, so drop them — and count it.
-            self.record_rect_skip(&update, recv_done_us, "before_base");
+            // Hold the newest one; the first AU runs `try_apply_pending` after
+            // establishing the canvas and resolves it by the normal seq gate.
+            self.hold_rects(update, recv_done_us, "before_base");
             return Ok(());
         };
 
@@ -627,22 +652,7 @@ impl MessageSink for DecodeSink {
                 return Ok(());
             }
             Some(_) => {
-                // Hold it, newest wins; the displaced older hold gets its line.
-                match self.pending_rects.take() {
-                    Some(old) if old.update.frame_seq >= update.frame_seq => {
-                        self.record_rect_skip(&update, recv_done_us, SKIP_GAP);
-                        self.pending_rects = Some(old);
-                    }
-                    old => {
-                        if let Some(old) = old {
-                            self.record_rect_skip(&old.update, old.recv_done_us, SKIP_GAP);
-                        }
-                        self.pending_rects = Some(PendingRects {
-                            update,
-                            recv_done_us,
-                        });
-                    }
-                }
+                self.hold_rects(update, recv_done_us, SKIP_GAP);
                 return Ok(());
             }
         }
@@ -1034,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rects_message_before_any_canvas_is_skipped_and_counted() {
+    fn a_rects_message_before_any_canvas_paints_after_the_base_arrives() {
         let log = TempLog::new("before-base");
         let slot = Arc::new(FrameSlot::new());
         let mut sink = sink_with(&log, slot.clone());
@@ -1043,18 +1053,20 @@ mod tests {
         sink.on_rects(&payload(&u), 1_234)
             .expect("a well-formed payload is not a protocol error");
 
-        assert!(
-            slot.take().is_none(),
-            "nothing to composite onto, so nothing published"
-        );
-        let lines = log.lines();
-        assert_eq!(lines.len(), 1, "the skip is visible, not silent: {lines:?}");
-        assert_eq!(lines[0]["type"], "rects");
-        assert_eq!(lines[0]["skipped"], "before_base");
-        assert_eq!(lines[0]["seq"], 3);
-        assert_eq!(lines[0]["recv_done_us"], 1_234);
-        assert_eq!(lines[0]["rect_count"], 1);
-        assert_eq!(lines[0]["dropped"], false);
+        assert!(slot.take().is_none(), "the update must wait for a base");
+        assert!(log.lines().is_empty(), "a held update is not a skipped one");
+
+        sink.canvas = Some(canvas_8x4(2));
+        sink.try_apply_pending();
+        let frame = slot.take().expect("the adjacent held update must paint");
+        assert_eq!(&frame.rgba[..4], &[0xf1, 0xea, 0xe3, 0xff]);
+        match frame.stamps {
+            PaintStamps::Rects(stamps) => {
+                assert_eq!(stamps.seq, 3);
+                assert_eq!(stamps.recv_done_us, 1_234);
+            }
+            PaintStamps::Au(_) => panic!("the held sparse update must own the paint"),
+        }
     }
 
     #[test]

@@ -504,8 +504,7 @@ pub fn spawn(
                 &mut on_cursor,
                 &net_stop,
             );
-            video_base_ready.cancel();
-            let end = finish_video_worker(end, &net_stop, || {
+            let end = finish_video_and_cancel_base(end, &net_stop, &video_base_ready, || {
                 let _ = video_waker.close();
             });
             let _ = video_waker.cursor(CursorUpdate::Default);
@@ -814,6 +813,19 @@ fn finish_video_worker(
     end
 }
 
+/// Finish the recovery owner, then release any sparse update waiting for it.
+/// Stop must be visible first or the released reader can enter another socket read.
+fn finish_video_and_cancel_base(
+    end: SessionEnd,
+    stop: &AtomicBool,
+    base_ready: &BaseReady,
+    close_window: impl FnOnce(),
+) -> SessionEnd {
+    let end = finish_video_worker(end, stop, close_window);
+    base_ready.cancel();
+    end
+}
+
 /// The input worker reports transport failures as `Some(reason)` rather than a `SessionEnd`.
 /// Keep the same terminal-window contract as the video worker.
 fn finish_input_worker(
@@ -893,6 +905,9 @@ fn pump_sparse(sparse: &mut TcpStream, sink: &mut SparseSink, stop: &AtomicBool)
             Ok(Some(message)) if message.msg_type == framing::MSG_RECTS => {
                 if let Err(reason) = sink.on_rects(&message.payload, stop) {
                     return SessionEnd::TransportFailed(reason);
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return SessionEnd::WindowClosed;
                 }
                 continue;
             }
@@ -1454,11 +1469,17 @@ struct BaseReady {
 #[derive(Default)]
 struct BaseReadyWait {
     cancelled: bool,
+    #[cfg(test)]
+    waiters: usize,
 }
 
 impl BaseReady {
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
     fn signal(&self) {
-        if self.ready.load(Ordering::Acquire) {
+        if self.is_ready() {
             return;
         }
         let state = self
@@ -1489,23 +1510,28 @@ impl BaseReady {
         if stop.load(Ordering::Relaxed) {
             return Ok(false);
         }
-        if self.ready.load(Ordering::Acquire) {
+        if self.is_ready() {
             return Ok(true);
         }
         let mut state = self
             .wait
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
+        #[cfg(test)]
+        {
+            state.waiters += 1;
+            self.changed.notify_all();
+        }
+        let outcome = loop {
             if state.cancelled || stop.load(Ordering::Relaxed) {
-                return Ok(false);
+                break Ok(false);
             }
-            if self.ready.load(Ordering::Acquire) {
-                return Ok(true);
+            if self.is_ready() {
+                break Ok(true);
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err("initial recovery frame did not arrive within 5 seconds".into());
+                break Err("initial recovery frame did not arrive within 5 seconds".into());
             }
             let (next, result) = self
                 .changed
@@ -1513,13 +1539,42 @@ impl BaseReady {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next;
             if result.timed_out()
-                && !self.ready.load(Ordering::Acquire)
+                && !self.is_ready()
                 && !state.cancelled
                 && !stop.load(Ordering::Relaxed)
             {
-                return Err("initial recovery frame did not arrive within 5 seconds".into());
+                break Err("initial recovery frame did not arrive within 5 seconds".into());
+            }
+        };
+        #[cfg(test)]
+        {
+            state.waiters -= 1;
+            self.changed.notify_all();
+        }
+        outcome
+    }
+
+    #[cfg(test)]
+    fn wait_for_waiter(&self, deadline: Instant) -> bool {
+        let mut state = self
+            .wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.waiters == 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, result) = self
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if result.timed_out() && state.waiters == 0 {
+                return false;
             }
         }
+        true
     }
 }
 
@@ -1661,7 +1716,7 @@ impl SparseSink {
     fn on_rects(&mut self, payload: &[u8], stop: &AtomicBool) -> Result<(), String> {
         let wire_bytes = payload.len() as u64;
         let update = rects::decode(payload).map_err(|error| format!("rects payload: {error}"))?;
-        if update.rects.is_empty() || !self.base_ready.wait(stop)? {
+        if update.rects.is_empty() {
             return Ok(());
         }
         if (update.frame_width, update.frame_height) != self.wire_size {
@@ -1677,6 +1732,17 @@ impl SparseSink {
                 height: u32::from(rect.h),
             })
             .collect();
+        if !self.base_ready.is_ready() {
+            // Reject static wire faults before entering the recovery wait. The
+            // steady-state path does not pay this extra validation or lock.
+            self.fences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .validate_coverage(&coverage)?;
+            if !self.base_ready.wait(stop)? {
+                return Ok(());
+            }
+        }
         let mut fences = self
             .fences
             .lock()
@@ -3465,6 +3531,7 @@ mod tests {
         let move_rendezvous = Arc::new(MoveRendezvous::default());
         let stats = StatsHandle::new();
         let input_clock = InputClock::default();
+        let base_ready_probe = Arc::clone(&base_ready);
         let mut video = NativeSink::new_tiled_shared(
             vec![NativeDecoder::H264(Box::new(FakeDecoder { size }))],
             vec![super::super::probe::TileHeader {
@@ -3508,20 +3575,42 @@ mod tests {
         let mut payload = Vec::new();
         rects::encode(&raw, &mut payload);
         let stop = Arc::new(AtomicBool::new(false));
+
+        let wrong_geometry = RectUpdate {
+            frame_seq: 2,
+            frame_width: size.0 + 1,
+            frame_height: size.1,
+            rects: vec![WireRect {
+                x: 0,
+                y: 0,
+                w: size.0 as u16,
+                h: size.1 as u16,
+                pixels: [0x33, 0x22, 0x11, 0xff].repeat((size.0 * size.1) as usize),
+            }],
+        };
+        let mut wrong_payload = Vec::new();
+        rects::encode(&wrong_geometry, &mut wrong_payload);
+        let already_stopping = AtomicBool::new(true);
+        assert!(
+            sparse
+                .on_rects(&wrong_payload, &already_stopping)
+                .unwrap_err()
+                .contains("geometry changed"),
+            "static geometry faults must fail before the recovery wait"
+        );
+
         let worker_stop = Arc::clone(&stop);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let sparse_join = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
             let result = sparse.on_rects(&payload, &worker_stop);
             done_tx.send(result).unwrap();
         });
 
-        started_rx.recv().unwrap();
         assert!(
-            done_rx.recv_timeout(Duration::from_millis(250)).is_err(),
-            "the sparse update returned instead of waiting for its recovery base"
+            base_ready_probe.wait_for_waiter(Instant::now() + Duration::from_secs(1)),
+            "the sparse update did not enter the recovery wait"
         );
+        assert!(matches!(done_rx.try_recv(), Err(TryRecvError::Empty)));
         video
             .on_video_update(VideoUpdate {
                 frame_seq: 1,
@@ -3555,8 +3644,29 @@ mod tests {
         drop(guard);
 
         let cancelled = Arc::new(BaseReady::default());
-        cancelled.cancel();
-        assert!(!cancelled.wait(&stop).unwrap());
+        let cancel_wait = Arc::clone(&cancelled);
+        let cancel_stop = Arc::new(AtomicBool::new(false));
+        let waiter_stop = Arc::clone(&cancel_stop);
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let cancel_join = std::thread::spawn(move || {
+            cancel_tx.send(cancel_wait.wait(&waiter_stop)).unwrap();
+        });
+        assert!(cancelled.wait_for_waiter(Instant::now() + Duration::from_secs(1)));
+        let end = finish_video_and_cancel_base(
+            SessionEnd::TransportFailed("test failure".into()),
+            &cancel_stop,
+            &cancelled,
+            || {},
+        );
+        assert!(matches!(end, SessionEnd::TransportFailed(_)));
+        assert!(cancel_stop.load(Ordering::Relaxed));
+        assert!(
+            !cancel_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+        );
+        cancel_join.join().unwrap();
         let timed_out = BaseReady::default();
         assert!(timed_out.wait_until(&stop, Instant::now()).is_err());
     }
