@@ -12,6 +12,7 @@
 //! regardless of the feature): a client build takes `default-features = false` and
 //! gets only the portable half (HLD tranche 3 §3).
 
+pub mod adaptive;
 pub mod annexb;
 pub mod audio_source;
 pub mod aux_proto;
