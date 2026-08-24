@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00096 — RDP reactivation rejects required no-input steps and stalls queued input
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/reactivation
 - **Raised:** 2026-08-24T10:49:26Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T104944Z-d7c91cc4
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00096-run-fix-20260824T104944Z-d7c91cc4
-- **Owner base:** da9f185eaf1ac6739b9630fdc86c80ad8830a527
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T10:49:44Z
-- **Owner until:** 2026-08-24T12:49:44Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T10:49:26Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-24T10:49:26Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T11:06:10Z, deltic:auto role=fix run=fix-20260824T104944Z-d7c91cc4 branch=task/bug-MDR-BUG-FLU-00096-run-fix-20260824T104944Z-d7c91cc4 code=0d80453 gate=manual)
 
 ## Observation
 
