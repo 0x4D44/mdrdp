@@ -6,15 +6,15 @@
 - **Area:** testing/graphics
 - **Raised:** 2026-08-24T20:16:01Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260824T201637Z-2b029615
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00119-run-fix-20260824T201637Z-2b029615
+- **Owner base:** 9a935ea9e5ce233f58936b87aa7e5062f392de00
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-24T20:16:37Z
+- **Owner until:** 2026-08-24T22:16:37Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
