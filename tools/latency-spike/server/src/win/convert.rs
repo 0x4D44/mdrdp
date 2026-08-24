@@ -25,6 +25,7 @@
 //! inside the encode stage, and the README says so.
 
 use super::Result;
+use crate::adaptive::{intersect, Region};
 use crate::colorspace;
 use crate::surface_pool::LeaseSlots;
 use std::mem::ManuallyDrop;
@@ -33,20 +34,105 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
     ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-    D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
-    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEX2D_VPIV,
+    D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+};
 
 /// Maximum NV12 surfaces per tile. Four allows the GPU and encoder to overlap while
 /// bounding 5K surface memory to roughly 88 MiB across the normal two-tile layout.
 pub const POOL_SIZE: usize = 4;
+
+/// Persistent BGRA input for one fixed H.264 tile. Sparse-owned and unchanged
+/// blocks are deliberately never copied here, keeping the encoder and decoder's
+/// private reference plane aligned at their last common coded pixels.
+pub struct CodecCanvas {
+    texture: ID3D11Texture2D,
+    context: ID3D11DeviceContext,
+    bounds: Region,
+}
+
+impl CodecCanvas {
+    pub fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        bounds: Region,
+    ) -> Result<Self> {
+        if bounds.width == 0 || bounds.height == 0 {
+            return Err("codec canvas has zero area".into());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: bounds.width,
+            Height: bounds.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        // SAFETY: `desc` and the out-parameter are live for the call.
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }?;
+        Ok(Self {
+            texture: texture.ok_or("CreateTexture2D returned no codec canvas")?,
+            context: context.clone(),
+            bounds,
+        })
+    }
+
+    pub fn texture(&self) -> &ID3D11Texture2D {
+        &self.texture
+    }
+
+    /// Copy only selected global-coordinate coverage from the current desktop.
+    /// Returns false when this tile owns none of it and therefore needs no AU.
+    pub fn update(&self, source: &ID3D11Texture2D, coverage: &[Region]) -> bool {
+        let mut copied = false;
+        for region in coverage
+            .iter()
+            .filter_map(|region| intersect(*region, self.bounds))
+        {
+            let source_box = D3D11_BOX {
+                left: region.x,
+                top: region.y,
+                front: 0,
+                right: region.x + region.width,
+                bottom: region.y + region.height,
+                back: 1,
+            };
+            // SAFETY: intersection proves the source box and tile-relative
+            // destination fit their textures; both textures and the box are live.
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    &self.texture,
+                    0,
+                    region.x - self.bounds.x,
+                    region.y - self.bounds.y,
+                    0,
+                    source,
+                    0,
+                    Some(&source_box as *const D3D11_BOX),
+                );
+            }
+            copied = true;
+        }
+        copied
+    }
+}
 
 struct Surface {
     texture: ID3D11Texture2D,
