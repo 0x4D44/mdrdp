@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00015 — Every fleet test host is headless, so display-transition faults are structurally unreachable in testing
 
-- **State:** Open
+- **State:** Blocked
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** testing
 - **Raised:** 2026-08-19T16:10:39Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T235505Z-345181fa
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00015-run-fix-20260824T235505Z-345181fa
-- **Owner base:** 8e60e644f732ebbbef35612736f9c42bf4623da4
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T23:55:05Z
-- **Owner until:** 2026-08-25T01:55:05Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T16:10:39Z, raised via `deltic bugs new` model=claude-opus-5@high)
+- **State history:** Open (2026-08-19T16:10:39Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Blocked (2026-08-24T23:56:08Z, 0x4D44/Codex: Arthur must designate kiln for repeatable testing or attach a real monitor/dummy plug to a fleet test host; `CLAUDE.md` already records the gap, and repository-only checks cannot produce physical panel, backlight, lid, or dock transitions)
 
 ## Observation
 
