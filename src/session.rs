@@ -1211,6 +1211,7 @@ fn drive_reactivation(
                 };
                 let ready = wake::wait_readable(&established.socket, wake_rx, wait)
                     .map_err(ConnectError::Io)?;
+                reset_reactivation_input_deadline_after_wait(batch_full, &mut input_turn_deadline);
                 if !ready.socket {
                     continue;
                 }
@@ -1397,6 +1398,18 @@ fn readiness_wait_after_work(batch_full: bool) -> Duration {
         Duration::ZERO
     } else {
         IDLE_WAIT
+    }
+}
+
+/// A real inbound wait starts a new input batch. Keep the old budget across the zero-time
+/// readiness poll used to yield a full local batch, so a busy producer cannot reset the
+/// write bound on every 255-event chunk without giving the server a turn.
+fn reset_reactivation_input_deadline_after_wait(
+    batch_full: bool,
+    input_turn_deadline: &mut Option<Instant>,
+) {
+    if !batch_full {
+        *input_turn_deadline = None;
     }
 }
 
@@ -1944,6 +1957,68 @@ mod tests {
             )
             .unwrap(),
             ReactivationInput::Stopped
+        );
+    }
+
+    #[test]
+    fn delayed_hinted_wait_starts_a_fresh_input_write_budget() {
+        let first = InputEvent::MouseMove { x: 4, y: 5 };
+        let second = InputEvent::MouseMove { x: 40, y: 50 };
+        let (tx, rx) = mpsc::channel();
+        tx.send(first).unwrap();
+        let latest = LatestMouseMove::default();
+        let stop = AtomicBool::new(false);
+        let mut framed = Framed::new(Sink(Vec::new()));
+        let mut input_sent_at = None;
+        let mut input_turn_deadline = None;
+
+        assert_eq!(
+            drain_reactivation_input(
+                true,
+                &stop,
+                &rx,
+                &latest,
+                &mut framed,
+                &mut input_sent_at,
+                &mut input_turn_deadline,
+            )
+            .unwrap(),
+            ReactivationInput::Continue { batch_full: false }
+        );
+        let first_wire_len = framed.get_inner().0.0.len();
+        assert!(input_turn_deadline.is_some());
+
+        // Model a hinted server wait longer than the five-second write budget without
+        // sleeping. The next input must not inherit this expired absolute deadline.
+        input_turn_deadline = Some(Instant::now() - RDP_WRITE_TIMEOUT);
+        tx.send(second).unwrap();
+        reset_reactivation_input_deadline_after_wait(false, &mut input_turn_deadline);
+
+        assert!(
+            drain_reactivation_input(
+                true,
+                &stop,
+                &rx,
+                &latest,
+                &mut framed,
+                &mut input_sent_at,
+                &mut input_turn_deadline,
+            )
+            .is_ok(),
+            "input after a delayed hinted wait must get a fresh write budget"
+        );
+        let wire = &framed.get_inner().0.0;
+        assert!(
+            wire.len() > first_wire_len,
+            "both inputs must be written after the delayed hinted wait"
+        );
+        assert_eq!(
+            decode_input(&wire[..first_wire_len]),
+            vec![to_fastpath(first)]
+        );
+        assert_eq!(
+            decode_input(&wire[first_wire_len..]),
+            vec![to_fastpath(second)]
         );
     }
 
