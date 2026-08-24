@@ -1422,6 +1422,8 @@ struct BlockFences {
     width: u32,
     height: u32,
     seqs: Vec<u64>,
+    #[cfg(test)]
+    inspected_blocks: std::cell::Cell<usize>,
 }
 
 #[derive(Default)]
@@ -1588,12 +1590,12 @@ impl SparseSink {
             .fences
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // One global pass rejects overlaps and out-of-order block coverage before
+        // One global pass rejects overlaps and malformed block coverage before
         // any source buffer is sliced or the surface is touched.
-        let _ = fences.visible(update.frame_seq, &coverage)?;
+        fences.validate_coverage(&coverage)?;
         let mut staged = Vec::new();
         for (wire_rect, region) in update.rects.iter().zip(&coverage) {
-            for visible in fences.visible(update.frame_seq, &[*region])? {
+            for visible in fences.visible_validated(update.frame_seq, &[*region])? {
                 let width = visible.width as usize;
                 let height = visible.height as usize;
                 let local_x = (visible.x - region.x) as usize;
@@ -1662,48 +1664,88 @@ impl BlockFences {
             width,
             height,
             seqs: vec![0; count as usize],
+            #[cfg(test)]
+            inspected_blocks: std::cell::Cell::new(0),
         }
     }
 
-    fn visible(&self, seq: u64, coverage: &[Region]) -> Result<Vec<Region>, String> {
+    fn block_bounds(&self, region: &Region) -> Result<(u32, u32, u32, u32), String> {
+        let right = region.x.saturating_add(region.width);
+        let bottom = region.y.saturating_add(region.height);
+        if region.width == 0
+            || region.height == 0
+            || right > self.width
+            || bottom > self.height
+            || !region.x.is_multiple_of(UPDATE_BLOCK_SIZE)
+            || !region.y.is_multiple_of(UPDATE_BLOCK_SIZE)
+            || (right != self.width && !right.is_multiple_of(UPDATE_BLOCK_SIZE))
+            || (bottom != self.height && !bottom.is_multiple_of(UPDATE_BLOCK_SIZE))
+        {
+            return Err("update coverage is not aligned to the negotiated codec grid".into());
+        }
+        Ok((
+            region.x / UPDATE_BLOCK_SIZE,
+            right.div_ceil(UPDATE_BLOCK_SIZE),
+            region.y / UPDATE_BLOCK_SIZE,
+            bottom.div_ceil(UPDATE_BLOCK_SIZE),
+        ))
+    }
+
+    fn validate_coverage(&self, coverage: &[Region]) -> Result<(), String> {
         let blocks_w = self.width.div_ceil(UPDATE_BLOCK_SIZE);
-        let blocks_h = self.height.div_ceil(UPDATE_BLOCK_SIZE);
-        let mut covered = vec![false; (blocks_w * blocks_h) as usize];
+        let mut covered = std::collections::HashSet::new();
         for region in coverage {
-            let right = region.x.saturating_add(region.width);
-            let bottom = region.y.saturating_add(region.height);
-            if region.width == 0
-                || region.height == 0
-                || right > self.width
-                || bottom > self.height
-                || region.x % UPDATE_BLOCK_SIZE != 0
-                || region.y % UPDATE_BLOCK_SIZE != 0
-                || (right != self.width && right % UPDATE_BLOCK_SIZE != 0)
-                || (bottom != self.height && bottom % UPDATE_BLOCK_SIZE != 0)
-            {
-                return Err("update coverage is not aligned to the negotiated codec grid".into());
-            }
-            for y in region.y / UPDATE_BLOCK_SIZE..bottom.div_ceil(UPDATE_BLOCK_SIZE) {
-                for x in region.x / UPDATE_BLOCK_SIZE..right.div_ceil(UPDATE_BLOCK_SIZE) {
+            let (left, right, top, bottom) = self.block_bounds(region)?;
+            for y in top..bottom {
+                for x in left..right {
                     let index = (y * blocks_w + x) as usize;
-                    if std::mem::replace(&mut covered[index], true) {
+                    if !covered.insert(index) {
                         return Err("update coverage overlaps on the codec grid".into());
                     }
                 }
             }
         }
-        let blocks = covered
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, covered)| {
-                (covered && self.seqs[index] < seq).then_some(Block {
-                    x: index as u32 % blocks_w,
-                    y: index as u32 / blocks_w,
-                })
-            })
-            .collect::<Vec<_>>();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn visible(&self, seq: u64, coverage: &[Region]) -> Result<Vec<Region>, String> {
+        self.validate_coverage(coverage)?;
+        self.visible_validated(seq, coverage)
+    }
+
+    /// Select blocks from coverage which the caller already validated as one batch.
+    /// Work is proportional to those regions, never to the full 5K codec grid.
+    fn visible_validated(&self, seq: u64, coverage: &[Region]) -> Result<Vec<Region>, String> {
+        let blocks_w = self.width.div_ceil(UPDATE_BLOCK_SIZE);
+        let mut blocks = Vec::new();
+        #[cfg(test)]
+        let mut inspected = 0usize;
+        for region in coverage {
+            let (left, right, top, bottom) = self.block_bounds(region)?;
+            for y in top..bottom {
+                for x in left..right {
+                    #[cfg(test)]
+                    {
+                        inspected += 1;
+                    }
+                    let index = (y * blocks_w + x) as usize;
+                    if self.seqs[index] < seq {
+                        blocks.push(Block { x, y });
+                    }
+                }
+            }
+        }
+        blocks.sort_unstable_by_key(|block| (block.y, block.x));
+        #[cfg(test)]
+        self.inspected_blocks.set(inspected);
         adaptive::blocks_to_regions(&blocks, self.width, self.height, UPDATE_BLOCK_SIZE)
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    fn inspected_blocks(&self) -> usize {
+        self.inspected_blocks.get()
     }
 
     fn commit(&mut self, seq: u64, coverage: &[Region]) {
@@ -2137,7 +2179,7 @@ impl NativeSink {
         self.fences
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .visible(update.frame_seq, &advertised_coverage)?;
+            .validate_coverage(&advertised_coverage)?;
 
         let started = Instant::now();
         let mut bytes = 0u64;
@@ -2179,7 +2221,7 @@ impl NativeSink {
         let mut staged = Vec::new();
         let mut committed_coverage = Vec::with_capacity(decoded_tiles.len());
         for decoded in decoded_tiles {
-            let visible = fences.visible(update.frame_seq, &decoded.coverage)?;
+            let visible = fences.visible_validated(update.frame_seq, &decoded.coverage)?;
             if visible.as_slice()
                 == [Region {
                     x: decoded.header.x,
@@ -2620,6 +2662,63 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn one_damaged_5k_block_inspects_only_that_block() {
+        let fences = BlockFences::new(5120, 2880);
+        let visible = fences
+            .visible(
+                1,
+                &[Region {
+                    x: 0,
+                    y: 0,
+                    width: UPDATE_BLOCK_SIZE,
+                    height: UPDATE_BLOCK_SIZE,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(
+            fences.inspected_blocks(),
+            1,
+            "tiny damage must not scan the complete 5K codec grid"
+        );
+    }
+
+    #[test]
+    fn damage_sized_selection_keeps_row_major_output_for_reversed_regions() {
+        let fences = BlockFences::new(32, 16);
+        let visible = fences
+            .visible(
+                1,
+                &[
+                    Region {
+                        x: 16,
+                        y: 0,
+                        width: 16,
+                        height: 16,
+                    },
+                    Region {
+                        x: 0,
+                        y: 0,
+                        width: 16,
+                        height: 16,
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            visible,
+            [Region {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 16,
+            }]
+        );
+    }
     use ironrdp_egfx::decode::{DecodedFrame, DecoderResult};
     use rhydra::input_proto::decode_record;
     use rhydra::rects::Rect as WireRect;

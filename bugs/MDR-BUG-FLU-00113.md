@@ -27,6 +27,15 @@ At 5120x2880, BlockFences::visible allocates and scans a 57,600-entry full-canva
 
 ## Fix
 
-<unfixed — raised only>
+`BlockFences` now validates aggregate geometry and overlap once, using storage
+proportional to the damaged blocks. The later precedence selection walks only each
+already-validated region, then restores row-major block order before coalescing. Sparse
+and regional video paths no longer allocate or scan a full-canvas bitmap once globally
+and again for every rectangle or tile.
+
+The 5K regression instruments selection work: one 16x16 damaged block inspected all
+57,600 grid entries before the fix and exactly one afterward. A second red-then-green
+test preserves the old row-major output when regions arrive in reverse order. All 41
+native-session tests and strict focused Clippy pass.
 
 ## Notes
