@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00085 — Deploy's legacy Rhydra uninstaller does not stop the current Windows service
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** deploy/rhydra
 - **Raised:** 2026-08-23T22:19:13Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T234549Z-b5e9422b
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00085-run-fix-20260824T234549Z-b5e9422b
-- **Owner base:** be8e1f04dcf8e1cddbbaa1a5421033a5a158e040
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T23:45:49Z
-- **Owner until:** 2026-08-25T01:45:49Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T22:19:13Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T22:19:13Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T23:54:48Z, deltic:auto role=fix run=fix-20260824T234549Z-b5e9422b branch=task/bug-MDR-BUG-FLU-00085-run-fix-20260824T234549Z-b5e9422b code=7ed0437ec2c5c513c70ca2b9a3a7638bfe7093c1 gate=manual)
 
 ## Observation
 
