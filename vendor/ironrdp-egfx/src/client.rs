@@ -703,6 +703,7 @@ impl GraphicsPipelineClient {
             }
             GfxPdu::WireToSurface2(pdu) => {
                 trace!("WireToSurface2 (progressive codec)");
+                self.invalidate_avc444(pdu.surface_id);
                 self.handler.on_wire_to_surface2(&pdu);
                 Ok(vec![])
             }
@@ -711,6 +712,7 @@ impl GraphicsPipelineClient {
             // Surface operations
             GfxPdu::SolidFill(pdu) => {
                 trace!(surface_id = pdu.surface_id, "SolidFill");
+                self.invalidate_avc444(pdu.surface_id);
                 self.handler.on_solid_fill(&pdu);
                 Ok(vec![])
             }
@@ -720,6 +722,7 @@ impl GraphicsPipelineClient {
                     dst = pdu.destination_surface_id,
                     "SurfaceToSurface"
                 );
+                self.invalidate_avc444(pdu.destination_surface_id);
                 self.handler.on_surface_to_surface(&pdu);
                 Ok(vec![])
             }
@@ -740,6 +743,7 @@ impl GraphicsPipelineClient {
                     surface_id = pdu.surface_id,
                     "CacheToSurface"
                 );
+                self.invalidate_avc444(pdu.surface_id);
                 self.handler.on_cache_to_surface(&pdu);
                 Ok(vec![])
             }
@@ -998,13 +1002,21 @@ impl GraphicsPipelineClient {
 
         match pdu.codec_id {
             Codec1Type::Avc420 => {
-                self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
+                if self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)? {
+                    self.invalidate_avc444(pdu.surface_id);
+                }
             }
             codec @ (Codec1Type::Avc444 | Codec1Type::Avc444v2) => {
                 self.decode_avc444(pdu.surface_id, codec, &pdu.bitmap_data);
             }
             Codec1Type::Uncompressed => {
+                self.invalidate_avc444(pdu.surface_id);
                 self.handle_uncompressed(pdu);
+            }
+            Codec1Type::ClearCodec => {
+                trace!(codec_id = ?pdu.codec_id, "Forwarding ClearCodec to handler");
+                self.invalidate_avc444(pdu.surface_id);
+                self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
             }
             _ => {
                 trace!(codec_id = ?pdu.codec_id, "Forwarding unsupported codec to handler");
@@ -1020,16 +1032,16 @@ impl GraphicsPipelineClient {
         surface_id: u16,
         dest_rect: &ExclusiveRectangle,
         bitmap_data: &[u8],
-    ) -> PduResult<()> {
+    ) -> PduResult<bool> {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
         if self.h264_decoder_factory.is_none() {
             debug!("No H.264 decoder configured, skipping AVC420 frame");
-            return Ok(());
+            return Ok(false);
         }
         let Some(()) = self.ensure_decoder_for_surface(surface_id) else {
-            return Ok(());
+            return Ok(false);
         };
 
         // mdrdp patch: a failed decode of one access unit skips that frame instead of
@@ -1047,7 +1059,7 @@ impl GraphicsPipelineClient {
                 warn!(error = %e, "H.264 decode failed; skipping this frame");
                 self.handler
                     .on_decode_failure(Codec1Type::Avc420, "h264 decode failed");
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -1069,7 +1081,7 @@ impl GraphicsPipelineClient {
             );
             self.handler
                 .on_decode_failure(Codec1Type::Avc420, "decoded frame smaller than destination");
-            return Ok(());
+            return Ok(false);
         }
 
         let cropped_data = crop_decoded_frame(
@@ -1090,7 +1102,7 @@ impl GraphicsPipelineClient {
         };
 
         self.handler.on_bitmap_updated(&update);
-        Ok(())
+        Ok(true)
     }
 
     /// Ensure a persistent decoder exists for `surface_id`, creating it on the first AVC
@@ -1113,6 +1125,14 @@ impl GraphicsPipelineClient {
         let decoder = factory.create()?;
         self.h264_decoders.insert(surface_id, decoder);
         Some(())
+    }
+
+    /// Drop the persistent AVC444 combination state when another codec or surface
+    /// operation overwrites this destination. LC=1/2 updates may only build on a
+    /// luma baseline from the current contents, never on pixels from before the
+    /// non-AVC mutation.
+    fn invalidate_avc444(&mut self, surface_id: u16) {
+        self.avc444_buffers.remove(&surface_id);
     }
 
     /// Retire a decoder with its surface, recycling only the legacy singleton adapter.
@@ -1375,6 +1395,11 @@ impl GraphicsPipelineClient {
             }
             Passes::ChromaOnly => {
                 // LC=2: the chroma frame travels in stream1, with stream1's rects.
+                if !self.avc444_buffers.contains_key(&surface_id) {
+                    self.handler
+                        .on_decode_failure(codec_id, "avc444 chroma-only missing luma baseline");
+                    return;
+                }
                 let decode_started = std::time::Instant::now();
                 if let Err(e) =
                     self.decode_yuv420_for_surface(surface_id, stream.stream1.data, true)
@@ -2536,6 +2561,62 @@ mod tests {
     }
 
     #[test]
+    fn a_non_avc_update_drops_stale_chroma_before_the_next_luma_pass() {
+        let (mut client, _rx) = avc444_client(64, 48);
+        let full = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
+            stream2: Some(avc420_sub_stream(
+                vec![wire_rect(0, 0, 64, 48)],
+                &[20, 0, 0],
+            )),
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &full);
+
+        let stale_chroma = {
+            let buffer = client.avc444_buffers.get(&1).expect("LC=0 buffer");
+            let (_, u, _) = buffer.planes();
+            u[5 * 64 + 5]
+        };
+        assert_ne!(stale_chroma, 31, "the seed must differ from a fresh luma baseline");
+
+        let _ = client.handle_pdu(GfxPdu::SolidFill(SolidFillPdu {
+            surface_id: 1,
+            fill_pixel: crate::pdu::Color {
+                b: 0,
+                g: 0,
+                r: 255,
+                xa: 0,
+            },
+            rectangles: vec![ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 32,
+                bottom: 24,
+            }],
+        }));
+        assert!(
+            !client.avc444_buffers.contains_key(&1),
+            "a destination mutation must retire persistent AVC444 state"
+        );
+
+        let luma_only = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 32, 48)], &[30, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &luma_only);
+
+        let buffer = client.avc444_buffers.get(&1).expect("fresh LC=1 buffer");
+        let (_, u, _) = buffer.planes();
+        assert_eq!(
+            u[5 * 64 + 5],
+            31,
+            "LC=1 after a non-AVC update must not repaint stale chroma"
+        );
+    }
+
+    #[test]
     fn avc444_lc1_skips_rects_not_covered_by_decoded_luma_frame() {
         // The surface is 64x48, but the decoded main frame is only 32x24. The
         // full wire rect is therefore not safe to repaint from the persistent buffer.
@@ -2626,11 +2707,10 @@ mod tests {
     }
 
     #[test]
-    fn avc444_lc2_takes_chroma_from_stream1_and_creates_the_buffer() {
+    fn avc444_lc2_without_luma_baseline_is_skipped() {
         let (mut client, rx) = avc444_client(64, 48);
 
-        // Chroma-only as the FIRST frame: the buffer must come into being sized from
-        // the surface, with luma untouched (black).
+        // Chroma-only as the FIRST frame has no luma baseline to combine with.
         let chroma_only = Avc444BitmapStream {
             encoding: Encoding::CHROMA,
             stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[40, 0, 0]),
@@ -2638,30 +2718,16 @@ mod tests {
         };
         deliver_avc444(&mut client, Codec1Type::Avc444v2, &chroma_only);
 
-        let buffer = client
-            .avc444_buffers
-            .get(&1)
-            .expect("buffer created by LC=2");
-        assert_eq!((buffer.width(), buffer.height()), (64, 48));
-        let (y, u, _) = buffer.planes();
-        assert_eq!(y[0], 0, "no luma was delivered");
-        assert_eq!(
-            u[3 * 64 + 3],
-            40u8.wrapping_add((3 * 64 + 1) as u8),
-            "odd column chroma from the stream1 aux frame"
-        );
-
         let events: Vec<Event> = rx.try_iter().collect();
         assert!(
-            matches!(
-                events.as_slice(),
-                [Event::Update {
-                    rect: (0, 0, 64, 48),
-                    ..
-                }]
-            ),
-            "one update over the stream1 rects: {events:?}"
+            events.iter().any(|event| matches!(
+                event,
+                Event::Failure(reason) if reason == "avc444 chroma-only missing luma baseline"
+            )),
+            "missing luma baseline must be counted: {events:?}"
         );
+        assert!(!events.iter().any(|event| matches!(event, Event::Update { .. })));
+        assert!(!client.avc444_buffers.contains_key(&1));
     }
 
     #[test]
