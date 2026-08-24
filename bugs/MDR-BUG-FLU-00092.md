@@ -6,15 +6,15 @@
 - **Area:** graphics/surface-mapping
 - **Raised:** 2026-08-24T09:37:41Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260824T095906Z-db220a0e
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00092-run-fix-20260824T095906Z-db220a0e
+- **Owner base:** 02b2e7154be2bae947cded02b17349eed37e7f03
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-24T09:59:06Z
+- **Owner until:** 2026-08-24T11:59:06Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
