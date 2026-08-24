@@ -16,6 +16,7 @@
 
 use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource};
 use super::{convert, dxgi, encode, idd_source, input, pixel_diff, qpc, send, Result};
+use crate::adaptive::Region;
 use crate::annexb::{self, AvcParameterSets, ParameterSets};
 use crate::bootstrap::ViewerBootstrap;
 use crate::channel_listeners::BoundChannels;
@@ -312,6 +313,7 @@ pub fn run(cfg: &Config) -> Result<()> {
 
 struct TilePipeline {
     header: stats::TileHeader,
+    codec_canvas: Option<convert::CodecCanvas>,
     converter: convert::Nv12Converter,
     encoder: Box<dyn encode::Encoder>,
 }
@@ -330,17 +332,42 @@ fn build_tiles(
     let per_tile_bitrate = cfg.bitrate_kbps.div_ceil(tile_count).max(1);
     let mut tiles = Vec::with_capacity(layout.len());
     for header in layout {
-        let converter = convert::Nv12Converter::new_region(
-            source.device(),
-            source.context(),
-            source.width(),
-            source.height(),
-            header.x,
-            header.y,
-            header.width,
-            header.height,
-            DECLARED_FPS,
-        )?;
+        let bounds = Region {
+            x: header.x,
+            y: header.y,
+            width: header.width,
+            height: header.height,
+        };
+        let (codec_canvas, converter) = match codec {
+            encode::Codec::H264 => (
+                Some(convert::CodecCanvas::new(
+                    source.device(),
+                    source.context(),
+                    bounds,
+                )?),
+                convert::Nv12Converter::new(
+                    source.device(),
+                    source.context(),
+                    header.width,
+                    header.height,
+                    DECLARED_FPS,
+                )?,
+            ),
+            encode::Codec::Hevc => (
+                None,
+                convert::Nv12Converter::new_region(
+                    source.device(),
+                    source.context(),
+                    source.width(),
+                    source.height(),
+                    header.x,
+                    header.y,
+                    header.width,
+                    header.height,
+                    DECLARED_FPS,
+                )?,
+            ),
+        };
         let encoder = encode::create(
             codec,
             header.width,
@@ -362,6 +389,7 @@ fn build_tiles(
         );
         tiles.push(TilePipeline {
             header,
+            codec_canvas,
             converter,
             encoder,
         });
@@ -1151,8 +1179,24 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             .zip(&mut last_epochs)
             .zip(0usize..)
         {
+            let convert_source = match tile.codec_canvas.as_ref() {
+                Some(canvas) => {
+                    let copied = canvas.update(
+                        &texture,
+                        &[Region {
+                            x: tile.header.x,
+                            y: tile.header.y,
+                            width: tile.header.width,
+                            height: tile.header.height,
+                        }],
+                    );
+                    debug_assert!(copied, "whole-tile coverage must update its codec canvas");
+                    canvas.texture()
+                }
+                None => &texture,
+            };
             let convert_start = qpc::now();
-            let nv12 = tile.converter.convert(&texture)?;
+            let nv12 = tile.converter.convert(convert_source)?;
             let convert_end = qpc::now();
             let mut meta = encode::FrameMeta {
                 seq: frame_seq,
