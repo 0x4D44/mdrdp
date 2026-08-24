@@ -946,6 +946,7 @@ impl SurfaceStore {
         if mapping_changed
             && self.surfaces.get(&id).is_some_and(Surface::is_painted)
             && self.presentation_fallback.is_none()
+            && !self.presentation_suppressed
             && !released_suppressed_presentation
         {
             if matches!(self.frame_state, FrameState::Idle) {
@@ -2017,6 +2018,67 @@ mod tests {
             .unwrap();
         assert!(store.commit_frame(13));
         assert_eq!(store.generation(), before + 1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, BLUE));
+    }
+
+    #[test]
+    fn suppressed_presentation_ignores_a_partial_surface_mapped_after_pre_map_paint() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let before = store.generation();
+
+        // An incomplete frame leaves the last copied snapshot suppressed rather than
+        // exposing the replacement's partial in-place pixels.
+        store.begin_frame(12);
+        store.create(2, 2, 1);
+        store.map_to_output(2);
+        store
+            .blit_rgba_strict(2, Rect::new(0, 0, 1, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        assert!(store.commit_frame(12));
+        assert_eq!(store.generation(), before);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+
+        // Writes may arrive before MapSurfaceToOutput. Mapping this already-painted,
+        // still-partial surface must not manufacture a damage event while suppression
+        // keeps the old snapshot on screen.
+        store.create(3, 2, 1);
+        store
+            .blit_rgba_strict(3, Rect::new(0, 0, 1, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        let before_map = store.generation();
+        store.map_to_output(3);
+        assert_eq!(
+            store.generation(),
+            before_map,
+            "partial pre-map pixels remain hidden until the surface is complete"
+        );
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+
+        store
+            .blit_rgba_strict(3, Rect::new(1, 0, 2, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        assert_eq!(store.generation(), before_map + 1);
         assert_eq!(
             store.copy_presentation_state(&mut snapshot),
             PresentationCopy::Copied
