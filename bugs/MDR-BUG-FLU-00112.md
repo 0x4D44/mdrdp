@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00112 — Fresh visible RDP session can show only incremental damage until the host forces a full repaint
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** session/rdp presentation
 - **Raised:** 2026-08-24T16:59:47Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T170017Z-aa80616e
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00112-run-fix-20260824T170017Z-aa80616e
-- **Owner base:** 7c5be43524d4be5684885f06bc7296020e80047e
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T17:00:17Z
-- **Owner until:** 2026-08-24T19:00:17Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T16:59:47Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-24T16:59:47Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T17:05:26Z, deltic:auto role=fix run=fix-20260824T170017Z-aa80616e branch=task/bug-MDR-BUG-FLU-00112-run-fix-20260824T170017Z-aa80616e code=91e04d0 gate=manual)
 
 ## Observation
 
