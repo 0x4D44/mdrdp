@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00003 — macOS session process UAF: session menu bar dropped before epilogue while still installed in NSApp; panics in muda icon code
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** window
 - **Raised:** 2026-08-16T20:44:33Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T075750Z-555dee06
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00003-run-fix-20260824T075750Z-555dee06
-- **Owner base:** f7d3c7991072d37d913e862d092023a39631cd88
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T07:57:50Z
-- **Owner until:** 2026-08-24T09:57:50Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-16T20:44:33Z, raised via `deltic bugs new` model=claude-fable-5)
+- **State history:** Open (2026-08-16T20:44:33Z, raised via `deltic bugs new` model=claude-fable-5) -> Fixed (2026-08-24T08:17:00Z, deltic:auto role=fix run=fix-20260824T075750Z-555dee06 branch=task/bug-MDR-BUG-FLUX-00003-run-fix-20260824T075750Z-555dee06 code=8e065fa3e5265203e5a4a379c6ce8a43df5bb8fa gate=manual)
 
 ## Observation
 
