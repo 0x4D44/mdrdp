@@ -1,6 +1,6 @@
 # MDR-BUG-FLUX-00011 — rhydra native: a fresh viewer gets no frame until the desktop changes, so connecting to an idle desktop paints nothing
 
-- **State:** Fixed
+- **State:** Open
 - **Priority:** Should
 - **Severity:** High
 - **Area:** native-transport
@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T11:18:15Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-23T19:42:03Z, deltic:auto role=fix run=fix-20260823T193534Z-bc7d638d branch=task/bug-MDR-BUG-FLUX-00011-run-fix-20260823T193534Z-bc7d638d code=787740f gate=manual)
+- **State history:** Open (2026-08-19T11:18:15Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-23T19:42:03Z, deltic:auto role=fix run=fix-20260823T193534Z-bc7d638d branch=task/bug-MDR-BUG-FLUX-00011-run-fix-20260823T193534Z-bc7d638d code=787740f gate=manual) -> Open (2026-08-24T16:50:34Z, reopened after human report reproduced the original static first-frame symptom on mdrdp 0.1.211 against Kiln)
 
 ## Observation
 
@@ -43,5 +43,10 @@ Later recovery keyframe requests may also reuse the retained texture, so a recon
 cannot freeze merely because its first recovery frame met a full outbound queue.
 Portable state tests cover cold missing state, reconnect, rebuild invalidation,
 successful admission, and recovery retry.
+
+The symptom recurred on mdrdp 0.1.211 against Kiln: the desktop took a long time to
+appear, then only a command-prompt cursor flashed until switching Windows desktops
+forced a full refresh. The existing fix therefore does not cover every cold/static
+viewer state and must be reverified against that exact sequence.
 
 ## Notes
