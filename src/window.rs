@@ -2504,6 +2504,11 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 self.policy.note_occluded(occluded, now);
                 if occluded != self.occluded {
                     self.occluded = occluded;
+                    if let Some(stats) = &self.stats {
+                        // Suppress Output is asynchronous: discard both an
+                        // in-flight visible handoff and any late hidden paint.
+                        stats.cancel_pending_present();
+                    }
                     // Nobody can see a fully occluded window, so the server should stop
                     // encoding frames for it (MDR-BUG-FLUX-00005: an idle hidden session
                     // burned most of a core presenting invisible frames). Resuming asks

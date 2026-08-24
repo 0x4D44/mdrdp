@@ -426,6 +426,12 @@ impl SessionStats {
         self.pending_present = Some((generation, now));
     }
 
+    /// Drop a paint-to-present handoff that cannot be observed because the
+    /// window became occluded. A later visible paint starts a fresh sample.
+    pub(crate) fn cancel_pending_present(&mut self) {
+        self.pending_present = None;
+    }
+
     /// The window put `generation` on screen; close the pending handoff if this
     /// present covers it. A newer generation covers an older pending one — the
     /// screen now shows content at least that new.
@@ -555,6 +561,11 @@ impl StatsHandle {
 
     pub fn update<F: FnOnce(&mut SessionStats)>(&self, f: F) {
         f(&mut self.lock());
+    }
+
+    /// Discard a paint-to-present handoff that cannot be observed while occluded.
+    pub fn cancel_pending_present(&self) {
+        self.update(|stats| stats.cancel_pending_present());
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SessionStats> {
@@ -773,6 +784,33 @@ mod tests {
         let mut s = SessionStats::new();
         s.mark_presented(1);
         assert_eq!(s.present.count(), 0);
+    }
+
+    #[test]
+    fn occlusion_drops_hidden_present_handoffs_but_visible_measurements_resume() {
+        let mut s = SessionStats::new();
+
+        // Entering occlusion discards the visible frame that was waiting for a
+        // present. A late frame can still arrive while suppress-output is in
+        // flight, so revealing the window must discard that handoff too.
+        s.mark_painted(7);
+        s.cancel_pending_present();
+        s.mark_painted(8);
+        s.cancel_pending_present();
+        s.mark_presented(8);
+        assert_eq!(
+            s.present.count(),
+            0,
+            "hidden paints must not become presentation-latency samples"
+        );
+
+        s.mark_painted(9);
+        s.mark_presented(9);
+        assert_eq!(
+            s.present.count(),
+            1,
+            "visible paints must still be measured"
+        );
     }
 
     #[test]
