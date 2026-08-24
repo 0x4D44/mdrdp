@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00115 — Native sparse updates can overtake recovery and be discarded
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/recovery-ordering
 - **Raised:** 2026-08-24T17:56:16Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T175633Z-30b96e7b
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00115-run-fix-20260824T175633Z-30b96e7b
-- **Owner base:** 0ad13e5494b99e200518b13f55e5f8c328db80ed
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T17:56:33Z
-- **Owner until:** 2026-08-24T19:56:33Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T17:56:16Z, raised via `deltic bugs new` model=gpt-5.6-sol@max)
+- **State history:** Open (2026-08-24T17:56:16Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-24T18:07:36Z, deltic:auto role=fix run=fix-20260824T175633Z-30b96e7b branch=task/bug-MDR-BUG-FLU-00115-run-fix-20260824T175633Z-30b96e7b code=c5409c4 gate=manual)
 
 ## Observation
 
