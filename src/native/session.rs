@@ -89,6 +89,7 @@ const MOVE_CODEC_LABEL: &str = "move + raw BGRA (rhydra)";
 /// How often the local clipboard is read. Matches the RDP bridge's cadence:
 /// macOS has no change notification worth using, so this is a poll.
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const AUX_SHUTDOWN_WAIT: Duration = Duration::from_millis(100);
 
 /// Bound a host that accepts the input channel and then stops reading it. Five seconds is
 /// the existing native auxiliary/video write bound: generous beside an input burst, finite
@@ -293,21 +294,93 @@ pub struct AudioPlayout {
 struct AuxChannel {
     socket: TcpStream,
     slot: Arc<Outbox>,
+    stop: Arc<AtomicBool>,
     joins: Vec<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct ClipboardSeedState {
+    ready: bool,
+    pending_remote: Option<String>,
+}
+
+fn defer_or_apply_remote(
+    state: &Mutex<ClipboardSeedState>,
+    stop: &AtomicBool,
+    text: &str,
+    mut apply: impl FnMut(&str),
+) {
+    let mut state = lock(state);
+    if stop.load(Ordering::Relaxed) {
+        state.pending_remote = None;
+        return;
+    }
+    if !state.ready {
+        state.pending_remote = Some(text.to_owned());
+        return;
+    }
+    // Keep the state lock through the write. The seed worker uses the same
+    // lock while draining its pending value, so a newer live update cannot
+    // overtake that value and then be overwritten by stale content.
+    apply(text);
+}
+
+fn complete_clipboard_seed(
+    state: &Mutex<ClipboardSeedState>,
+    stop: &AtomicBool,
+    mut apply: impl FnMut(&str),
+) {
+    let mut state = lock(state);
+    if stop.load(Ordering::Relaxed) {
+        state.pending_remote = None;
+        return;
+    }
+    state.ready = true;
+    if let Some(text) = state.pending_remote.take() {
+        apply(&text);
+    }
+}
+
+fn apply_remote_clipboard(os: &Mutex<Box<dyn TextClipboard>>, bridge: &Mutex<Bridge>, text: &str) {
+    let mut os = lock(os);
+    match clip::apply_remote(&mut **os, bridge, text, &mut report) {
+        clip::Applied::Written => COUNTERS.note_applied(),
+        clip::Applied::Suppressed => COUNTERS.note_echo_suppressed(),
+        clip::Applied::Disabled | clip::Applied::TooLarge | clip::Applied::WriteFailed => {
+            COUNTERS.note_refused();
+        }
+    }
+}
+
 impl AuxChannel {
-    /// Close the slot, drop the socket, and join the threads.
+    /// Close the slot and socket, then briefly join cooperative threads.
     ///
     /// Order matters: closing the slot is what lets the writer return from its
     /// park, and shutting the socket is what unblocks the reader out of
     /// `read`. Joining before either would hang the session's teardown on a
-    /// thread that is still waiting to be told to stop.
+    /// thread that is still waiting to be told to stop. OS clipboard calls are
+    /// not interruptible, so a thread still inside one after the deadline is
+    /// detached; it owns no live session callback and exits when that call does.
     fn shutdown(self) {
+        self.stop.store(true, Ordering::Relaxed);
         self.slot.close();
         let _ = self.socket.shutdown(Shutdown::Both);
+        let deadline = Instant::now() + AUX_SHUTDOWN_WAIT;
+        while self.joins.iter().any(|join| !join.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         for join in self.joins {
-            let _ = join.join();
+            if join.is_finished() {
+                let _ = join.join();
+            } else {
+                let name = join
+                    .thread()
+                    .name()
+                    .unwrap_or("native auxiliary")
+                    .to_owned();
+                report(&format!("{name} did not stop within 100ms; detached"));
+                drop(join);
+            }
         }
     }
 }
@@ -591,17 +664,11 @@ fn spawn_aux(
     let apply_os = Arc::new(Mutex::new(make_clipboard()));
     let poll_os = Arc::new(Mutex::new(make_clipboard()));
     let bridge = Arc::new(Mutex::new(Bridge::new(policy)));
-
-    // Seed from whatever the pasteboard already holds. Without this the first
-    // poll reads as a change and one end clobbers the other's clipboard with no
-    // user action — and which end wins is a race.
-    {
-        let mut guard = lock(&bridge);
-        // An image or an unreadable pasteboard both mean "no text we could
-        // have sent", which is exactly what an empty seed says.
-        let seed = lock(&poll_os).read_text().ok().flatten();
-        guard.seed(seed.as_deref());
-    }
+    // The seed is asynchronous so a wedged OS pasteboard cannot delay the
+    // video/window startup. Hold the newest remote change until it completes:
+    // applying it early would corrupt echo suppression, while refusing it at
+    // the reader would lose the peer's one-shot change notification.
+    let clipboard_seed = Arc::new(Mutex::new(ClipboardSeedState::default()));
 
     let slot = Outbox::new();
     let mut joins = Vec::new();
@@ -628,6 +695,7 @@ fn spawn_aux(
         None => (None, None),
     };
     if let (Some(rx), Some(playout)) = (audio_rx, audio) {
+        let audio_stop = Arc::clone(&stop);
         joins.push(
             std::thread::Builder::new()
                 .name("native-audio".to_owned())
@@ -642,9 +710,16 @@ fn spawn_aux(
                         playout.device.sample_rate as usize * playout.device.channels as usize / 4; // a quarter-second
                     let mut probed = false;
 
-                    // Ends when the reader thread drops its sender, which is
-                    // exactly when there is no more audio coming.
-                    while let Ok(frame) = rx.recv() {
+                    // Usually ends when the reader drops its sender. Also heed
+                    // the session stop directly: a reader stuck in an OS
+                    // clipboard write can be detached, and must not retain this
+                    // worker and its playback resources with it.
+                    while !audio_stop.load(Ordering::Relaxed) {
+                        let frame = match rx.recv_timeout(Duration::from_millis(10)) {
+                            Ok(frame) => frame,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        };
                         AUDIO.note_frame();
                         let samples = crate::audio::pcm16_le_to_f32(&frame.pcm);
                         let matched = crate::audio::remap_channels(
@@ -679,6 +754,8 @@ fn spawn_aux(
     let rx_socket = socket.try_clone()?;
     let rx_bridge = Arc::clone(&bridge);
     let rx_os = Arc::clone(&apply_os);
+    let rx_clipboard_seed = Arc::clone(&clipboard_seed);
+    let rx_stop = Arc::clone(&stop);
     joins.push(
         std::thread::Builder::new()
             .name("native-aux-rx".to_owned())
@@ -690,20 +767,9 @@ fn spawn_aux(
                     &mut auxchan::ReaderSinks {
                         accepts_clipboard: &mut || lock(&rx_bridge).accepts_incoming(),
                         on_text: &mut |text| {
-                            // Both locks are taken here and nowhere else together,
-                            // and never while the reader holds either — so the
-                            // ordering cannot deadlock against the poll thread.
-                            let mut os = lock(&rx_os);
-                            // Counted from what `apply_remote` reports rather than
-                            // decided again here: two places deciding the same
-                            // policy eventually disagree.
-                            match clip::apply_remote(&mut **os, &rx_bridge, text, &mut report) {
-                                clip::Applied::Written => COUNTERS.note_applied(),
-                                clip::Applied::Suppressed => COUNTERS.note_echo_suppressed(),
-                                clip::Applied::Disabled
-                                | clip::Applied::TooLarge
-                                | clip::Applied::WriteFailed => COUNTERS.note_refused(),
-                            }
+                            defer_or_apply_remote(&rx_clipboard_seed, &rx_stop, text, |text| {
+                                apply_remote_clipboard(&rx_os, &rx_bridge, text);
+                            });
                         },
                         // **Handed off, never processed here.** Decode, channel
                         // remap and resample are the expensive part, and doing them
@@ -755,11 +821,24 @@ fn spawn_aux(
     let poll_slot = Arc::clone(&slot);
     let poll_bridge = Arc::clone(&bridge);
     let poll_os = Arc::clone(&poll_os);
+    let poll_apply_os = Arc::clone(&apply_os);
+    let poll_clipboard_seed = Arc::clone(&clipboard_seed);
+    let poll_stop = Arc::clone(&stop);
     joins.push(
         std::thread::Builder::new()
             .name("native-clipboard-poll".to_owned())
             .spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
+                // An image or unreadable pasteboard both mean "no text we could
+                // have sent", which is exactly what an empty seed says.
+                let seed = lock(&poll_os).read_text().ok().flatten();
+                if poll_stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                lock(&poll_bridge).seed(seed.as_deref());
+                complete_clipboard_seed(&poll_clipboard_seed, &poll_stop, |text| {
+                    apply_remote_clipboard(&poll_apply_os, &poll_bridge, text);
+                });
+                while !poll_stop.load(Ordering::Relaxed) {
                     {
                         let mut os = lock(&poll_os);
                         if let Some(text) = clip::poll_local(&mut **os, &poll_bridge, &mut report) {
@@ -767,7 +846,13 @@ fn spawn_aux(
                             poll_slot.put_clipboard(text);
                         }
                     }
-                    std::thread::sleep(CLIPBOARD_POLL_INTERVAL);
+                    let deadline = Instant::now() + CLIPBOARD_POLL_INTERVAL;
+                    while !poll_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                        std::thread::sleep(
+                            Duration::from_millis(10)
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
+                    }
                 }
             })?,
     );
@@ -775,6 +860,7 @@ fn spawn_aux(
     Ok(AuxChannel {
         socket,
         slot,
+        stop,
         joins,
     })
 }
@@ -2773,6 +2859,424 @@ mod tests {
         fn write_text(&mut self, _: &str) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct ClipboardReadGate {
+        state: Mutex<ClipboardReadGateState>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct ClipboardReadGateState {
+        calls: usize,
+        block_on: usize,
+        entered: bool,
+        released: bool,
+        writes: Vec<String>,
+    }
+
+    impl ClipboardReadGate {
+        fn blocking_on(call: usize) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(ClipboardReadGateState {
+                    block_on: call,
+                    ..ClipboardReadGateState::default()
+                }),
+                changed: Condvar::new(),
+            })
+        }
+
+        fn read(&self) -> Result<Option<String>, String> {
+            let mut state = self.state.lock().unwrap();
+            state.calls += 1;
+            if state.calls < state.block_on {
+                return Ok(Some(String::new()));
+            }
+            state.entered = true;
+            self.changed.notify_all();
+            while !state.released {
+                state = self.changed.wait(state).unwrap();
+            }
+            Ok(Some(String::new()))
+        }
+
+        fn wait_until_entered(&self) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut state = self.state.lock().unwrap();
+            while !state.entered {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "clipboard read did not enter its gate"
+                );
+                let (next, result) = self.changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                assert!(
+                    !result.timed_out() || state.entered,
+                    "clipboard read did not start"
+                );
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.released = true;
+            self.changed.notify_all();
+        }
+
+        fn write(&self, text: &str) {
+            let mut state = self.state.lock().unwrap();
+            state.writes.push(text.to_owned());
+            self.changed.notify_all();
+        }
+
+        fn wait_for_writes(&self, expected: &[&str]) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut state = self.state.lock().unwrap();
+            while state.writes.len() < expected.len() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "clipboard write did not arrive");
+                let (next, result) = self.changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                assert!(
+                    !result.timed_out() || state.writes.len() >= expected.len(),
+                    "clipboard write did not arrive"
+                );
+            }
+            assert_eq!(
+                state.writes,
+                expected
+                    .iter()
+                    .map(|text| (*text).to_owned())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    struct GatedClipboard(Arc<ClipboardReadGate>);
+
+    impl TextClipboard for GatedClipboard {
+        fn read_text(&mut self) -> Result<Option<String>, String> {
+            self.0.read()
+        }
+
+        fn write_text(&mut self, text: &str) -> Result<(), String> {
+            self.0.write(text);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct ClipboardWriteGate {
+        state: Mutex<ClipboardWriteGateState>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct ClipboardWriteGateState {
+        seeded: bool,
+        write_entered: bool,
+        released: bool,
+    }
+
+    impl ClipboardWriteGate {
+        fn wait_for(&self, reached: impl Fn(&ClipboardWriteGateState) -> bool, message: &str) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut state = self.state.lock().unwrap();
+            while !reached(&state) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "{message}");
+                let (next, result) = self.changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                assert!(!result.timed_out() || reached(&state), "{message}");
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct WriteBlockedClipboard(Arc<ClipboardWriteGate>);
+
+    impl TextClipboard for WriteBlockedClipboard {
+        fn read_text(&mut self) -> Result<Option<String>, String> {
+            let mut state = self.0.state.lock().unwrap();
+            state.seeded = true;
+            self.0.changed.notify_all();
+            Ok(Some(String::new()))
+        }
+
+        fn write_text(&mut self, _: &str) -> Result<(), String> {
+            let mut state = self.0.state.lock().unwrap();
+            state.write_entered = true;
+            self.0.changed.notify_all();
+            while !state.released {
+                state = self.0.changed.wait(state).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    fn auxiliary_socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = std::thread::spawn(move || TcpStream::connect(addr).unwrap());
+        let peer = listener.accept().unwrap().0;
+        (connect.join().unwrap(), peer)
+    }
+
+    #[test]
+    fn blocked_clipboard_seed_does_not_delay_auxiliary_startup() {
+        let (socket, peer) = auxiliary_socket_pair();
+        let gate = ClipboardReadGate::blocking_on(1);
+        let worker_gate = Arc::clone(&gate);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (aux_tx, aux_rx) = std::sync::mpsc::channel();
+        let starter = std::thread::spawn(move || {
+            let mut make =
+                || Box::new(GatedClipboard(Arc::clone(&worker_gate))) as Box<dyn TextClipboard>;
+            aux_tx
+                .send(spawn_aux(
+                    socket,
+                    &mut make,
+                    Policy::default(),
+                    worker_stop,
+                    None,
+                ))
+                .unwrap();
+        });
+
+        gate.wait_until_entered();
+        let early = aux_rx.recv_timeout(Duration::from_millis(100));
+        let returned_while_blocked = early.is_ok();
+        gate.release();
+        let aux = match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => aux_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+        };
+        stop.store(true, Ordering::Relaxed);
+        aux.shutdown();
+        starter.join().unwrap();
+        drop(peer);
+        assert!(
+            returned_while_blocked,
+            "spawn_aux waited for the OS clipboard seed"
+        );
+    }
+
+    #[test]
+    fn remote_clipboard_change_waits_for_blocked_seed_without_being_lost() {
+        let (socket, mut peer) = auxiliary_socket_pair();
+        let gate = ClipboardReadGate::blocking_on(1);
+        let factory_gate = Arc::clone(&gate);
+        let stop = Arc::new(AtomicBool::new(false));
+        let aux = spawn_aux(
+            socket,
+            &mut || Box::new(GatedClipboard(Arc::clone(&factory_gate))) as Box<dyn TextClipboard>,
+            Policy::default(),
+            Arc::clone(&stop),
+            None,
+        )
+        .unwrap();
+        gate.wait_until_entered();
+
+        let mut wire = Vec::new();
+        rhydra::aux_proto::encode_clipboard_text("remote while seeding", &mut wire).unwrap();
+        peer.write_all(&wire).unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !aux
+            .joins
+            .iter()
+            .find(|join| join.thread().name() == Some("native-aux-rx"))
+            .unwrap()
+            .is_finished()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "auxiliary reader did not consume the remote clipboard frame"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        gate.release();
+        gate.wait_for_writes(&["remote while seeding"]);
+        stop.store(true, Ordering::Relaxed);
+        aux.shutdown();
+    }
+
+    #[test]
+    fn live_remote_change_cannot_overtake_pending_seed_change() {
+        let state = Arc::new(Mutex::new(ClipboardSeedState::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        defer_or_apply_remote(&state, &stop, "pending", |_| panic!("seed is not ready"));
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let seed_state = Arc::clone(&state);
+        let seed_stop = Arc::clone(&stop);
+        let seed_applied = Arc::clone(&applied);
+        let seed_worker = std::thread::spawn(move || {
+            complete_clipboard_seed(&seed_state, &seed_stop, |text| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                seed_applied.lock().unwrap().push(text.to_owned());
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let live_state = Arc::clone(&state);
+        let live_stop = Arc::clone(&stop);
+        let live_applied = Arc::clone(&applied);
+        let (live_done_tx, live_done_rx) = std::sync::mpsc::channel();
+        let live_worker = std::thread::spawn(move || {
+            defer_or_apply_remote(&live_state, &live_stop, "live", |text| {
+                live_applied.lock().unwrap().push(text.to_owned());
+            });
+            live_done_tx.send(()).unwrap();
+        });
+        assert!(
+            live_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "live update overtook the pending seed update"
+        );
+        release_tx.send(()).unwrap();
+        seed_worker.join().unwrap();
+        live_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        live_worker.join().unwrap();
+        assert_eq!(*applied.lock().unwrap(), ["pending", "live"]);
+    }
+
+    #[test]
+    fn shutdown_discards_live_remote_change_waiting_behind_blocked_write() {
+        let state = Arc::new(Mutex::new(ClipboardSeedState::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        defer_or_apply_remote(&state, &stop, "started before shutdown", |_| {
+            panic!("seed is not ready")
+        });
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let seed_state = Arc::clone(&state);
+        let seed_stop = Arc::clone(&stop);
+        let seed_applied = Arc::clone(&applied);
+        let seed_worker = std::thread::spawn(move || {
+            complete_clipboard_seed(&seed_state, &seed_stop, |text| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                seed_applied.lock().unwrap().push(text.to_owned());
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let live_state = Arc::clone(&state);
+        let live_stop = Arc::clone(&stop);
+        let live_applied = Arc::clone(&applied);
+        let live_worker = std::thread::spawn(move || {
+            defer_or_apply_remote(&live_state, &live_stop, "queued after shutdown", |text| {
+                live_applied.lock().unwrap().push(text.to_owned());
+            });
+        });
+        stop.store(true, Ordering::Relaxed);
+        release_tx.send(()).unwrap();
+        seed_worker.join().unwrap();
+        live_worker.join().unwrap();
+        assert_eq!(*applied.lock().unwrap(), ["started before shutdown"]);
+    }
+
+    #[test]
+    fn blocked_clipboard_poll_does_not_delay_auxiliary_shutdown() {
+        let (socket, peer) = auxiliary_socket_pair();
+        // The seed succeeds; the first poll after it blocks in the OS backend.
+        let gate = ClipboardReadGate::blocking_on(2);
+        let factory_gate = Arc::clone(&gate);
+        let stop = Arc::new(AtomicBool::new(false));
+        let aux = spawn_aux(
+            socket,
+            &mut || Box::new(GatedClipboard(Arc::clone(&factory_gate))) as Box<dyn TextClipboard>,
+            Policy::default(),
+            Arc::clone(&stop),
+            None,
+        )
+        .unwrap();
+        gate.wait_until_entered();
+        stop.store(true, Ordering::Relaxed);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            aux.shutdown();
+            done_tx.send(()).unwrap();
+        });
+
+        let early = done_rx.recv_timeout(Duration::from_millis(200));
+        gate.release();
+        if early.is_err() {
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        shutdown.join().unwrap();
+        drop(peer);
+        assert!(early.is_ok(), "shutdown joined a blocked OS clipboard call");
+    }
+
+    #[test]
+    fn blocked_clipboard_reader_does_not_retain_audio_worker_after_stop() {
+        let (socket, mut peer) = auxiliary_socket_pair();
+        let gate = Arc::new(ClipboardWriteGate::default());
+        let factory_gate = Arc::clone(&gate);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = crate::audio::AudioStatsHandle::new();
+        let aux = spawn_aux(
+            socket,
+            &mut || {
+                Box::new(WriteBlockedClipboard(Arc::clone(&factory_gate))) as Box<dyn TextClipboard>
+            },
+            Policy::default(),
+            Arc::clone(&stop),
+            Some(AudioPlayout {
+                ring: AudioRing::for_native_device(48_000, 2, stats),
+                device: AudioFormatSummary {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bits_per_sample: 32,
+                },
+            }),
+        )
+        .unwrap();
+        gate.wait_for(|state| state.seeded, "clipboard seed did not complete");
+
+        let mut wire = Vec::new();
+        rhydra::aux_proto::encode_clipboard_text("block the OS write", &mut wire).unwrap();
+        peer.write_all(&wire).unwrap();
+        gate.wait_for(
+            |state| state.write_entered,
+            "remote clipboard write did not enter its gate",
+        );
+        stop.store(true, Ordering::Relaxed);
+
+        let audio_join = aux
+            .joins
+            .iter()
+            .find(|join| join.thread().name() == Some("native-audio"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while !audio_join.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "audio worker was retained by the blocked clipboard reader"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        aux.shutdown();
+        gate.release();
     }
 
     #[test]
