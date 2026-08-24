@@ -73,6 +73,23 @@ fn display_ready(status: &rhydra::control::StatusReport, request: DisplayRequest
 
 /// The whole probe's wall-clock budget, ssh spawn to input connect.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(8);
+/// A negotiated display may need an agent tick, a Windows topology change and
+/// a replacement capture server before the ordinary probe can continue. Keep
+/// that cold path bounded, but do not force it into the legacy 8-second budget.
+const DISPLAY_PROBE_DEADLINE: Duration = Duration::from_secs(20);
+
+fn display_probe_deadline(
+    status: &rhydra::control::StatusReport,
+    request: DisplayRequest,
+    ordinary: Instant,
+    cold: Instant,
+) -> Instant {
+    if display_ready(status, request) {
+        ordinary
+    } else {
+        cold
+    }
+}
 
 /// How much of the budget one control query may consume.
 const CONTROL_BUDGET: Duration = Duration::from_secs(2);
@@ -188,6 +205,8 @@ pub fn establish(
     stages: Option<&std::sync::mpsc::Sender<crate::connect::LiveStage>>,
 ) -> Result<ProbedTransport, ProbeFailure> {
     let started = Instant::now();
+    let ordinary_deadline = started + PROBE_DEADLINE;
+    let cold_display_deadline = started + DISPLAY_PROBE_DEADLINE;
     let mut report = move |name: &'static str, qualifier: Option<String>| {
         if let Some(tx) = stages {
             let _ = tx.send(crate::connect::LiveStage {
@@ -209,11 +228,10 @@ pub fn establish(
         let mut tunnel =
             Tunnel::spawn(&spec).map_err(|e| ProbeFailure::Io(format!("spawn ssh: {e}")))?;
         report(STAGE_SSH_SPAWN, None);
-        let deadline = Instant::now() + PROBE_DEADLINE;
         match probe_over_with_display(
             ports,
-            deadline,
-            Some(display),
+            ordinary_deadline,
+            Some((display, cold_display_deadline)),
             || tunnel.poll_exit(),
             &mut report,
         ) {
@@ -255,8 +273,8 @@ pub fn probe_over(
 
 fn probe_over_with_display(
     ports: ForwardPorts,
-    deadline: Instant,
-    display: Option<DisplayRequest>,
+    mut deadline: Instant,
+    display: Option<(DisplayRequest, Instant)>,
     mut tunnel_exited: impl FnMut() -> Option<String>,
     mut stage: impl FnMut(&'static str, Option<String>),
 ) -> Result<ProbeSuccess, ProbeFailure> {
@@ -284,7 +302,11 @@ fn probe_over_with_display(
             return Err(ProbeFailure::Io(format!("control answered strangely: {m}")));
         }
     };
-    if let Some(request) = display {
+    if let Some((request, cold_deadline)) = display {
+        // A warm connection retains the original eight-second end-to-end
+        // bound. Extend the same absolute deadline only when the first report
+        // proves that Windows or the capture server still needs to converge.
+        deadline = display_probe_deadline(&report, request, deadline, cold_deadline);
         rhydra::control::send_request(
             ("127.0.0.1", ports.control),
             &request.control_line(),
@@ -335,7 +357,7 @@ fn probe_over_with_display(
     }
     validate_video_contract(&header)
         .map_err(|message| ProbeFailure::Io(format!("video contract: {message}")))?;
-    if let Some(request) = display
+    if let Some((request, _)) = display
         && (header.width, header.height) != (request.width, request.height)
     {
         return Err(ProbeFailure::Io(format!(
@@ -767,6 +789,36 @@ mod tests {
         status.desktop_scale_percent = 200;
         status.display_mode.as_mut().unwrap().width = 2560;
         assert!(!display_ready(&status, request));
+    }
+
+    #[test]
+    fn display_negotiation_gets_a_cold_transition_budget() {
+        let request = DisplayRequest {
+            width: 5120,
+            height: 2880,
+            hz: 240,
+            scale_percent: 200,
+        };
+        let started = Instant::now();
+        let ordinary = started + PROBE_DEADLINE;
+        let cold = started + DISPLAY_PROBE_DEADLINE;
+        let mut status = green_report();
+        status.display_mode = Some(request.mode());
+        status.desired_display_mode = request.mode();
+        status.desktop_scale_percent = request.scale_percent;
+        status.desired_desktop_scale_percent = request.scale_percent;
+        assert_eq!(
+            display_probe_deadline(&status, request, ordinary, cold),
+            ordinary,
+            "an already-settled display must retain the ordinary probe bound"
+        );
+
+        status.desktop_scale_percent = 175;
+        assert_eq!(
+            display_probe_deadline(&status, request, ordinary, cold),
+            cold,
+            "a real display transition gets the cold-mode bound"
+        );
     }
 
     #[test]
