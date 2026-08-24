@@ -364,10 +364,16 @@ impl DesiredDisplay {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedAgentServiceCommand {
+    executable: String,
+    display: Option<DesiredDisplay>,
+}
+
 /// Parse only the command shape emitted by `rhydra-agent install` when it
-/// registers the Windows service. Any other shape, including the default
-/// no-display service command, deliberately falls back to no display args.
-fn parse_agent_service_display(command: &str) -> Option<DesiredDisplay> {
+/// registers the Windows service. Keep the executable and optional display
+/// tuple together so quiesce and reinstall decisions use one validation.
+fn parse_agent_service_command(command: &str) -> Option<ParsedAgentServiceCommand> {
     let quoted = command.strip_prefix('"')?;
     let closing_quote = quoted.find('"')?;
     let path = &quoted[..closing_quote];
@@ -379,27 +385,38 @@ fn parse_agent_service_display(command: &str) -> Option<DesiredDisplay> {
         return None;
     }
 
-    let args = quoted
-        .get(closing_quote + 1..)?
-        .strip_prefix(" service --display ")?;
-    let mut values = args.split(' ');
-    let parse_positive = |value: Option<&str>| {
-        let value = value?;
-        if value.is_empty()
-            || (value.len() > 1 && value.starts_with('0'))
-            || !value.bytes().all(|byte| byte.is_ascii_digit())
-        {
+    let suffix = quoted.get(closing_quote + 1..)?;
+    let display = if suffix == " service" {
+        None
+    } else {
+        let args = suffix.strip_prefix(" service --display ")?;
+        let mut values = args.split(' ');
+        let parse_positive = |value: Option<&str>| {
+            let value = value?;
+            if value.is_empty()
+                || (value.len() > 1 && value.starts_with('0'))
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            value.parse::<u32>().ok().filter(|value| *value > 0)
+        };
+        let display = DesiredDisplay {
+            width: parse_positive(values.next())?,
+            height: parse_positive(values.next())?,
+            hz: parse_positive(values.next())?,
+            scale_percent: parse_positive(values.next())?,
+        };
+        if values.next().is_some() {
             return None;
         }
-        value.parse::<u32>().ok().filter(|value| *value > 0)
+        Some(display)
     };
-    let display = DesiredDisplay {
-        width: parse_positive(values.next())?,
-        height: parse_positive(values.next())?,
-        hz: parse_positive(values.next())?,
-        scale_percent: parse_positive(values.next())?,
-    };
-    values.next().is_none().then_some(display)
+
+    Some(ParsedAgentServiceCommand {
+        executable: path.to_owned(),
+        display,
+    })
 }
 
 impl Evidence {
@@ -409,7 +426,8 @@ impl Evidence {
         self.desired_display.or_else(|| {
             self.agent_service_command
                 .as_deref()
-                .and_then(parse_agent_service_display)
+                .and_then(parse_agent_service_command)
+                .and_then(|command| command.display)
         })
     }
 }
@@ -458,20 +476,28 @@ pub struct Plan {
     pub notes: Vec<String>,
 }
 
-fn quiesce_actions(evidence: &Evidence) -> Vec<Action> {
+fn quiesce_actions(evidence: &Evidence) -> Result<Vec<Action>, String> {
     // Presence-keyed, never gated on the control port answering (review
-    // finding): the existing exe's own uninstall handles both the clean arm and
-    // the wedged arm, and tolerates an unregistered task.
-    evidence
-        .agent_exes
-        .first()
-        .map(|exe| {
-            vec![Action::Run {
-                label: "quiesce existing agent".to_owned(),
-                command: format!("\"{exe}\" uninstall"),
-            }]
-        })
-        .unwrap_or_default()
+    // finding): use the exact executable registered with the service when one
+    // exists. A legacy flat binary may predate service-aware uninstall and must
+    // not be allowed to stand in for the installed service.
+    let executable = match evidence.agent_service_command.as_deref() {
+        Some(command) => parse_agent_service_command(command)
+            .map(|command| command.executable)
+            .ok_or_else(|| {
+                "the installed RhydraAgent service command is malformed; refusing to run a legacy agent uninstaller"
+                    .to_owned()
+            })?,
+        None => match evidence.agent_exes.first() {
+            Some(exe) => exe.clone(),
+            None => return Ok(Vec::new()),
+        },
+    };
+
+    Ok(vec![Action::Run {
+        label: "quiesce existing agent".to_owned(),
+        command: format!("\"{executable}\" uninstall"),
+    }])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -658,7 +684,7 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
     // Copy-collision: replacing the same version dir the running agent lives in
     // means quiescing first; a fresh version dir keeps copy-first atomicity.
     let target_exists = evidence.version_dirs.iter().any(|d| d == &vdir);
-    let quiesce = quiesce_actions(evidence);
+    let quiesce = quiesce_actions(evidence)?;
     let quiesce_first = target_exists && !quiesce.is_empty();
     if quiesce_first {
         plan.notes.push(format!(
@@ -1915,6 +1941,26 @@ mod tests {
     }
 
     #[test]
+    fn quiesce_prefers_the_installed_service_agent_over_a_legacy_flat_binary() {
+        let mut evidence = healthy_evidence();
+        evidence.agent_exes = vec![
+            r"C:\mdrdp\rhydra-agent.exe".to_owned(),
+            r"C:\mdrdp\v0.5.0\rhydra-agent.exe".to_owned(),
+        ];
+        evidence.agent_service_command = Some(
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 240 200"#.to_owned(),
+        );
+
+        assert_eq!(
+            quiesce_actions(&evidence).unwrap(),
+            vec![Action::Run {
+                label: "quiesce existing agent".to_owned(),
+                command: r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" uninstall"#.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn stopped_agent_redeploy_preserves_the_installed_service_display_request() {
         let dir = scratch_dir("stopped-agent-display-preserve");
         let art = test_artifacts(&dir);
@@ -1967,10 +2013,16 @@ mod tests {
 
     #[test]
     fn installed_service_display_parser_accepts_the_agent_generated_shape() {
+        let parsed = parse_agent_service_command(
+            r#""C:\Program Files\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 240 200"#,
+        )
+        .unwrap();
         assert_eq!(
-            parse_agent_service_display(
-                r#""C:\Program Files\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 240 200"#
-            ),
+            parsed.executable,
+            r"C:\Program Files\mdrdp\v0.5.0\rhydra-agent.exe"
+        );
+        assert_eq!(
+            parsed.display,
             Some(DesiredDisplay {
                 width: 5120,
                 height: 2880,
@@ -1978,12 +2030,18 @@ mod tests {
                 scale_percent: 200,
             })
         );
+
+        let no_display = parse_agent_service_command(
+            r#""C:\Program Files\mdrdp\v0.5.0\rhydra-agent.exe" service"#,
+        )
+        .unwrap();
+        assert_eq!(no_display.executable, parsed.executable);
+        assert_eq!(no_display.display, None);
     }
 
     #[test]
     fn installed_service_display_parser_fails_closed_for_untrusted_shapes() {
         let commands = [
-            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service"#,
             r#"C:\mdrdp\v0.5.0\rhydra-agent.exe service --display 5120 2880 240 200"#,
             r#""C:\mdrdp\v0.5.0\other-agent.exe" service --display 5120 2880 240 200"#,
             r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" run --display 5120 2880 240 200"#,
@@ -1997,7 +2055,7 @@ mod tests {
         ];
         for command in commands {
             assert_eq!(
-                parse_agent_service_display(command),
+                parse_agent_service_command(command),
                 None,
                 "must reject {command:?}"
             );
@@ -2032,6 +2090,32 @@ mod tests {
         evidence.agent_service_command =
             Some(r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service"#.to_owned());
         assert_eq!(evidence.effective_display(), None);
+    }
+
+    #[test]
+    fn malformed_installed_service_command_stops_before_legacy_quiesce() {
+        let mut evidence = healthy_evidence();
+        evidence.agent_service_command = Some(
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 0 2880 240 200"#.to_owned(),
+        );
+
+        let error = quiesce_actions(&evidence).unwrap_err();
+        assert!(
+            error.contains("service command") && error.contains("legacy"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn quiesce_uses_legacy_agent_only_without_service_evidence() {
+        let evidence = healthy_evidence();
+        assert_eq!(
+            quiesce_actions(&evidence).unwrap(),
+            vec![Action::Run {
+                label: "quiesce existing agent".to_owned(),
+                command: r#""C:\mdrdp\v0.1.0\rhydra-agent.exe" uninstall"#.to_owned(),
+            }]
+        );
     }
 
     #[test]
