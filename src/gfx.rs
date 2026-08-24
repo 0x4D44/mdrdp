@@ -692,7 +692,10 @@ impl GraphicsPipelineHandler for GfxHandler {
         // ClearCodec reset does not break these hits in practice and ours measurably
         // does. Codec state dies with the SURFACE (see on_surface_deleted), never with
         // the reset.
-        self.with_store(SurfaceStore::abort_frame);
+        self.with_store(|store| {
+            store.abort_frame();
+            let _ = store.set_graphics_output_size(width, height);
+        });
         self.stats
             .note(|s| s.reset_graphics = Some((width, height)));
     }
@@ -736,11 +739,25 @@ impl GraphicsPipelineHandler for GfxHandler {
             .note(|s| s.surfaces_deleted = s.surfaces_deleted.saturating_add(1));
     }
 
-    /// The `MapSurfaceToOutput` callback. `origin_x`/`origin_y` place the surface within
-    /// the output; the presenter owns that offset, so the store only records *which*
-    /// surface is the visible one.
-    fn on_surface_mapped(&mut self, surface_id: u16, _origin_x: u32, _origin_y: u32) {
-        self.with_store(|store| store.map_to_output(surface_id));
+    /// Map the whole surface into the Graphics Output Buffer at the wire origin.
+    fn on_surface_mapped(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
+        self.with_store(|store| {
+            let Some((width, height)) = store
+                .get(surface_id)
+                .map(|surface| (surface.width, surface.height))
+            else {
+                return;
+            };
+            let _ = store.map_to_output_geometry(
+                surface_id,
+                width,
+                height,
+                origin_x,
+                origin_y,
+                u32::from(width),
+                u32::from(height),
+            );
+        });
     }
 
     /// `MapSurfaceToScaledOutput` — the same job as [`Self::on_surface_mapped`].
@@ -753,29 +770,40 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// real server, and no counter could see it, because a defaulted trait method never
     /// reaches `on_unhandled_pdu`.
     ///
-    /// The scale factor is ignored on purpose: the renderer letterboxes the surface into
-    /// the window itself, so the only thing the store needs is *which* surface is visible.
     fn on_map_surface_to_scaled_output(
         &mut self,
         pdu: &ironrdp_egfx::pdu::MapSurfaceToScaledOutputPdu,
     ) {
-        self.with_store(|store| store.map_to_output(pdu.surface_id));
+        self.with_store(|store| {
+            let Some((width, height)) = store
+                .get(pdu.surface_id)
+                .map(|surface| (surface.width, surface.height))
+            else {
+                return;
+            };
+            let _ = store.map_to_output_geometry(
+                pdu.surface_id,
+                width,
+                height,
+                pdu.output_origin_x,
+                pdu.output_origin_y,
+                pdu.target_width,
+                pdu.target_height,
+            );
+        });
     }
 
     /// `MapSurfaceToWindow` — see [`Self::on_map_surface_to_scaled_output`].
     ///
-    /// Per-window mapping belongs to RemoteApp/RAIL, which is out of scope; treating it
-    /// as "this surface is the visible one" is still better than showing nothing.
-    fn on_map_surface_to_window(&mut self, pdu: &ironrdp_egfx::pdu::MapSurfaceToWindowPdu) {
-        self.with_store(|store| store.map_to_output(pdu.surface_id));
-    }
+    /// Per-window placement belongs to RemoteApp/RAIL, which this desktop client does
+    /// not implement. A RAIL mapping must not replace the Graphics Output Buffer.
+    fn on_map_surface_to_window(&mut self, _pdu: &ironrdp_egfx::pdu::MapSurfaceToWindowPdu) {}
 
     /// `MapSurfaceToScaledWindow` — see [`Self::on_map_surface_to_scaled_output`].
     fn on_map_surface_to_scaled_window(
         &mut self,
-        pdu: &ironrdp_egfx::pdu::MapSurfaceToScaledWindowPdu,
+        _pdu: &ironrdp_egfx::pdu::MapSurfaceToScaledWindowPdu,
     ) {
-        self.with_store(|store| store.map_to_output(pdu.surface_id));
     }
 
     /// One AVC444/AVC444v2 PDU (one logical frame).
@@ -909,8 +937,7 @@ impl GraphicsPipelineHandler for GfxHandler {
             GfxPdu::SurfaceToCache(p) => self.apply_surface_to_cache(p),
             GfxPdu::CacheToSurface(p) => self.apply_cache_to_surface(p),
             GfxPdu::MapSurfaceToOutput(p) => {
-                let id = p.surface_id;
-                self.with_store(|store| store.map_to_output(id));
+                self.on_surface_mapped(p.surface_id, p.output_origin_x, p.output_origin_y);
             }
             GfxPdu::WireToSurface2(p) => {
                 let name = format!("WireToSurface2/{:?}", p.codec_id);
@@ -1980,26 +2007,25 @@ mod tests {
         assert_eq!(snapshot.pixels, vec![0, 0, 255, 255, 0, 255, 0, 255]);
     }
 
-    /// EVERY mapping PDU must end with a surface on screen.
+    /// Output mapping PDUs must display a surface; unsupported RAIL mappings must not
+    /// replace the desktop output.
     ///
     /// This is the regression for the bug that made the client show a black window
-    /// against a real server. `ironrdp-egfx` dispatches each of the four map PDUs to its
-    /// OWN defaulted trait method, so implementing `on_surface_mapped` alone leaves the
-    /// other three as silent no-ops — and silent is exact: they never reach
-    /// `on_unhandled_pdu`, so `unhandled_pdus` stays 0 and every other counter looks
-    /// healthy while nothing is displayed.
+    /// against a real server. `ironrdp-egfx` dispatches scaled output to its own defaulted
+    /// trait method, so implementing `on_surface_mapped` alone silently loses it. The two
+    /// window callbacks target RAIL windows and must remain separate from desktop output.
     ///
     /// The older test below covers the raw `on_unhandled_pdu` arm, which upstream never
     /// takes; it passed throughout and proved nothing about real behaviour.
     #[test]
-    fn every_map_surface_pdu_results_in_something_on_screen() {
+    fn output_maps_display_and_rail_maps_do_not_steal_the_desktop() {
         use ironrdp_egfx::pdu::{
             MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu,
         };
 
-        // Each closure exercises one of the four callbacks on a fresh handler.
+        // Each closure exercises one of the two Graphics Output Buffer callbacks.
         type Map = (&'static str, fn(&mut GfxHandler));
-        let cases: [Map; 4] = [
+        let output_cases: [Map; 2] = [
             ("MapSurfaceToOutput", |h| h.on_surface_mapped(7, 0, 0)),
             ("MapSurfaceToScaledOutput", |h| {
                 h.on_map_surface_to_scaled_output(&MapSurfaceToScaledOutputPdu {
@@ -2010,27 +2036,9 @@ mod tests {
                     target_height: 600,
                 })
             }),
-            ("MapSurfaceToWindow", |h| {
-                h.on_map_surface_to_window(&MapSurfaceToWindowPdu {
-                    surface_id: 7,
-                    window_id: 1,
-                    mapped_width: 800,
-                    mapped_height: 600,
-                })
-            }),
-            ("MapSurfaceToScaledWindow", |h| {
-                h.on_map_surface_to_scaled_window(&MapSurfaceToScaledWindowPdu {
-                    surface_id: 7,
-                    window_id: 1,
-                    mapped_width: 800,
-                    mapped_height: 600,
-                    target_width: 800,
-                    target_height: 600,
-                })
-            }),
         ];
 
-        for (name, apply) in cases {
+        for (name, apply) in output_cases {
             let store = store();
             store.lock().unwrap().create(7, 4, 4);
             let mut handler = GfxHandler::new(Arc::clone(&store));
@@ -2046,6 +2054,78 @@ mod tests {
                 "{name} left nothing mapped to output — the window would render black"
             );
         }
+
+        let store = store();
+        {
+            let mut store = store.lock().unwrap();
+            store.create(7, 4, 4);
+            store.create(8, 4, 4);
+            store
+                .solid_fill(7, &[Rect::new(0, 0, 4, 4)], [255, 0, 0, 255])
+                .unwrap();
+            store
+                .solid_fill(8, &[Rect::new(0, 0, 4, 4)], [0, 0, 255, 255])
+                .unwrap();
+            store.map_to_output(7);
+        }
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_map_surface_to_window(&MapSurfaceToWindowPdu {
+            surface_id: 8,
+            window_id: 1,
+            mapped_width: 4,
+            mapped_height: 4,
+        });
+        assert_eq!(
+            store.lock().unwrap().output_surface().unwrap().pixels(),
+            [255, 0, 0, 255].repeat(16)
+        );
+
+        handler.on_map_surface_to_scaled_window(&MapSurfaceToScaledWindowPdu {
+            surface_id: 8,
+            window_id: 1,
+            mapped_width: 4,
+            mapped_height: 4,
+            target_width: 8,
+            target_height: 8,
+        });
+        assert_eq!(
+            store.lock().unwrap().output_surface().unwrap().pixels(),
+            [255, 0, 0, 255].repeat(16)
+        );
+    }
+
+    #[test]
+    fn scaled_output_mapping_reaches_the_presentation_geometry() {
+        use crate::surface::{PresentationCopy, PresentationSnapshot};
+        use ironrdp_egfx::pdu::MapSurfaceToScaledOutputPdu;
+
+        let store = store();
+        {
+            let mut store = store.lock().unwrap();
+            store.create(7, 2, 2);
+            store
+                .solid_fill(7, &[Rect::new(0, 0, 2, 2)], [1, 2, 3, 255])
+                .unwrap();
+        }
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_reset_graphics(6, 3);
+        handler.on_map_surface_to_scaled_output(&MapSurfaceToScaledOutputPdu {
+            surface_id: 7,
+            output_origin_x: 1,
+            output_origin_y: 0,
+            target_width: 4,
+            target_height: 2,
+        });
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.lock().unwrap().copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!((snapshot.width, snapshot.height), (6, 3));
+        assert_eq!(snapshot.mapping.dest_x, 1);
+        assert_eq!(snapshot.mapping.dest_width, 4);
+        assert_eq!(snapshot.mapping.dest_height, 2);
     }
 
     #[test]

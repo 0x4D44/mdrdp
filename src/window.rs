@@ -42,7 +42,7 @@ use winit::window::{CustomCursor, Fullscreen, Window, WindowAttributes, WindowId
 use crate::input::{self, InputEvent, PointerMap};
 use crate::session::SessionCommand;
 use crate::stats::{SessionStats, StatsHandle};
-use crate::surface::{PresentationCopy, PresentationSnapshot, SurfaceStore};
+use crate::surface::{PresentationCopy, PresentationMapping, PresentationSnapshot, SurfaceStore};
 use crate::ui::font;
 use crate::window_policy::{Geometry, ResizeVerdict, WindowPolicy};
 
@@ -347,10 +347,8 @@ fn copy_presentation_when_due(
 ) -> Result<PresentationCopy, Instant> {
     let generation = store.generation();
     let (width, height) = store
-        .presentation_surface()
-        .map_or(fallback_dimensions, |surface| {
-            (surface.width, surface.height)
-        });
+        .presentation_dimensions()
+        .unwrap_or(fallback_dimensions);
     if presented != Some(generation)
         && let Some(deadline) = presentation_deadline(last_presented, now, width, height)
     {
@@ -525,7 +523,40 @@ pub fn present_into(
     viewport: &Viewport,
     src: &[u8],
 ) {
-    let needed = usize::from(viewport.session_width) * usize::from(viewport.session_height) * 4;
+    let mapping = PresentationMapping {
+        canvas_width: viewport.session_width,
+        canvas_height: viewport.session_height,
+        source_width: viewport.session_width,
+        source_height: viewport.session_height,
+        dest_x: 0,
+        dest_y: 0,
+        dest_width: u32::from(viewport.session_width),
+        dest_height: u32::from(viewport.session_height),
+    };
+    present_mapped_rgba(
+        dst,
+        window_width,
+        window_height,
+        viewport,
+        src,
+        viewport.session_width,
+        viewport.session_height,
+        mapping,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn present_mapped_rgba(
+    dst: &mut [u32],
+    window_width: u32,
+    window_height: u32,
+    viewport: &Viewport,
+    src: &[u8],
+    pixel_width: u16,
+    pixel_height: u16,
+    mapping: PresentationMapping,
+) {
+    let needed = usize::from(pixel_width) * usize::from(pixel_height) * 4;
     let fits = dst.len() >= (window_width as usize) * (window_height as usize);
     // `letterbox` never places the origin outside the window, but this is a public
     // function taking a caller-supplied viewport: an out-of-window origin would underflow
@@ -535,8 +566,15 @@ pub fn present_into(
     // and indexes an empty source. `letterbox` never produces one, but this is a public
     // function taking a caller-supplied viewport, and its contract says it blanks rather
     // than panics.
-    let session_real = viewport.session_width > 0 && viewport.session_height > 0;
-    if !fits || !origin_inside || !session_real || viewport.is_empty() || src.len() < needed {
+    let geometry_valid = mapping.canvas_width == viewport.session_width
+        && mapping.canvas_height == viewport.session_height
+        && mapping.source_width > 0
+        && mapping.source_height > 0
+        && mapping.source_width <= pixel_width
+        && mapping.source_height <= pixel_height
+        && mapping.dest_width > 0
+        && mapping.dest_height > 0;
+    if !fits || !origin_inside || viewport.is_empty() || !geometry_valid || src.len() < needed {
         dst.fill(0);
         return;
     }
@@ -556,11 +594,19 @@ pub fn present_into(
         .min(window_height);
 
     // Column table: one division per column instead of one per pixel.
-    let mut col: Vec<u32> = Vec::with_capacity((dest_right - viewport.dest_x) as usize);
+    let map_right = mapping.dest_x.saturating_add(mapping.dest_width);
+    let map_bottom = mapping.dest_y.saturating_add(mapping.dest_height);
+    let mut col: Vec<Option<u32>> = Vec::with_capacity((dest_right - viewport.dest_x) as usize);
     for x in viewport.dest_x..dest_right {
-        let sx = u64::from(x - viewport.dest_x) * u64::from(viewport.session_width)
+        let canvas_x = u64::from(x - viewport.dest_x) * u64::from(viewport.session_width)
             / u64::from(viewport.dest_width);
-        col.push((sx as u32).min(u32::from(viewport.session_width) - 1));
+        let canvas_x = (canvas_x as u32).min(u32::from(viewport.session_width) - 1);
+        let sx = (canvas_x >= mapping.dest_x && canvas_x < map_right).then(|| {
+            let sx = u64::from(canvas_x - mapping.dest_x) * u64::from(mapping.source_width)
+                / u64::from(mapping.dest_width);
+            (sx as u32).min(u32::from(mapping.source_width) - 1)
+        });
+        col.push(sx);
     }
 
     for y in 0..window_height {
@@ -572,25 +618,56 @@ pub fn present_into(
             continue;
         }
 
-        let sy = u64::from(y - viewport.dest_y) * u64::from(viewport.session_height)
+        let canvas_y = u64::from(y - viewport.dest_y) * u64::from(viewport.session_height)
             / u64::from(viewport.dest_height);
-        let sy = (sy as u32).min(u32::from(viewport.session_height) - 1);
-        let src_row = (sy as usize) * usize::from(viewport.session_width) * 4;
+        let canvas_y = (canvas_y as u32).min(u32::from(viewport.session_height) - 1);
 
         row[..viewport.dest_x as usize].fill(0);
         row[dest_right as usize..].fill(0);
+
+        if canvas_y < mapping.dest_y || canvas_y >= map_bottom {
+            row[viewport.dest_x as usize..dest_right as usize].fill(0);
+            continue;
+        }
+        let sy = u64::from(canvas_y - mapping.dest_y) * u64::from(mapping.source_height)
+            / u64::from(mapping.dest_height);
+        let sy = (sy as u32).min(u32::from(mapping.source_height) - 1);
+        let src_row = (sy as usize) * usize::from(pixel_width) * 4;
 
         for (i, out) in row[viewport.dest_x as usize..dest_right as usize]
             .iter_mut()
             .enumerate()
         {
-            let off = src_row + (col[i] as usize) * 4;
+            let Some(sx) = col[i] else {
+                *out = 0;
+                continue;
+            };
+            let off = src_row + (sx as usize) * 4;
             let r = u32::from(src[off]);
             let g = u32::from(src[off + 1]);
             let b = u32::from(src[off + 2]);
             *out = (r << 16) | (g << 8) | b;
         }
     }
+}
+
+fn present_snapshot_into(
+    dst: &mut [u32],
+    window_width: u32,
+    window_height: u32,
+    viewport: &Viewport,
+    snapshot: &PresentationSnapshot,
+) {
+    present_mapped_rgba(
+        dst,
+        window_width,
+        window_height,
+        viewport,
+        &snapshot.pixels,
+        snapshot.pixel_width,
+        snapshot.pixel_height,
+        snapshot.mapping,
+    );
 }
 
 /// Draw the stats panel over the session image.
@@ -2035,12 +2112,12 @@ impl SessionApp {
                 self.presentation.width,
                 self.presentation.height,
             );
-            present_into(
+            present_snapshot_into(
                 &mut buffer,
                 size.width,
                 size.height,
                 &self.viewport,
-                &self.presentation.pixels,
+                &self.presentation,
             );
         }
 
@@ -2797,6 +2874,7 @@ mod tests {
             height: 9,
             pixels: vec![0xA5; 3],
             generation: 11,
+            ..PresentationSnapshot::default()
         };
         let now = Instant::now();
         let result = copy_presentation_when_due(
@@ -3033,6 +3111,48 @@ mod tests {
         assert_eq!(at(1, 3), rgb(BLUE));
         assert_eq!(at(2, 2), rgb(WHITE));
         assert_eq!(at(3, 3), rgb(WHITE));
+    }
+
+    #[test]
+    fn scaled_surface_mapping_honours_canvas_origin_and_target_size() {
+        let mut store = SurfaceStore::new();
+        assert!(store.set_graphics_output_size(6, 3));
+        store.create(1, 2, 2);
+        store.adopt_pixels(1, quad()).unwrap();
+        assert!(store.map_to_output_geometry(1, 2, 2, 1, 0, 4, 2));
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let viewport = Viewport::letterbox(6, 3, 6, 3);
+        let mut dst = vec![0xDEAD_BEEF; 18];
+
+        present_snapshot_into(&mut dst, 6, 3, &viewport, &snapshot);
+
+        assert_eq!(
+            dst,
+            vec![
+                0,
+                rgb(RED),
+                rgb(RED),
+                rgb(GREEN),
+                rgb(GREEN),
+                0,
+                0,
+                rgb(BLUE),
+                rgb(BLUE),
+                rgb(WHITE),
+                rgb(WHITE),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
     }
 
     #[test]

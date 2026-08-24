@@ -537,17 +537,48 @@ struct CacheEntry {
     pixels: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputMapping {
+    surface_id: u16,
+    source_width: u16,
+    source_height: u16,
+    dest_x: u32,
+    dest_y: u32,
+    dest_width: u32,
+    dest_height: u32,
+}
+
+#[derive(Debug, Clone)]
+struct PresentationFallback {
+    surface: Surface,
+    mapping: PresentationMapping,
+}
+
+/// Geometry needed to place one source surface inside the logical output canvas.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PresentationMapping {
+    pub(crate) canvas_width: u16,
+    pub(crate) canvas_height: u16,
+    pub(crate) source_width: u16,
+    pub(crate) source_height: u16,
+    pub(crate) dest_x: u32,
+    pub(crate) dest_y: u32,
+    pub(crate) dest_width: u32,
+    pub(crate) dest_height: u32,
+}
+
 /// All surfaces, the offscreen cache, and which surface is mapped to output.
 #[derive(Debug, Default)]
 pub struct SurfaceStore {
     surfaces: HashMap<u16, Surface>,
     cache: HashMap<u16, CacheEntry>,
-    output: Option<u16>,
+    output: Option<OutputMapping>,
+    graphics_output_size: Option<(u16, u16)>,
     /// Last painted output retained while a newly mapped surface is still empty.
     ///
     /// This is presentation state only. The replacement surface remains zero-initialized,
     /// so no stale pixels can leak into protocol operations or codec reference state.
-    presentation_fallback: Option<Surface>,
+    presentation_fallback: Option<PresentationFallback>,
     /// Keep the window's already-copied snapshot when a frame commits without a presentable
     /// output. The snapshot lives outside the store; this bit is the only transaction state
     /// needed to retain it without cloning another full surface.
@@ -600,6 +631,9 @@ pub(crate) enum PresentationCopy {
 pub(crate) struct PresentationSnapshot {
     pub(crate) width: u16,
     pub(crate) height: u16,
+    pub(crate) pixel_width: u16,
+    pub(crate) pixel_height: u16,
+    pub(crate) mapping: PresentationMapping,
     pub(crate) pixels: Vec<u8>,
     pub(crate) generation: u64,
 }
@@ -691,21 +725,30 @@ impl SurfaceStore {
         {
             return;
         }
-        if let Some(surface) = self.output_surface().filter(|surface| surface.is_painted()) {
-            self.presentation_fallback = Some(surface.clone_for_presentation());
+        if let Some(mapping) = self.output
+            && let Some(presentation_mapping) = self.presentation_mapping_for(mapping)
+            && let Some(surface) = self
+                .surfaces
+                .get(&mapping.surface_id)
+                .filter(|surface| surface.is_painted())
+        {
+            self.presentation_fallback = Some(PresentationFallback {
+                surface: surface.clone_for_presentation(),
+                mapping: presentation_mapping,
+            });
         }
     }
 
     fn finish_surface_mutation(&mut self, id: u16) {
         if !matches!(self.frame_state, FrameState::Idle) {
-            let is_current_output = self.output == Some(id);
+            let is_current_output = self.output.is_some_and(|mapping| mapping.surface_id == id);
             let is_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
             if is_current_output && (self.presentation_fallback.is_none() || is_complete) {
                 self.frame_visible_dirty = true;
             }
             return;
         }
-        let is_current_output = self.output == Some(id);
+        let is_current_output = self.output.is_some_and(|mapping| mapping.surface_id == id);
         if !is_current_output {
             return;
         }
@@ -730,7 +773,7 @@ impl SurfaceStore {
     }
 
     pub fn create(&mut self, id: u16, width: u16, height: u16) {
-        if self.output == Some(id) {
+        if self.output.is_some_and(|mapping| mapping.surface_id == id) {
             self.mark_frame_visible_dirty();
             self.retain_painted_output();
         }
@@ -738,7 +781,7 @@ impl SurfaceStore {
     }
 
     pub fn delete(&mut self, id: u16) {
-        let deleting_output = self.output == Some(id);
+        let deleting_output = self.output.is_some_and(|mapping| mapping.surface_id == id);
         let idle_presentation_changed = deleting_output
             && matches!(self.frame_state, FrameState::Idle)
             && (self.presentation_fallback.is_some()
@@ -783,13 +826,96 @@ impl SurfaceStore {
         }
     }
 
+    pub fn set_graphics_output_size(&mut self, width: u32, height: u32) -> bool {
+        let (Ok(width), Ok(height)) = (u16::try_from(width), u16::try_from(height)) else {
+            return false;
+        };
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let changed = self.graphics_output_size != Some((width, height));
+        self.graphics_output_size = Some((width, height));
+        if changed && self.output.is_some() {
+            if matches!(self.frame_state, FrameState::Idle) {
+                if !self.presentation_suppressed
+                    && self.presentation_fallback.is_none()
+                    && self.presentation_surface().is_some()
+                {
+                    self.touch_presentation();
+                }
+            } else {
+                self.mark_frame_visible_dirty();
+            }
+        }
+        true
+    }
+
     pub fn map_to_output(&mut self, id: u16) {
-        let mapping_changed = self.output != Some(id);
+        let Some(surface) = self.surfaces.get(&id) else {
+            return;
+        };
+        let _ = self.map_to_output_geometry(
+            id,
+            surface.width,
+            surface.height,
+            0,
+            0,
+            u32::from(surface.width),
+            u32::from(surface.height),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_to_output_geometry(
+        &mut self,
+        id: u16,
+        source_width: u16,
+        source_height: u16,
+        dest_x: u32,
+        dest_y: u32,
+        dest_width: u32,
+        dest_height: u32,
+    ) -> bool {
+        let Some(surface) = self.surfaces.get(&id) else {
+            return false;
+        };
+        if source_width == 0
+            || source_height == 0
+            || source_width > surface.width
+            || source_height > surface.height
+            || dest_width == 0
+            || dest_height == 0
+            || dest_x.checked_add(dest_width).is_none()
+            || dest_y.checked_add(dest_height).is_none()
+        {
+            return false;
+        }
+        if self
+            .graphics_output_size
+            .is_some_and(|(canvas_width, canvas_height)| {
+                dest_x >= u32::from(canvas_width) || dest_y >= u32::from(canvas_height)
+            })
+        {
+            return false;
+        }
+        let mapping = OutputMapping {
+            surface_id: id,
+            source_width,
+            source_height,
+            dest_x,
+            dest_y,
+            dest_width,
+            dest_height,
+        };
+        if self.presentation_mapping_for(mapping).is_none() {
+            return false;
+        }
+        let mapping_changed = self.output != Some(mapping);
         if mapping_changed {
             self.mark_frame_visible_dirty();
             self.retain_painted_output();
         }
-        self.output = Some(id);
+        self.output = Some(mapping);
         let output_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
         let released_suppressed_presentation = if matches!(self.frame_state, FrameState::Idle)
             && output_complete
@@ -819,11 +945,63 @@ impl SurfaceStore {
                 self.mark_frame_visible_dirty();
             }
         }
+        true
     }
 
     /// The surface currently mapped to output in protocol state.
     pub fn output_surface(&self) -> Option<&Surface> {
-        self.output.and_then(|id| self.surfaces.get(&id))
+        self.output
+            .and_then(|mapping| self.surfaces.get(&mapping.surface_id))
+    }
+
+    fn presentation_mapping_for(&self, mapping: OutputMapping) -> Option<PresentationMapping> {
+        let (canvas_width, canvas_height) = self.graphics_output_size.unwrap_or_else(|| {
+            (
+                u16::try_from(mapping.dest_x + mapping.dest_width).unwrap_or(u16::MAX),
+                u16::try_from(mapping.dest_y + mapping.dest_height).unwrap_or(u16::MAX),
+            )
+        });
+        if canvas_width == 0 || canvas_height == 0 {
+            return None;
+        }
+        Some(PresentationMapping {
+            canvas_width,
+            canvas_height,
+            source_width: mapping.source_width,
+            source_height: mapping.source_height,
+            dest_x: mapping.dest_x,
+            dest_y: mapping.dest_y,
+            dest_width: mapping.dest_width,
+            dest_height: mapping.dest_height,
+        })
+    }
+
+    fn presentation_frame(&self) -> Option<(&Surface, PresentationMapping)> {
+        if !matches!(self.frame_state, FrameState::Idle) {
+            return self
+                .presentation_fallback
+                .as_ref()
+                .map(|fallback| (&fallback.surface, fallback.mapping));
+        }
+        if let Some(fallback) = self.presentation_fallback.as_ref() {
+            if let Some(mapping) = self.output
+                && let Some(surface) = self
+                    .surfaces
+                    .get(&mapping.surface_id)
+                    .filter(|surface| surface.is_complete())
+                && let Some(presentation_mapping) = self.presentation_mapping_for(mapping)
+            {
+                return Some((surface, presentation_mapping));
+            }
+            return Some((&fallback.surface, fallback.mapping));
+        }
+        let output_mapping = self.output?;
+        let surface = self
+            .surfaces
+            .get(&output_mapping.surface_id)
+            .filter(|surface| surface.is_painted())?;
+        let presentation_mapping = self.presentation_mapping_for(output_mapping)?;
+        Some((surface, presentation_mapping))
     }
 
     /// The surface the window should present.
@@ -833,16 +1011,12 @@ impl SurfaceStore {
     /// The presenter must keep the last good desktop through that handoff instead of
     /// flashing the replacement's zero-filled allocation.
     pub fn presentation_surface(&self) -> Option<&Surface> {
-        if !matches!(self.frame_state, FrameState::Idle) {
-            return self.presentation_fallback.as_ref();
-        }
-        if self.presentation_fallback.is_some() {
-            self.output_surface()
-                .filter(|surface| surface.is_complete())
-                .or(self.presentation_fallback.as_ref())
-        } else {
-            self.output_surface().filter(|surface| surface.is_painted())
-        }
+        self.presentation_frame().map(|(surface, _)| surface)
+    }
+
+    pub(crate) fn presentation_dimensions(&self) -> Option<(u16, u16)> {
+        let (_, mapping) = self.presentation_frame()?;
+        Some((mapping.canvas_width, mapping.canvas_height))
     }
 
     /// Copy the current presentation surface into a reusable snapshot.
@@ -858,14 +1032,20 @@ impl SurfaceStore {
             return PresentationCopy::Retained;
         }
         snapshot.generation = self.generation;
-        let Some(surface) = self.presentation_surface() else {
+        let Some((surface, mapping)) = self.presentation_frame() else {
             snapshot.width = 0;
             snapshot.height = 0;
+            snapshot.pixel_width = 0;
+            snapshot.pixel_height = 0;
+            snapshot.mapping = PresentationMapping::default();
             snapshot.pixels.clear();
             return PresentationCopy::Empty;
         };
-        snapshot.width = surface.width;
-        snapshot.height = surface.height;
+        snapshot.width = mapping.canvas_width;
+        snapshot.height = mapping.canvas_height;
+        snapshot.pixel_width = surface.width;
+        snapshot.pixel_height = surface.height;
+        snapshot.mapping = mapping;
         snapshot.pixels.resize(surface.pixels.len(), 0);
         snapshot.pixels.copy_from_slice(surface.pixels());
         PresentationCopy::Copied
@@ -1916,6 +2096,95 @@ mod tests {
     }
 
     #[test]
+    fn replacement_fallback_retains_its_own_mapping() {
+        let mut store = SurfaceStore::new();
+        assert!(store.set_graphics_output_size(4, 1));
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        assert!(store.map_to_output_geometry(1, 2, 1, 0, 0, 2, 1));
+
+        store.create(2, 2, 1);
+        assert!(store.map_to_output_geometry(2, 2, 1, 2, 0, 2, 1));
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.mapping.dest_x, 0);
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+
+        store.solid_fill(2, &[Rect::new(0, 0, 2, 1)], BLUE).unwrap();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.mapping.dest_x, 2);
+        assert_eq!(snapshot.pixels, solid(2, 1, BLUE));
+    }
+
+    #[test]
+    fn replacement_fallback_retains_its_original_canvas_size() {
+        let mut store = SurfaceStore::new();
+        assert!(store.set_graphics_output_size(4, 1));
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        assert!(store.map_to_output_geometry(1, 2, 1, 0, 0, 2, 1));
+
+        store.create(2, 2, 1);
+        assert!(store.map_to_output_geometry(2, 2, 1, 2, 0, 2, 1));
+        assert!(store.set_graphics_output_size(8, 1));
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!((snapshot.width, snapshot.height), (4, 1));
+        assert_eq!(snapshot.mapping.canvas_width, 4);
+        assert_eq!(snapshot.pixels, solid(2, 1, RED));
+    }
+
+    #[test]
+    fn wholly_off_canvas_mapping_preserves_the_live_desktop() {
+        let mut store = SurfaceStore::new();
+        assert!(store.set_graphics_output_size(2, 1));
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        store.create(2, 1, 1);
+        store.solid_fill(2, &[Rect::new(0, 0, 1, 1)], BLUE).unwrap();
+        let before = store.generation();
+
+        assert!(!store.map_to_output_geometry(2, 1, 1, 2, 0, 1, 1));
+        assert_eq!(store.generation(), before);
+        assert_eq!(store.output_surface().unwrap().pixels(), solid(2, 1, RED));
+    }
+
+    #[test]
+    fn resizing_a_suppressed_partial_output_does_not_wake_the_presenter() {
+        let mut store = SurfaceStore::new();
+        assert!(store.set_graphics_output_size(2, 1));
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        let before = store.generation();
+
+        store.begin_frame(31);
+        store.delete(1);
+        store.create(1, 2, 1);
+        store.map_to_output(1);
+        store
+            .blit_rgba_strict(1, Rect::new(0, 0, 1, 1), &solid(1, 1, BLUE))
+            .unwrap();
+        assert!(store.commit_frame(31));
+        assert_eq!(store.generation(), before);
+
+        assert!(store.set_graphics_output_size(4, 1));
+        assert_eq!(store.generation(), before);
+    }
+
+    #[test]
     fn output_surface_follows_the_mapping() {
         let mut store = SurfaceStore::new();
         store.create(1, 2, 2);
@@ -1927,6 +2196,55 @@ mod tests {
             store.output_surface().is_none(),
             "deleting clears the mapping"
         );
+    }
+
+    #[test]
+    fn scaled_mapping_geometry_is_copied_atomically_with_pixels() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 2);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        assert!(store.set_graphics_output_size(6, 3));
+        assert!(store.map_to_output_geometry(1, 2, 2, 1, 0, 4, 2));
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        assert_eq!((snapshot.width, snapshot.height), (6, 3));
+        assert_eq!((snapshot.pixel_width, snapshot.pixel_height), (2, 2));
+        assert_eq!(
+            snapshot.mapping,
+            PresentationMapping {
+                canvas_width: 6,
+                canvas_height: 3,
+                source_width: 2,
+                source_height: 2,
+                dest_x: 1,
+                dest_y: 0,
+                dest_width: 4,
+                dest_height: 2,
+            }
+        );
+        assert_eq!(snapshot.pixels, solid(2, 2, RED));
+    }
+
+    #[test]
+    fn invalid_mapping_geometry_preserves_the_live_presentation() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 2);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 2)], RED).unwrap();
+        store.map_to_output(1);
+        let before = store.generation();
+
+        assert!(!store.map_to_output_geometry(1, 2, 2, 0, 0, 0, 2));
+        assert!(!store.map_to_output_geometry(1, 3, 2, 0, 0, 3, 2));
+        assert_eq!(store.generation(), before);
+
+        let mut snapshot = PresentationSnapshot::default();
+        assert!(store.copy_presentation(&mut snapshot));
+        assert_eq!((snapshot.width, snapshot.height), (2, 2));
+        assert_eq!(snapshot.mapping.dest_width, 2);
     }
 
     #[test]

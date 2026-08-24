@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Carry EGFX geometry with raw snapshots; scale outside the store lock (`surface.rs:PresentationMapping`).
+  Pair fallback pixels with their mapping so a partial replacement cannot move or rescale old
+  pixels. A second composed output canvas would add about 56 MiB at 5K and hold up decoding.
+
 - Preflight IOSurface ownership before 5K frame work, then recheck at present (`present.rs:can_start_frame`).
   Compositor ownership can change after any read, so the preflight may only defer work; it must
   never reserve or authorize a surface. A resized or empty pool must stay ready for lazy rebuild.
