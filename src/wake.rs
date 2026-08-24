@@ -128,13 +128,25 @@ pub fn wait_readable(
     imp::wait_readable(socket, &bell.0, timeout)
 }
 
+/// Sleep until the TCP socket can accept another write, or `timeout` elapses.
+///
+/// Error and hangup events count as ready so the following write surfaces the
+/// transport failure. `false` means only that the timeout elapsed.
+pub fn wait_writable(socket: &TcpStream, timeout: Duration) -> io::Result<bool> {
+    imp::wait_writable(socket, timeout)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::Ready;
     use std::io;
     use std::net::{TcpStream, UdpSocket};
     use std::os::fd::AsRawFd;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    fn poll_timeout(remaining: Duration) -> i32 {
+        i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX)
+    }
 
     pub(super) fn wait_readable(
         socket: &TcpStream,
@@ -173,6 +185,30 @@ mod imp {
             });
         }
     }
+
+    pub(super) fn wait_writable(socket: &TcpStream, timeout: Duration) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        let mut fd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let n = unsafe { libc::poll(&mut fd, 1, poll_timeout(remaining)) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(n > 0);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -181,8 +217,14 @@ mod imp {
     use std::io;
     use std::net::{TcpStream, UdpSocket};
     use std::os::windows::io::AsRawSocket;
-    use std::time::Duration;
-    use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, SOCKET_ERROR, WSAPOLLFD, WSAPoll};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLRDNORM, POLLWRNORM, SOCKET_ERROR, WSAPOLLFD, WSAPoll,
+    };
+
+    fn poll_timeout(remaining: Duration) -> i32 {
+        i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX)
+    }
 
     pub(super) fn wait_readable(
         socket: &TcpStream,
@@ -210,6 +252,30 @@ mod imp {
             socket: fds[0].revents != 0,
             bell: fds[1].revents != 0,
         })
+    }
+
+    pub(super) fn wait_writable(socket: &TcpStream, timeout: Duration) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        let mut fd = WSAPOLLFD {
+            fd: socket.as_raw_socket() as usize,
+            events: POLLWRNORM,
+            revents: 0,
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let n = unsafe { WSAPoll(&mut fd, 1, poll_timeout(remaining)) };
+            if n == SOCKET_ERROR {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(n > 0);
+        }
     }
 }
 
@@ -247,6 +313,12 @@ mod tests {
         let ready = wait_readable(&socket, &rx, Duration::from_secs(5)).unwrap();
         assert!(ready.socket);
         assert!(!ready.bell);
+    }
+
+    #[test]
+    fn connected_socket_reports_writable_without_polling_on_a_timer() {
+        let (socket, _peer) = tcp_pair();
+        assert!(wait_writable(&socket, Duration::from_secs(5)).unwrap());
     }
 
     #[test]

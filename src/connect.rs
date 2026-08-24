@@ -303,11 +303,16 @@ fn send_shutdown_with(
 /// Toggle the nonblocking mode of the transport owned by the live Framed stream.
 pub(crate) trait SetNonblocking {
     fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()>;
+    fn wait_writable(&mut self, timeout: Duration) -> std::io::Result<bool>;
 }
 
 impl SetNonblocking for StreamOwned<ClientConnection, TcpStream> {
     fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
         self.sock.set_nonblocking(nonblocking)
+    }
+
+    fn wait_writable(&mut self, timeout: Duration) -> std::io::Result<bool> {
+        crate::wake::wait_writable(&self.sock, timeout)
     }
 }
 
@@ -359,7 +364,14 @@ fn write_framed_with_clock<
             Ok(count) => written += count,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                wait_for_write_progress(deadline);
+                let remaining = deadline.saturating_duration_since(now());
+                let writable = {
+                    let (stream, _) = framed.get_inner_mut();
+                    !remaining.is_zero() && stream.wait_writable(remaining)?
+                };
+                if !writable {
+                    return Err(write_deadline_error());
+                }
             }
             Err(e) => return Err(e),
         }
@@ -377,17 +389,17 @@ fn write_framed_with_clock<
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                wait_for_write_progress(deadline);
+                let remaining = deadline.saturating_duration_since(now());
+                let writable = {
+                    let (stream, _) = framed.get_inner_mut();
+                    !remaining.is_zero() && stream.wait_writable(remaining)?
+                };
+                if !writable {
+                    return Err(write_deadline_error());
+                }
             }
             Err(e) => return Err(e),
         }
-    }
-}
-
-fn wait_for_write_progress(deadline: Instant) {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if !remaining.is_zero() {
-        std::thread::sleep(remaining.min(Duration::from_millis(1)));
     }
 }
 
@@ -875,6 +887,39 @@ mod tests {
         writes: usize,
     }
 
+    struct BlockedWriter {
+        writes: usize,
+        waits: usize,
+    }
+
+    impl Read for BlockedWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "quiet"))
+        }
+    }
+
+    impl Write for BlockedWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "blocked"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("flush must not follow an unwritten frame")
+        }
+    }
+
+    impl SetNonblocking for BlockedWriter {
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn wait_writable(&mut self, _timeout: Duration) -> io::Result<bool> {
+            self.waits += 1;
+            Ok(false)
+        }
+    }
+
     impl Read for DribblingWriter {
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "quiet"))
@@ -897,6 +942,10 @@ mod tests {
     impl SetNonblocking for DribblingWriter {
         fn set_nonblocking(&mut self, _nonblocking: bool) -> io::Result<()> {
             Ok(())
+        }
+
+        fn wait_writable(&mut self, _timeout: Duration) -> io::Result<bool> {
+            Ok(true)
         }
     }
 
@@ -925,6 +974,35 @@ mod tests {
         let (writer, _) = framed.get_inner_mut();
         assert_eq!(writer.bytes.len(), 4);
         assert_eq!(writer.writes, 4);
+    }
+
+    #[test]
+    fn blocked_writer_waits_for_writability_instead_of_retrying_each_millisecond() {
+        let base = Instant::now();
+        let mut clock = base;
+        let mut framed = Framed::new(BlockedWriter {
+            writes: 0,
+            waits: 0,
+        });
+
+        let error = write_framed_with_clock(
+            &mut framed,
+            b"frame",
+            base + Duration::from_millis(5),
+            || {
+                clock += Duration::from_millis(1);
+                clock
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            framed.get_inner().0.writes,
+            1,
+            "a blocked socket must sleep in OS readiness, not retry at 1 kHz"
+        );
+        assert_eq!(framed.get_inner().0.waits, 1);
     }
 
     #[test]

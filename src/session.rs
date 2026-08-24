@@ -1747,11 +1747,19 @@ mod tests {
         fn set_nonblocking(&mut self, _nonblocking: bool) -> std::io::Result<()> {
             Ok(())
         }
+
+        fn wait_writable(&mut self, _timeout: Duration) -> std::io::Result<bool> {
+            Ok(true)
+        }
     }
 
     impl SetNonblocking for WriteObserver {
         fn set_nonblocking(&mut self, _nonblocking: bool) -> std::io::Result<()> {
             Ok(())
+        }
+
+        fn wait_writable(&mut self, _timeout: Duration) -> std::io::Result<bool> {
+            Ok(true)
         }
     }
 
@@ -1759,11 +1767,19 @@ mod tests {
         fn set_nonblocking(&mut self, _nonblocking: bool) -> std::io::Result<()> {
             Ok(())
         }
+
+        fn wait_writable(&mut self, _timeout: Duration) -> std::io::Result<bool> {
+            Ok(true)
+        }
     }
 
     impl SetNonblocking for FlushFailure {
         fn set_nonblocking(&mut self, _nonblocking: bool) -> std::io::Result<()> {
             Ok(())
+        }
+
+        fn wait_writable(&mut self, _timeout: Duration) -> std::io::Result<bool> {
+            Ok(true)
         }
     }
 
