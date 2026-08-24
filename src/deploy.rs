@@ -279,6 +279,11 @@ pub struct Evidence {
     /// Absent for fresh, unreachable, old-schema, or defaulted/partial status.
     #[serde(default)]
     pub desired_display: Option<DesiredDisplay>,
+    /// The installed RhydraAgent service's command line, when the service exists.
+    /// This is independent of the control port: a stopped agent can still retain
+    /// the display policy in its service registration.
+    #[serde(default)]
+    pub agent_service_command: Option<String>,
     /// The official VB-CABLE package is staged in the Windows driver store.
     #[serde(default)]
     pub audio_package_staged: bool,
@@ -356,6 +361,56 @@ impl DesiredDisplay {
             " --display {} {} {} {}",
             self.width, self.height, self.hz, self.scale_percent
         )
+    }
+}
+
+/// Parse only the command shape emitted by `rhydra-agent install` when it
+/// registers the Windows service. Any other shape, including the default
+/// no-display service command, deliberately falls back to no display args.
+fn parse_agent_service_display(command: &str) -> Option<DesiredDisplay> {
+    let quoted = command.strip_prefix('"')?;
+    let closing_quote = quoted.find('"')?;
+    let path = &quoted[..closing_quote];
+    let executable = path
+        .rsplit_once(['\\', '/'])
+        .map(|(_, name)| name)
+        .unwrap_or(path);
+    if !executable.eq_ignore_ascii_case("rhydra-agent.exe") {
+        return None;
+    }
+
+    let args = quoted
+        .get(closing_quote + 1..)?
+        .strip_prefix(" service --display ")?;
+    let mut values = args.split(' ');
+    let parse_positive = |value: Option<&str>| {
+        let value = value?;
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        value.parse::<u32>().ok().filter(|value| *value > 0)
+    };
+    let display = DesiredDisplay {
+        width: parse_positive(values.next())?,
+        height: parse_positive(values.next())?,
+        hz: parse_positive(values.next())?,
+        scale_percent: parse_positive(values.next())?,
+    };
+    values.next().is_none().then_some(display)
+}
+
+impl Evidence {
+    /// Select the live schema-5 policy first, then recover a stopped service's
+    /// installed policy when status could not answer on the control port.
+    fn effective_display(&self) -> Option<DesiredDisplay> {
+        self.desired_display.or_else(|| {
+            self.agent_service_command
+                .as_deref()
+                .and_then(parse_agent_service_display)
+        })
     }
 }
 
@@ -645,7 +700,7 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
         command: format!(
             "\"{remote_dir}\\rhydra-agent.exe\" install{}",
             evidence
-                .desired_display
+                .effective_display()
                 .map(DesiredDisplay::cli_args)
                 .unwrap_or_default()
         ),
@@ -701,6 +756,14 @@ $sizes = @{}
 if ($TargetDir -and (Test-Path $TargetDir)) {
     Get-ChildItem -Path $TargetDir -Recurse -File | ForEach-Object { $sizes[$_.Name] = $_.Length }
 }
+$agentServiceCommand = $null
+try {
+    $service = Get-CimInstance Win32_Service -Filter "Name='RhydraAgent'" -ErrorAction Stop |
+        Select-Object -First 1
+    if ($service -and $service.PathName) {
+        $agentServiceCommand = "$($service.PathName)"
+    }
+} catch {}
 $agent = $null
 $desiredDisplay = $null
 try {
@@ -834,6 +897,7 @@ $out = @{
     target_dir_sizes = $sizes
     agent = $agent
     desired_display = $desiredDisplay
+    agent_service_command = $agentServiceCommand
     audio_package_staged = [bool]$audioPackageStaged
     audio_setup_ran = [bool]$audioSetupRan
     audio_reboot_pending = [bool]$audioRebootPending
@@ -1485,7 +1549,7 @@ pub fn run(args: &[String]) -> i32 {
     };
     report_evidence(&evidence);
 
-    let expected_display = evidence.desired_display;
+    let expected_display = evidence.effective_display();
     let branch = match decide(&cfg, &artifacts, &evidence) {
         Ok(b) => b,
         Err(stop) => {
@@ -1785,6 +1849,7 @@ mod tests {
                 server_running: false,
             }),
             desired_display: None,
+            agent_service_command: None,
             audio_package_staged: true,
             audio_setup_ran: true,
             audio_reboot_pending: false,
@@ -1847,6 +1912,126 @@ mod tests {
             })
             .unwrap();
         assert!(install.ends_with(" install"), "{install}");
+    }
+
+    #[test]
+    fn stopped_agent_redeploy_preserves_the_installed_service_display_request() {
+        let dir = scratch_dir("stopped-agent-display-preserve");
+        let art = test_artifacts(&dir);
+        let evidence = parse_evidence(
+            r#"{
+                "elevated": true,
+                "console_user": "QUENCH\\ano",
+                "ssh_user": "ano",
+                "agent_exes": ["C:\\mdrdp\\v0.5.0\\rhydra-agent.exe"],
+                "port9502_owner": null,
+                "port9500_owner": null,
+                "device_present": true,
+                "active_driver_ver": "1.0.0.1",
+                "staged_driver_vers": ["1.0.0.1"],
+                "inf2cat_present": false,
+                "signtool_present": false,
+                "version_dirs": ["v0.2.0"],
+                "target_dir_sizes": {},
+                "agent": null,
+                "desired_display": null,
+                "agent_service_command": "\"C:\\mdrdp\\v0.5.0\\rhydra-agent.exe\" service --display 5120 2880 240 200",
+                "audio_package_staged": true,
+                "audio_setup_ran": true,
+                "audio_reboot_pending": false,
+                "cable_identity_ok": true,
+                "cable_render_active": true,
+                "cable_capture_active": true,
+                "cable_formats_ok": true,
+                "audio_default_render_active": true
+            }"#,
+        )
+        .unwrap();
+
+        let Branch::Full(plan) = decide(&cfg(), &art, &evidence).unwrap() else {
+            panic!("expected full deploy");
+        };
+        let install = plan
+            .post
+            .iter()
+            .find_map(|action| match action {
+                Action::Run { label, command } if label == "install agent" => Some(command),
+                _ => None,
+            })
+            .expect("full deploy installs the replacement agent");
+        assert!(
+            install.ends_with("install --display 5120 2880 240 200"),
+            "stopped-agent retry must preserve the service's display tuple: {install}"
+        );
+    }
+
+    #[test]
+    fn installed_service_display_parser_accepts_the_agent_generated_shape() {
+        assert_eq!(
+            parse_agent_service_display(
+                r#""C:\Program Files\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 240 200"#
+            ),
+            Some(DesiredDisplay {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+                scale_percent: 200,
+            })
+        );
+    }
+
+    #[test]
+    fn installed_service_display_parser_fails_closed_for_untrusted_shapes() {
+        let commands = [
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service"#,
+            r#"C:\mdrdp\v0.5.0\rhydra-agent.exe service --display 5120 2880 240 200"#,
+            r#""C:\mdrdp\v0.5.0\other-agent.exe" service --display 5120 2880 240 200"#,
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" run --display 5120 2880 240 200"#,
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 0 2880 240 200"#,
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 0 240 200"#,
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 0 200"#,
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 240 0"#,
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 05120 2880 240 200"#,
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display +5120 2880 240 200"#,
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 240 200 trailing"#,
+        ];
+        for command in commands {
+            assert_eq!(
+                parse_agent_service_display(command),
+                None,
+                "must reject {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_display_prefers_live_status_and_falls_back_to_service_command() {
+        let mut evidence = healthy_evidence();
+        evidence.agent_service_command = Some(
+            r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 5120 2880 240 200"#.to_owned(),
+        );
+        assert_eq!(
+            evidence.effective_display(),
+            Some(DesiredDisplay {
+                width: 5120,
+                height: 2880,
+                hz: 240,
+                scale_percent: 200,
+            })
+        );
+
+        evidence.desired_display = Some(DesiredDisplay {
+            width: 2560,
+            height: 1440,
+            hz: 120,
+            scale_percent: 100,
+        });
+        assert_eq!(evidence.effective_display(), evidence.desired_display);
+
+        evidence.desired_display = None;
+        evidence.agent_service_command =
+            Some(r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service"#.to_owned());
+        assert_eq!(evidence.effective_display(), None);
     }
 
     #[test]
@@ -2276,6 +2461,22 @@ mod tests {
         assert!(PROBE_PS1.contains("Get-PnpDevice -Class Display -PresentOnly"));
         assert!(PROBE_PS1.contains("$presentDisplayIds -contains $_.DeviceID"));
         assert!(!PROBE_PS1.contains("$_.DeviceName -eq 'mdrdp latency-spike display'"));
+    }
+
+    #[test]
+    fn probe_reads_the_installed_service_command_independently_of_agent_status() {
+        let service_query = PROBE_PS1
+            .find("Get-CimInstance Win32_Service")
+            .expect("probe must inspect the installed RhydraAgent service");
+        let control_port = PROBE_PS1
+            .find("New-Object Net.Sockets.TcpClient")
+            .expect("probe must retain its control-port status query");
+        assert!(
+            service_query < control_port,
+            "service command evidence must be collected before the optional control-port query"
+        );
+        assert!(PROBE_PS1.contains("Name='RhydraAgent'"));
+        assert!(PROBE_PS1.contains("agent_service_command = $agentServiceCommand"));
     }
 
     #[test]
