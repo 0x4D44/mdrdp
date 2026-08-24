@@ -318,6 +318,8 @@ MdrdpSharedSlot* SharedSection::Slot(UINT32 Index) const
 
 SharedFramePool::SharedFramePool() :
     m_pSection(nullptr),
+    m_CurrentDirtyCount(MDRDP_IDD_COVERAGE_ABSENT),
+    m_CurrentMoveCount(MDRDP_IDD_COVERAGE_ABSENT),
     m_CopyWaitLimitUs(2000),
     m_FrameSeq(0),
     m_Started(false)
@@ -488,6 +490,8 @@ HRESULT SharedFramePool::Start(
         pSlot->DirtySinceFrameSeq = 0;
         pSlot->PresentQpc = 0;
         pSlot->CoverageRectCount = MDRDP_IDD_COVERAGE_ABSENT;
+        pSlot->CurrentDirtyRectCount = MDRDP_IDD_COVERAGE_ABSENT;
+        pSlot->CurrentMoveRectCount = MDRDP_IDD_COVERAGE_ABSENT;
         SeqlockEnd(pSlotSequence);
     }
 
@@ -511,6 +515,8 @@ HRESULT SharedFramePool::Start(
 
     m_Generation = Generation;
     m_FrameSeq = 0;
+    m_CurrentDirtyCount = MDRDP_IDD_COVERAGE_ABSENT;
+    m_CurrentMoveCount = MDRDP_IDD_COVERAGE_ABSENT;
     m_Started = true;
 
     wchar_t Message[192];
@@ -553,6 +559,8 @@ void SharedFramePool::Stop()
     m_pSection = nullptr;
     m_CopyWaitLimitUs = 2000;
     m_FrameSeq = 0;
+    m_CurrentDirtyCount = MDRDP_IDD_COVERAGE_ABSENT;
+    m_CurrentMoveCount = MDRDP_IDD_COVERAGE_ABSENT;
     m_Started = false;
 }
 
@@ -575,7 +583,7 @@ void SharedFramePool::ProcessFrame(
 
     // Fold before publish. This frame's own coverage belongs both in the record it is about
     // to produce and in the two records the other slots will produce later.
-    FoldFrameCoverage(hSwapChain, MetaData);
+    ReadAndFoldFrameMetadata(hSwapChain, MetaData);
 
     const UINT32 Index = static_cast<UINT32>(m_FrameSeq % MDRDP_IDD_SLOT_COUNT);
     Slot& Target = m_Slots[Index];
@@ -632,6 +640,8 @@ void SharedFramePool::ProcessFrame(
             pSlot->Generation = m_Generation;
             pSlot->FrameSeq = 0;
             pSlot->CoverageRectCount = MDRDP_IDD_COVERAGE_ABSENT;
+            pSlot->CurrentDirtyRectCount = MDRDP_IDD_COVERAGE_ABSENT;
+            pSlot->CurrentMoveRectCount = MDRDP_IDD_COVERAGE_ABSENT;
             SeqlockEnd(pSequence);
         }
     }
@@ -655,8 +665,11 @@ void SharedFramePool::TakeWindowStats(WindowStats& Stats)
 
 #pragma region SharedFramePool - coverage
 
-void SharedFramePool::FoldFrameCoverage(IDDCX_SWAPCHAIN hSwapChain, const IDDCX_METADATA& MetaData)
+void SharedFramePool::ReadAndFoldFrameMetadata(IDDCX_SWAPCHAIN hSwapChain, const IDDCX_METADATA& MetaData)
 {
+    m_CurrentDirtyCount = 0;
+    m_CurrentMoveCount = 0;
+
     // Zero dirty rects AND zero move regions is not missing metadata: the OS reports it for
     // a re-present of an unchanged desktop. "Nothing changed" folds nothing, and that is
     // information the consumer is entitled to.
@@ -665,6 +678,8 @@ void SharedFramePool::FoldFrameCoverage(IDDCX_SWAPCHAIN hSwapChain, const IDDCX_
     {
         // More than the scratch buffers can retrieve in one go, so this frame's union
         // cannot be completed at all.
+        m_CurrentDirtyCount = MDRDP_IDD_COVERAGE_OVERFLOW;
+        m_CurrentMoveCount = MDRDP_IDD_COVERAGE_OVERFLOW;
         MarkAllOverflowed();
         return;
     }
@@ -678,10 +693,20 @@ void SharedFramePool::FoldFrameCoverage(IDDCX_SWAPCHAIN hSwapChain, const IDDCX_
         IDARG_OUT_GETDIRTYRECTS Out = {};
         if (FAILED(IddCxSwapChainGetDirtyRects(hSwapChain, &In, &Out)))
         {
+            m_CurrentDirtyCount = MDRDP_IDD_COVERAGE_ABSENT;
+            m_CurrentMoveCount = MDRDP_IDD_COVERAGE_ABSENT;
             MarkAllAbsent();
             return;
         }
 
+        if (Out.DirtyRectOutCount > MDRDP_IDD_MAX_COVERAGE_RECTS)
+        {
+            m_CurrentDirtyCount = MDRDP_IDD_COVERAGE_OVERFLOW;
+            m_CurrentMoveCount = MDRDP_IDD_COVERAGE_OVERFLOW;
+            MarkAllOverflowed();
+            return;
+        }
+        m_CurrentDirtyCount = Out.DirtyRectOutCount;
         for (UINT32 i = 0; i < Out.DirtyRectOutCount && i < MDRDP_IDD_MAX_COVERAGE_RECTS; i++)
         {
             AppendCoverageRect(m_ScratchRects[i]);
@@ -703,14 +728,22 @@ void SharedFramePool::FoldFrameCoverage(IDDCX_SWAPCHAIN hSwapChain, const IDDCX_
         IDARG_OUT_GETMOVEREGIONS Out = {};
         if (FAILED(IddCxSwapChainGetMoveRegions(hSwapChain, &In, &Out)))
         {
+            m_CurrentDirtyCount = MDRDP_IDD_COVERAGE_ABSENT;
+            m_CurrentMoveCount = MDRDP_IDD_COVERAGE_ABSENT;
             MarkAllAbsent();
             return;
         }
 
-        // We transport FINAL PIXELS, so a move's destination rect is the whole of what a
-        // consumer has to re-read; the source rect and the ordering are irrelevant to us.
-        // That is what makes an accumulated union complete rather than merely plausible
-        // (HLD decision 17) - coverage is order-free, a replay of moves would not be.
+        if (Out.MoveRegionOutCount > MDRDP_IDD_MAX_COVERAGE_RECTS)
+        {
+            m_CurrentDirtyCount = MDRDP_IDD_COVERAGE_OVERFLOW;
+            m_CurrentMoveCount = MDRDP_IDD_COVERAGE_OVERFLOW;
+            MarkAllOverflowed();
+            return;
+        }
+        m_CurrentMoveCount = Out.MoveRegionOutCount;
+        // Accumulated fallback remains final pixels and therefore order-free. The
+        // current-frame list published separately below preserves source and order.
         for (UINT32 i = 0; i < Out.MoveRegionOutCount && i < MDRDP_IDD_MAX_COVERAGE_RECTS; i++)
         {
             AppendCoverageRect(m_ScratchMoves[i].DestRect);
@@ -852,6 +885,24 @@ void SharedFramePool::PublishSlot(UINT32 Index, UINT64 FrameSeq, INT64 PresentQp
     for (UINT32 i = 0; i < Accumulator.Count; i++)
     {
         pSlot->CoverageRects[i] = Accumulator.Rects[i];
+    }
+    pSlot->CurrentDirtyRectCount = m_CurrentDirtyCount;
+    pSlot->CurrentMoveRectCount = m_CurrentMoveCount;
+    if (m_CurrentDirtyCount <= MDRDP_IDD_MAX_COVERAGE_RECTS)
+    {
+        for (UINT32 i = 0; i < m_CurrentDirtyCount; i++)
+        {
+            pSlot->CurrentDirtyRects[i] = m_ScratchRects[i];
+        }
+    }
+    if (m_CurrentMoveCount <= MDRDP_IDD_MAX_COVERAGE_RECTS)
+    {
+        for (UINT32 i = 0; i < m_CurrentMoveCount; i++)
+        {
+            pSlot->CurrentMoves[i].SourceX = m_ScratchMoves[i].SourcePoint.x;
+            pSlot->CurrentMoves[i].SourceY = m_ScratchMoves[i].SourcePoint.y;
+            pSlot->CurrentMoves[i].DestRect = m_ScratchMoves[i].DestRect;
+        }
     }
     SeqlockEnd(pSequence);
 

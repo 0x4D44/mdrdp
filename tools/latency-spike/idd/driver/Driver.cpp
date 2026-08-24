@@ -661,6 +661,10 @@ void IndirectDeviceContext::InitAdapter()
 
     IDDCX_ADAPTER_CAPS AdapterCaps = {};
     AdapterCaps.Size = sizeof(AdapterCaps);
+    // Pre-IddCx 1.7 only: without this flag Windows folds moves into dirty rects.
+    // Current runtimes ignore the deprecated flag and report complete dirty pixels,
+    // which the server's exact inference path handles instead.
+    AdapterCaps.Flags = IDDCX_ADAPTER_FLAGS_CAN_USE_MOVE_REGIONS;
 
     // Declare basic feature support for the adapter (required)
     AdapterCaps.MaxMonitorsSupported = MDRDP_IDD_MONITOR_COUNT;

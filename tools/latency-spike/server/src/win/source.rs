@@ -78,8 +78,9 @@ pub struct MoveRect {
 ///
 /// `rects` contains final pixels which must be read from the current texture. `moves`
 /// contains replayable copies from the preceding canvas; their destinations are not
-/// duplicated in `rects`. The IDD driver publishes one already-unioned final-pixel
-/// coverage list, so its `moves` is empty.
+/// duplicated in `rects`. IDD layout v2 supplies that ordered current-frame pair
+/// only across an adjacent consumed frame; its accumulated fallback remains final
+/// pixels and therefore has no moves.
 #[derive(Debug, Clone, Default)]
 pub struct ChangeInfo {
     pub rects: Vec<DirtyRect>,

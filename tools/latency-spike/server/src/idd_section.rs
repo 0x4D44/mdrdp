@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! page 0 — header
-//!    0  u32 layout_version        # 1; anything else is refused loudly
+//!    0  u32 layout_version        # 2; anything else is refused loudly
 //!    4  u32 generation            # 0 = no pool yet; bumps on every rebuild
 //!    8  u64 render_adapter_luid   # LowPart | HighPart << 32
 //!   16  u32 width
@@ -34,6 +34,11 @@
 //!   32  u32 coverage_rect_count   # 0xFFFFFFFF absent, 0xFFFFFFFE overflowed
 //!   36  u32 reserved
 //!   40  RECT coverage_rects[64]   # i32 left, top, right, bottom
+//! 1064  u32 current_dirty_count   # same absent/overflow sentinels
+//! 1068  u32 current_move_count    # same absent/overflow sentinels
+//! 1072  RECT current_dirty[64]
+//! 2096  packed_move current_moves[64]
+//!       packed_move = i32 source_x, source_y, dest_left, dest_top, dest_right, dest_bottom
 //! ```
 //!
 //! ## The seqlock
@@ -68,7 +73,7 @@ pub const SECTION_NAME: &str = r"Global\mdrdp-idd";
 pub const SECTION_BYTES: usize = 16384;
 
 /// The only layout this server speaks.
-pub const LAYOUT_VERSION: u32 = 1;
+pub const LAYOUT_VERSION: u32 = 2;
 
 /// Pool depth. Fixed by the contract, not a tuning knob: the names, the event
 /// array and the slot pages all assume it.
@@ -129,9 +134,14 @@ const OFF_PRESENT_QPC: usize = 24;
 const OFF_COVERAGE_COUNT: usize = 32;
 const OFF_COVERAGE_RECTS: usize = 40;
 const RECT_BYTES: usize = 16;
+const OFF_CURRENT_DIRTY_COUNT: usize = OFF_COVERAGE_RECTS + MAX_COVERAGE_RECTS * RECT_BYTES;
+const OFF_CURRENT_MOVE_COUNT: usize = OFF_CURRENT_DIRTY_COUNT + 4;
+const OFF_CURRENT_DIRTY_RECTS: usize = OFF_CURRENT_MOVE_COUNT + 4;
+const MOVE_BYTES: usize = 24;
+const OFF_CURRENT_MOVES: usize = OFF_CURRENT_DIRTY_RECTS + MAX_COVERAGE_RECTS * RECT_BYTES;
 
 /// Bytes of a slot page the contract defines.
-pub const SLOT_BYTES: usize = OFF_COVERAGE_RECTS + MAX_COVERAGE_RECTS * RECT_BYTES;
+pub const SLOT_BYTES: usize = OFF_CURRENT_MOVES + MAX_COVERAGE_RECTS * MOVE_BYTES;
 
 /// Where a slot's seqlock word sits, on the same terms as
 /// [`HEADER_SEQUENCE_OFFSET`].
@@ -174,6 +184,14 @@ pub struct SectionRect {
     pub bottom: i32,
 }
 
+/// One ordered current-frame copy in the layout-v2 packed representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionMove {
+    pub source_x: i32,
+    pub source_y: i32,
+    pub dest: SectionRect,
+}
+
 /// What a slot record says about the pixels that changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Coverage {
@@ -183,6 +201,19 @@ pub enum Coverage {
     Overflowed,
     /// A complete coverage list for `(dirty_since_frame_seq, frame_seq]`.
     Rects(Vec<SectionRect>),
+}
+
+/// Current-frame metadata is useful only as one complete pair. A missing dirty or
+/// move list makes the whole replay unavailable; accumulated final-pixel coverage
+/// remains the safe fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentMetadata {
+    Absent,
+    Overflowed,
+    Complete {
+        dirty: Vec<SectionRect>,
+        moves: Vec<SectionMove>,
+    },
 }
 
 /// One slot's published record.
@@ -204,6 +235,7 @@ pub struct SlotRecord {
     /// it — that is the whole reason the decomposition survives the source swap.
     pub present_qpc: i64,
     pub coverage: Coverage,
+    pub current: CurrentMetadata,
 }
 
 /// Why a section read could not be believed.
@@ -224,6 +256,8 @@ pub enum LayoutError {
     SlotCount(u32),
     /// `coverage_rect_count` is neither a sentinel nor a count that fits.
     CoverageCount(u32),
+    /// A current dirty/move count is neither a sentinel nor a bounded count.
+    CurrentCount(u32),
 }
 
 impl std::fmt::Display for LayoutError {
@@ -248,6 +282,10 @@ impl std::fmt::Display for LayoutError {
             Self::CoverageCount(n) => write!(
                 f,
                 "coverage_rect_count {n} is neither a sentinel nor <= {MAX_COVERAGE_RECTS}"
+            ),
+            Self::CurrentCount(n) => write!(
+                f,
+                "current metadata count {n} is neither a sentinel nor <= {MAX_COVERAGE_RECTS}"
             ),
         }
     }
@@ -367,6 +405,45 @@ pub fn parse_slot(page: &[u8]) -> Result<SlotRecord, LayoutError> {
         }
         n => return Err(LayoutError::CoverageCount(n)),
     };
+    let dirty_count = u32_at(page, OFF_CURRENT_DIRTY_COUNT);
+    let move_count = u32_at(page, OFF_CURRENT_MOVE_COUNT);
+    let current = if dirty_count == COVERAGE_ABSENT || move_count == COVERAGE_ABSENT {
+        CurrentMetadata::Absent
+    } else if dirty_count == COVERAGE_OVERFLOWED || move_count == COVERAGE_OVERFLOWED {
+        CurrentMetadata::Overflowed
+    } else {
+        if dirty_count as usize > MAX_COVERAGE_RECTS {
+            return Err(LayoutError::CurrentCount(dirty_count));
+        }
+        if move_count as usize > MAX_COVERAGE_RECTS {
+            return Err(LayoutError::CurrentCount(move_count));
+        }
+        let mut dirty = Vec::with_capacity(dirty_count as usize);
+        for i in 0..dirty_count as usize {
+            let base = OFF_CURRENT_DIRTY_RECTS + i * RECT_BYTES;
+            dirty.push(SectionRect {
+                left: i32_at(page, base),
+                top: i32_at(page, base + 4),
+                right: i32_at(page, base + 8),
+                bottom: i32_at(page, base + 12),
+            });
+        }
+        let mut moves = Vec::with_capacity(move_count as usize);
+        for i in 0..move_count as usize {
+            let base = OFF_CURRENT_MOVES + i * MOVE_BYTES;
+            moves.push(SectionMove {
+                source_x: i32_at(page, base),
+                source_y: i32_at(page, base + 4),
+                dest: SectionRect {
+                    left: i32_at(page, base + 8),
+                    top: i32_at(page, base + 12),
+                    right: i32_at(page, base + 16),
+                    bottom: i32_at(page, base + 20),
+                },
+            });
+        }
+        CurrentMetadata::Complete { dirty, moves }
+    };
     Ok(SlotRecord {
         sequence,
         generation: u32_at(page, OFF_SLOT_GENERATION),
@@ -374,6 +451,7 @@ pub fn parse_slot(page: &[u8]) -> Result<SlotRecord, LayoutError> {
         dirty_since_frame_seq: u64_at(page, OFF_DIRTY_SINCE),
         present_qpc: i64_at(page, OFF_PRESENT_QPC),
         coverage,
+        current,
     })
 }
 
@@ -440,11 +518,38 @@ pub fn coverage_for(slot: &SlotRecord, last_consumed: u64) -> Option<&[SectionRe
     }
 }
 
+/// Ordered metadata applies only to the immediately preceding consumed surface.
+/// Unlike accumulated final-pixel coverage, a move cannot span a skipped frame.
+pub fn current_change_for(
+    slot: &SlotRecord,
+    last_consumed: u64,
+) -> Option<(&[SectionRect], &[SectionMove])> {
+    if last_consumed == 0 || last_consumed.checked_add(1) != Some(slot.frame_seq) {
+        return None;
+    }
+    match &slot.current {
+        CurrentMetadata::Complete { dirty, moves } => Some((dirty, moves)),
+        CurrentMetadata::Absent | CurrentMetadata::Overflowed => None,
+    }
+}
+
 /// A section rect clamped to the pool's pixel dimensions, as the pipeline wants it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoverageRect {
     pub x: u32,
     pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// A move clipped identically at source and destination so it remains a copy of
+/// equal-sized rectangles entirely inside the desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageMove {
+    pub source_x: u32,
+    pub source_y: u32,
+    pub dest_x: u32,
+    pub dest_y: u32,
     pub w: u32,
     pub h: u32,
 }
@@ -465,6 +570,48 @@ pub fn clamp(r: &SectionRect, width: u32, height: u32) -> Option<CoverageRect> {
         y: y0,
         w: x1 - x0,
         h: y1 - y0,
+    })
+}
+
+/// Clamp one ordered move while preserving the source/destination translation.
+pub fn clamp_move(m: &SectionMove, width: u32, height: u32) -> Option<CoverageMove> {
+    let mut source_x = i64::from(m.source_x);
+    let mut source_y = i64::from(m.source_y);
+    let mut dest_x = i64::from(m.dest.left);
+    let mut dest_y = i64::from(m.dest.top);
+    let mut move_width = i64::from(m.dest.right) - dest_x;
+    let mut move_height = i64::from(m.dest.bottom) - dest_y;
+    if move_width <= 0 || move_height <= 0 {
+        return None;
+    }
+
+    let clip_left = (-dest_x).max(-source_x).max(0).min(move_width);
+    let clip_top = (-dest_y).max(-source_y).max(0).min(move_height);
+    source_x += clip_left;
+    dest_x += clip_left;
+    move_width -= clip_left;
+    source_y += clip_top;
+    dest_y += clip_top;
+    move_height -= clip_top;
+
+    let frame_width = i64::from(width);
+    let frame_height = i64::from(height);
+    move_width = move_width
+        .min(frame_width - source_x)
+        .min(frame_width - dest_x);
+    move_height = move_height
+        .min(frame_height - source_y)
+        .min(frame_height - dest_y);
+    if move_width <= 0 || move_height <= 0 {
+        return None;
+    }
+    Some(CoverageMove {
+        source_x: source_x as u32,
+        source_y: source_y as u32,
+        dest_x: dest_x as u32,
+        dest_y: dest_y as u32,
+        w: move_width as u32,
+        h: move_height as u32,
     })
 }
 
@@ -498,7 +645,7 @@ mod tests {
     fn fixture() -> Vec<u8> {
         let mut b = vec![0u8; 16384];
         // Header page.
-        b[0..4].copy_from_slice(&1u32.to_le_bytes()); // layout_version
+        b[0..4].copy_from_slice(&2u32.to_le_bytes()); // layout_version
         b[4..8].copy_from_slice(&7u32.to_le_bytes()); // generation
         b[8..16].copy_from_slice(&0x0000_002A_1234_5678u64.to_le_bytes()); // luid
         b[16..20].copy_from_slice(&1920u32.to_le_bytes()); // width
@@ -520,6 +667,16 @@ mod tests {
             let off = 4136 + i * 4;
             b[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
+        b[5160..5164].copy_from_slice(&1u32.to_le_bytes()); // current_dirty_count
+        b[5164..5168].copy_from_slice(&1u32.to_le_bytes()); // current_move_count
+        for (i, v) in [101i32, 102, 103, 104].iter().enumerate() {
+            let off = 5168 + i * 4;
+            b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (i, v) in [201i32, 202, 203, 204, 205, 206].iter().enumerate() {
+            let off = 6192 + i * 4;
+            b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
 
         // Slot 1 at 8192 — an older frame, so slot selection has something to reject.
         b[8192..8196].copy_from_slice(&6u32.to_le_bytes());
@@ -527,6 +684,8 @@ mod tests {
         b[8208..8216].copy_from_slice(&97u64.to_le_bytes());
         b[8216..8224].copy_from_slice(&999i64.to_le_bytes());
         b[8224..8228].copy_from_slice(&COVERAGE_ABSENT.to_le_bytes());
+        b[9256..9260].copy_from_slice(&COVERAGE_ABSENT.to_le_bytes());
+        b[9260..9264].copy_from_slice(&COVERAGE_ABSENT.to_le_bytes());
 
         // Slot 2 at 12288 — never published.
         b[12288..12292].copy_from_slice(&2u32.to_le_bytes());
@@ -534,6 +693,8 @@ mod tests {
         b[12304..12312].copy_from_slice(&0u64.to_le_bytes());
         b[12312..12320].copy_from_slice(&0i64.to_le_bytes());
         b[12320..12324].copy_from_slice(&COVERAGE_OVERFLOWED.to_le_bytes());
+        b[13352..13356].copy_from_slice(&COVERAGE_OVERFLOWED.to_le_bytes());
+        b[13356..13360].copy_from_slice(&COVERAGE_OVERFLOWED.to_le_bytes());
         b
     }
 
@@ -557,7 +718,8 @@ mod tests {
         assert_eq!(slot_offset(0), 4096);
         assert_eq!(slot_offset(1), 8192);
         assert_eq!(slot_offset(2), 12288);
-        assert_eq!(SLOT_BYTES, 40 + 64 * 16);
+        assert_eq!(LAYOUT_VERSION, 2);
+        assert_eq!(SLOT_BYTES, 3632);
         assert_eq!(HEADER_BYTES, 48);
         assert_eq!(HEADER_SEQUENCE_OFFSET, 40);
         assert_eq!(SLOT_SEQUENCE_OFFSET, 0);
@@ -583,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn an_old_layout_v1_producer_keeps_cursor_ownership_in_the_surface() {
+    fn a_zero_cursor_word_keeps_cursor_ownership_in_the_surface() {
         let mut b = fixture();
         b[44..48].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(
@@ -619,6 +781,27 @@ mod tests {
                     bottom: 88,
                 },
             ])
+        );
+        assert_eq!(
+            s.current,
+            CurrentMetadata::Complete {
+                dirty: vec![SectionRect {
+                    left: 101,
+                    top: 102,
+                    right: 103,
+                    bottom: 104,
+                }],
+                moves: vec![SectionMove {
+                    source_x: 201,
+                    source_y: 202,
+                    dest: SectionRect {
+                        left: 203,
+                        top: 204,
+                        right: 205,
+                        bottom: 206,
+                    },
+                }],
+            }
         );
         assert_eq!(slot_sequence(slot_page(&b, 0)).unwrap(), 4);
     }
@@ -664,10 +847,10 @@ mod tests {
         assert_eq!(parse_header(&zero), Err(LayoutError::Uninitialised));
 
         let mut b = fixture();
-        b[0..4].copy_from_slice(&2u32.to_le_bytes());
+        b[0..4].copy_from_slice(&3u32.to_le_bytes());
         assert_eq!(
             parse_header(header_page(&b)),
-            Err(LayoutError::UnsupportedVersion(2))
+            Err(LayoutError::UnsupportedVersion(3))
         );
     }
 
@@ -730,6 +913,24 @@ mod tests {
             dirty_since_frame_seq: dirty_since,
             present_qpc: 1,
             coverage,
+            current: CurrentMetadata::Complete {
+                dirty: vec![SectionRect {
+                    left: 10,
+                    top: 20,
+                    right: 30,
+                    bottom: 40,
+                }],
+                moves: vec![SectionMove {
+                    source_x: 10,
+                    source_y: 30,
+                    dest: SectionRect {
+                        left: 10,
+                        top: 20,
+                        right: 30,
+                        bottom: 30,
+                    },
+                }],
+            },
         }
     }
 
@@ -813,6 +1014,23 @@ mod tests {
     }
 
     #[test]
+    fn current_moves_require_the_exact_preceding_consumed_frame() {
+        let complete = record(10, 4, one_rect());
+        let (dirty, moves) = current_change_for(&complete, 9).expect("adjacent metadata");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(moves.len(), 1);
+        assert!(current_change_for(&complete, 8).is_none());
+        assert!(current_change_for(&complete, 10).is_none());
+
+        let mut absent = complete.clone();
+        absent.current = CurrentMetadata::Absent;
+        assert!(current_change_for(&absent, 9).is_none());
+        let mut overflowed = complete;
+        overflowed.current = CurrentMetadata::Overflowed;
+        assert!(current_change_for(&overflowed, 9).is_none());
+    }
+
+    #[test]
     fn clamping_keeps_the_inside_and_drops_the_degenerate() {
         let r = |l, t, rt, b| SectionRect {
             left: l,
@@ -843,6 +1061,43 @@ mod tests {
         assert_eq!(clamp(&r(10, 10, 10, 20), 1920, 1080), None);
         assert_eq!(clamp(&r(30, 10, 20, 20), 1920, 1080), None);
         assert_eq!(clamp(&r(2000, 10, 2100, 20), 1920, 1080), None);
+    }
+
+    #[test]
+    fn move_clamping_keeps_source_and_destination_aligned() {
+        let movement = SectionMove {
+            source_x: -4,
+            source_y: 10,
+            dest: SectionRect {
+                left: 2,
+                top: 8,
+                right: 22,
+                bottom: 28,
+            },
+        };
+        assert_eq!(
+            clamp_move(&movement, 16, 20),
+            Some(CoverageMove {
+                source_x: 0,
+                source_y: 10,
+                dest_x: 6,
+                dest_y: 8,
+                w: 10,
+                h: 10,
+            })
+        );
+
+        let unusable_source = SectionMove {
+            source_x: 40,
+            source_y: 0,
+            dest: SectionRect {
+                left: 0,
+                top: 0,
+                right: 10,
+                bottom: 10,
+            },
+        };
+        assert_eq!(clamp_move(&unusable_source, 16, 20), None);
     }
 
     #[test]

@@ -65,7 +65,7 @@ namespace Microsoft
 
         static constexpr DWORD  MDRDP_IDD_SECTION_BYTES = 16384;
         static constexpr DWORD  MDRDP_IDD_SLOT_STRIDE = 4096;
-        static constexpr UINT32 MDRDP_IDD_LAYOUT_VERSION = 1;
+        static constexpr UINT32 MDRDP_IDD_LAYOUT_VERSION = 2;
         static constexpr UINT32 MDRDP_IDD_SLOT_COUNT = 3;
         static constexpr UINT32 MDRDP_IDD_MAX_COVERAGE_RECTS = 64;
 
@@ -109,6 +109,15 @@ namespace Microsoft
             UINT32 CoverageRectCount;   // 32 - or MDRDP_IDD_COVERAGE_ABSENT / _OVERFLOW
             UINT32 Reserved1;           // 36 - 0
             RECT   CoverageRects[MDRDP_IDD_MAX_COVERAGE_RECTS];  // 40 - 1024 bytes
+            UINT32 CurrentDirtyRectCount; // 1064 - count or absent / overflow
+            UINT32 CurrentMoveRectCount;  // 1068 - count or absent / overflow
+            RECT   CurrentDirtyRects[MDRDP_IDD_MAX_COVERAGE_RECTS]; // 1072 - 1024 bytes
+            struct MdrdpSharedMove
+            {
+                INT32 SourceX;
+                INT32 SourceY;
+                RECT DestRect;
+            } CurrentMoves[MDRDP_IDD_MAX_COVERAGE_RECTS]; // 2096 - 1536 bytes
         };
 
         // The contract is byte offsets, not "whatever the compiler picked today".
@@ -125,12 +134,17 @@ namespace Microsoft
 
         static_assert(offsetof(MdrdpSharedSlot, Generation) == 4, "slot layout drifted");
         static_assert(sizeof(RECT) == 16, "RECT is not 4 x i32");
-        static_assert(sizeof(MdrdpSharedSlot) == 1064, "slot layout drifted");
+        static_assert(sizeof(MdrdpSharedSlot::MdrdpSharedMove) == 24, "move layout drifted");
+        static_assert(sizeof(MdrdpSharedSlot) == 3632, "slot layout drifted");
         static_assert(offsetof(MdrdpSharedSlot, FrameSeq) == 8, "slot layout drifted");
         static_assert(offsetof(MdrdpSharedSlot, DirtySinceFrameSeq) == 16, "slot layout drifted");
         static_assert(offsetof(MdrdpSharedSlot, PresentQpc) == 24, "slot layout drifted");
         static_assert(offsetof(MdrdpSharedSlot, CoverageRectCount) == 32, "slot layout drifted");
         static_assert(offsetof(MdrdpSharedSlot, CoverageRects) == 40, "slot layout drifted");
+        static_assert(offsetof(MdrdpSharedSlot, CurrentDirtyRectCount) == 1064, "slot layout drifted");
+        static_assert(offsetof(MdrdpSharedSlot, CurrentMoveRectCount) == 1068, "slot layout drifted");
+        static_assert(offsetof(MdrdpSharedSlot, CurrentDirtyRects) == 1072, "slot layout drifted");
+        static_assert(offsetof(MdrdpSharedSlot, CurrentMoves) == 2096, "slot layout drifted");
         static_assert(MDRDP_IDD_SLOT_STRIDE * (1 + MDRDP_IDD_SLOT_COUNT) == MDRDP_IDD_SECTION_BYTES,
             "the section must hold the header page plus one page per slot");
 
@@ -267,7 +281,7 @@ namespace Microsoft
                 RECT Rects[MDRDP_IDD_MAX_COVERAGE_RECTS];
             };
 
-            void FoldFrameCoverage(IDDCX_SWAPCHAIN hSwapChain, const IDDCX_METADATA& MetaData);
+            void ReadAndFoldFrameMetadata(IDDCX_SWAPCHAIN hSwapChain, const IDDCX_METADATA& MetaData);
             void AppendCoverageRect(const RECT& Rect);
             void MarkAllOverflowed();
             void MarkAllAbsent();
@@ -284,6 +298,8 @@ namespace Microsoft
             // Scratch for the two IddCx metadata queries. Fixed, never reallocated.
             RECT m_ScratchRects[MDRDP_IDD_MAX_COVERAGE_RECTS];
             IDDCX_MOVEREGION m_ScratchMoves[MDRDP_IDD_MAX_COVERAGE_RECTS];
+            UINT32 m_CurrentDirtyCount;
+            UINT32 m_CurrentMoveCount;
 
             LARGE_INTEGER m_PerfFrequency;
             LONGLONG m_CopyWaitLimitUs;

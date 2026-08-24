@@ -45,7 +45,7 @@
 //!   `Result`-returning wrapper gives — waves both through, and the first of them
 //!   means we would copy a surface we do not hold.
 
-use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource, RectReadback};
+use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource, MoveRect, RectReadback};
 use super::{qpc, wide_to_string, Result};
 use crate::agent::PoolObservation;
 use crate::idd_section::{self, LayoutError, PoolHeader, SlotRecord};
@@ -744,7 +744,42 @@ impl IddSource {
                 continue;
             }
             let acquire_qpc = qpc::now();
-            let change =
+            let current = idd_section::current_change_for(&record, last_consumed).and_then(
+                |(dirty, movements)| {
+                    let mut moves = Vec::with_capacity(movements.len());
+                    for movement in movements {
+                        match idd_section::clamp_move(movement, self.width, self.height) {
+                            Some(movement) => moves.push(MoveRect {
+                                src_x: movement.source_x,
+                                src_y: movement.source_y,
+                                dst_x: movement.dest_x,
+                                dst_y: movement.dest_y,
+                                w: movement.w,
+                                h: movement.h,
+                            }),
+                            // A wholly off-desktop destination changes no visible pixel.
+                            // Any other unusable move needs accumulated final pixels.
+                            None if idd_section::clamp(&movement.dest, self.width, self.height)
+                                .is_none() => {}
+                            None => return None,
+                        }
+                    }
+                    Some(ChangeInfo {
+                        rects: dirty
+                            .iter()
+                            .filter_map(|r| idd_section::clamp(r, self.width, self.height))
+                            .map(|c| DirtyRect {
+                                x: c.x,
+                                y: c.y,
+                                w: c.w,
+                                h: c.h,
+                            })
+                            .collect(),
+                        moves,
+                    })
+                },
+            );
+            let change = current.or_else(|| {
                 idd_section::coverage_for(&record, last_consumed).map(|rects| ChangeInfo {
                     rects: rects
                         .iter()
@@ -756,9 +791,9 @@ impl IddSource {
                             h: c.h,
                         })
                         .collect(),
-                    // The driver publishes one already-unioned final-pixel list.
                     moves: Vec::new(),
-                });
+                })
+            });
             self.last_consumed = record.frame_seq;
             return Ok(Acquired::Frame {
                 texture: self.private.clone(),
