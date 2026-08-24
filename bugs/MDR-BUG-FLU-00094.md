@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00094 — IOSurface backpressure repeats full 5K redraw work on the input event thread
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** window/presentation-latency
 - **Raised:** 2026-08-24T09:51:00Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T095120Z-a12ed09b
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00094-run-fix-20260824T095120Z-a12ed09b
-- **Owner base:** daa48320cdcfe59bd0a8a6ca9853f601f19eeff3
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T09:51:20Z
-- **Owner until:** 2026-08-24T11:51:20Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T09:51:00Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-24T09:51:00Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T09:58:35Z, deltic:auto role=fix run=fix-20260824T095120Z-a12ed09b branch=task/bug-MDR-BUG-FLU-00094-run-fix-20260824T095120Z-a12ed09b code=ab364fc gate=manual)
 
 ## Observation
 
