@@ -18,7 +18,7 @@
 //! until the AU that closes its gap arrives; painting over a hole would lose
 //! the missing frame's content forever (transport HLD decisions 13/16).
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
@@ -92,6 +92,16 @@ const NATIVE_INPUT_WRITE_TIMEOUT: Duration = auxchan::WRITE_TIMEOUT;
 /// a button or wheel can emit two records), so 32 logical events bounds command latency
 /// without making a keyboard burst pay a sleep between batches.
 const NATIVE_INPUT_BATCH_MAX: usize = 32;
+
+trait NativeTimedWrite: Write {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl NativeTimedWrite for TcpStream {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
 
 /// Everything one session's auxiliary channel owns, so [`NativeHandle`] carries
 /// one optional field rather than five.
@@ -929,7 +939,10 @@ fn pump_input_with_timeout(
         }
         let mut clock_stamped = false;
         let batch = match drain_native_input_batch(
-            &mut writer,
+            NativeWriteBudget {
+                writer: &mut writer,
+                timeout: write_timeout,
+            },
             &input_rx,
             &latest_mouse_move,
             &input_clock,
@@ -961,9 +974,14 @@ enum NativeInputBatch {
     Closed,
 }
 
+struct NativeWriteBudget<'a, W> {
+    writer: &'a mut W,
+    timeout: Duration,
+}
+
 /// Drain at most one reliable-input batch, leaving the rest for the next pump turn.
-fn drain_native_input_batch<W: Write>(
-    writer: &mut W,
+fn drain_native_input_batch<W: NativeTimedWrite>(
+    write_budget: NativeWriteBudget<'_, W>,
     input_rx: &Receiver<InputEvent>,
     latest_mouse_move: &LatestMouseMove,
     input_clock: &InputClock,
@@ -971,6 +989,7 @@ fn drain_native_input_batch<W: Write>(
     seq: &mut u32,
     written: &mut u64,
 ) -> std::io::Result<NativeInputBatch> {
+    let NativeWriteBudget { writer, timeout } = write_budget;
     let mut drained = 0;
     while drained < NATIVE_INPUT_BATCH_MAX {
         match next_native_input(input_rx, latest_mouse_move) {
@@ -981,6 +1000,7 @@ fn drain_native_input_batch<W: Write>(
                     input_clock,
                     clock_stamped,
                     written,
+                    timeout,
                 )?;
                 drained += 1;
             }
@@ -1036,14 +1056,43 @@ fn write_native_records<W, I>(
     input_clock: &InputClock,
     clock_stamped: &mut bool,
     written: &mut u64,
-) -> std::io::Result<()>
+    write_timeout: Duration,
+) -> io::Result<()>
 where
-    W: Write,
+    W: NativeTimedWrite,
     I: IntoIterator<Item = Record>,
+{
+    let mut now = Instant::now;
+    write_native_records_with_clock(
+        writer,
+        records,
+        input_clock,
+        clock_stamped,
+        written,
+        write_timeout,
+        &mut now,
+    )
+}
+
+fn write_native_records_with_clock<W, I, N>(
+    writer: &mut W,
+    records: I,
+    input_clock: &InputClock,
+    clock_stamped: &mut bool,
+    written: &mut u64,
+    write_timeout: Duration,
+    now: &mut N,
+) -> io::Result<()>
+where
+    W: NativeTimedWrite,
+    I: IntoIterator<Item = Record>,
+    N: FnMut() -> Instant,
 {
     for record in records {
         let (bytes, len) = encode_record(record);
-        writer.write_all(&bytes[..len])?;
+        let started = now();
+        let deadline = started.checked_add(write_timeout).unwrap_or(started);
+        write_record_until(writer, &bytes[..len], deadline, now)?;
         if !*clock_stamped {
             // Something reached the host: start the round-trip clock the next paint on
             // `native-net` will close.
@@ -1051,6 +1100,51 @@ where
             *clock_stamped = true;
         }
         *written = (*written).saturating_add(1);
+    }
+    Ok(())
+}
+
+fn write_record_until<W, N>(
+    writer: &mut W,
+    bytes: &[u8],
+    deadline: Instant,
+    now: &mut N,
+) -> io::Result<()>
+where
+    W: NativeTimedWrite,
+    N: FnMut() -> Instant,
+{
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let current = now();
+        let remaining = deadline.saturating_duration_since(current);
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "input record write deadline exceeded after {offset}/{} bytes",
+                    bytes.len()
+                ),
+            ));
+        }
+        writer.set_write_timeout(Some(remaining))?;
+        match writer.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "input record writer returned zero bytes",
+                ));
+            }
+            Ok(written) => offset += written,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -2626,6 +2720,74 @@ mod tests {
         }
     }
 
+    impl NativeTimedWrite for StampProbe {
+        fn set_write_timeout(&mut self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl NativeTimedWrite for Vec<u8> {
+        fn set_write_timeout(&mut self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DribblingTimedWriter {
+        bytes: Vec<u8>,
+        timeouts: Vec<Duration>,
+    }
+
+    impl Write for DribblingTimedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let Some(&byte) = bytes.first() else {
+                return Ok(0);
+            };
+            self.bytes.push(byte);
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl NativeTimedWrite for DribblingTimedWriter {
+        fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+            self.timeouts
+                .push(timeout.expect("record writes are always bounded"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dribbling_native_record_honours_one_absolute_deadline() {
+        let base = Instant::now();
+        let deadline = base + Duration::from_millis(5);
+        let mut clock = base;
+        let mut writer = DribblingTimedWriter {
+            bytes: Vec::new(),
+            timeouts: Vec::new(),
+        };
+
+        let error = write_record_until(&mut writer, b"0123456789", deadline, &mut || {
+            clock += Duration::from_millis(1);
+            clock
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(writer.bytes, b"0123");
+        assert_eq!(
+            writer.timeouts,
+            [
+                Duration::from_millis(4),
+                Duration::from_millis(3),
+                Duration::from_millis(2),
+                Duration::from_millis(1),
+            ]
+        );
+    }
+
     #[test]
     fn native_input_stamps_before_the_second_record_of_a_burst() {
         let clock = InputClock::default();
@@ -2651,6 +2813,7 @@ mod tests {
             &clock,
             &mut clock_stamped,
             &mut written,
+            NATIVE_INPUT_WRITE_TIMEOUT,
         )
         .unwrap();
 
@@ -2694,7 +2857,10 @@ mod tests {
         let mut seq = 1;
         let mut written = 0;
         let batch = drain_native_input_batch(
-            &mut writer,
+            NativeWriteBudget {
+                writer: &mut writer,
+                timeout: NATIVE_INPUT_WRITE_TIMEOUT,
+            },
             &input_rx,
             &LatestMouseMove::default(),
             &InputClock::default(),
