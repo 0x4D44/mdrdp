@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00002 — cargo check --target x86_64-pc-windows-msvc fails on macOS: libz-sys build script cannot cross-compile C
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** build
 - **Raised:** 2026-08-16T20:34:32Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T235727Z-1e06e976
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00002-run-fix-20260824T235727Z-1e06e976
-- **Owner base:** 589df3b0e420a9805264cb64ddb2c0be77130791
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T23:57:27Z
-- **Owner until:** 2026-08-25T01:57:27Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-16T20:34:32Z, raised via `deltic bugs new` model=claude-fable-5)
+- **State history:** Open (2026-08-16T20:34:32Z, raised via `deltic bugs new` model=claude-fable-5) -> Fixed (2026-08-24T23:58:11Z, deltic:auto role=fix run=fix-20260824T235727Z-1e06e976 branch=task/bug-MDR-BUG-FLUX-00002-run-fix-20260824T235727Z-1e06e976 code=dcd80e06249f2fd22776084048c83837aebdac86 gate=manual)
 
 ## Observation
 
