@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00084 — Deploy retry without a running Rhydra agent loses the retained 5K/200% policy
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** deploy/display
 - **Raised:** 2026-08-23T22:19:13Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T233341Z-1ba54fdd
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00084-run-fix-20260824T233341Z-1ba54fdd
-- **Owner base:** da3ff62ee6c864588f1a6ce0c7cc8d09c86f5993
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T23:33:41Z
-- **Owner until:** 2026-08-25T01:33:41Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T22:19:13Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T22:19:13Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T23:45:30Z, deltic:auto role=fix run=fix-20260824T233341Z-1ba54fdd branch=task/bug-MDR-BUG-FLU-00084-run-fix-20260824T233341Z-1ba54fdd code=db1b0ae8bd7527393db73cc19b63243d31ef73ab gate=manual)
 
 ## Observation
 
