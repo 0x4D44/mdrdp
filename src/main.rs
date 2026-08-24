@@ -25,7 +25,7 @@ use ironrdp::connector::DesktopSize;
 use mdrdp::audio::{
     AudioPlayback, AudioRing, AudioStatsHandle, DynamicRdpsndListener, RdpsndBackend,
 };
-use mdrdp::clipboard::{ArboardClipboard, clipboard_channel};
+use mdrdp::clipboard::{ArboardClipboard, clipboard_channel_with_waker};
 use mdrdp::connect::{Channels, ConnectOptions, RdpsndHandlers, establish};
 use mdrdp::favourites::{Favourite, Favourites, WindowSize};
 use mdrdp::gfx::{GfxHandler, GfxStatsHandle};
@@ -1061,8 +1061,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // opens its own OS handle inside the session (tranche 5).
     let clipboard_enabled =
         !is_native && settings.clipboard.direction != mdrdp::settings::ClipboardDirection::Off;
-    let clipboard = (!is_native).then(|| {
-        let (backend, bridge) = clipboard_channel(Box::new(ArboardClipboard::new()));
+    let clipboard = clipboard_enabled.then(|| {
+        let (backend, bridge) =
+            clipboard_channel_with_waker(Box::new(ArboardClipboard::new()), session_bell.clone());
         let bridge = bridge.with_policy(mdrdp::clipboard::ClipboardPolicy {
             to_remote: clipboard_to_remote,
             from_remote: clipboard_from_remote,

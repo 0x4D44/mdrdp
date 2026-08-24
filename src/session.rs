@@ -12,7 +12,7 @@
 //! [`READ_SLICE`] only bounds the rare wait for the rest of an already-started PDU.
 
 use crate::clipboard::ClipboardBridge;
-use crate::connect::{ConnectError, Established, describe, send_shutdown};
+use crate::connect::{ConnectError, Established, describe, send_shutdown, write_framed};
 use crate::disconnect::{self, ServerFarewell};
 use crate::input::{InputEvent, LatestMouseMove, encode_fastpath_input, to_fastpath};
 use crate::stats::{CacheStats, StatsHandle};
@@ -37,6 +37,12 @@ use std::time::{Duration, Instant};
 /// while the socket is quiet. It only caps the wait for the tail of a PDU whose head
 /// is already buffered, where more socket data is the only thing that can help.
 const READ_SLICE: Duration = Duration::from_millis(5);
+/// A peer that stops reading must not hold the sole session thread forever.
+///
+/// Five seconds matches the native side-channel policy: long enough for transient
+/// backpressure, but finite. Any write error is terminal because part of an RDP frame
+/// may already have reached the wire.
+const RDP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Fast-path's event count is one byte. Limiting one pump turn to one valid PDU also
 /// prevents a producer that stays ahead of the wire from starving inbound processing.
 const FASTPATH_INPUT_BATCH_MAX: usize = 255;
@@ -52,7 +58,7 @@ const IDLE_WAIT: Duration = Duration::from_millis(250);
 ///
 /// No cross-platform OS notification exists for "the pasteboard changed", so it is
 /// polled. 250 ms is below the threshold at which a copy-then-paste feels broken, and
-/// the check is a cheap string read, not a channel round trip.
+/// the check is submitted to the clipboard worker and never blocks this session thread.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(250);
 
 /// Services the session drives alongside the pixel stream.
@@ -201,12 +207,9 @@ fn run(
     mut services: SessionServices,
     wake_rx: DoorbellReceiver,
 ) -> SessionEnd {
-    // A short read timeout is what lets one thread serve both directions.
-    if let Err(e) = established
-        .socket
-        .set_read_timeout(Some(READ_SLICE))
-        .map_err(ConnectError::Io)
-    {
+    // A short read timeout lets one thread serve both directions; a finite write
+    // timeout keeps peer backpressure from wedging that same thread forever.
+    if let Err(e) = configure_session_socket(&established.socket) {
         return SessionEnd::Failed(e);
     }
 
@@ -242,9 +245,12 @@ fn run(
     // has stopped draining it. This mirrors the native input thread's close-before-exit.
     latest_mouse_move.close();
 
-    // Always disconnect properly. Abandoning the socket leaves a session alive on the
-    // Windows host, and they accumulate until it stops accepting logons.
-    let _ = send_shutdown(&established.stage, &mut established.framed);
+    // Disconnect properly while the transport is still usable. After an I/O failure a
+    // frame may be partial and another write can only spend the timeout or further corrupt
+    // framing; the peer will reap the broken TCP connection instead.
+    if !matches!(&outcome, SessionEnd::Failed(ConnectError::Io(_))) {
+        let _ = send_shutdown(&established.stage, &mut established.framed);
+    }
 
     // Tell the window the session is over — but ONLY when the session ended on its own.
     //
@@ -259,6 +265,15 @@ fn run(
     }
 
     outcome
+}
+
+fn configure_session_socket(socket: &TcpStream) -> Result<(), ConnectError> {
+    socket
+        .set_read_timeout(Some(READ_SLICE))
+        .map_err(ConnectError::Io)?;
+    socket
+        .set_write_timeout(Some(RDP_WRITE_TIMEOUT))
+        .map_err(ConnectError::Io)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,10 +354,20 @@ fn pump(
         }
 
         // --- clipboard --------------------------------------------------------
-        if let Err(e) = service_clipboard(established, services, &mut last_clipboard_poll) {
-            // A clipboard failure is never worth dropping the desktop for.
-            tracing::warn!(error = %e, "clipboard exchange failed; session continues");
-        }
+        let clipboard_batch_full =
+            match service_clipboard(established, services, &mut last_clipboard_poll) {
+                Ok(batch_full) => batch_full,
+                Err(e) => {
+                    if matches!(&e, ConnectError::Io(_)) {
+                        // A failed write may have emitted only part of one static-channel frame.
+                        // Continuing would corrupt ordering, so the bounded transport failure is
+                        // terminal even though OS clipboard and encoding failures remain recoverable.
+                        return SessionEnd::Failed(e);
+                    }
+                    tracing::warn!(error = %e, "clipboard exchange failed; session continues");
+                    false
+                }
+            };
 
         // --- inbound: server PDUs ---------------------------------------------
         // Only read when something is already decodable client-side or the socket
@@ -363,7 +388,7 @@ fn pump(
             let ready = match wake::wait_readable(
                 &established.socket,
                 wake_rx,
-                readiness_wait_after_input(input_batch_full),
+                readiness_wait_after_work(input_batch_full || clipboard_batch_full),
             ) {
                 Ok(ready) => ready,
                 Err(e) => return SessionEnd::Failed(ConnectError::Io(e)),
@@ -410,7 +435,7 @@ fn pump(
         for output in outputs {
             match output {
                 ActiveStageOutput::ResponseFrame(frame) => {
-                    if let Err(e) = established.framed.write_all(&frame) {
+                    if let Err(e) = write_framed(&mut established.framed, &frame) {
                         return SessionEnd::Failed(ConnectError::Io(e));
                     }
                 }
@@ -484,9 +509,9 @@ fn service_clipboard(
     established: &mut Established,
     services: &mut SessionServices,
     last_poll: &mut Instant,
-) -> Result<(), ConnectError> {
+) -> Result<bool, ConnectError> {
     let Some(bridge) = services.clipboard.as_mut() else {
-        return Ok(());
+        return Ok(false);
     };
 
     // Timers first: a paste that timed out must return to Idle before the next pump, or
@@ -501,21 +526,18 @@ fn service_clipboard(
         // The server never joined CLIPRDR. Queued actions have nowhere to go; draining
         // them keeps the channel from growing without bound for the life of the session.
         bridge.discard_pending();
-        return Ok(());
+        return Ok(false);
     };
 
-    let batches = bridge.pump(cliprdr);
+    let (batches, batch_full) = bridge.pump_bounded(cliprdr);
     for batch in batches {
         let encoded = established
             .stage
             .process_svc_processor_messages(batch)
             .map_err(|e| ConnectError::Protocol(describe(&e)))?;
-        established
-            .framed
-            .write_all(&encoded)
-            .map_err(ConnectError::Io)?;
+        write_framed(&mut established.framed, &encoded).map_err(ConnectError::Io)?;
     }
-    Ok(())
+    Ok(batch_full)
 }
 
 /// Nudge the window only when something actually changed.
@@ -785,10 +807,7 @@ fn service_resize(
                 );
             }
             eprintln!("resolution: requested {width}x{height} (scale {scale_percent:?})");
-            established
-                .framed
-                .write_all(&frame)
-                .map_err(ConnectError::Io)
+            write_framed(&mut established.framed, &frame).map_err(ConnectError::Io)
         }
         Some(Err(e)) => {
             // Losing one resize is not worth losing the desktop.
@@ -848,10 +867,7 @@ fn service_visibility(
     } else {
         eprintln!("display: window hidden; asked the server to suppress updates");
     }
-    established
-        .framed
-        .write_all(buf.filled())
-        .map_err(ConnectError::Io)
+    write_framed(&mut established.framed, buf.filled()).map_err(ConnectError::Io)
 }
 
 /// Build the PDUs a visibility change owes the server.
@@ -1014,10 +1030,7 @@ fn drive_reactivation(
             .step(&pdu, &mut buf)
             .map_err(|e| ConnectError::Protocol(describe(&e)))?;
         if let Some(len) = written.size() {
-            established
-                .framed
-                .write_all(&buf[..len])
-                .map_err(ConnectError::Io)?;
+            write_framed(&mut established.framed, &buf[..len]).map_err(ConnectError::Io)?;
         }
     }
 }
@@ -1090,7 +1103,7 @@ fn drain_input<S: std::io::Read + std::io::Write>(
     // Batched into one PDU: a burst of mouse moves should not become a burst of writes.
     let encoded = encode_fastpath_input(batch)
         .map_err(|e| ConnectError::Protocol(format!("encode input: {e}")))?;
-    framed.write_all(&encoded).map_err(ConnectError::Io)?;
+    write_framed(framed, &encoded).map_err(ConnectError::Io)?;
     Ok(Drained::Sent { batch_full })
 }
 
@@ -1112,7 +1125,7 @@ fn next_session_input(
     }
 }
 
-fn readiness_wait_after_input(batch_full: bool) -> Duration {
+fn readiness_wait_after_work(batch_full: bool) -> Duration {
     if batch_full {
         Duration::ZERO
     } else {
@@ -1128,6 +1141,18 @@ mod tests {
     use ironrdp::core::decode;
     use ironrdp::pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
     use std::sync::mpsc;
+
+    #[test]
+    fn the_session_socket_bounds_both_read_and_write_stalls() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+
+        configure_session_socket(&peer).unwrap();
+
+        assert_eq!(peer.read_timeout().unwrap(), Some(READ_SLICE));
+        assert_eq!(peer.write_timeout().unwrap(), Some(RDP_WRITE_TIMEOUT));
+    }
 
     // --- visibility / suppress output --------------------------------------------
 
@@ -1221,6 +1246,38 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    struct FlushFailure {
+        wrote: bool,
+    }
+
+    impl std::io::Read for FlushFailure {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "quiet"))
+        }
+    }
+
+    impl std::io::Write for FlushFailure {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.wrote = true;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "socket write timed out",
+            ))
+        }
+    }
+
+    #[test]
+    fn a_deferred_transport_error_is_observed_by_the_frame_flush() {
+        let mut framed = Framed::new(FlushFailure { wrote: false });
+        let error = write_framed(&mut framed, b"frame").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(framed.get_inner().0.wrote, "the write preceded the flush");
     }
 
     fn decode_input(wire: &[u8]) -> Vec<FastPathInputEvent> {
@@ -1412,7 +1469,7 @@ mod tests {
             unreachable!("asserted sent above")
         };
         assert_eq!(
-            readiness_wait_after_input(batch_full),
+            readiness_wait_after_work(batch_full),
             Duration::ZERO,
             "a full batch may have consumed the only wake for its queued tail"
         );

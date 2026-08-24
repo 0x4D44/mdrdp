@@ -267,10 +267,23 @@ pub fn send_shutdown<S: std::io::Read + std::io::Write>(
 
     for output in outputs {
         if let ironrdp::session::ActiveStageOutput::ResponseFrame(frame) = output {
-            framed.write_all(&frame).map_err(ConnectError::Io)?;
+            write_framed(framed, &frame).map_err(ConnectError::Io)?;
         }
     }
     Ok(())
+}
+
+/// Queue one frame and force the underlying transport to report deferred write errors.
+///
+/// Rustls may accept plaintext while its best-effort socket write fails. `flush` is what
+/// surfaces that failure and makes the socket timeout observable to the session.
+pub(crate) fn write_framed<S: std::io::Read + std::io::Write>(
+    framed: &mut Framed<S>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    framed.write_all(bytes)?;
+    let (stream, _) = framed.get_inner_mut();
+    std::io::Write::flush(stream)
 }
 
 /// Pump the session so the graphics channel can open, for a bounded time.
