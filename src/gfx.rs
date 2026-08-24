@@ -1001,8 +1001,13 @@ impl GraphicsPipelineHandler for GfxHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp::pdu::geometry::InclusiveRectangle;
+    use ironrdp_egfx::client::GraphicsPipelineClient;
+    use ironrdp_egfx::decode::{DecodedFrame, DecoderError, DecoderResult, H264Decoder};
     use ironrdp_egfx::pdu::{
-        CacheImportOfferPdu, Color, MapSurfaceToOutputPdu, PixelFormat, Point,
+        Avc420BitmapStream, Avc444BitmapStream, CacheImportOfferPdu, Color, Encoding,
+        MapSurfaceToOutputPdu, PixelFormat, Point, QuantQuality, SurfaceToSurfacePdu,
+        WireToSurface1Pdu,
     };
     use ironrdp_graphics::clearcodec::{ClearCodecDecoder, ClearCodecEncoder, ClearCodecRect};
 
@@ -1066,6 +1071,114 @@ mod tests {
         let surface = guard.get(id).expect("surface");
         let off = (y as usize * surface.width as usize + x as usize) * BPP;
         surface.pixels()[off..off + BPP].try_into().unwrap()
+    }
+
+    /// Encode the tiny AVC444 container used by the pixel-level scroll regression below.
+    /// The fake decoder reads each sub-stream's four-byte marker as `[Y, U, V, aux]`.
+    fn avc444_payload(
+        encoding: Encoding,
+        stream1_rects: Vec<InclusiveRectangle>,
+        stream1_data: &[u8],
+        stream2: Option<(Vec<InclusiveRectangle>, &[u8])>,
+    ) -> Vec<u8> {
+        let quant_qualities = |rects: &[InclusiveRectangle]| {
+            rects
+                .iter()
+                .map(|_| QuantQuality {
+                    quantization_parameter: 22,
+                    progressive: false,
+                    quality: 100,
+                })
+                .collect()
+        };
+        let stream1 = Avc420BitmapStream {
+            quant_qual_vals: quant_qualities(&stream1_rects),
+            rectangles: stream1_rects,
+            data: stream1_data,
+        };
+        let stream2 = stream2.map(|(rects, data)| Avc420BitmapStream {
+            quant_qual_vals: quant_qualities(&rects),
+            rectangles: rects,
+            data,
+        });
+        let stream = Avc444BitmapStream {
+            encoding,
+            stream1,
+            stream2,
+        };
+        let mut encoded = vec![0u8; stream.size()];
+        use ironrdp::core::Encode as _;
+        stream
+            .encode(&mut ironrdp::core::WriteCursor::new(&mut encoded))
+            .expect("AVC444 test stream must encode");
+        encoded
+    }
+
+    fn avc444_pdu(
+        encoding: Encoding,
+        stream1_rects: Vec<InclusiveRectangle>,
+        stream1_data: &[u8],
+        stream2: Option<(Vec<InclusiveRectangle>, &[u8])>,
+    ) -> GfxPdu {
+        GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id: 1,
+            codec_id: Codec1Type::Avc444v2,
+            pixel_format: PixelFormat::XRgb,
+            destination_rectangle: rect(0, 0, 32, 16),
+            bitmap_data: avc444_payload(encoding, stream1_rects, stream1_data, stream2),
+        })
+    }
+
+    fn process_pdu(client: &mut GraphicsPipelineClient, pdu: GfxPdu) {
+        use ironrdp_dvc::DvcProcessor as _;
+        client
+            .process(0, &encoded_gfx(&pdu))
+            .expect("test EGFX PDU must process");
+    }
+
+    /// A deterministic YUV decoder for the end-to-end AVC444/SurfaceStore regression.
+    /// Main frames are uniform; auxiliary v2 frames pack U in the first half of each
+    /// row and V in the second half, so the resulting 4:4:4 colour is uniform too.
+    struct TaggedYuvDecoder;
+
+    impl H264Decoder for TaggedYuvDecoder {
+        fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
+            Err(DecoderError::msg("test decoder only supplies YUV"))
+        }
+
+        fn decode_yuv420(
+            &mut self,
+            data: &[u8],
+            out: &mut ironrdp_graphics::avc444::Yuv420Frame,
+        ) -> DecoderResult<()> {
+            let &[y, u, v, aux] = data else {
+                return Err(DecoderError::msg("test marker must contain Y, U, V, aux"));
+            };
+            const WIDTH: usize = 32;
+            const HEIGHT: usize = 16;
+            out.width = WIDTH;
+            out.height = HEIGHT;
+            out.y = vec![y; WIDTH * HEIGHT];
+            out.u = vec![u; (WIDTH / 2) * (HEIGHT / 2)];
+            out.v = vec![v; (WIDTH / 2) * (HEIGHT / 2)];
+            if aux != 0 {
+                for row in out.y.chunks_exact_mut(WIDTH) {
+                    row[..WIDTH / 2].fill(u);
+                    row[WIDTH / 2..].fill(v);
+                }
+                for plane in [&mut out.u, &mut out.v] {
+                    for row in plane.chunks_exact_mut(WIDTH / 2) {
+                        row[..WIDTH / 4].fill(u);
+                        row[WIDTH / 4..].fill(v);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn supports_yuv420(&self) -> bool {
+            true
+        }
     }
 
     fn sparse_clearcodec_stream(x: u16, y: u16, bgr: [u8; 3]) -> Vec<u8> {
@@ -1945,6 +2058,123 @@ mod tests {
         assert_eq!(pixel_at(&store, 2, 1, 7), [0x33, 0x22, 0x11, 0xFF]);
 
         assert_eq!(handler.stats().snapshot().surface_errors, 0);
+    }
+
+    #[test]
+    fn avc444_scroll_copy_then_partial_lc1_lc2_keeps_old_and_new_rgba_pixels() {
+        // MDR-BUG-FLU-00119: a same-surface scroll/copy changes the visible destination
+        // without changing the AVC decoder's reference chain. A later partial LC=1/LC=2
+        // update must not let stale chroma state repaint the copied-but-uncovered pixels
+        // at a fixed coordinate. Exercise the real GraphicsPipelineClient, GfxHandler and
+        // SurfaceStore so the assertions inspect final RGBA pixels, not plane metadata.
+        let store = store();
+        let handler = GfxHandler::new(Arc::clone(&store));
+        let mut client =
+            GraphicsPipelineClient::new(Box::new(handler), Some(Box::new(TaggedYuvDecoder)));
+
+        const FULL: InclusiveRectangle = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 32,
+            bottom: 16,
+        };
+        const OLD: InclusiveRectangle = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 8,
+            bottom: 4,
+        };
+        const OLD_COPY: ExclusiveRectangle = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 8,
+            bottom: 4,
+        };
+        const NEW: InclusiveRectangle = InclusiveRectangle {
+            left: 8,
+            top: 0,
+            right: 16,
+            bottom: 4,
+        };
+        const NEW_LEFT: InclusiveRectangle = InclusiveRectangle {
+            left: 8,
+            top: 0,
+            right: 12,
+            bottom: 4,
+        };
+
+        process_pdu(
+            &mut client,
+            GfxPdu::CreateSurface(ironrdp_egfx::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 32,
+                height: 16,
+                pixel_format: PixelFormat::XRgb,
+            }),
+        );
+
+        // Establish a full AVC444 baseline (A), then give the old scroll location its
+        // distinct colour (B) through the normal LC=1/LC=2 alternation.
+        process_pdu(
+            &mut client,
+            avc444_pdu(
+                Encoding::LUMA_AND_CHROMA,
+                vec![FULL],
+                &[100, 120, 140, 0],
+                Some((vec![FULL], &[0, 120, 140, 1])),
+            ),
+        );
+        process_pdu(
+            &mut client,
+            avc444_pdu(Encoding::LUMA, vec![OLD], &[80, 130, 150, 0], None),
+        );
+        process_pdu(
+            &mut client,
+            avc444_pdu(Encoding::CHROMA, vec![OLD], &[0, 130, 150, 1], None),
+        );
+
+        // Scroll by copying the old region into a new coordinate on the SAME surface.
+        // SurfaceStore extracts before writing, so this is also safe for overlap.
+        process_pdu(
+            &mut client,
+            GfxPdu::SurfaceToSurface(SurfaceToSurfacePdu {
+                source_surface_id: 1,
+                destination_surface_id: 1,
+                source_rectangle: OLD_COPY,
+                destination_points: vec![Point { x: 8, y: 0 }],
+            }),
+        );
+        let expected_b = [114, 69, 83, 0xFF];
+        assert_eq!(pixel_at(&store, 1, 1, 1), expected_b, "old scroll pixel");
+        assert_eq!(pixel_at(&store, 1, 13, 1), expected_b, "copied new pixel");
+
+        // Only the left half of the copied destination gets a fresh LC=1 luma pass.
+        // LC=2 covers the whole destination. Regional validity must suppress the stale
+        // right-half AVC buffer and leave its visible copied RGBA pixels untouched.
+        process_pdu(
+            &mut client,
+            avc444_pdu(Encoding::LUMA, vec![NEW_LEFT], &[60, 110, 170, 0], None),
+        );
+        process_pdu(
+            &mut client,
+            avc444_pdu(Encoding::CHROMA, vec![NEW], &[0, 110, 170, 1], None),
+        );
+
+        assert_eq!(
+            pixel_at(&store, 1, 1, 1),
+            expected_b,
+            "old coordinate must retain the pre-scroll content"
+        );
+        assert_eq!(
+            pixel_at(&store, 1, 9, 1),
+            [126, 43, 26, 0xFF],
+            "the LC=1/LC=2-covered new pixels must use the fresh colour"
+        );
+        assert_eq!(
+            pixel_at(&store, 1, 13, 1),
+            expected_b,
+            "the copied new pixels outside partial LC=1 must not become a fixed ghost"
+        );
     }
 
     #[test]
