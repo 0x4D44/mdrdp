@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- AVC444 edge blocks need an in-surface odd-sample mask (`avc444.rs:record_partial_chroma`).
+  Requiring all three 2x2 odd positions drops valid right/bottom detail on odd-sized surfaces;
+  a block with no in-surface odd positions must not be promoted.
+
 - Suppressed partial remaps must not wake presentation (`surface.rs:map_to_output_geometry`).
   Pre-map writes can leave a surface painted but incomplete; keep the old snapshot and generation
   until the replacement is complete.

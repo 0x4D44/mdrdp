@@ -166,7 +166,7 @@ impl Yuv444Buffer {
         self.chroma_stale[word] & mask != 0
     }
 
-    /// Record a block whose three auxiliary samples were delivered in this pass.
+    /// Record a block whose in-surface auxiliary samples were delivered in this pass.
     fn promote_chroma_block(&mut self, idx: usize, bx: usize, by: usize) {
         let word_mask = 1 << (idx % 64);
         self.chroma_seen[idx / 64] |= word_mask;
@@ -189,21 +189,27 @@ impl Yuv444Buffer {
         let x = bx * 2;
         let y = by * 2;
         let mut samples = partial.get(&idx).copied().unwrap_or_default();
+        let mut required = 0;
         for (bit, dx, dy) in [(1, x + 1, y), (2, x, y + 1), (4, x + 1, y + 1)] {
-            if dx >= left && dx < right && dy >= top && dy < bottom {
-                samples |= bit;
+            if dx < self.width && dy < self.height {
+                required |= bit;
+                if dx >= left && dx < right && dy >= top && dy < bottom {
+                    samples |= bit;
+                }
             }
         }
-        if samples == 0b111 {
+        if required != 0 && samples & required == required {
             partial.remove(&idx);
             self.promote_chroma_block(idx, bx, by);
+        } else if required == 0 {
+            partial.remove(&idx);
         } else {
             partial.insert(idx, samples);
         }
     }
 
-    /// Add one clipped rectangle's three auxiliary samples per 2x2 block to this
-    /// chroma pass's coverage, promoting blocks once the union is complete.
+    /// Add one clipped rectangle's in-surface auxiliary samples per 2x2 block to
+    /// this chroma pass's coverage, promoting blocks once the union is complete.
     ///
     /// Keeping partial coverage local to one pass matters: adjacent rectangles in
     /// one PDU may split a block and still deliver all its samples, while a later
@@ -1114,6 +1120,65 @@ mod tests {
         // dst row 5, col 2: U <- aux V[2][0]; V <- aux V[2][2].
         assert_eq!(buf.u[5 * 8 + 2], aux.v[2 * 4 + 0]);
         assert_eq!(buf.v[5 * 8 + 2], aux.v[2 * 4 + 2]);
+    }
+
+    #[test]
+    fn v1_odd_sized_edge_chroma_survives_a_luma_update() {
+        let aux = tagged_420(3, 9, 200);
+        let mut buf = Yuv444Buffer::new(3, 3);
+        buf.apply_chroma_v1(&aux, &[rect(0, 0, 3, 3)]);
+        let before = [
+            (buf.u[3 + 2], buf.v[3 + 2]),
+            (buf.u[2 * 3 + 1], buf.v[2 * 3 + 1]),
+        ];
+
+        buf.apply_luma(&uniform_420(3, 3, 100, 100), &[rect(0, 0, 3, 3)]);
+
+        assert_eq!(
+            [
+                (buf.u[3 + 2], buf.v[3 + 2]),
+                (buf.u[2 * 3 + 1], buf.v[2 * 3 + 1])
+            ],
+            before,
+            "v1 right and bottom edge detail must survive LC=1"
+        );
+        assert!(buf.chroma_seen_at(2, 1));
+        assert!(buf.chroma_seen_at(1, 2));
+    }
+
+    #[test]
+    fn v2_odd_sized_edge_chroma_survives_a_luma_update() {
+        let aux = tagged_420(3, 3, 200);
+        let mut buf = Yuv444Buffer::new(3, 3);
+        buf.apply_chroma_v2(&aux, &[rect(0, 0, 3, 3)]);
+        let before = [
+            (buf.u[3 + 2], buf.v[3 + 2]),
+            (buf.u[2 * 3 + 1], buf.v[2 * 3 + 1]),
+        ];
+
+        buf.apply_luma(&uniform_420(3, 3, 100, 100), &[rect(0, 0, 3, 3)]);
+
+        assert_eq!(
+            [
+                (buf.u[3 + 2], buf.v[3 + 2]),
+                (buf.u[2 * 3 + 1], buf.v[2 * 3 + 1])
+            ],
+            before,
+            "v2 right and bottom edge detail must survive LC=1"
+        );
+        assert!(buf.chroma_seen_at(2, 1));
+        assert!(buf.chroma_seen_at(1, 2));
+    }
+
+    #[test]
+    fn a_surface_without_odd_positions_does_not_promote_chroma() {
+        let mut v1 = Yuv444Buffer::new(1, 1);
+        v1.apply_chroma_v1(&tagged_420(1, 9, 200), &[rect(0, 0, 1, 1)]);
+        assert!(!v1.chroma_seen_at(0, 0));
+
+        let mut v2 = Yuv444Buffer::new(1, 1);
+        v2.apply_chroma_v2(&tagged_420(1, 1, 200), &[rect(0, 0, 1, 1)]);
+        assert!(!v2.chroma_seen_at(0, 0));
     }
 
     /// The split offset uses align32(surface width), not the surface width: a
