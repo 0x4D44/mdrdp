@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- LC2-before-LC1 needs an explicit average-valid bit (`avc444.rs:Yuv444Buffer::luma_avg_seen`).
+  Neutral plane initialization is not an aux-confirmed chroma average. Keep validity separate so
+  the first real luma average establishes the baseline instead of suppressing valid chroma detail.
+
 - A short/timed-out frameless write must close the link before another record (`viewer/input_link.rs:InputLink::send`).
   `Write::write` may send only a prefix or time out. Retrying a later input on the same
   stream corrupts framing, so fail closed and let disconnect release held input.

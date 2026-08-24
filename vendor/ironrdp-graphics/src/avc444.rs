@@ -114,6 +114,10 @@ pub struct Yuv444Buffer {
     /// each 2x2 block. A later luma pass can return to this signature without a
     /// new aux frame, so it can safely clear [`chroma_stale`].
     chroma_confirmed_avg: Vec<[u8; 2]>,
+    /// One bit per 2x2 block: set after a luma pass has supplied a real chroma
+    /// average. LC=2 can legally arrive first, so the neutral buffer fill cannot
+    /// serve as an aux-confirmed baseline until this bit is set.
+    luma_avg_seen: Vec<u64>,
 }
 
 /// Chroma-average delta (per channel, from the last aux-confirmed average) above
@@ -139,6 +143,7 @@ impl Yuv444Buffer {
             chroma_seen: vec![0; blocks.div_ceil(64)],
             chroma_stale: vec![0; blocks.div_ceil(64)],
             chroma_confirmed_avg: vec![[128, 128]; blocks],
+            luma_avg_seen: vec![0; blocks.div_ceil(64)],
         }
     }
 
@@ -175,8 +180,11 @@ impl Yuv444Buffer {
                 let idx = by * blocks_per_row + bx;
                 self.chroma_seen[idx / 64] |= 1 << (idx % 64);
                 self.chroma_stale[idx / 64] &= !(1 << (idx % 64));
-                let i = (by * 2) * self.width + bx * 2;
-                self.chroma_confirmed_avg[idx] = [self.u[i], self.v[i]];
+                let mask = 1 << (idx % 64);
+                if self.luma_avg_seen[idx / 64] & mask != 0 {
+                    let i = (by * 2) * self.width + bx * 2;
+                    self.chroma_confirmed_avg[idx] = [self.u[i], self.v[i]];
+                }
             }
         }
     }
@@ -212,6 +220,7 @@ impl Yuv444Buffer {
             chroma_seen: vec![0; blocks.div_ceil(64)],
             chroma_stale: vec![0; blocks.div_ceil(64)],
             chroma_confirmed_avg: vec![[128, 128]; blocks],
+            luma_avg_seen: vec![0; blocks.div_ceil(64)],
         }
     }
 
@@ -266,23 +275,33 @@ impl Yuv444Buffer {
                     }
                     let s = sy * uv_row + dx / 2;
                     let i = dy * self.width + dx;
-                    if seen {
-                        // Even/even of a chroma'd block: an average that differs
-                        // from the aux-confirmed state means the content changed
-                        // and the preserved odd samples are now a chroma catch-up
-                        // behind — mark the block so paint falls back to the flat
-                        // average (see `chroma_stale`) instead of reconstructing a
-                        // wrong hue.
+                    if !odd_position {
                         let (word, mask) = self.block_bit(dx, dy);
                         let block = (dy / 2) * self.width.div_ceil(2) + dx / 2;
-                        let confirmed = self.chroma_confirmed_avg[block];
-                        let confirmed_delta = confirmed[0]
-                            .abs_diff(main.u[s])
-                            .max(confirmed[1].abs_diff(main.v[s]));
-                        if confirmed_delta <= STALE_AVG_DELTA {
+                        if !seen || self.luma_avg_seen[word] & mask == 0 {
+                            // Before aux arrives, keep the candidate baseline at
+                            // the latest luma average. If aux arrived first, this
+                            // first real average establishes the baseline without
+                            // falsely declaring the delivered detail stale.
+                            self.chroma_confirmed_avg[block] = [main.u[s], main.v[s]];
+                            self.luma_avg_seen[word] |= mask;
                             self.chroma_stale[word] &= !mask;
                         } else {
-                            self.chroma_stale[word] |= mask;
+                            // Even/even of a chroma'd block: an average that differs
+                            // from the aux-confirmed state means the content changed
+                            // and the preserved odd samples are now a chroma catch-up
+                            // behind — mark the block so paint falls back to the flat
+                            // average (see `chroma_stale`) instead of reconstructing a
+                            // wrong hue.
+                            let confirmed = self.chroma_confirmed_avg[block];
+                            let confirmed_delta = confirmed[0]
+                                .abs_diff(main.u[s])
+                                .max(confirmed[1].abs_diff(main.v[s]));
+                            if confirmed_delta <= STALE_AVG_DELTA {
+                                self.chroma_stale[word] &= !mask;
+                            } else {
+                                self.chroma_stale[word] |= mask;
+                            }
                         }
                     }
                     self.u[i] = main.u[s];
@@ -617,6 +636,100 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An LC=2 packet may arrive before this surface's first LC=1 packet. The
+    /// neutral buffer fill is not a real chroma average and must not make that
+    /// first luma update look like a content change.
+    #[test]
+    fn an_lc2_first_sequence_keeps_detail_after_the_first_luma_average() {
+        let aux = tagged_420(8, 8, 200);
+        let mut buf = Yuv444Buffer::new(8, 8);
+        buf.apply_chroma_v2(&aux, &[rect(0, 0, 8, 8)]);
+
+        let main = uniform_420(8, 8, 100, 100);
+        buf.apply_luma(&main, &[rect(0, 0, 8, 8)]);
+
+        let i = 3 * 8 + 3;
+        assert!(
+            !buf.chroma_stale_at(3, 3),
+            "the first real luma average must establish the baseline"
+        );
+        let mut out = Vec::new();
+        buf.to_rgba_into(&rect(0, 0, 8, 8), &mut out);
+        let expect = yuv_to_rgba(main.y[i], aux.y[3 * 8 + 1], aux.y[3 * 8 + 5]);
+        assert_eq!(
+            out[i * 4..][..4],
+            expect,
+            "LC=2 detail must survive the first LC=1 packet"
+        );
+    }
+
+    #[test]
+    fn an_lc2_first_baseline_still_detects_a_later_luma_change() {
+        let aux = tagged_420(8, 8, 200);
+        let mut buf = Yuv444Buffer::new(8, 8);
+        buf.apply_chroma_v2(&aux, &[rect(0, 0, 8, 8)]);
+        buf.apply_luma(&uniform_420(8, 8, 100, 100), &[rect(0, 0, 8, 8)]);
+
+        let changed = uniform_420(8, 8, 120, 120);
+        buf.apply_luma(&changed, &[rect(0, 0, 8, 8)]);
+
+        assert!(
+            buf.chroma_stale_at(3, 3),
+            "later luma must still be compared with the established baseline"
+        );
+        let i = 3 * 8 + 3;
+        let mut out = Vec::new();
+        buf.to_rgba_into(&rect(0, 0, 8, 8), &mut out);
+        assert_eq!(
+            out[i * 4..][..4],
+            yuv_to_rgba(changed.y[i], 120, 120),
+            "changed content must paint flat until aux catches up"
+        );
+    }
+
+    #[test]
+    fn an_avc444v1_lc2_first_sequence_also_keeps_detail() {
+        let aux = tagged_420(8, 32, 200);
+        let mut buf = Yuv444Buffer::new(8, 32);
+        buf.apply_chroma_v1(&aux, &[rect(0, 0, 8, 32)]);
+
+        let main = uniform_420(8, 32, 100, 100);
+        buf.apply_luma(&main, &[rect(0, 0, 8, 32)]);
+
+        let i = 3 * 8 + 3;
+        assert!(
+            !buf.chroma_stale_at(3, 3),
+            "the shared AVC444v1 marker must not confirm neutral initialization"
+        );
+        let mut out = Vec::new();
+        buf.to_rgba_into(&rect(0, 0, 8, 32), &mut out);
+        let expect = yuv_to_rgba(main.y[i], aux.y[1 * 8 + 3], aux.y[9 * 8 + 3]);
+        assert_eq!(out[i * 4..][..4], expect);
+    }
+
+    #[test]
+    fn a_chroma_only_block_in_lc0_accepts_its_first_later_luma_average() {
+        let aux = tagged_420(8, 8, 200);
+        let main = uniform_420(8, 8, 100, 100);
+        let mut buf = Yuv444Buffer::new(8, 8);
+
+        // Model one LC0 update whose luma and chroma rects are disjoint.
+        buf.apply_luma(&main, &[rect(0, 0, 4, 8)]);
+        buf.apply_chroma_v2(&aux, &[rect(4, 0, 8, 8)]);
+        buf.apply_luma(&main, &[rect(4, 0, 8, 8)]);
+
+        assert!(
+            !buf.chroma_stale_at(5, 3),
+            "the first luma average for this block must establish its baseline"
+        );
+        let i = 3 * 8 + 5;
+        let mut out = Vec::new();
+        buf.to_rgba_into(&rect(4, 0, 8, 8), &mut out);
+        let expect = yuv_to_rgba(main.y[i], aux.y[3 * 8 + 2], aux.y[3 * 8 + 6]);
+        let out_i = (3 * 4 + 1) * 4;
+        assert_eq!(out[out_i..][..4], expect);
     }
 
     /// Blocks the chroma pass never covered keep first-paint behaviour: the luma
