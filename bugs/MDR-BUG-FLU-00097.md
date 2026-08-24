@@ -1,0 +1,32 @@
+# MDR-BUG-FLU-00097 — AVC444 split chroma rectangles lose supplied detail
+
+- **State:** Open
+- **Priority:** Must
+- **Severity:** High
+- **Area:** graphics/AVC444
+- **Raised:** 2026-08-24T11:06:32Z
+- **Discovery source:** Agent
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
+- **Verify retry after:** -
+- **Held branch:** -
+- **Legacy fixed run:** -
+- **Attempts:** fix=0, doubt=0, indeterminate=0
+- **State history:** Open (2026-08-24T11:06:32Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+
+## Observation
+
+Two adjacent auxiliary chroma rectangles can collectively cover one 2x2 luma block, but avc444.rs marks chroma_seen only when one rectangle covers the whole block. A following luma update treats that block as missing chroma and overwrites the valid auxiliary U/V samples with replicated 4:2:0 averages, causing colour leakage and fuzzy coloured edges.
+
+## Fix
+
+<unfixed — raised only>
+
+## Notes
