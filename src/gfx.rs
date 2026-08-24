@@ -1,9 +1,9 @@
 //! The EGFX graphics handler: PDUs in, pixels in the [`SurfaceStore`] out.
 //!
 //! `ironrdp-egfx` parses the wire and tracks surfaces as metadata, but it does not keep the
-//! pixels presented by this client. Uncompressed updates are routed directly, ClearCodec
-//! reaches [`GraphicsPipelineHandler::on_unhandled_pdu`], and RFX Progressive reaches the
-//! dedicated `on_wire_to_surface2` callback. This module turns all three paths into pixels.
+//! pixels presented by this client. Uncompressed updates are routed directly, while
+//! ClearCodec and RFX Progressive reach callbacks that also report their exact painted
+//! regions for AVC444 invalidation. This module turns all three paths into pixels.
 //!
 //! So the division of labour is:
 //!
@@ -358,7 +358,10 @@ impl GfxHandler {
     ///
     /// The decoder needs the *surface* dimensions to size its tile grid, not the region's,
     /// so a surface we do not know about cannot be decoded into.
-    fn apply_wire_to_surface2(&mut self, pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
+    fn apply_wire_to_surface2(
+        &mut self,
+        pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu,
+    ) -> Vec<ExclusiveRectangle> {
         let surface_id = pdu.surface_id;
         self.note_surface_codec(surface_id, codec2_name(pdu.codec_id));
         let Some((width, height)) =
@@ -367,7 +370,7 @@ impl GfxHandler {
             // The server referenced a surface we never created. Counted as a store error
             // rather than a decode error: nothing was wrong with the bytes.
             self.note_surface_error("no_such_surface", 1);
-            return;
+            return Vec::new();
         };
 
         // Keyed by SURFACE, not by codec context.
@@ -397,7 +400,7 @@ impl GfxHandler {
                     s.undecoded_regions = s.undecoded_regions.saturating_add(1);
                     *s.decode_error_reasons.entry(reason).or_insert(0) += 1;
                 });
-                return;
+                return Vec::new();
             }
         };
 
@@ -408,26 +411,36 @@ impl GfxHandler {
             .insert(surface_id, pdu.codec_context_id);
 
         let mut painted_px: u64 = 0;
+        let mut painted_regions = Vec::new();
         for tile in tiles {
             let rect = progressive_tile_rect(tile.x_idx, tile.y_idx);
-            painted_px =
-                painted_px.saturating_add(u64::from(rect.width()) * u64::from(rect.height()));
             // `pixels` is a full 64x64 RGBA tile, so the source stride is the tile side
             // even when the destination is clipped at the surface edge. Passing the
             // clipped width instead shears the tile — the same trap `blit_rgba` documents.
             let result = self.with_store(|store| {
                 store.blit_rgba(surface_id, rect, &tile.pixels, PROGRESSIVE_TILE)
             });
+            if result.is_ok() {
+                painted_px =
+                    painted_px.saturating_add(u64::from(rect.width()) * u64::from(rect.height()));
+                painted_regions.push(ExclusiveRectangle {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                });
+            }
             self.absorb(result);
         }
         self.note_painted(&format!("WireToSurface2/{:?}", pdu.codec_id), painted_px);
+        painted_regions
     }
 
     /// Decode a ClearCodec tile and blit it into its surface.
     ///
     /// The decode happens **outside** the store lock: it is the expensive step, and
     /// holding the lock across it would stall the presenter for no reason.
-    fn apply_wire_to_surface1(&mut self, pdu: &WireToSurface1Pdu) {
+    fn apply_wire_to_surface1(&mut self, pdu: &WireToSurface1Pdu) -> Vec<ExclusiveRectangle> {
         self.note_codec(pdu.codec_id);
         self.note_surface_codec(pdu.surface_id, codec_name(pdu.codec_id));
 
@@ -435,12 +448,12 @@ impl GfxHandler {
             // Some other codec we do not decode. Counted above; nothing to paint.
             self.stats
                 .note(|s| s.unhandled_pdus = s.unhandled_pdus.saturating_add(1));
-            return;
+            return Vec::new();
         }
 
         let dest = rect_from_egfx(&pdu.destination_rectangle);
         if dest.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // Seed the decode with what is already on the surface. ClearCodec's layers need
@@ -482,7 +495,7 @@ impl GfxHandler {
                 });
                 // One dropped tile is a smear the next frame repaints; an error returned
                 // to the DVC processor would end the session.
-                return;
+                return Vec::new();
             }
         };
 
@@ -509,9 +522,21 @@ impl GfxHandler {
         match result {
             Ok(written) if written > 0 => {
                 self.note_painted(codec_name(pdu.codec_id), (written / BPP) as u64);
+                coverage
+                    .into_iter()
+                    .map(|rect| ExclusiveRectangle {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    })
+                    .collect()
             }
-            Ok(_) => {}
-            Err(error) => self.absorb(Err(error)),
+            Ok(_) => Vec::new(),
+            Err(error) => {
+                self.absorb(Err(error));
+                Vec::new()
+            }
         }
     }
 
@@ -913,7 +938,8 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// routes each of them to exactly one of the two — `handle_pdu` returns after calling
     /// the specific callback and never falls through — so this cannot double-apply, and
     /// it means the handler still behaves correctly if that routing ever changes.
-    /// RFX Progressive arrives HERE, not via `on_unhandled_pdu`.
+    /// RFX Progressive arrives through the dedicated region-reporting callback, not
+    /// through `on_unhandled_pdu`.
     ///
     /// `ironrdp-egfx` dispatches `WireToSurface2` to this dedicated callback and returns
     /// (client.rs:490-494), so a `WireToSurface2` arm inside `on_unhandled_pdu` is
@@ -927,12 +953,31 @@ impl GraphicsPipelineHandler for GfxHandler {
         let name = format!("WireToSurface2/{:?}", pdu.codec_id);
         self.stats
             .note(|s| *s.codec_ids_seen.entry(name).or_insert(0) += 1);
-        self.apply_wire_to_surface2(pdu);
+        let _ = self.apply_wire_to_surface2(pdu);
+    }
+
+    fn on_wire_to_surface2_regions(
+        &mut self,
+        pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu,
+    ) -> Option<Vec<ExclusiveRectangle>> {
+        let name = format!("WireToSurface2/{:?}", pdu.codec_id);
+        self.stats
+            .note(|s| *s.codec_ids_seen.entry(name).or_insert(0) += 1);
+        Some(self.apply_wire_to_surface2(pdu))
+    }
+
+    fn on_unhandled_wire_to_surface1(
+        &mut self,
+        pdu: &WireToSurface1Pdu,
+    ) -> Option<Vec<ExclusiveRectangle>> {
+        Some(self.apply_wire_to_surface1(pdu))
     }
 
     fn on_unhandled_pdu(&mut self, pdu: &GfxPdu) {
         match pdu {
-            GfxPdu::WireToSurface1(p) => self.apply_wire_to_surface1(p),
+            GfxPdu::WireToSurface1(p) => {
+                let _ = self.apply_wire_to_surface1(p);
+            }
             GfxPdu::SolidFill(p) => self.apply_solid_fill(p),
             GfxPdu::SurfaceToSurface(p) => self.apply_surface_to_surface(p),
             GfxPdu::SurfaceToCache(p) => self.apply_surface_to_cache(p),
@@ -944,7 +989,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                 let name = format!("WireToSurface2/{:?}", p.codec_id);
                 self.stats
                     .note(|s| *s.codec_ids_seen.entry(name).or_insert(0) += 1);
-                self.apply_wire_to_surface2(p);
+                let _ = self.apply_wire_to_surface2(p);
             }
             _ => self
                 .stats

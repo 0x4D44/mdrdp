@@ -119,6 +119,15 @@ pub struct Yuv444Buffer {
     /// average. LC=2 can legally arrive first, so the neutral buffer fill cannot
     /// serve as an aux-confirmed baseline until this bit is set.
     luma_avg_seen: Vec<u64>,
+    /// One bit per surface pixel: set after a luma pass supplied that pixel's Y
+    /// value. Chroma-only updates may touch only 2x2 blocks whose in-surface pixels
+    /// all have a current luma baseline.
+    luma_valid: Vec<u64>,
+    /// One bit per 2x2 block whose in-surface luma pixels are all valid.
+    valid_luma_blocks: Vec<u64>,
+    /// Number of blocks not represented by `valid_luma_blocks`. This makes the
+    /// steady-state full-surface chroma path O(rectangles), not O(surface pixels).
+    invalid_luma_blocks: usize,
 }
 
 /// Chroma-average delta (per channel, from the last aux-confirmed average) above
@@ -145,6 +154,9 @@ impl Yuv444Buffer {
             chroma_stale: vec![0; blocks.div_ceil(64)],
             chroma_confirmed_avg: vec![[128, 128]; blocks],
             luma_avg_seen: vec![0; blocks.div_ceil(64)],
+            luma_valid: vec![0; (w * h).div_ceil(64)],
+            valid_luma_blocks: vec![0; blocks.div_ceil(64)],
+            invalid_luma_blocks: blocks,
         }
     }
 
@@ -152,6 +164,95 @@ impl Yuv444Buffer {
     fn block_bit(&self, dx: usize, dy: usize) -> (usize, u64) {
         let idx = (dy / 2) * self.width.div_ceil(2) + dx / 2;
         (idx / 64, 1 << (idx % 64))
+    }
+
+    fn pixel_bit(&self, dx: usize, dy: usize) -> (usize, u64) {
+        let idx = dy * self.width + dx;
+        (idx / 64, 1 << (idx % 64))
+    }
+
+    fn luma_valid_at(&self, dx: usize, dy: usize) -> bool {
+        let (word, mask) = self.pixel_bit(dx, dy);
+        self.luma_valid[word] & mask != 0
+    }
+
+    fn block_has_valid_luma(&self, bx: usize, by: usize) -> bool {
+        let idx = by * self.width.div_ceil(2) + bx;
+        self.valid_luma_blocks[idx / 64] & (1 << (idx % 64)) != 0
+    }
+
+    fn promote_luma_block_if_complete(&mut self, bx: usize, by: usize) {
+        if self.block_has_valid_luma(bx, by) {
+            return;
+        }
+        let left = bx * 2;
+        let top = by * 2;
+        let complete = (top..(top + 2).min(self.height)).all(|y| {
+            (left..(left + 2).min(self.width)).all(|x| self.luma_valid_at(x, y))
+        });
+        if complete {
+            let idx = by * self.width.div_ceil(2) + bx;
+            self.valid_luma_blocks[idx / 64] |= 1 << (idx % 64);
+            self.invalid_luma_blocks = self.invalid_luma_blocks.saturating_sub(1);
+        }
+    }
+
+    fn set_valid_luma_block_range(&mut self, by: usize, start_bx: usize, end_bx: usize) {
+        if start_bx >= end_bx {
+            return;
+        }
+        let blocks_per_row = self.width.div_ceil(2);
+        let mut start = by * blocks_per_row + start_bx;
+        let end = by * blocks_per_row + end_bx;
+        while start < end {
+            let word = start / 64;
+            let past = end.min((word + 1) * 64);
+            let bits = past - start;
+            let shift = start % 64;
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << bits) - 1) << shift
+            };
+            let newly_valid = (!self.valid_luma_blocks[word] & mask).count_ones() as usize;
+            self.valid_luma_blocks[word] |= mask;
+            self.invalid_luma_blocks = self.invalid_luma_blocks.saturating_sub(newly_valid);
+            start = past;
+        }
+    }
+
+    fn mark_luma_rect_valid(&mut self, left: usize, top: usize, right: usize, bottom: usize) {
+        if left >= right || top >= bottom {
+            return;
+        }
+        let (first_full_col, first_full_row) = (left.div_ceil(2), top.div_ceil(2));
+        let (past_full_col, past_full_row) = (right / 2, bottom / 2);
+        for by in first_full_row..past_full_row {
+            self.set_valid_luma_block_range(by, first_full_col, past_full_col);
+        }
+
+        let (first_col, first_row) = (left / 2, top / 2);
+        let (past_col, past_row) = (right.div_ceil(2), bottom.div_ceil(2));
+        if !top.is_multiple_of(2) {
+            for bx in first_col..past_col {
+                self.promote_luma_block_if_complete(bx, first_row);
+            }
+        }
+        if !bottom.is_multiple_of(2) {
+            for bx in first_col..past_col {
+                self.promote_luma_block_if_complete(bx, past_row - 1);
+            }
+        }
+        if !left.is_multiple_of(2) {
+            for by in first_row..past_row {
+                self.promote_luma_block_if_complete(first_col, by);
+            }
+        }
+        if !right.is_multiple_of(2) {
+            for by in first_row..past_row {
+                self.promote_luma_block_if_complete(past_col - 1, by);
+            }
+        }
     }
 
     /// Whether the 2x2 block containing `(dx, dy)` has ever received true chroma.
@@ -291,7 +392,122 @@ impl Yuv444Buffer {
             chroma_stale: vec![0; blocks.div_ceil(64)],
             chroma_confirmed_avg: vec![[128, 128]; blocks],
             luma_avg_seen: vec![0; blocks.div_ceil(64)],
+            luma_valid: vec![u64::MAX; (width * height).div_ceil(64)],
+            valid_luma_blocks: vec![u64::MAX; blocks.div_ceil(64)],
+            invalid_luma_blocks: 0,
         }
+    }
+
+    /// Invalidate every 2x2 block touched by a non-AVC destination mutation.
+    ///
+    /// Chroma reconstruction crosses pixel boundaries inside a block, so a partial
+    /// mutation retires the whole block's baseline while preserving disjoint blocks.
+    pub fn invalidate(&mut self, rects: &[ExclusiveRectangle]) {
+        let blocks_per_row = self.width.div_ceil(2);
+        for rect in rects {
+            let (left, top, right, bottom) = self.clip(rect);
+            if left >= right || top >= bottom {
+                continue;
+            }
+            for by in top / 2..bottom.div_ceil(2) {
+                for bx in left / 2..right.div_ceil(2) {
+                    let block = by * blocks_per_row + bx;
+                    let block_mask = 1 << (block % 64);
+                    self.chroma_seen[block / 64] &= !block_mask;
+                    self.chroma_stale[block / 64] &= !block_mask;
+                    self.luma_avg_seen[block / 64] &= !block_mask;
+                    self.chroma_confirmed_avg[block] = [128, 128];
+                    if self.valid_luma_blocks[block / 64] & block_mask != 0 {
+                        self.valid_luma_blocks[block / 64] &= !block_mask;
+                        self.invalid_luma_blocks = self.invalid_luma_blocks.saturating_add(1);
+                    }
+                    for y in by * 2..(by * 2 + 2).min(self.height) {
+                        for x in bx * 2..(bx * 2 + 2).min(self.width) {
+                            let (word, mask) = self.pixel_bit(x, y);
+                            self.luma_valid[word] &= !mask;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Intersect update rectangles with 2x2 blocks that have a current luma baseline.
+    /// Adjacent block-row runs are coalesced so a full-surface update remains one rect.
+    pub fn valid_chroma_rects(
+        &self,
+        rects: &[ExclusiveRectangle],
+    ) -> Option<Vec<ExclusiveRectangle>> {
+        const MAX_FRAGMENTED_RECTS: usize = 1024;
+        if self.invalid_luma_blocks == 0 {
+            return Some(
+                rects
+                .iter()
+                .filter_map(|rect| {
+                    let (left, top, right, bottom) = self.clip(rect);
+                    (left < right && top < bottom).then(|| ExclusiveRectangle {
+                        left: u16::try_from(left).expect("surface coordinate is u16"),
+                        top: u16::try_from(top).expect("surface coordinate is u16"),
+                        right: u16::try_from(right).expect("surface coordinate is u16"),
+                        bottom: u16::try_from(bottom).expect("surface coordinate is u16"),
+                    })
+                })
+                .collect(),
+            );
+        }
+        let mut out: Vec<ExclusiveRectangle> = Vec::new();
+        for rect in rects {
+            let (left, top, right, bottom) = self.clip(rect);
+            if left >= right || top >= bottom {
+                continue;
+            }
+            let mut previous_runs: HashMap<(u16, u16), usize> = HashMap::new();
+            let mut current_runs: HashMap<(u16, u16), usize> = HashMap::new();
+            for by in top / 2..bottom.div_ceil(2) {
+                let row_top = top.max(by * 2);
+                let row_bottom = bottom.min(by * 2 + 2);
+                let mut bx = left / 2;
+                let past_bx = right.div_ceil(2);
+                current_runs.clear();
+                while bx < past_bx {
+                    while bx < past_bx && !self.block_has_valid_luma(bx, by) {
+                        bx += 1;
+                    }
+                    let run_start = bx;
+                    while bx < past_bx && self.block_has_valid_luma(bx, by) {
+                        bx += 1;
+                    }
+                    if run_start == bx {
+                        continue;
+                    }
+                    let run_left = left.max(run_start * 2);
+                    let run_right = right.min(bx * 2);
+                    let left_u16 = u16::try_from(run_left).expect("surface coordinate is u16");
+                    let right_u16 = u16::try_from(run_right).expect("surface coordinate is u16");
+                    let row_top_u16 = u16::try_from(row_top).expect("surface coordinate is u16");
+                    let row_bottom_u16 =
+                        u16::try_from(row_bottom).expect("surface coordinate is u16");
+                    let key = (left_u16, right_u16);
+                    if let Some(&index) = previous_runs.get(&key) {
+                        out[index].bottom = row_bottom_u16;
+                        current_runs.insert(key, index);
+                    } else {
+                        out.push(ExclusiveRectangle {
+                            left: left_u16,
+                            top: row_top_u16,
+                            right: right_u16,
+                            bottom: row_bottom_u16,
+                        });
+                        if out.len() > MAX_FRAGMENTED_RECTS {
+                            return None;
+                        }
+                        current_runs.insert(key, out.len() - 1);
+                    }
+                }
+                core::mem::swap(&mut previous_runs, &mut current_runs);
+            }
+        }
+        Some(out)
     }
 
     /// Clip a rect to this buffer, returning half-open pixel ranges.
@@ -338,6 +554,8 @@ impl Yuv444Buffer {
                 }
                 let sy = dy / 2;
                 for dx in left..src_right {
+                    let (valid_word, valid_mask) = self.pixel_bit(dx, dy);
+                    self.luma_valid[valid_word] |= valid_mask;
                     let odd_position = dx % 2 != 0 || dy % 2 != 0;
                     let seen = self.chroma_seen_at(dx, dy);
                     if odd_position && seen {
@@ -378,6 +596,10 @@ impl Yuv444Buffer {
                     self.v[i] = main.v[s];
                 }
             }
+        }
+        for rect in rects {
+            let (left, top, right, bottom) = self.clip(rect);
+            self.mark_luma_rect_valid(left, top, right.min(main.width), bottom.min(main.height));
         }
     }
 
@@ -556,7 +778,12 @@ impl Yuv444Buffer {
                     let b = (y & !1) * self.width + (x & !1);
                     u = self.u[b];
                     v = self.v[b];
-                } else if x % 2 == 0 && y % 2 == 0 && x + 1 < self.width && y + 1 < self.height {
+                } else if self.chroma_seen_at(x, y)
+                    && x % 2 == 0
+                    && y % 2 == 0
+                    && x + 1 < self.width
+                    && y + 1 < self.height
+                {
                     u = reconstruct_chroma(
                         u,
                         self.u[i + 1],
