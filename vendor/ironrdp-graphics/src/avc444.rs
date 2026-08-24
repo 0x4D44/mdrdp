@@ -1471,6 +1471,9 @@ mod tests {
         buf.u[1] = 50;
         buf.u[3] = 60;
         buf.u[4] = 70;
+        // Reconstruction is valid only after auxiliary chroma delivered the
+        // block's odd-position samples; direct plane setup must state that.
+        buf.promote_chroma_block(0, 0, 0);
 
         let mut out = Vec::new();
         buf.to_rgba_into(&rect(0, 0, 3, 3), &mut out);
@@ -1481,6 +1484,34 @@ mod tests {
         // (2,2): last row/column -> no complete block -> raw U=128 -> B = 128.
         let last = 8 * 4;
         assert_eq!(out[last + 2], 128);
+    }
+
+    #[test]
+    fn invalidated_blocks_need_a_complete_fresh_luma_baseline_before_chroma() {
+        let mut buf = Yuv444Buffer::new(4, 2);
+        let main = uniform_420(4, 2, 100, 100);
+        buf.apply_luma(&main, &[rect(0, 0, 4, 2)]);
+
+        buf.invalidate(&[rect(1, 0, 2, 1)]);
+        assert_eq!(
+            buf.valid_chroma_rects(&[rect(0, 0, 4, 2)]).unwrap(),
+            [rect(2, 0, 4, 2)],
+            "one non-AVC pixel retires its whole reconstruction block only"
+        );
+
+        buf.apply_luma(&main, &[rect(0, 0, 1, 2)]);
+        assert_eq!(
+            buf.valid_chroma_rects(&[rect(0, 0, 4, 2)]).unwrap(),
+            [rect(2, 0, 4, 2)],
+            "half a block cannot authorize a chroma-only update"
+        );
+
+        buf.apply_luma(&main, &[rect(1, 0, 2, 2)]);
+        assert_eq!(
+            buf.valid_chroma_rects(&[rect(0, 0, 4, 2)]).unwrap(),
+            [rect(0, 0, 4, 2)],
+            "complementary luma regions collectively restore the block"
+        );
     }
 
     #[test]

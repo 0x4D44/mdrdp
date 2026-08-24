@@ -227,7 +227,7 @@ mod tests {
         // Both top bits clear: y_on=2, y_off=5, pixel_count = y_off - y_on = 3
         let y_on: u16 = 2;
         let y_off: u16 = 5;
-        let first_word = (y_on << 6) | y_off;
+        let first_word = (y_off << 8) | y_on;
         let mut data = Vec::new();
         data.extend_from_slice(&first_word.to_le_bytes());
         // 3 pixels * 3 bytes = 9 bytes BGR data

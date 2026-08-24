@@ -8,46 +8,41 @@
 #
 # Run this alongside `cargo test`. Package names match their vendor/ directory names.
 #
-# KNOWN GAP, deliberately not closed: a crate with dev-dependencies cannot be tested this
-# way at all — cargo refuses with "requires dev-dependencies and is not a member of the
-# workspace". Today that is ironrdp-graphics and ironrdp-pdu, so the avc444 codec-math
-# tests do not run anywhere. Making them workspace members does fix it, and was tried:
-# it resolves their dev-dependencies into Cargo.lock, adding 37 packages including
-# `winscard`, `libz-sys`, `openh264`, `zstd-sys` and `nasm-rs`. CLAUDE.md is explicit that
-# the `winscard -> flate2/zlib -> libz-sys` subtree is what breaks
-# `scripts/check-windows.sh`, so that cure is worse than the disease. This script reports
-# those crates as SKIPPED rather than pretending they passed.
+# Crates with dev-dependencies cannot be selected from mdrdp's package context.
+# Run those from their own manifest and tracked lockfile instead; their test-only
+# resolution then stays separate from the Windows-cross-checked application lock.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
 failed=()
-skipped=()
+vendor_target="${CARGO_TARGET_DIR:-$PWD/target}/vendored-crates"
 
 for dir in vendor/*/; do
     [ -f "${dir}Cargo.toml" ] || continue
     pkg="$(basename "$dir")"
     echo "=== ${pkg} ==="
-    output="$(cargo test -p "$pkg" 2>&1 </dev/null)"
+    case "$pkg" in
+        ironrdp-graphics|ironrdp-pdu)
+            output="$(CARGO_TARGET_DIR="$vendor_target" cargo test \
+                --manifest-path "${dir}Cargo.toml" --locked 2>&1 </dev/null)"
+            ;;
+        *)
+            output="$(cargo test -p "$pkg" 2>&1 </dev/null)"
+            ;;
+    esac
     status=$?
     echo "$output"
     if [ "$status" -eq 0 ]; then
         continue
     fi
-    if grep -q 'requires dev-dependencies and is not a member of the workspace' <<<"$output"; then
-        skipped+=("$pkg")
-    else
-        failed+=("$pkg")
-    fi
+    failed+=("$pkg")
 done
 
 echo
-if [ "${#skipped[@]}" -gt 0 ]; then
-    echo "SKIPPED (cannot be tested outside a workspace): ${skipped[*]}"
-fi
 if [ "${#failed[@]}" -gt 0 ]; then
     echo "FAILED: ${failed[*]}"
     echo "These crates are NOT covered by 'cargo test' — fix them before integrating."
     exit 1
 fi
-echo "All runnable vendored crates passed."
+echo "All vendored crates passed."
