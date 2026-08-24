@@ -296,7 +296,7 @@ fn pump(
     // A resize waiting for the Display Control channel to open, with when it was asked.
     let mut pending_resize: Option<(SessionCommand, Instant)> = None;
     // The latest visibility change not yet told to the server.
-    let mut pending_visibility: Option<bool> = None;
+    let mut pending_visibility = initial_visibility_request();
     // When input went out with no resulting paint seen yet. The gap between the two is
     // the round trip the latency requirement is about.
     let mut input_sent_at: Option<Instant> = None;
@@ -963,6 +963,15 @@ fn visibility_pdus(
     }
 }
 
+fn initial_visibility_request() -> Option<bool> {
+    // A newly established session is visible, but winit does not emit an
+    // `Occluded(false)` transition for that initial state. Ask for the same complete
+    // desktop that a later reveal requests: Windows may otherwise send only future
+    // damage, leaving untouched parts of our new surface black until the host happens
+    // to invalidate the whole desktop.
+    Some(true)
+}
+
 /// Whether a resize request names the state the session is already in.
 ///
 /// Pure so it is testable without an [`Established`]. `scale` compares exactly:
@@ -1623,6 +1632,26 @@ mod tests {
         // Hiding must NOT request a repaint: the refresh would fight the suppression
         // it rides along with.
         assert_eq!(visibility_pdus(false, desktop).len(), 1);
+    }
+
+    #[test]
+    fn a_fresh_visible_session_requests_a_complete_first_desktop() {
+        let desktop = DesktopSize {
+            width: 2560,
+            height: 1440,
+        };
+        let visible = initial_visibility_request()
+            .expect("session startup must enqueue a visibility request");
+        assert!(visible, "the startup request must enable output");
+        assert!(
+            matches!(
+                visibility_pdus(visible, desktop).last(),
+                Some(ironrdp::pdu::rdp::headers::ShareDataPdu::RefreshRectangle(
+                    _
+                ))
+            ),
+            "the startup request must end with a full-desktop repaint"
+        );
     }
 
     /// A framed sink that records what was written, so the input path can be tested

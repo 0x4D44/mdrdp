@@ -27,6 +27,15 @@ Arthur reported on 2026-08-24 that mdrdp 0.1.211 took a while to show Kiln's rem
 
 ## Fix
 
-<unfixed — raised only>
+The RDP pump now starts with a pending visible-state request. Its first outbound turn
+therefore sends Suppress Output's allow form followed by a full-desktop Refresh Rectangle,
+using the same ordered path as a later reveal. This closes the startup-only hole: winit
+initializes a fresh visible window as not occluded and does not owe the application an
+`Occluded(false)` transition, so the old code could wait forever for a visibility event
+before asking Windows for complete pixels.
+
+The focused regression checks that startup enqueues an enabled visibility request whose
+last PDU is the full-desktop refresh. It failed with “session startup must enqueue a
+visibility request” before the fix, then passed with all 71 session tests.
 
 ## Notes
