@@ -157,6 +157,8 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
     }]
 }
 
+/// Schema 12: frame rows expose native/inferred move counts and bounded inference
+/// attempts, hits, and elapsed microseconds; move-prelude rows identify inference.
 /// Schema 11: headers name the dedicated sparse-pixel listener.
 /// Schema 10: `dropped_frames` counts complete logical desktop frames withheld
 /// before the sender — including fixed conversion-budget pressure, assembly,
@@ -179,7 +181,8 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
 /// (Schema 4: the header gained `source`, naming which capture path the run used.
 /// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
-pub const SCHEMA: u32 = 11;
+pub const SCHEMA: u32 = 12;
+/// Bumped 8 → 9 by metadata-first moves and independently routed remainders.
 /// Bumped 6 → 7 by the mandatory dedicated sparse-pixel connection.
 /// Bumped 5 → 6 by the atomic coverage-bearing `MSG_VIDEO_UPDATE` envelope.
 /// (Bumped 4 → 5 by the return to H.264 and the tiled `MSG_VIDEO_TILE` envelope.
@@ -188,7 +191,7 @@ pub const SCHEMA: u32 = 11;
 /// kinds beside the original VK down/up) — the video/rects wire itself is
 /// unchanged, but the header's `wire_version` couples both dialects together so a
 /// client's video-header gate also gates which input records it may send.
-pub const WIRE_VERSION: u32 = 8;
+pub const WIRE_VERSION: u32 = 9;
 
 impl Header {
     pub fn new() -> Self {
@@ -294,6 +297,15 @@ pub struct FrameRecord {
     /// (like `dropped_rects`) so the cost is attributable even when the frame that
     /// paid it produced no rect message.
     pub diff_us_total: u64,
+    /// Cumulative move descriptors supplied directly by capture metadata.
+    pub native_moves: u64,
+    /// Cumulative move descriptors inferred from adjacent frame pixels.
+    pub inferred_moves: u64,
+    /// Cumulative bounded move-inference attempts and successful selections.
+    pub move_inference_runs: u64,
+    pub move_inference_hits: u64,
+    /// Cumulative microseconds spent sampling and exactly checking move candidates.
+    pub move_inference_us_total: u64,
     /// Dirty-rect metadata from the duplication, when the frame carried any
     /// (`None` = metadata unavailable, which is NOT the same as zero rects).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -355,6 +367,8 @@ pub struct RectRecord {
     pub record: &'static str,
     pub frame: u64,
     pub rect_count: u32,
+    /// Move descriptors when `record == "move"`; zero on raw-rectangle rows.
+    pub move_count: u32,
     /// Pixel payload bytes (the wire message adds per-rect headers on top).
     pub rect_bytes: u64,
     /// Immediately before the GPU→CPU readback began.
@@ -371,6 +385,8 @@ pub struct RectRecord {
     /// different trust arguments, so a row that cannot say which one it is cannot be
     /// analysed.
     pub from_diff: bool,
+    /// This row is a pixel-free move prelude produced by frame inference.
+    pub move_inferred: bool,
 }
 
 impl RectRecord {
@@ -613,6 +629,11 @@ mod tests {
         r.diff_runs = 11;
         r.diff_hits = 6;
         r.diff_us_total = 90_000;
+        r.native_moves = 7;
+        r.inferred_moves = 5;
+        r.move_inference_runs = 13;
+        r.move_inference_hits = 4;
+        r.move_inference_us_total = 81_000;
         r.dirty_rect_count = Some(4);
         r.dirty_bytes = Some(8192);
         r.move_rect_count = Some(1);
@@ -647,6 +668,11 @@ mod tests {
         assert_eq!(v["diff_runs"], 11);
         assert_eq!(v["diff_hits"], 6);
         assert_eq!(v["diff_us_total"], 90_000);
+        assert_eq!(v["native_moves"], 7);
+        assert_eq!(v["inferred_moves"], 5);
+        assert_eq!(v["move_inference_runs"], 13);
+        assert_eq!(v["move_inference_hits"], 4);
+        assert_eq!(v["move_inference_us_total"], 81_000);
         assert_eq!(v["dirty_rect_count"], 4);
         assert_eq!(v["dirty_bytes"], 8192);
         assert_eq!(v["move_rect_count"], 1);
@@ -659,7 +685,7 @@ mod tests {
         assert_eq!(v["keyframe_wait_frames"], 17);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 32, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 37, "unexpected field count: {keys:?}");
     }
 
     #[test]
@@ -694,6 +720,7 @@ mod tests {
         // would hide a swap, and so would equal pack stamps.
         r.frame = 12;
         r.rect_count = 3;
+        r.move_count = 2;
         r.rect_bytes = 6144;
         r.pack_start_us = 2000;
         r.pack_end_us = 2100;
@@ -702,22 +729,25 @@ mod tests {
         // The pixel-diff arm. `false` is the metadata arm, and the default, so the
         // fixture sets the value that a forgotten assignment would not produce.
         r.from_diff = true;
+        r.move_inferred = true;
 
         let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
         assert_eq!(v["record"], "rects");
         assert_eq!(v["frame"], 12);
         assert_eq!(v["rect_count"], 3);
+        assert_eq!(v["move_count"], 2);
         assert_eq!(v["rect_bytes"], 6144);
         assert_eq!(v["pack_start_us"], 2000);
         assert_eq!(v["pack_end_us"], 2100);
         assert_eq!(v["send_done_us"], 2200);
         assert_eq!(v["dropped_rects"], 4);
         assert_eq!(v["from_diff"], true);
+        assert_eq!(v["move_inferred"], true);
         // A fresh record is the metadata arm until something says otherwise.
         assert!(to_line(&RectRecord::new()).contains(r#""from_diff":false"#));
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 9, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 11, "unexpected field count: {keys:?}");
     }
 
     #[test]

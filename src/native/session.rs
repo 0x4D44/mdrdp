@@ -997,14 +997,8 @@ fn pump_sparse(sparse: &mut TcpStream, sink: &mut SparseSink, stop: &AtomicBool)
                 }
                 continue;
             }
-            Ok(Some(message)) if message.msg_type == framing::MSG_MOVE_FENCE => {
-                let (baseline_seq, frame_seq) = match framing::decode_move_fence(&message.payload) {
-                    Ok(fence) => fence,
-                    Err(error) => {
-                        return SessionEnd::TransportFailed(format!("move fence: {error}"));
-                    }
-                };
-                if let Err(reason) = sink.move_rendezvous.sparse_pause(baseline_seq, frame_seq) {
+            Ok(Some(message)) if message.msg_type == framing::MSG_MOVE_UPDATE => {
+                if let Err(reason) = sink.on_move_prelude(&message.payload) {
                     return SessionEnd::TransportFailed(reason);
                 }
                 continue;
@@ -1047,7 +1041,7 @@ fn dispatch_video_message(
 ) -> Result<(), String> {
     match message.msg_type {
         framing::MSG_RECTS => {
-            Err("raw rectangles arrived on the bulk video channel under wire v8".to_owned())
+            Err("raw rectangles arrived on the bulk video channel under wire v9".to_owned())
         }
         framing::MSG_VIDEO_SEQ => {
             if message.payload.len() < 8 {
@@ -1065,7 +1059,10 @@ fn dispatch_video_message(
             Ok(update) => sink.on_video_update(update),
             Err(error) => Err(format!("MSG_VIDEO_UPDATE: {error}")),
         },
-        framing::MSG_MOVE_UPDATE => sink.on_move_update(&message.payload),
+        framing::MSG_MOVE_FENCE => sink.on_move_fence(&message.payload),
+        framing::MSG_MOVE_UPDATE => {
+            Err("move prelude arrived on the bulk channel under wire v9".to_owned())
+        }
         framing::MSG_VIDEO => sink.on_au(&message.payload, None),
         framing::MSG_CURSOR => match framing::decode_cursor(&message.payload) {
             Ok(true) => {
@@ -1668,15 +1665,18 @@ impl BaseReady {
 enum MoveRendezvousState {
     #[default]
     Idle,
-    SparseWaiting {
-        baseline_seq: u64,
-        frame_seq: u64,
+    Pending {
+        prelude: rects::MovePrelude,
+        applied: bool,
+        deadline: Instant,
     },
     Failed,
 }
 
 impl MoveRendezvous {
-    fn sparse_pause(&self, baseline_seq: u64, frame_seq: u64) -> Result<(), String> {
+    fn register_and_wait(&self, prelude: rects::MovePrelude) -> Result<(), String> {
+        let frame_seq = prelude.frame_seq;
+        let remainder = prelude.remainder;
         let mut state = self
             .state
             .lock()
@@ -1686,58 +1686,72 @@ impl MoveRendezvous {
             self.changed.notify_all();
             return Err("overlapping move fences".into());
         }
-        *state = MoveRendezvousState::SparseWaiting {
-            baseline_seq,
-            frame_seq,
+        *state = MoveRendezvousState::Pending {
+            prelude,
+            applied: false,
+            deadline: Instant::now() + MOVE_RENDEZVOUS_TIMEOUT,
         };
         self.changed.notify_all();
-        let deadline = Instant::now() + MOVE_RENDEZVOUS_TIMEOUT;
         loop {
-            match *state {
+            match &*state {
                 MoveRendezvousState::Idle => return Ok(()),
                 MoveRendezvousState::Failed => return Err("move rendezvous failed".into()),
-                MoveRendezvousState::SparseWaiting {
-                    baseline_seq: waiting_baseline,
-                    frame_seq: waiting_frame,
-                } if waiting_baseline == baseline_seq && waiting_frame == frame_seq => {}
-                MoveRendezvousState::SparseWaiting { .. } => {
+                MoveRendezvousState::Pending {
+                    prelude,
+                    applied: true,
+                    ..
+                } if prelude.frame_seq == frame_seq && remainder == rects::MoveRemainder::Raw => {
+                    return Ok(());
+                }
+                MoveRendezvousState::Pending {
+                    prelude, deadline, ..
+                } if prelude.frame_seq == frame_seq => {
+                    let now = Instant::now();
+                    if now >= *deadline {
+                        *state = MoveRendezvousState::Failed;
+                        self.changed.notify_all();
+                        return Err(
+                            "move bulk barrier or remainder did not arrive within 5 seconds".into(),
+                        );
+                    }
+                    let duration = deadline.saturating_duration_since(now);
+                    let (next, _) = self
+                        .changed
+                        .wait_timeout(state, duration)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state = next;
+                    continue;
+                }
+                MoveRendezvousState::Pending { .. } => {
                     *state = MoveRendezvousState::Failed;
                     self.changed.notify_all();
                     return Err("move rendezvous changed while sparse waited".into());
                 }
             }
-            let now = Instant::now();
-            if now >= deadline {
-                *state = MoveRendezvousState::Failed;
-                self.changed.notify_all();
-                return Err("move bulk update did not arrive within 5 seconds".into());
-            }
-            let (next, _) = self
-                .changed
-                .wait_timeout(state, deadline.saturating_duration_since(now))
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
         }
     }
 
-    fn bulk_wait(&self, baseline_seq: u64, frame_seq: u64) -> Result<(), String> {
+    fn prelude_for_fence(
+        &self,
+        baseline_seq: u64,
+        frame_seq: u64,
+    ) -> Result<rects::MovePrelude, String> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deadline = Instant::now() + MOVE_RENDEZVOUS_TIMEOUT;
         loop {
-            match *state {
-                MoveRendezvousState::SparseWaiting {
-                    baseline_seq: waiting_baseline,
-                    frame_seq: waiting_frame,
-                } if waiting_baseline == baseline_seq && waiting_frame == frame_seq => {
-                    return Ok(());
+            match &*state {
+                MoveRendezvousState::Pending { prelude, .. }
+                    if prelude.baseline_seq == baseline_seq && prelude.frame_seq == frame_seq =>
+                {
+                    return Ok(prelude.clone());
                 }
-                MoveRendezvousState::SparseWaiting { .. } => {
+                MoveRendezvousState::Pending { .. } => {
                     *state = MoveRendezvousState::Failed;
                     self.changed.notify_all();
-                    return Err("bulk move does not match sparse fence".into());
+                    return Err("bulk move fence does not match sparse prelude".into());
                 }
                 MoveRendezvousState::Failed => return Err("move rendezvous failed".into()),
                 MoveRendezvousState::Idle => {}
@@ -1746,7 +1760,7 @@ impl MoveRendezvous {
             if now >= deadline {
                 *state = MoveRendezvousState::Failed;
                 self.changed.notify_all();
-                return Err("move sparse fence did not arrive within 5 seconds".into());
+                return Err("move sparse prelude did not arrive within 5 seconds".into());
             }
             let (next, _) = self
                 .changed
@@ -1756,16 +1770,74 @@ impl MoveRendezvous {
         }
     }
 
-    fn bulk_complete(&self, frame_seq: u64) -> Result<(), String> {
+    fn mark_applied(&self, frame_seq: u64) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match *state {
-            MoveRendezvousState::SparseWaiting {
-                frame_seq: waiting_frame,
+        match &mut *state {
+            MoveRendezvousState::Pending {
+                prelude, applied, ..
+            } if prelude.frame_seq == frame_seq => {
+                *applied = true;
+                self.changed.notify_all();
+                Ok(())
+            }
+            _ => {
+                *state = MoveRendezvousState::Failed;
+                self.changed.notify_all();
+                Err("move applied without its prelude".into())
+            }
+        }
+    }
+
+    fn completion_coverage(
+        &self,
+        frame_seq: u64,
+        remainder: rects::MoveRemainder,
+    ) -> Result<Option<Vec<Region>>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            MoveRendezvousState::Idle => Ok(None),
+            MoveRendezvousState::Pending {
+                prelude,
+                applied: true,
                 ..
-            } if waiting_frame == frame_seq => {
+            } if prelude.frame_seq == frame_seq && prelude.remainder == remainder => Ok(Some(
+                prelude
+                    .moves
+                    .iter()
+                    .map(|movement| Region {
+                        x: u32::from(movement.dst_x),
+                        y: u32::from(movement.dst_y),
+                        width: u32::from(movement.w),
+                        height: u32::from(movement.h),
+                    })
+                    .collect(),
+            )),
+            MoveRendezvousState::Failed => Err("move rendezvous failed".into()),
+            _ => {
+                *state = MoveRendezvousState::Failed;
+                self.changed.notify_all();
+                Err("pixel update does not match pending move remainder".into())
+            }
+        }
+    }
+
+    fn complete(&self, frame_seq: u64) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            MoveRendezvousState::Pending {
+                prelude,
+                applied: true,
+                ..
+            } if prelude.frame_seq == frame_seq => {
                 *state = MoveRendezvousState::Idle;
                 self.changed.notify_all();
                 Ok(())
@@ -1773,12 +1845,46 @@ impl MoveRendezvous {
             _ => {
                 *state = MoveRendezvousState::Failed;
                 self.changed.notify_all();
-                Err("bulk move completed without its sparse fence".into())
+                Err("move completed without its applied prelude".into())
             }
         }
     }
 
-    fn bulk_abort(&self) {
+    fn wait_complete(&self, frame_seq: u64) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match &*state {
+                MoveRendezvousState::Idle => return Ok(()),
+                MoveRendezvousState::Failed => return Err("move rendezvous failed".into()),
+                MoveRendezvousState::Pending {
+                    prelude, deadline, ..
+                } if prelude.frame_seq == frame_seq => {
+                    let now = Instant::now();
+                    if now >= *deadline {
+                        *state = MoveRendezvousState::Failed;
+                        self.changed.notify_all();
+                        return Err("move remainder did not arrive within 5 seconds".into());
+                    }
+                    let duration = deadline.saturating_duration_since(now);
+                    let (next, _) = self
+                        .changed
+                        .wait_timeout(state, duration)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state = next;
+                }
+                MoveRendezvousState::Pending { .. } => {
+                    *state = MoveRendezvousState::Failed;
+                    self.changed.notify_all();
+                    return Err("move changed while bulk waited for raw remainder".into());
+                }
+            }
+        }
+    }
+
+    fn abort(&self) {
         *self
             .state
             .lock()
@@ -1799,14 +1905,36 @@ struct SparseSink {
 }
 
 impl SparseSink {
+    fn on_move_prelude(&mut self, payload: &[u8]) -> Result<(), String> {
+        let prelude = rects::decode_move_prelude(payload)
+            .map_err(|error| format!("move prelude payload: {error}"))?;
+        if (prelude.frame_width, prelude.frame_height) != self.wire_size {
+            return Err(format!(
+                "host move geometry changed ({}x{} vs session {}x{}); reconnect",
+                prelude.frame_width, prelude.frame_height, self.wire_size.0, self.wire_size.1
+            ));
+        }
+        if !self.base_ready.is_ready() {
+            return Err("move prelude cannot bootstrap without recovery".into());
+        }
+        self.move_rendezvous.register_and_wait(prelude)
+    }
+
     fn on_rects(&mut self, payload: &[u8], stop: &AtomicBool) -> Result<(), String> {
         let wire_bytes = payload.len() as u64;
         let update = rects::decode(payload).map_err(|error| format!("rects payload: {error}"))?;
-        if update.rects.is_empty() {
-            return Ok(());
-        }
         if (update.frame_width, update.frame_height) != self.wire_size {
             return Err("sparse update geometry changed; reconnect".into());
+        }
+        let move_coverage = self
+            .move_rendezvous
+            .completion_coverage(update.frame_seq, rects::MoveRemainder::Raw)?;
+        if update.rects.is_empty() {
+            if move_coverage.is_some() {
+                self.move_rendezvous.abort();
+                return Err("move declared a raw remainder but sent no pixels".into());
+            }
+            return Ok(());
         }
         let coverage: Vec<_> = update
             .rects
@@ -1861,6 +1989,10 @@ impl SparseSink {
             }
         }
         if staged.is_empty() {
+            if move_coverage.is_some() {
+                self.move_rendezvous.abort();
+                return Err("move raw remainder was entirely suppressed".into());
+            }
             return Ok(());
         }
         let updates: Vec<_> = staged
@@ -1877,6 +2009,9 @@ impl SparseSink {
                 .map_err(|error| format!("sparse batch: {error}"))?
         };
         fences.commit(update.frame_seq, &coverage);
+        if let Some(move_coverage) = &move_coverage {
+            fences.commit(update.frame_seq, move_coverage);
+        }
         drop(fences);
         let input_us = self.input_clock.take_us();
         self.stats.update(|stats| {
@@ -1896,6 +2031,9 @@ impl SparseSink {
             stats.mark_painted(generation);
         });
         (self.wake)();
+        if move_coverage.is_some() {
+            self.move_rendezvous.complete(update.frame_seq)?;
+        }
         Ok(())
     }
 }
@@ -2380,6 +2518,9 @@ impl NativeSink {
                 update.frame_seq, self.exact_through
             ));
         }
+        let move_coverage = self
+            .move_rendezvous
+            .completion_coverage(update.frame_seq, rects::MoveRemainder::Video)?;
 
         // Validate the advertised layout before advancing any decoder reference.
         let mut selected = Vec::with_capacity(update.tiles.len());
@@ -2433,6 +2574,10 @@ impl NativeSink {
                 Ok(decoded) => decoded,
                 Err(_) => {
                     self.stats.update(|stats| stats.decode_errors += 1);
+                    if move_coverage.is_some() {
+                        self.move_rendezvous.abort();
+                        return Err("move video remainder failed to decode".into());
+                    }
                     return Ok(());
                 }
             };
@@ -2505,6 +2650,10 @@ impl NativeSink {
         }
 
         if staged.is_empty() {
+            if move_coverage.is_some() {
+                self.move_rendezvous.abort();
+                return Err("move video remainder was entirely suppressed".into());
+            }
             self.suppressed += 1;
             self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
             if self.has_base {
@@ -2541,6 +2690,9 @@ impl NativeSink {
         for coverage in &committed_coverage {
             fences.commit(update.frame_seq, coverage);
         }
+        if let Some(move_coverage) = &move_coverage {
+            fences.commit(update.frame_seq, move_coverage);
+        }
         drop(fences);
         self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
         if self.has_base {
@@ -2558,36 +2710,29 @@ impl NativeSink {
             );
         }
         (self.wake)();
+        if move_coverage.is_some() {
+            self.move_rendezvous.complete(update.frame_seq)?;
+        }
         Ok(())
     }
 
-    fn on_move_update(&mut self, payload: &[u8]) -> Result<(), String> {
+    fn on_move_fence(&mut self, payload: &[u8]) -> Result<(), String> {
         let rendezvous = Arc::clone(&self.move_rendezvous);
-        let update = match rects::decode_move_update(payload) {
-            Ok(update) => update,
+        let (baseline_seq, frame_seq) = match framing::decode_move_fence(payload) {
+            Ok(fence) => fence,
             Err(error) => {
-                rendezvous.bulk_abort();
-                return Err(format!("move update payload: {error}"));
+                rendezvous.abort();
+                return Err(format!("move fence: {error}"));
             }
         };
-        if (update.frame.frame_width, update.frame.frame_height) != self.wire_size {
-            rendezvous.bulk_abort();
-            return Err(format!(
-                "host move geometry changed ({}x{} vs session {}x{}); reconnect",
-                update.frame.frame_width,
-                update.frame.frame_height,
-                self.wire_size.0,
-                self.wire_size.1
-            ));
-        }
         if !self.has_base {
-            rendezvous.bulk_abort();
-            return Err("move update cannot bootstrap without recovery".into());
+            rendezvous.abort();
+            return Err("move fence cannot bootstrap without recovery".into());
         }
 
-        rendezvous.bulk_wait(update.baseline_seq, update.frame.frame_seq)?;
+        let prelude = rendezvous.prelude_for_fence(baseline_seq, frame_seq)?;
         let result = (|| {
-            let move_rects: Vec<_> = update
+            let move_rects: Vec<_> = prelude
                 .moves
                 .iter()
                 .map(|movement| {
@@ -2607,18 +2752,7 @@ impl NativeSink {
                     )
                 })
                 .collect();
-            let dirty: Vec<_> = update
-                .frame
-                .rects
-                .iter()
-                .map(|rect| {
-                    (
-                        Rect::new(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h),
-                        rect.pixels.as_slice(),
-                    )
-                })
-                .collect();
-            let mut coverage: Vec<_> = update
+            let coverage: Vec<_> = prelude
                 .moves
                 .iter()
                 .map(|movement| Region {
@@ -2628,21 +2762,15 @@ impl NativeSink {
                     height: u32::from(movement.h),
                 })
                 .collect();
-            coverage.extend(update.frame.rects.iter().map(|rect| Region {
-                x: u32::from(rect.x),
-                y: u32::from(rect.y),
-                width: u32::from(rect.w),
-                height: u32::from(rect.h),
-            }));
 
             let mut fences = self
                 .fences
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if fences.max_seq() != update.baseline_seq {
+            if fences.max_seq() != prelude.baseline_seq {
                 return Err(format!(
                     "move baseline {} does not match displayed sequence {}",
-                    update.baseline_seq,
+                    prelude.baseline_seq,
                     fences.max_seq()
                 ));
             }
@@ -2655,16 +2783,16 @@ impl NativeSink {
                     .move_and_blit_bgra_strict_batch(
                         OUTPUT_SURFACE,
                         &move_rects,
-                        dirty.iter().copied(),
+                        std::iter::empty(),
                     )
                     .map_err(|error| format!("move batch: {error}"))?
             };
-            fences.commit(update.frame.frame_seq, &coverage);
+            if prelude.remainder == rects::MoveRemainder::None {
+                fences.commit(prelude.frame_seq, &coverage);
+            }
             drop(fences);
-            self.exact_through = Some(update.frame.frame_seq);
             let input_us = self.input_clock.take_us();
             self.stats.update(|stats| {
-                stats.frames += 1;
                 stats.bytes_in = stats.bytes_in.saturating_add(payload.len() as u64);
                 *stats.codecs.entry(MOVE_CODEC_LABEL.to_owned()).or_insert(0) += 1;
                 *stats
@@ -2677,12 +2805,20 @@ impl NativeSink {
                 stats.mark_painted(generation);
             });
             (self.wake)();
-            Ok(())
+            rendezvous.mark_applied(prelude.frame_seq)?;
+            match prelude.remainder {
+                rects::MoveRemainder::None => {
+                    self.exact_through = Some(prelude.frame_seq);
+                    rendezvous.complete(prelude.frame_seq)
+                }
+                rects::MoveRemainder::Raw => rendezvous.wait_complete(prelude.frame_seq),
+                rects::MoveRemainder::Video => Ok(()),
+            }
         })();
         match result {
-            Ok(()) => rendezvous.bulk_complete(update.frame.frame_seq),
+            Ok(()) => Ok(()),
             Err(error) => {
-                rendezvous.bulk_abort();
+                rendezvous.abort();
                 Err(error)
             }
         }
@@ -4913,27 +5049,49 @@ mod tests {
     }
 
     #[test]
-    fn move_rendezvous_pauses_newer_sparse_work_until_bulk_commit() {
+    fn move_rendezvous_releases_only_the_declared_remainder_lane() {
         let rendezvous = Arc::new(MoveRendezvous::default());
         let sparse = Arc::clone(&rendezvous);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let prelude = rects::MovePrelude {
+            baseline_seq: 40,
+            frame_seq: 41,
+            frame_width: 4,
+            frame_height: 1,
+            remainder: rects::MoveRemainder::Raw,
+            moves: vec![rects::MoveRect {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 1,
+                dst_y: 0,
+                w: 3,
+                h: 1,
+            }],
+        };
         let join = std::thread::spawn(move || {
-            sparse.sparse_pause(40, 41).unwrap();
+            sparse.register_and_wait(prelude).unwrap();
             done_tx.send(()).unwrap();
         });
 
-        rendezvous.bulk_wait(40, 41).unwrap();
+        rendezvous.prelude_for_fence(40, 41).unwrap();
         assert!(
             done_rx.try_recv().is_err(),
-            "sparse reader must remain paused while bulk applies the move"
+            "sparse reader must remain paused until the move is applied"
         );
-        rendezvous.bulk_complete(41).unwrap();
+        rendezvous.mark_applied(41).unwrap();
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            rendezvous
+                .completion_coverage(41, rects::MoveRemainder::Raw)
+                .unwrap()
+                .is_some()
+        );
+        rendezvous.complete(41).unwrap();
         join.join().unwrap();
     }
 
     #[test]
-    fn move_update_copies_the_baseline_then_paints_exposed_pixels() {
+    fn move_prelude_copies_the_baseline_at_the_bulk_barrier() {
         let size = (4, 1);
         let store = Arc::new(Mutex::new(SurfaceStore::new()));
         {
@@ -4980,20 +5138,12 @@ mod tests {
             .unwrap()
             .blit_rgba_strict(OUTPUT_SURFACE, Rect::new(0, 0, 4, 1), &initial)
             .unwrap();
-        let update = rects::MoveUpdate {
+        let update = rects::MovePrelude {
             baseline_seq: 40,
-            frame: rects::RectUpdate {
-                frame_seq: 41,
-                frame_width: size.0,
-                frame_height: size.1,
-                rects: vec![rects::Rect {
-                    x: 3,
-                    y: 0,
-                    w: 1,
-                    h: 1,
-                    pixels: vec![30, 20, 10, 255],
-                }],
-            },
+            frame_seq: 41,
+            frame_width: size.0,
+            frame_height: size.1,
+            remainder: rects::MoveRemainder::None,
             moves: vec![
                 rects::MoveRect {
                     src_x: 0,
@@ -5013,27 +5163,38 @@ mod tests {
                 },
             ],
         };
-        let mut payload = Vec::new();
-        rects::encode_move_update(&update, &mut payload);
         let sparse = Arc::clone(&sink.move_rendezvous);
-        let pause = std::thread::spawn(move || sparse.sparse_pause(40, 41));
+        let pause = std::thread::spawn(move || sparse.register_and_wait(update));
 
-        sink.on_move_update(&payload).unwrap();
+        sink.on_move_fence(&framing::encode_move_fence(40, 41))
+            .unwrap();
         pause.join().unwrap().unwrap();
 
         assert_eq!(
             store.lock().unwrap().get(OUTPUT_SURFACE).unwrap().pixels(),
-            [3, 0, 0, 255, 4, 0, 0, 255, 2, 0, 0, 255, 10, 20, 30, 255]
+            [3, 0, 0, 255, 4, 0, 0, 255, 2, 0, 0, 255, 4, 0, 0, 255]
         );
 
-        let mut stale = update;
-        stale.baseline_seq = 39;
-        stale.frame.frame_seq = 42;
-        let mut stale_payload = Vec::new();
-        rects::encode_move_update(&stale, &mut stale_payload);
+        let stale = rects::MovePrelude {
+            baseline_seq: 39,
+            frame_seq: 42,
+            frame_width: size.0,
+            frame_height: size.1,
+            remainder: rects::MoveRemainder::None,
+            moves: vec![rects::MoveRect {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 1,
+                dst_y: 0,
+                w: 1,
+                h: 1,
+            }],
+        };
         let sparse = Arc::clone(&sink.move_rendezvous);
-        let pause = std::thread::spawn(move || sparse.sparse_pause(39, 42));
-        let error = sink.on_move_update(&stale_payload).unwrap_err();
+        let pause = std::thread::spawn(move || sparse.register_and_wait(stale));
+        let error = sink
+            .on_move_fence(&framing::encode_move_fence(39, 42))
+            .unwrap_err();
         assert!(error.contains("does not match displayed sequence 41"));
         assert!(pause.join().unwrap().is_err());
     }

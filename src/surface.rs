@@ -393,6 +393,38 @@ impl Surface {
         Ok(())
     }
 
+    /// Copy one equal-sized rectangle within this surface without allocating.
+    /// Row direction preserves vertically overlapping sources; `copy_within`
+    /// provides the corresponding memmove semantics inside each row.
+    fn move_rgba_strict(&mut self, source: Rect, destination: Rect) -> Result<(), SurfaceError> {
+        if source.width() != destination.width() || source.height() != destination.height() {
+            return Err(SurfaceError::MoveSizeMismatch {
+                source,
+                destination,
+            });
+        }
+        self.validate_rect_strict(source)?;
+        self.validate_rect_strict(destination)?;
+        let row_bytes = source.width() as usize * BPP;
+        if destination.top > source.top {
+            for row in (0..source.height()).rev() {
+                let src = self.row_start(source.top + row) + source.left as usize * BPP;
+                let dst = self.row_start(destination.top + row) + destination.left as usize * BPP;
+                self.pixels.copy_within(src..src + row_bytes, dst);
+            }
+        } else {
+            for row in 0..source.height() {
+                let src = self.row_start(source.top + row) + source.left as usize * BPP;
+                let dst = self.row_start(destination.top + row) + destination.left as usize * BPP;
+                self.pixels.copy_within(src..src + row_bytes, dst);
+            }
+        }
+        self.painted = true;
+        self.coverage
+            .mark_rect(self.width, self.height, destination);
+        Ok(())
+    }
+
     /// Blit a tightly packed **BGRA** rectangle, swizzling to RGBA in place.
     ///
     /// The native transport's rect path: wire payloads arrive BGRA (the capture
@@ -1265,9 +1297,9 @@ impl SurfaceStore {
 
     /// Apply screen-to-screen moves and raw BGRA remainder as one visible update.
     ///
-    /// Every source is staged from the pre-update surface before any destination is
-    /// written. This is required both for overlapping moves and for separate moves
-    /// whose destinations cover another move's source. Dirty final pixels land last.
+    /// A single move uses an overlap-safe in-place copy. Multi-move batches stage
+    /// every source from the pre-update surface because one destination may cover
+    /// another move's source. Dirty final pixels land last.
     pub(crate) fn move_and_blit_bgra_strict_batch<'a, I>(
         &mut self,
         id: u16,
@@ -1295,24 +1327,36 @@ impl SurfaceStore {
             surface.validate_strict(destination, pixels)?;
         }
 
-        let staged: Vec<_> = moves
-            .iter()
-            .map(|&(source, destination)| {
-                (
-                    destination,
-                    surface
-                        .extract(source)
-                        .expect("strictly validated move source must extract"),
-                )
-            })
-            .collect();
+        if moves.len() == 1 {
+            let (source, destination) = moves[0];
+            self.surfaces
+                .get_mut(&id)
+                .ok_or(SurfaceError::NoSuchSurface(id))?
+                .move_rgba_strict(source, destination)?;
+        } else {
+            let staged: Vec<_> = moves
+                .iter()
+                .map(|&(source, destination)| {
+                    (
+                        destination,
+                        surface
+                            .extract(source)
+                            .expect("strictly validated move source must extract"),
+                    )
+                })
+                .collect();
+            let surface = self
+                .surfaces
+                .get_mut(&id)
+                .ok_or(SurfaceError::NoSuchSurface(id))?;
+            for (destination, pixels) in staged {
+                surface.blit_rgba_strict(destination, &pixels)?;
+            }
+        }
         let surface = self
             .surfaces
             .get_mut(&id)
             .ok_or(SurfaceError::NoSuchSurface(id))?;
-        for (destination, pixels) in staged {
-            surface.blit_rgba_strict(destination, &pixels)?;
-        }
         let mut wire_bytes = 0u64;
         for (destination, pixels) in dirty {
             surface.blit_bgra_strict(destination, pixels)?;
@@ -2722,6 +2766,61 @@ mod tests {
             "both move sources must come from the pre-update canvas, then dirty wins"
         );
         assert_eq!(store.cache_stats().bytes_from_wire, before_bytes + 4);
+    }
+
+    #[test]
+    fn one_move_copies_overlapping_rows_in_place_in_both_directions() {
+        for (source, destination, expected) in [
+            (
+                Rect::new(0, 1, 3, 4),
+                Rect::new(0, 0, 3, 3),
+                vec![2, 3, 4, 4],
+            ),
+            (
+                Rect::new(0, 0, 3, 3),
+                Rect::new(0, 1, 3, 4),
+                vec![1, 1, 2, 3],
+            ),
+        ] {
+            let mut surface = Surface::new(3, 4);
+            let pixels = (1u8..=4)
+                .flat_map(|value| [value, 0, 0, 255].repeat(3))
+                .collect::<Vec<_>>();
+            surface
+                .blit_rgba_strict(Rect::new(0, 0, 3, 4), &pixels)
+                .unwrap();
+
+            surface.move_rgba_strict(source, destination).unwrap();
+
+            let rows = surface
+                .pixels()
+                .chunks_exact(3 * BPP)
+                .map(|row| row[0])
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected);
+        }
+    }
+
+    #[test]
+    fn one_move_copies_overlapping_columns_in_place() {
+        let mut surface = Surface::new(4, 1);
+        let pixels = [1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255];
+        surface
+            .blit_rgba_strict(Rect::new(0, 0, 4, 1), &pixels)
+            .unwrap();
+
+        surface
+            .move_rgba_strict(Rect::new(0, 0, 3, 1), Rect::new(1, 0, 4, 1))
+            .unwrap();
+
+        assert_eq!(
+            surface
+                .pixels()
+                .chunks_exact(BPP)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            [1, 1, 2, 3]
+        );
     }
 
     #[test]

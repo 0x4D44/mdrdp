@@ -212,8 +212,6 @@ pub(crate) struct PlannedComplete<P, T> {
 
 pub(crate) struct PlannedPush<P, T> {
     pub(crate) ready: Vec<PlannedComplete<P, T>>,
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub(crate) dropped: u64,
 }
 
 struct PlannedPartial<P, T> {
@@ -239,6 +237,13 @@ impl<P, T> PlannedAssembler<P, T> {
             pending: BTreeMap::new(),
             retired_through: None,
         }
+    }
+
+    /// True when no older encoded update can be overtaken by an immediate bulk
+    /// barrier such as a metadata-first move.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
     }
 
     /// Register a plan before submitting any of its selected tiles. Returns the
@@ -275,81 +280,26 @@ impl<P, T> PlannedAssembler<P, T> {
 
     pub(crate) fn push(&mut self, seq: u64, tile_id: u8, tile: T) -> PlannedPush<P, T> {
         if self.retired_through.is_some_and(|retired| seq <= retired) {
-            return PlannedPush {
-                ready: Vec::new(),
-                dropped: 0,
-            };
+            return PlannedPush { ready: Vec::new() };
         }
         let Some(partial) = self.pending.get_mut(&seq) else {
-            return PlannedPush {
-                ready: Vec::new(),
-                dropped: 0,
-            };
+            return PlannedPush { ready: Vec::new() };
         };
         let Some((_, slot)) = partial
             .tiles
             .iter_mut()
             .find(|(expected, _)| *expected == tile_id)
         else {
-            return PlannedPush {
-                ready: Vec::new(),
-                dropped: 0,
-            };
+            return PlannedPush { ready: Vec::new() };
         };
         if slot.is_some() {
-            return PlannedPush {
-                ready: Vec::new(),
-                dropped: 0,
-            };
+            return PlannedPush { ready: Vec::new() };
         }
         *slot = Some(tile);
 
         PlannedPush {
             ready: self.drain_ready(),
-            dropped: 0,
         }
-    }
-
-    /// Register a bulk update which needs no encoder callback (currently a move).
-    /// It is complete immediately but remains behind any older incomplete video plan.
-    pub(crate) fn begin_complete(&mut self, seq: u64, plan: P) -> PlannedPush<P, T> {
-        if self.retired_through.is_some_and(|retired| seq <= retired) {
-            return PlannedPush {
-                ready: Vec::new(),
-                dropped: 0,
-            };
-        }
-        assert!(!self.pending.contains_key(&seq));
-        self.pending.insert(
-            seq,
-            PlannedPartial {
-                plan,
-                tiles: Vec::new(),
-            },
-        );
-        let mut dropped = 0;
-        while self.pending.len() > self.max_pending {
-            let oldest = *self
-                .pending
-                .first_key_value()
-                .expect("pending plan count proved non-empty")
-                .0;
-            self.pending.remove(&oldest);
-            self.retire(oldest);
-            dropped += 1;
-        }
-        PlannedPush {
-            ready: self.drain_ready(),
-            dropped,
-        }
-    }
-
-    /// Whether an encoder-free plan is waiting behind an older encoded plan.
-    /// The move transport uses this to keep newer sparse work behind its fence.
-    pub(crate) fn has_complete_pending(&self) -> bool {
-        self.pending
-            .values()
-            .any(|partial| partial.tiles.is_empty())
     }
 
     fn drain_ready(&mut self) -> Vec<PlannedComplete<P, T>> {
@@ -447,25 +397,6 @@ mod tests {
         assert_eq!(assembler.begin(61, (), &[0]), 0);
         assert_eq!(assembler.begin(62, (), &[1]), 1);
         assert!(assembler.push(60, 0, "late").ready.is_empty());
-    }
-
-    #[test]
-    fn a_ready_bulk_plan_waits_behind_older_encoding_then_releases_in_order() {
-        let mut assembler = PlannedAssembler::new(2, 3);
-        assert_eq!(assembler.begin(70, "video", &[0, 1]), 0);
-        assert!(assembler.begin_complete(71, "move").ready.is_empty());
-        assert!(assembler.has_complete_pending());
-        assert!(assembler.push(70, 0, "left").ready.is_empty());
-
-        let ready = assembler.push(70, 1, "right").ready;
-
-        assert_eq!(
-            ready.iter().map(|frame| frame.seq).collect::<Vec<_>>(),
-            [70, 71]
-        );
-        assert_eq!(ready[1].plan, "move");
-        assert!(ready[1].tiles.is_empty());
-        assert!(!assembler.has_complete_pending());
     }
 
     #[test]

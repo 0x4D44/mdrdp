@@ -87,6 +87,7 @@ const RECT_MAX_BYTES: u64 = 96 * 1024;
 /// [`RECT_MAX_COUNT`]: a tuning knob, reported in the stats header so every
 /// archived measurement names the threshold it ran under.
 const DIFF_IDLE_GAP_US: i64 = 100_000;
+const MAX_INFERRED_MOVE_SHIFT: u32 = 512;
 
 /// `--list-outputs`.
 pub fn list_outputs() -> Result<()> {
@@ -527,6 +528,11 @@ struct EmitCtx {
     /// Cumulative microseconds spent inside those diffs — the cost side of the
     /// trade the hit count is the benefit side of.
     diff_us_total: u64,
+    native_moves: u64,
+    inferred_moves: u64,
+    move_inference_runs: u64,
+    move_inference_hits: u64,
+    move_inference_us_total: u64,
     codec: CodecEmitState,
     config_epoch: u64,
     param_set_failures: u64,
@@ -549,13 +555,12 @@ struct VideoPlan {
     block_size: u16,
     coverage: Vec<(u8, Vec<Region>)>,
     raw: Option<send::SparseOutbound>,
-    move_update: Option<PreparedMove>,
+    move_remainder: bool,
 }
 
 struct PreparedMove {
-    record: Box<stats::RectRecord>,
-    payload: Vec<u8>,
-    fence: send::SparseOutbound,
+    prelude: send::SparseOutbound,
+    fence: Vec<u8>,
 }
 
 struct RoutingPlan {
@@ -577,7 +582,7 @@ fn full_video_plan(
         frame_height,
         block_size: CODEC_BLOCK_SIZE as u16,
         raw: None,
-        move_update: None,
+        move_remainder: false,
         coverage: tiles
             .iter()
             .map(|tile| {
@@ -730,7 +735,7 @@ fn select_routing_plan(
         block_size: CODEC_BLOCK_SIZE as u16,
         coverage,
         raw: None,
-        move_update: None,
+        move_remainder: false,
     });
     Ok(RoutingPlan { raw, video })
 }
@@ -864,6 +869,11 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     record.diff_runs = ctx.diff_runs;
     record.diff_hits = ctx.diff_hits;
     record.diff_us_total = ctx.diff_us_total;
+    record.native_moves = ctx.native_moves;
+    record.inferred_moves = ctx.inferred_moves;
+    record.move_inference_runs = ctx.move_inference_runs;
+    record.move_inference_hits = ctx.move_inference_hits;
+    record.move_inference_us_total = ctx.move_inference_us_total;
     record.stamp_mismatches = au.stamp_mismatches;
     record.claimed_changed_pixels = au.meta.claimed_changed_pixels;
     record.measured_changed_pixels = au.meta.measured_changed_pixels;
@@ -929,28 +939,20 @@ fn admit_ready_frames(
     want_keyframe: &mut bool,
 ) -> Result<()> {
     for mut frame in ready {
-        if let Some(movement) = frame.plan.move_update.take() {
-            debug_assert!(frame.tiles.is_empty());
-            if !recovery.allows_overlays() {
-                continue;
-            }
-            if admit_move(tx, &ctx.sparse_tx, movement)? {
-                recovery.admitted(false);
-            } else {
-                ctx.dropped_rects += 1;
-                recovery.queue_full();
-                *want_keyframe = true;
-            }
-            continue;
-        }
         debug_assert!(frame.tiles.iter().all(|(_, tile)| tile.seq == frame.seq));
         let has_keyframe = frame.tiles.iter().any(|(_, tile)| tile.record.keyframe);
         let all_keyframes = frame.tiles.iter().all(|(_, tile)| tile.record.keyframe);
         let is_recovery = frame.plan.kind == VideoKind::Recovery && all_keyframes;
         match recovery.prepare(has_keyframe, is_recovery) {
             logical_frame::RecoveryDecision::Admit => {}
+            logical_frame::RecoveryDecision::Suppress if frame.plan.move_remainder => {
+                return Err("move video remainder was suppressed after its prelude".into());
+            }
             logical_frame::RecoveryDecision::Suppress => continue,
             logical_frame::RecoveryDecision::SuppressAndRequest => {
+                if frame.plan.move_remainder {
+                    return Err("move video remainder requested recovery after its prelude".into());
+                }
                 *want_keyframe = true;
                 continue;
             }
@@ -993,6 +995,9 @@ fn admit_ready_frames(
         match admit_video_and_raw(tx, &ctx.sparse_tx, outbound, frame.plan.raw.take())? {
             true => recovery.admitted(is_recovery),
             false => {
+                if frame.plan.move_remainder {
+                    return Err("move video remainder was rejected after its prelude".into());
+                }
                 if had_raw {
                     ctx.dropped_rects += 1;
                 }
@@ -1012,9 +1017,7 @@ fn admit_move(
     movement: PreparedMove,
 ) -> Result<bool> {
     let gate = AdmissionGate::pending();
-    let mut fence = movement.fence;
-    fence.gate = Some(gate.clone());
-    let outbound = send::Outbound::Move(movement.record, movement.payload, Some(gate.clone()));
+    let outbound = send::Outbound::MoveFence(movement.fence, Some(gate.clone()));
     match video_tx.try_send(outbound) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
@@ -1026,7 +1029,9 @@ fn admit_move(
             return Err("sender thread has gone away".to_owned().into());
         }
     }
-    match sparse_tx.try_send(fence) {
+    let mut prelude = movement.prelude;
+    prelude.gate = Some(gate.clone());
+    match sparse_tx.try_send(prelude) {
         Ok(()) => {
             gate.decide(true);
             Ok(true)
@@ -1247,8 +1252,12 @@ fn prepare_rects(
 
 fn prepare_move(
     movements: &[super::source::MoveRect],
-    frame: rects::RectUpdate,
     baseline_seq: u64,
+    frame_seq: u64,
+    frame_width: u32,
+    frame_height: u32,
+    remainder: rects::MoveRemainder,
+    inferred: bool,
     pack_start: i64,
     ctx: &EmitCtx,
 ) -> Result<PreparedMove> {
@@ -1265,36 +1274,32 @@ fn prepare_move(
             })
         })
         .collect::<std::result::Result<Vec<_>, std::num::TryFromIntError>>()?;
-    let rect_count = frame.rects.len() as u32;
-    let rect_bytes = frame
-        .rects
-        .iter()
-        .map(|rect| rect.pixels.len() as u64)
-        .sum();
-    let frame_seq = frame.frame_seq;
-    let update = rects::MoveUpdate {
+    let update = rects::MovePrelude {
         baseline_seq,
-        frame,
+        frame_seq,
+        frame_width,
+        frame_height,
+        remainder,
         moves,
     };
     let mut payload = Vec::with_capacity(rects::move_encoded_len(&update));
-    rects::encode_move_update(&update, &mut payload);
+    rects::encode_move_prelude(&update, &mut payload);
     let mut record = stats::RectRecord::new();
+    record.record = "move";
     record.frame = frame_seq;
-    record.rect_count = rect_count;
-    record.rect_bytes = rect_bytes;
+    record.move_count = movements.len() as u32;
     record.pack_start_us = ctx.clock.micros(pack_start);
     record.pack_end_us = ctx.clock.micros(qpc::now());
     record.dropped_rects = ctx.dropped_rects;
+    record.move_inferred = inferred;
     Ok(PreparedMove {
-        record: Box::new(record),
-        payload,
-        fence: send::SparseOutbound {
-            msg_type: crate::framing::MSG_MOVE_FENCE,
-            record: None,
-            payload: crate::framing::encode_move_fence(baseline_seq, frame_seq).to_vec(),
+        prelude: send::SparseOutbound {
+            msg_type: crate::framing::MSG_MOVE_UPDATE,
+            record: Some(Box::new(record)),
+            payload,
             gate: None,
         },
+        fence: crate::framing::encode_move_fence(baseline_seq, frame_seq).to_vec(),
     })
 }
 
@@ -1376,6 +1381,11 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             diff_runs: 0,
             diff_hits: 0,
             diff_us_total: 0,
+            native_moves: 0,
+            inferred_moves: 0,
+            move_inference_runs: 0,
+            move_inference_hits: 0,
+            move_inference_us_total: 0,
             codec: match state.codec {
                 encode::Codec::H264 => CodecEmitState::H264 {
                     stream_sets: None,
@@ -1524,62 +1534,187 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         let mut measured_changed_pixels = None;
         let mut raw_rect_attempted = false;
         let mut raw_rect_sent = false;
-        let sparse_allowed = recovery.allows_overlays()
-            && state.sparse_connected.load(Ordering::Acquire)
-            && !assembler.has_complete_pending();
+        let sparse_allowed =
+            recovery.allows_overlays() && state.sparse_connected.load(Ordering::Acquire);
         let force_full_once = suppress_rects_once;
         suppress_rects_once = false;
-        let move_change = change.as_ref().filter(|change| {
+        let mut effective_change = change.clone();
+        let mut inferred_move = false;
+        if state.codec == encode::Codec::H264
+            && state.rects_enabled
+            && sparse_allowed
+            && assembler.is_empty()
+            && !force_full_once
+            && last_scheduled_seq == frame_seq.checked_sub(1)
+            && pixel_diff.valid()
+            && effective_change.as_ref().is_some_and(|change| {
+                change.moves.is_empty()
+                    && !change.rects.is_empty()
+                    && change.dirty_bytes() > RECT_MAX_BYTES
+            })
+        {
+            let damage = effective_change
+                .as_ref()
+                .expect("inference predicate established damage")
+                .rects
+                .iter()
+                .map(|rect| diff::Region {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                })
+                .collect::<Vec<_>>();
+            let bounds = claimed_bounds(
+                &effective_change
+                    .as_ref()
+                    .expect("inference predicate established damage")
+                    .rects,
+                state.capture.width(),
+                state.capture.height(),
+            );
+            let inference_start = qpc::now();
+            let inferred = {
+                let device = state.capture.device();
+                let context = state.capture.context();
+                pixel_diff.infer_vertical_move(
+                    device,
+                    context,
+                    &texture,
+                    bounds,
+                    &damage,
+                    MAX_INFERRED_MOVE_SHIFT,
+                )?
+            };
+            contexts[0].move_inference_runs += 1;
+            contexts[0].move_inference_us_total += state
+                .clock
+                .micros(qpc::now().saturating_sub(inference_start))
+                .max(0) as u64;
+            if let Some(inferred) = inferred {
+                contexts[0].move_inference_hits += 1;
+                inferred_move = true;
+                effective_change = Some(ChangeInfo {
+                    rects: inferred
+                        .remainder
+                        .into_iter()
+                        .map(|region| DirtyRect {
+                            x: region.x,
+                            y: region.y,
+                            w: region.w,
+                            h: region.h,
+                        })
+                        .collect(),
+                    moves: vec![super::source::MoveRect {
+                        src_x: inferred.movement.source.x,
+                        src_y: inferred.movement.source.y,
+                        dst_x: inferred.movement.destination.x,
+                        dst_y: inferred.movement.destination.y,
+                        w: inferred.movement.destination.w,
+                        h: inferred.movement.destination.h,
+                    }],
+                });
+            }
+        }
+        let move_change = effective_change.as_ref().filter(|change| {
             !change.moves.is_empty()
                 && change.moves.len() <= RECT_MAX_COUNT
-                && change.rects.len() <= RECT_MAX_COUNT
-                && change.dirty_bytes() <= RECT_MAX_BYTES
                 && change.moves.iter().fold(0u64, |pixels, movement| {
                     pixels.saturating_add(u64::from(movement.w) * u64::from(movement.h))
                 }) <= u64::from(state.capture.width()) * u64::from(state.capture.height())
                 && state.codec == encode::Codec::H264
                 && state.rects_enabled
                 && sparse_allowed
+                && assembler.is_empty()
                 && !force_full_once
-                && last_scheduled_seq.is_some()
+                && last_scheduled_seq == frame_seq.checked_sub(1)
         });
-        let fallback_change = change
+        let fallback_change = effective_change
             .as_ref()
             .filter(|change| move_change.is_none() && !change.moves.is_empty())
             .map(final_pixel_coverage);
+        let mut move_remainder_active = false;
         let mut routing =
             if let (Some(move_change), Some(baseline_seq)) = (move_change, last_scheduled_seq) {
-                raw_rect_attempted = true;
-                raw_rect_sent = true;
-                let pack_start = qpc::now();
                 let dirty_only = ChangeInfo {
                     rects: move_change.rects.clone(),
                     moves: Vec::new(),
                 };
-                let rect_pixels = state.capture.read_rects(&texture, &dirty_only)?;
-                RoutingPlan {
-                    raw: None,
-                    video: Some(VideoPlan {
-                        atomic_avc: false,
-                        kind: VideoKind::Regional,
-                        frame_width: state.capture.width(),
-                        frame_height: state.capture.height(),
-                        block_size: CODEC_BLOCK_SIZE as u16,
-                        coverage: Vec::new(),
-                        raw: None,
-                        move_update: Some(prepare_move(
-                            &move_change.moves,
-                            rects::RectUpdate {
-                                frame_seq,
-                                frame_width: state.capture.width(),
-                                frame_height: state.capture.height(),
-                                rects: rect_pixels,
-                            },
-                            baseline_seq,
-                            pack_start,
-                            &contexts[0],
-                        )?),
-                    }),
+                let raw_remainder = if dirty_only.rects.is_empty() {
+                    None
+                } else {
+                    block_aligned_raw_change(
+                        &dirty_only,
+                        state.capture.width(),
+                        state.capture.height(),
+                    )?
+                };
+                let remainder = if dirty_only.rects.is_empty() {
+                    rects::MoveRemainder::None
+                } else if raw_remainder.is_some() {
+                    rects::MoveRemainder::Raw
+                } else {
+                    rects::MoveRemainder::Video
+                };
+                let prepared = prepare_move(
+                    &move_change.moves,
+                    baseline_seq,
+                    frame_seq,
+                    state.capture.width(),
+                    state.capture.height(),
+                    remainder,
+                    inferred_move,
+                    qpc::now(),
+                    &contexts[0],
+                )?;
+                if admit_move(&state.tx, &contexts[0].sparse_tx, prepared)? {
+                    if inferred_move {
+                        contexts[0].inferred_moves += move_change.moves.len() as u64;
+                    } else {
+                        contexts[0].native_moves += move_change.moves.len() as u64;
+                    }
+                    move_remainder_active = true;
+                    last_scheduled_seq = Some(frame_seq);
+                    match remainder {
+                        rects::MoveRemainder::None => RoutingPlan {
+                            raw: None,
+                            video: None,
+                        },
+                        rects::MoveRemainder::Raw => RoutingPlan {
+                            raw: raw_remainder,
+                            video: None,
+                        },
+                        rects::MoveRemainder::Video => {
+                            let mut route = select_routing_plan(
+                                state.codec,
+                                false,
+                                false,
+                                false,
+                                state.capture.width(),
+                                state.capture.height(),
+                                Some(&dirty_only),
+                                &state.tiles,
+                            )?;
+                            route
+                                .video
+                                .as_mut()
+                                .expect("non-empty video-only remainder must make a video plan")
+                                .move_remainder = true;
+                            route
+                        }
+                    }
+                } else {
+                    let final_pixels = final_pixel_coverage(move_change);
+                    select_routing_plan(
+                        state.codec,
+                        !recovery.allows_overlays(),
+                        true,
+                        false,
+                        state.capture.width(),
+                        state.capture.height(),
+                        Some(&final_pixels),
+                        &state.tiles,
+                    )?
                 }
             } else {
                 select_routing_plan(
@@ -1589,7 +1724,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                     state.rects_enabled && sparse_allowed,
                     state.capture.width(),
                     state.capture.height(),
-                    fallback_change.as_ref().or(change.as_ref()),
+                    fallback_change.as_ref().or(effective_change.as_ref()),
                     &state.tiles,
                 )?
             };
@@ -1618,7 +1753,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 raw_only = Some(outbound);
             }
         }
-        let metadata_took_fast_path = raw_rect_attempted;
+        let metadata_took_fast_path = raw_rect_attempted || move_remainder_active;
 
         // Increment 3 (HLD §6b): the metadata missed, so measure instead of
         // trusting. Five conditions, each earning its place:
@@ -1744,6 +1879,9 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
 
         if let Some(outbound) = raw_only {
             raw_rect_sent = admit_rects(outbound, &mut contexts[0])?;
+            if move_remainder_active && !raw_rect_sent {
+                return Err("move raw remainder was rejected after its prelude".into());
+            }
             if raw_rect_sent {
                 last_scheduled_seq = Some(frame_seq);
             }
@@ -1771,6 +1909,11 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             contexts[0].diff_runs,
             contexts[0].diff_hits,
             contexts[0].diff_us_total,
+            contexts[0].native_moves,
+            contexts[0].inferred_moves,
+            contexts[0].move_inference_runs,
+            contexts[0].move_inference_hits,
+            contexts[0].move_inference_us_total,
         );
         for ctx in contexts.iter_mut().skip(1) {
             (
@@ -1778,31 +1921,23 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 ctx.diff_runs,
                 ctx.diff_hits,
                 ctx.diff_us_total,
+                ctx.native_moves,
+                ctx.inferred_moves,
+                ctx.move_inference_runs,
+                ctx.move_inference_hits,
+                ctx.move_inference_us_total,
             ) = shared;
         }
 
         let Some(plan) = routing.video else {
             continue;
         };
-        if plan.move_update.is_some() {
-            let assembled = assembler.begin_complete(frame_seq, plan);
-            if assembled.dropped != 0 {
-                recovery.drop_incomplete(assembled.dropped);
-                want_keyframe = true;
-            }
-            last_scheduled_seq = Some(frame_seq);
-            admit_ready_frames(
-                assembled.ready,
-                &mut contexts[0],
-                &state.tx,
-                &mut recovery,
-                &mut want_keyframe,
-            )?;
-            continue;
-        }
         let planned_coverage = plan.coverage.clone();
         let expected_tiles: Vec<_> = plan.coverage.iter().map(|(tile_id, _)| *tile_id).collect();
         let dropped = assembler.begin(frame_seq, plan, &expected_tiles);
+        if dropped != 0 && move_remainder_active {
+            return Err("move video remainder assembler dropped a frame after its prelude".into());
+        }
         if dropped != 0 {
             recovery.drop_incomplete(dropped);
             want_keyframe = true;

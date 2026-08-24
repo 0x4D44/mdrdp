@@ -65,13 +65,25 @@ pub struct MoveRect {
     pub h: u16,
 }
 
-/// One ordered move batch and its raw final-pixel remainder.
+/// The one lane that will finish a metadata-first move frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MoveRemainder {
+    None = 0,
+    Raw = 1,
+    Video = 2,
+}
+
+/// One pixel-free move prelude. Its declared remainder, if any, follows as the
+/// ordinary update type on the named lane with the same `frame_seq`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MoveUpdate {
+pub struct MovePrelude {
     /// The exact displayed canvas sequence the move sources refer to.
     pub baseline_seq: u64,
-    /// Sequence, geometry, and raw pixels for the resulting frame.
-    pub frame: RectUpdate,
+    pub frame_seq: u64,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub remainder: MoveRemainder,
     pub moves: Vec<MoveRect>,
 }
 
@@ -85,8 +97,8 @@ pub const ENCODING_RAW_BGRA: u8 = 0;
 const UPDATE_HEADER_LEN: usize = 8 + 4 + 4 + 2;
 /// Per-rect prefix ahead of the pixels: `x`, `y`, `w`, `h`, `encoding`, `pixel_bytes`.
 const RECT_HEADER_LEN: usize = 2 + 2 + 2 + 2 + 1 + 4;
-/// `baseline_seq`, `move_count`; the regular rect update follows the moves.
-const MOVE_UPDATE_HEADER_LEN: usize = 8 + 2;
+/// `baseline_seq`, `frame_seq`, geometry, remainder, reserved, and `move_count`.
+const MOVE_PRELUDE_HEADER_LEN: usize = 8 + 8 + 4 + 4 + 1 + 1 + 2;
 const MOVE_RECT_LEN: usize = 6 * 2;
 
 /// Bytes per pixel in both the wire format (BGRA) and the canvas (RGBA).
@@ -147,8 +159,12 @@ pub enum RectsError {
     RawAreaLimit { pixels: u64, limit: u64 },
     /// Move sources must name a strictly older displayed canvas.
     InvalidBaseline { baseline_seq: u64, frame_seq: u64 },
-    /// A bulk move payload must carry at least one ordered move.
+    /// A move prelude must carry at least one ordered move.
     NoMoves,
+    /// The move prelude named an unknown remainder lane.
+    UnknownMoveRemainder(u8),
+    /// Reserved move-prelude bits must remain zero.
+    MoveReserved(u8),
 }
 
 impl std::fmt::Display for RectsError {
@@ -236,6 +252,12 @@ impl std::fmt::Display for RectsError {
                 "rects: move baseline {baseline_seq} is not older than frame {frame_seq}"
             ),
             RectsError::NoMoves => write!(f, "rects: move update contains no moves"),
+            RectsError::UnknownMoveRemainder(value) => {
+                write!(f, "rects: move prelude uses unknown remainder {value}")
+            }
+            RectsError::MoveReserved(value) => {
+                write!(f, "rects: move prelude reserved byte is {value}, not zero")
+            }
         }
     }
 }
@@ -289,20 +311,20 @@ pub fn encode(update: &RectUpdate, out: &mut Vec<u8>) {
     }
 }
 
-/// Bytes [`encode_move_update`] will append for `update`.
-pub fn move_encoded_len(update: &MoveUpdate) -> usize {
-    MOVE_UPDATE_HEADER_LEN + update.moves.len() * MOVE_RECT_LEN + encoded_len(&update.frame)
+/// Bytes [`encode_move_prelude`] will append for `update`.
+pub fn move_encoded_len(update: &MovePrelude) -> usize {
+    MOVE_PRELUDE_HEADER_LEN + update.moves.len() * MOVE_RECT_LEN
 }
 
-/// Encode one move payload. Sender-side shape mistakes are invariant failures;
-/// network-facing validation lives in [`decode_move_update`].
-pub fn encode_move_update(update: &MoveUpdate, out: &mut Vec<u8>) {
+/// Encode one move prelude. Sender-side shape mistakes are invariant failures;
+/// network-facing validation lives in [`decode_move_prelude`].
+pub fn encode_move_prelude(update: &MovePrelude, out: &mut Vec<u8>) {
     assert!(
         !update.moves.is_empty(),
         "rects: move update must contain a move"
     );
     assert!(
-        update.baseline_seq < update.frame.frame_seq,
+        update.baseline_seq < update.frame_seq,
         "rects: move baseline must be older than its frame"
     );
     assert!(
@@ -312,6 +334,11 @@ pub fn encode_move_update(update: &MoveUpdate, out: &mut Vec<u8>) {
     );
     out.reserve(move_encoded_len(update));
     out.extend_from_slice(&update.baseline_seq.to_le_bytes());
+    out.extend_from_slice(&update.frame_seq.to_le_bytes());
+    out.extend_from_slice(&update.frame_width.to_le_bytes());
+    out.extend_from_slice(&update.frame_height.to_le_bytes());
+    out.push(update.remainder as u8);
+    out.push(0);
     out.extend_from_slice(&(update.moves.len() as u16).to_le_bytes());
     for movement in &update.moves {
         out.extend_from_slice(&movement.src_x.to_le_bytes());
@@ -321,7 +348,6 @@ pub fn encode_move_update(update: &MoveUpdate, out: &mut Vec<u8>) {
         out.extend_from_slice(&movement.w.to_le_bytes());
         out.extend_from_slice(&movement.h.to_le_bytes());
     }
-    encode(&update.frame, out);
 }
 
 /// A bounds-checked forward reader. Every read either yields the bytes or reports
@@ -459,10 +485,23 @@ pub fn decode(payload: &[u8]) -> Result<RectUpdate, RectsError> {
     })
 }
 
-/// Parse and fully validate one move payload before exposing it to a canvas.
-pub fn decode_move_update(payload: &[u8]) -> Result<MoveUpdate, RectsError> {
+/// Parse and fully validate one pixel-free move prelude.
+pub fn decode_move_prelude(payload: &[u8]) -> Result<MovePrelude, RectsError> {
     let mut reader = Reader::new(payload);
     let baseline_seq = reader.u64("move.baseline_seq")?;
+    let frame_seq = reader.u64("move.frame_seq")?;
+    let frame_width = reader.u32("move.frame_width")?;
+    let frame_height = reader.u32("move.frame_height")?;
+    let remainder = match reader.u8("move.remainder")? {
+        0 => MoveRemainder::None,
+        1 => MoveRemainder::Raw,
+        2 => MoveRemainder::Video,
+        value => return Err(RectsError::UnknownMoveRemainder(value)),
+    };
+    let reserved = reader.u8("move.reserved")?;
+    if reserved != 0 {
+        return Err(RectsError::MoveReserved(reserved));
+    }
     let move_count = reader.u16("move.move_count")? as usize;
     if move_count == 0 {
         return Err(RectsError::NoMoves);
@@ -479,26 +518,30 @@ pub fn decode_move_update(payload: &[u8]) -> Result<MoveUpdate, RectsError> {
         });
     }
 
-    let frame = decode(&payload[reader.pos..])?;
-    if baseline_seq >= frame.frame_seq {
+    if reader.remaining() != 0 {
+        return Err(RectsError::TrailingBytes {
+            extra: reader.remaining(),
+        });
+    }
+    if baseline_seq >= frame_seq {
         return Err(RectsError::InvalidBaseline {
             baseline_seq,
-            frame_seq: frame.frame_seq,
+            frame_seq,
         });
     }
 
-    let canvas_pixels = u64::from(frame.frame_width) * u64::from(frame.frame_height);
+    let canvas_pixels = u64::from(frame_width) * u64::from(frame_height);
     let mut move_pixels = 0u64;
     for (move_index, movement) in moves.iter().enumerate() {
         if movement.w == 0 || movement.h == 0 {
             return Err(RectsError::MoveZeroArea { move_index });
         }
         let source_fits = u64::from(movement.src_x) + u64::from(movement.w)
-            <= u64::from(frame.frame_width)
-            && u64::from(movement.src_y) + u64::from(movement.h) <= u64::from(frame.frame_height);
+            <= u64::from(frame_width)
+            && u64::from(movement.src_y) + u64::from(movement.h) <= u64::from(frame_height);
         let destination_fits = u64::from(movement.dst_x) + u64::from(movement.w)
-            <= u64::from(frame.frame_width)
-            && u64::from(movement.dst_y) + u64::from(movement.h) <= u64::from(frame.frame_height);
+            <= u64::from(frame_width)
+            && u64::from(movement.dst_y) + u64::from(movement.h) <= u64::from(frame_height);
         if !source_fits || !destination_fits {
             return Err(RectsError::MoveOutOfCanvas { move_index });
         }
@@ -511,9 +554,12 @@ pub fn decode_move_update(payload: &[u8]) -> Result<MoveUpdate, RectsError> {
         }
     }
 
-    Ok(MoveUpdate {
+    Ok(MovePrelude {
         baseline_seq,
-        frame,
+        frame_seq,
+        frame_width,
+        frame_height,
+        remainder,
         moves,
     })
 }
@@ -1236,15 +1282,13 @@ mod tests {
     }
 
     #[test]
-    fn move_update_round_trips_with_an_explicit_baseline() {
-        let update = MoveUpdate {
+    fn move_prelude_round_trips_without_pixels() {
+        let update = MovePrelude {
             baseline_seq: 40,
-            frame: RectUpdate {
-                frame_seq: 44,
-                frame_width: 8,
-                frame_height: 4,
-                rects: vec![rect(0, 3, 8, 1, 7)],
-            },
+            frame_seq: 44,
+            frame_width: 8,
+            frame_height: 4,
+            remainder: MoveRemainder::Raw,
             moves: vec![MoveRect {
                 src_x: 0,
                 src_y: 1,
@@ -1256,21 +1300,20 @@ mod tests {
         };
         let mut payload = Vec::new();
 
-        encode_move_update(&update, &mut payload);
+        encode_move_prelude(&update, &mut payload);
 
-        assert_eq!(decode_move_update(&payload).unwrap(), update);
+        assert_eq!(decode_move_prelude(&payload).unwrap(), update);
+        assert_eq!(payload.len(), MOVE_PRELUDE_HEADER_LEN + MOVE_RECT_LEN);
     }
 
     #[test]
     fn move_update_rejects_a_non_older_baseline() {
-        let update = MoveUpdate {
+        let update = MovePrelude {
             baseline_seq: 40,
-            frame: RectUpdate {
-                frame_seq: 44,
-                frame_width: 8,
-                frame_height: 4,
-                rects: vec![],
-            },
+            frame_seq: 44,
+            frame_width: 8,
+            frame_height: 4,
+            remainder: MoveRemainder::None,
             moves: vec![MoveRect {
                 src_x: 0,
                 src_y: 0,
@@ -1281,11 +1324,11 @@ mod tests {
             }],
         };
         let mut payload = Vec::new();
-        encode_move_update(&update, &mut payload);
+        encode_move_prelude(&update, &mut payload);
         payload[..8].copy_from_slice(&44u64.to_le_bytes());
 
         assert_eq!(
-            decode_move_update(&payload),
+            decode_move_prelude(&payload),
             Err(RectsError::InvalidBaseline {
                 baseline_seq: 44,
                 frame_seq: 44
@@ -1295,17 +1338,15 @@ mod tests {
 
     #[test]
     fn move_update_cannot_masquerade_as_a_bulk_raw_update() {
-        let frame = RectUpdate {
-            frame_seq: 44,
-            frame_width: 8,
-            frame_height: 4,
-            rects: vec![rect(0, 0, 1, 1, 9)],
-        };
-        let mut payload = 40u64.to_le_bytes().to_vec();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&40u64.to_le_bytes());
+        payload.extend_from_slice(&44u64.to_le_bytes());
+        payload.extend_from_slice(&8u32.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&[MoveRemainder::Raw as u8, 0]);
         payload.extend_from_slice(&0u16.to_le_bytes());
-        encode(&frame, &mut payload);
 
-        assert_eq!(decode_move_update(&payload), Err(RectsError::NoMoves));
+        assert_eq!(decode_move_prelude(&payload), Err(RectsError::NoMoves));
     }
 
     #[test]
@@ -1328,14 +1369,12 @@ mod tests {
 
     #[test]
     fn every_move_payload_truncation_is_refused_without_panicking() {
-        let update = MoveUpdate {
+        let update = MovePrelude {
             baseline_seq: 40,
-            frame: RectUpdate {
-                frame_seq: 44,
-                frame_width: 8,
-                frame_height: 4,
-                rects: vec![rect(0, 3, 8, 1, 7)],
-            },
+            frame_seq: 44,
+            frame_width: 8,
+            frame_height: 4,
+            remainder: MoveRemainder::Raw,
             moves: vec![MoveRect {
                 src_x: 0,
                 src_y: 1,
@@ -1346,11 +1385,11 @@ mod tests {
             }],
         };
         let mut payload = Vec::new();
-        encode_move_update(&update, &mut payload);
+        encode_move_prelude(&update, &mut payload);
 
         for end in 0..payload.len() {
             assert!(
-                decode_move_update(&payload[..end]).is_err(),
+                decode_move_prelude(&payload[..end]).is_err(),
                 "accepted {end}"
             );
         }

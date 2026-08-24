@@ -29,8 +29,8 @@ use super::ssh::{self, ForwardPorts, ProbeFailure, Tunnel, TunnelSpec};
 
 /// The wire dialects this client speaks. A range, not an equality, so the day a
 /// compatible v5 exists the gate loosens without a format break (review S-m4).
-pub const WIRE_VERSION_MIN: u32 = 8;
-pub const WIRE_VERSION_MAX: u32 = 8;
+pub const WIRE_VERSION_MIN: u32 = 9;
+pub const WIRE_VERSION_MAX: u32 = 9;
 
 /// The IDD backing-pixel mode and Windows UI scale selected by the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn a_green_host_probes_through_to_connected_sockets_and_a_parsed_header() {
         // Extra bytes after the header must survive inside the reassembler.
-        let mut payload = header_bytes(8);
+        let mut payload = header_bytes(WIRE_VERSION_MAX);
         let mut second = Vec::new();
         framing::encode(framing::MSG_VIDEO_SEQ, &[0u8; 12], &mut second);
         payload.extend_from_slice(&second[..7]); // a partial second message
@@ -748,7 +748,7 @@ mod tests {
             },
         )
         .expect("probe should succeed");
-        assert_eq!(ok.header.wire_version, 8);
+        assert_eq!(ok.header.wire_version, WIRE_VERSION_MAX);
         assert_eq!((ok.header.width, ok.header.height), (2560, 1440));
         assert!(
             ok.reassembler.buffered() > 0,
@@ -760,7 +760,7 @@ mod tests {
             vec![
                 (STAGE_TUNNEL_UP, None),
                 (STAGE_PROBE, None),
-                (STAGE_HANDSHAKE, Some("wire v8".to_owned())),
+                (STAGE_HANDSHAKE, Some("wire v9".to_owned())),
             ]
         );
     }
@@ -841,7 +841,13 @@ mod tests {
         let (ports, _aux, _joins) =
             fake_host(Some(status_line(&green_report())), Some(header_bytes(3)));
         let err = probe_over(ports, far_deadline(), || None, |_, _| {}).unwrap_err();
-        assert_eq!(err, ProbeFailure::VersionMismatch { host: 3, client: 8 });
+        assert_eq!(
+            err,
+            ProbeFailure::VersionMismatch {
+                host: 3,
+                client: WIRE_VERSION_MAX
+            }
+        );
     }
 
     /// Poll the counter rather than sleeping a guessed interval.
@@ -868,8 +874,10 @@ mod tests {
         // zero only because the absent `clipboard` field held the gate shut.
         // That is the shape a deployed 0.4.0 host sends: the field is missing,
         // not false.
-        let (ports, aux_accepts, _joins) =
-            fake_host(Some(status_line(&green_report())), Some(header_bytes(8)));
+        let (ports, aux_accepts, _joins) = fake_host(
+            Some(status_line(&green_report())),
+            Some(header_bytes(WIRE_VERSION_MAX)),
+        );
         let ok =
             probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
         assert!(!ok.header.clipboard, "an absent flag must read as false");
@@ -891,7 +899,7 @@ mod tests {
         // covering for a gate that only works by accident.
         let (ports, aux_accepts, _joins) = fake_host(
             Some(status_line(&green_report())),
-            Some(header_bytes_advertising(8, false)),
+            Some(header_bytes_advertising(WIRE_VERSION_MAX, false)),
         );
         let ok =
             probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
@@ -904,7 +912,7 @@ mod tests {
     fn a_host_that_advertises_the_channel_is_connected_to_exactly_once() {
         let (ports, aux_accepts, _joins) = fake_host(
             Some(status_line(&green_report())),
-            Some(header_bytes_advertising(8, true)),
+            Some(header_bytes_advertising(WIRE_VERSION_MAX, true)),
         );
         let ok =
             probe_over(ports, far_deadline(), || None, |_, _| {}).expect("probe should succeed");
@@ -924,7 +932,7 @@ mod tests {
         // connect would make an optional feature able to break the product.
         let (ports, _aux_accepts, _joins) = fake_host_with(
             Some(status_line(&green_report())),
-            Some(header_bytes_advertising(8, true)),
+            Some(header_bytes_advertising(WIRE_VERSION_MAX, true)),
             AuxHost::Dead,
         );
         let ok = probe_over(ports, far_deadline(), || None, |_, _| {})

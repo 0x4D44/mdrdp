@@ -35,10 +35,11 @@ pub const MSG_CURSOR: u8 = 6;
 /// One atomic regional/full H.264 update. The payload carries every selected
 /// tile AU and the exact desktop coverage those decoded pixels may replace.
 pub const MSG_VIDEO_UPDATE: u8 = 7;
-/// One ordered screen-to-screen copy batch plus its raw final-pixel remainder.
+/// Sparse-lane pixel-free move prelude. The declared raw/video remainder follows
+/// as its ordinary message type with the same frame sequence.
 pub const MSG_MOVE_UPDATE: u8 = 8;
-/// Sparse-lane half of a move rendezvous. The sparse reader pauses after all
-/// earlier raw updates and resumes only after the named bulk move commits.
+/// Bulk-lane baseline barrier for a move prelude. It ensures every earlier bulk
+/// update is visible before the screen-to-screen copy reads its source.
 pub const MSG_MOVE_FENCE: u8 = 9;
 
 pub const MOVE_FENCE_BYTES: usize = 16;

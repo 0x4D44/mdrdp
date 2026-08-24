@@ -37,9 +37,8 @@ pub enum Outbound {
     /// One complete logical video update. Coverage and all selected tile AUs share
     /// one framed payload, so the socket cannot expose a partial 5K update.
     Video(Vec<FrameTile>, Vec<u8>, Option<AdmissionGate>),
-    /// Ordered screen copy plus raw exposed pixels. Its sparse-lane fence shares
-    /// the gate, so neither half can become visible after a local queue rejection.
-    Move(Box<RectRecord>, Vec<u8>, Option<AdmissionGate>),
+    /// Bulk-lane baseline barrier paired atomically with a sparse move prelude.
+    MoveFence(Vec<u8>, Option<AdmissionGate>),
     /// HEVC remains the explicit full-frame fallback and retains its existing
     /// per-tile envelope; it never claims the AVC regional-update contract.
     FrameSet(Vec<FrameTile>),
@@ -374,17 +373,11 @@ impl Sender {
                     );
                 }
             }
-            Outbound::Move(mut record, payload, gate) => {
+            Outbound::MoveFence(payload, gate) => {
                 if gate.as_ref().is_some_and(|gate| !gate.admitted()) {
                     return;
                 }
-                let delivered = self.write_message(framing::MSG_MOVE_UPDATE, &payload);
-                send_schedule::emit_if_delivered(
-                    delivered,
-                    &mut record,
-                    |record| record.send_done_us = self.clock.micros(qpc::now()),
-                    |record| stats_lines.push(crate::stats::to_line(&*record)),
-                );
+                self.write_message(framing::MSG_MOVE_FENCE, &payload);
             }
             Outbound::FrameSet(tiles) => {
                 for mut tile in tiles {
@@ -432,7 +425,7 @@ impl Sender {
             // so stats may follow payloads that arrived later in this bounded batch
             // rather than delaying those payloads.
             send_schedule::payload_first(&mut batch, |msg| match msg {
-                Outbound::Video(..) | Outbound::Move(..) | Outbound::FrameSet(..) => {
+                Outbound::Video(..) | Outbound::MoveFence(..) | Outbound::FrameSet(..) => {
                     BatchKind::Payload
                 }
                 Outbound::Line(..) => BatchKind::Line,
