@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Bound total live surface pixels before callbacks allocate (`client.rs:handle_create_surface`).
+  A valid u16 width and height can still request gigabytes, and many individually bounded surface
+  IDs can do the same in aggregate. Account same-ID replacement and deletion inside the client.
+
 - AVC region structs are inclusive but stream masks are exclusive (`pdu/avc.rs:Avc420Region::to_rectangle`).
   Convert right and bottom only when building the wire rectangle. Copying the stored bounds omits
   the final row and column from AVC420, both AVC444 substreams, and mixed-tile updates.

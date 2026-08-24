@@ -500,6 +500,12 @@ impl H264DecoderFactory {
 // Graphics Pipeline Client
 // ============================================================================
 
+/// The handler stores every live protocol surface as four-byte RGBA. A 64-Mpixel
+/// budget permits one 8192-square surface (256 MiB) or several product-sized
+/// surfaces, while preventing a server from exhausting memory through either one
+/// huge surface or many individually legal IDs.
+const MAX_LIVE_SURFACE_PIXELS: u64 = 64 * 1024 * 1024;
+
 /// Client for the Graphics Pipeline Virtual Channel (EGFX)
 ///
 /// This client handles capability negotiation, surface tracking,
@@ -519,6 +525,7 @@ pub struct GraphicsPipelineClient {
     codec_caps: CodecCapabilities,
 
     surfaces: BTreeMap<u16, Surface>,
+    live_surface_pixels: u64,
     current_frame_id: Option<u32>,
     frames_queued: u32,
     total_frames_decoded: u32,
@@ -578,6 +585,7 @@ impl GraphicsPipelineClient {
             negotiated_caps: None,
             codec_caps: CodecCapabilities::default(),
             surfaces: BTreeMap::new(),
+            live_surface_pixels: 0,
             current_frame_id: None,
             frames_queued: 0,
             total_frames_decoded: 0,
@@ -886,6 +894,27 @@ impl GraphicsPipelineClient {
             return;
         }
 
+        let pixels = u64::from(width) * u64::from(height);
+        let replaced_pixels = self
+            .surfaces
+            .get(&surface_id)
+            .map(|surface| u64::from(surface.width) * u64::from(surface.height))
+            .unwrap_or(0);
+        let next_live_pixels = self
+            .live_surface_pixels
+            .saturating_sub(replaced_pixels)
+            .saturating_add(pixels);
+        if next_live_pixels > MAX_LIVE_SURFACE_PIXELS {
+            warn!(
+                surface_id,
+                width,
+                height,
+                next_live_pixels,
+                "Ignoring CreateSurface outside the client allocation budget"
+            );
+            return;
+        }
+
         let surface = Surface {
             id: surface_id,
             width,
@@ -905,12 +934,15 @@ impl GraphicsPipelineClient {
         debug!(surface_id, width, height, ?pixel_format, "Surface created");
         self.handler.on_surface_created(&surface);
         self.surfaces.insert(surface_id, surface);
+        self.live_surface_pixels = next_live_pixels;
     }
 
     fn handle_delete_surface(&mut self, surface_id: u16) {
         self.avc444_buffers.remove(&surface_id);
         self.retire_decoder(surface_id);
-        if self.surfaces.remove(&surface_id).is_some() {
+        if let Some(surface) = self.surfaces.remove(&surface_id) {
+            let pixels = u64::from(surface.width) * u64::from(surface.height);
+            self.live_surface_pixels = self.live_surface_pixels.saturating_sub(pixels);
             debug!(surface_id, "Surface deleted");
             self.handler.on_surface_deleted(surface_id);
         } else {
@@ -1742,6 +1774,96 @@ mod tests {
         client.close(0);
         assert_eq!(client.state, ClientState::Closed);
         assert!(!client.is_active());
+    }
+
+    #[test]
+    fn oversized_surface_is_rejected_before_the_allocation_callback() {
+        struct CountCreates(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl GraphicsPipelineHandler for CountCreates {
+            fn on_surface_created(&mut self, _surface: &Surface) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let creates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(CountCreates(std::sync::Arc::clone(&creates))),
+            None,
+        );
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: u16::MAX,
+            height: u16::MAX,
+            pixel_format: PixelFormat::XRgb,
+        }));
+
+        assert_eq!(creates.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!client.surfaces.contains_key(&1));
+    }
+
+    #[test]
+    fn protocol_legal_skinny_surface_is_not_rejected_by_monitor_limits() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 32_766,
+            height: 1,
+            pixel_format: PixelFormat::XRgb,
+        }));
+
+        assert!(client.surfaces.contains_key(&1));
+        assert_eq!(client.live_surface_pixels, 32_766);
+    }
+
+    #[test]
+    fn live_surface_memory_budget_accounts_for_id_replacement() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 8192,
+            height: 8192,
+            pixel_format: PixelFormat::XRgb,
+        }));
+        assert!(client.surfaces.contains_key(&1));
+
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 2,
+            width: 1,
+            height: 1,
+            pixel_format: PixelFormat::XRgb,
+        }));
+        assert!(
+            !client.surfaces.contains_key(&2),
+            "the total live-surface budget must reject another allocation"
+        );
+
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 1,
+            height: 1,
+            pixel_format: PixelFormat::XRgb,
+        }));
+        assert_eq!(
+            client.surfaces.get(&1).map(|surface| surface.width),
+            Some(1)
+        );
+        assert_eq!(client.live_surface_pixels, 1);
+
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: u16::MAX,
+            height: u16::MAX,
+            pixel_format: PixelFormat::XRgb,
+        }));
+        assert_eq!(
+            client.surfaces.get(&1).map(|surface| surface.width),
+            Some(1),
+            "a rejected same-id surface must preserve the live incarnation"
+        );
+        assert_eq!(client.live_surface_pixels, 1);
+
+        client.handle_delete_surface(1);
+        assert_eq!(client.live_surface_pixels, 0);
     }
 
     #[test]
