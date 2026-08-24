@@ -660,6 +660,15 @@ impl SurfaceStore {
             if had_fallback || had_suppressed_presentation || frame_visible_dirty {
                 self.touch_presentation();
             }
+        } else if self.output.is_none() {
+            // A frame that terminally deletes the mapped surface publishes an empty
+            // presentation at the frame boundary. Retaining the fallback here would
+            // leave pixels from a surface the server destroyed visible indefinitely.
+            self.presentation_fallback = None;
+            self.presentation_suppressed = false;
+            if had_fallback || had_suppressed_presentation || frame_visible_dirty {
+                self.touch_presentation();
+            }
         } else if had_suppressed_presentation || (!had_fallback && frame_visible_dirty) {
             self.presentation_suppressed = true;
         }
@@ -729,13 +738,28 @@ impl SurfaceStore {
     }
 
     pub fn delete(&mut self, id: u16) {
-        if self.output == Some(id) {
+        let deleting_output = self.output == Some(id);
+        let idle_presentation_changed = deleting_output
+            && matches!(self.frame_state, FrameState::Idle)
+            && (self.presentation_fallback.is_some()
+                || self.presentation_suppressed
+                || self.output_surface().is_some_and(Surface::is_painted));
+        if deleting_output {
             self.mark_frame_visible_dirty();
-            self.retain_painted_output();
+            if !matches!(self.frame_state, FrameState::Idle) {
+                self.retain_painted_output();
+            }
         }
         self.surfaces.remove(&id);
-        if self.output == Some(id) {
+        if deleting_output {
             self.output = None;
+            if matches!(self.frame_state, FrameState::Idle) {
+                self.presentation_fallback = None;
+                self.presentation_suppressed = false;
+                if idle_presentation_changed {
+                    self.touch_presentation();
+                }
+            }
         }
     }
 
@@ -1902,6 +1926,60 @@ mod tests {
         assert!(
             store.output_surface().is_none(),
             "deleting clears the mapping"
+        );
+    }
+
+    #[test]
+    fn deleting_the_only_mapped_surface_clears_the_presentation() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+
+        let before = store.generation();
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+
+        store.delete(1);
+
+        assert_eq!(store.generation(), before + 1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Empty
+        );
+        assert!(snapshot.pixels.is_empty());
+    }
+
+    #[test]
+    fn terminal_frame_delete_clears_only_at_commit() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+
+        let before = store.generation();
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+
+        store.begin_frame(7);
+        store.delete(1);
+        assert_eq!(store.generation(), before);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+
+        assert!(store.commit_frame(7));
+        assert_eq!(store.generation(), before + 1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Empty
         );
     }
 
