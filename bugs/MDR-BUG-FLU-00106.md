@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00106 — RDP input deadline expires while waiting for hinted display traffic
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/input-latency
 - **Raised:** 2026-08-24T12:24:24Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T122653Z-f395f582
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00106-run-fix-20260824T122653Z-f395f582
-- **Owner base:** 04aa9824d6944d6e0f31806cf63d975d2f5ecf83
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T12:26:53Z
-- **Owner until:** 2026-08-24T14:26:53Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T12:24:24Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-24T12:24:24Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T12:35:03Z, deltic:auto role=fix run=fix-20260824T122653Z-f395f582 branch=task/bug-MDR-BUG-FLU-00106-run-fix-20260824T122653Z-f395f582 code=99ec3be gate=manual)
 
 ## Observation
 
