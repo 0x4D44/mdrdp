@@ -6,15 +6,15 @@
 - **Area:** native/latency
 - **Raised:** 2026-08-24T17:13:35Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260824T171359Z-6508958c
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00113-run-fix-20260824T171359Z-6508958c
+- **Owner base:** 157a227437182e35ffea50a69aa00fe41879606e
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-24T17:13:59Z
+- **Owner until:** 2026-08-24T19:13:59Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
