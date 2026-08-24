@@ -6,13 +6,16 @@
 //! clocks are not synchronised, by design — so server lines are passed through in a
 //! wrapper that keeps them visibly separate rather than merged into the same shape.
 //!
-//! Lines are flushed individually. The operator ends a run with Ctrl-C or by closing
-//! the window, and a buffered tail lost at that moment is a measurement lost.
+//! A dedicated writer thread flushes lines individually. The bounded handoff never
+//! makes decode or present wait for disk; overload is recorded explicitly. The
+//! operator ends a run with Ctrl-C or by closing the window, and a buffered tail lost
+//! at that moment is a measurement lost.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -333,64 +336,260 @@ pub fn server_line(payload: &[u8]) -> String {
     }
 }
 
+/// Enough room for ordinary writer jitter without turning a sustained slow disk into
+/// unbounded memory growth. Producers never wait for this queue: overflow is counted
+/// and written as an explicit `stats_drop` record when the writer catches up.
+const WRITE_QUEUE_CAPACITY: usize = 1_024;
+/// Cap the queue by bytes as well as records. Legitimate stats JSON is a few KiB;
+/// video access units use another message type and never enter this queue.
+const MAX_QUEUED_LINE_BYTES: usize = 16 * 1024;
+/// Bound work on untrusted server stats before UTF-8 validation or JSON wrapping.
+/// JSON escaping can expand one input byte to six output bytes.
+const MAX_SERVER_LINE_BYTES: usize = 2 * 1024;
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+enum WriterCommand {
+    Line(String),
+    Flush(mpsc::SyncSender<()>),
+}
+
 /// The stats file, or a sink that discards everything when `--out` was not given.
-#[derive(Debug)]
 pub struct StatsLog {
-    out: Mutex<Option<BufWriter<File>>>,
+    sender: Option<mpsc::SyncSender<WriterCommand>>,
+    enqueue_gate: RwLock<()>,
+    closed: AtomicBool,
+    dropped: Arc<AtomicU64>,
+    write_failed: Arc<AtomicBool>,
     /// A write failure is reported once. A per-frame warning would bury the run's own
     /// output under thousands of identical lines.
-    warned: AtomicBool,
+    writer_warned: AtomicBool,
 }
 
 impl StatsLog {
     pub fn create(path: Option<&str>) -> std::io::Result<Self> {
-        let out = match path {
-            Some(p) => Some(BufWriter::new(File::create(p)?)),
-            None => None,
-        };
-        Ok(Self {
-            out: Mutex::new(out),
-            warned: AtomicBool::new(false),
-        })
+        match path {
+            Some(p) => Self::with_writer(Box::new(BufWriter::new(File::create(p)?))),
+            None => Ok(Self::discarding()),
+        }
     }
 
     /// A log that writes nowhere — for tests and for a run without `--out`.
     pub fn discarding() -> Self {
         Self {
-            out: Mutex::new(None),
-            warned: AtomicBool::new(false),
+            sender: None,
+            enqueue_gate: RwLock::new(()),
+            closed: AtomicBool::new(false),
+            dropped: Arc::new(AtomicU64::new(0)),
+            write_failed: Arc::new(AtomicBool::new(false)),
+            writer_warned: AtomicBool::new(false),
         }
     }
 
+    fn with_writer(mut out: Box<dyn Write + Send>) -> std::io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker_dropped = dropped.clone();
+        let write_failed = Arc::new(AtomicBool::new(false));
+        let worker_write_failed = write_failed.clone();
+        drop(
+            std::thread::Builder::new()
+                .name("spike-stats".to_owned())
+                .spawn(move || {
+                    let mut write_warned = false;
+                    while let Ok(command) = receiver.recv() {
+                        if !write_dropped_count(&mut *out, &worker_dropped, &mut write_warned) {
+                            worker_write_failed.store(true, Ordering::Relaxed);
+                        }
+                        match command {
+                            WriterCommand::Line(line) => {
+                                if !write_one_line(&mut *out, &line, &mut write_warned) {
+                                    worker_dropped.fetch_add(1, Ordering::Relaxed);
+                                    worker_write_failed.store(true, Ordering::Relaxed);
+                                }
+                            }
+                            WriterCommand::Flush(done) => {
+                                if !flush_writer(&mut *out, &mut write_warned) {
+                                    worker_write_failed.store(true, Ordering::Relaxed);
+                                }
+                                let _ = done.send(());
+                            }
+                        }
+                    }
+                    // The final sender disappeared. Drain any loss count that raced the
+                    // last queued command, then make the best bounded-process-lifetime
+                    // effort to persist the tail.
+                    if !write_dropped_count(&mut *out, &worker_dropped, &mut write_warned) {
+                        worker_write_failed.store(true, Ordering::Relaxed);
+                    }
+                    if !flush_writer(&mut *out, &mut write_warned) {
+                        worker_write_failed.store(true, Ordering::Relaxed);
+                    }
+                })?,
+        );
+        Ok(Self {
+            sender: Some(sender),
+            enqueue_gate: RwLock::new(()),
+            closed: AtomicBool::new(false),
+            dropped,
+            write_failed,
+            writer_warned: AtomicBool::new(false),
+        })
+    }
+
     pub fn record<T: Serialize>(&self, value: &T) {
-        self.write_line(&to_line(value));
+        self.enqueue(to_line(value));
     }
 
     pub fn write_line(&self, line: &str) {
-        let mut guard = self
-            .out
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(file) = guard.as_mut() else {
+        if line.len() > MAX_QUEUED_LINE_BYTES {
+            self.count_drop();
+            return;
+        }
+        self.enqueue(line.to_owned());
+    }
+
+    pub fn record_server_line(&self, payload: &[u8]) {
+        if payload.len() > MAX_SERVER_LINE_BYTES {
+            self.count_drop();
+            return;
+        }
+        self.enqueue(server_line(payload));
+    }
+
+    fn enqueue(&self, line: String) {
+        let Some(sender) = &self.sender else {
             return;
         };
-        // Flushed per line: see the module docs.
-        let result = writeln!(file, "{line}").and_then(|()| file.flush());
-        if let Err(e) = result {
-            if !self.warned.swap(true, Ordering::Relaxed) {
-                eprintln!("stats: write failed, further failures are silent: {e}");
+        if line.len() > MAX_QUEUED_LINE_BYTES {
+            self.count_drop();
+            return;
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let _gate = match self.enqueue_gate.try_read() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        match sender.try_send(WriterCommand::Line(line)) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.warn_writer_once("stats: writer stopped; further records are discarded");
             }
         }
     }
 
-    pub fn flush(&self) {
-        let mut guard = self
-            .out
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(file) = guard.as_mut() {
-            let _ = file.flush();
+    fn count_drop(&self) {
+        if self.sender.is_none() || self.closed.load(Ordering::SeqCst) {
+            return;
         }
+        let _gate = match self.enqueue_gate.try_read() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        if !self.closed.load(Ordering::SeqCst) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn flush(&self) -> bool {
+        // The gate establishes that no producer can pass the final flush marker.
+        // A producer racing shutdown either finishes first or observes `closed`.
+        self.closed.store(true, Ordering::SeqCst);
+        let _gate = self
+            .enqueue_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ok = self.flush_for(FLUSH_TIMEOUT);
+        if !ok {
+            self.warn_writer_once(
+                "stats: final flush failed or timed out; the unwritten tail may be lost",
+            );
+        }
+        ok
+    }
+
+    fn flush_for(&self, timeout: Duration) -> bool {
+        let Some(sender) = &self.sender else {
+            return true;
+        };
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let deadline = Instant::now() + timeout;
+        let mut command = WriterCommand::Flush(done_tx);
+        loop {
+            match sender.try_send(command) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    command = returned;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        done_rx.recv_timeout(deadline - now).is_ok() && !self.write_failed.load(Ordering::Relaxed)
+    }
+
+    fn warn_writer_once(&self, message: &str) {
+        if !self.writer_warned.swap(true, Ordering::Relaxed) {
+            eprintln!("{message}");
+        }
+    }
+}
+
+fn write_dropped_count(out: &mut dyn Write, dropped: &AtomicU64, warned: &mut bool) -> bool {
+    let count = dropped.swap(0, Ordering::Relaxed);
+    if count != 0
+        && !write_one_line(
+            out,
+            &format!(r#"{{"type":"stats_drop","lines":{count}}}"#),
+            warned,
+        )
+    {
+        dropped.fetch_add(count, Ordering::Relaxed);
+        false
+    } else {
+        true
+    }
+}
+
+fn write_one_line(out: &mut dyn Write, line: &str, warned: &mut bool) -> bool {
+    // Flushed per line: see the module docs. Only the dedicated writer thread waits.
+    if let Err(e) = writeln!(out, "{line}").and_then(|()| out.flush()) {
+        if !*warned {
+            *warned = true;
+            eprintln!("stats: write failed, further failures are silent: {e}");
+        }
+        false
+    } else {
+        true
+    }
+}
+
+fn flush_writer(out: &mut dyn Write, warned: &mut bool) -> bool {
+    if let Err(e) = out.flush() {
+        if !*warned {
+            *warned = true;
+            eprintln!("stats: flush failed, further failures are silent: {e}");
+        }
+        false
+    } else {
+        true
     }
 }
 
@@ -398,6 +597,84 @@ impl StatsLog {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    struct BlockingWriter {
+        started: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            let (lock, ready) = &*self.release;
+            let mut released = lock.lock().expect("release mutex");
+            while !*released {
+                released = ready.wait(released).expect("release wait");
+            }
+            self.written
+                .lock()
+                .expect("written bytes mutex")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailFirstWriter {
+        fail: bool,
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Write for FailFirstWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail {
+                self.fail = false;
+                return Err(std::io::Error::other("injected stats write failure"));
+            }
+            self.written
+                .lock()
+                .expect("written bytes mutex")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    type WriterGate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+    fn blocked_log() -> (
+        StatsLog,
+        std::sync::mpsc::Receiver<()>,
+        WriterGate,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = StatsLog::with_writer(Box::new(BlockingWriter {
+            started: Some(started_tx),
+            release: release.clone(),
+            written: written.clone(),
+        }))
+        .expect("start stats writer");
+        (log, started_rx, release, written)
+    }
+
+    fn release_writer(release: &WriterGate) {
+        let (lock, ready) = &**release;
+        *lock.lock().expect("release mutex") = true;
+        ready.notify_all();
+    }
 
     fn parse(line: &str) -> Value {
         serde_json::from_str(line).expect("a stats line must be valid JSON")
@@ -634,5 +911,180 @@ mod tests {
         let log = StatsLog::discarding();
         log.write_line("anything");
         log.flush();
+    }
+
+    #[test]
+    fn a_blocked_stats_writer_does_not_block_the_recording_thread() {
+        let (log, started_rx, release, _) = blocked_log();
+        let log = std::sync::Arc::new(log);
+        let caller_log = log.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            caller_log.write_line("one record");
+            let _ = done_tx.send(());
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the writer started");
+        let timely = done_rx.recv_timeout(std::time::Duration::from_secs(1));
+        release_writer(&release);
+        caller.join().expect("recording caller");
+
+        assert!(timely.is_ok(), "recording waited for the blocked writer");
+    }
+
+    #[test]
+    fn queue_overload_is_bounded_and_recorded_after_the_writer_recovers() {
+        let (log, started_rx, release, written) = blocked_log();
+
+        log.write_line("lead");
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the writer started");
+        for _ in 0..WRITE_QUEUE_CAPACITY + 10 {
+            log.write_line("queued");
+        }
+        assert_eq!(log.dropped.load(Ordering::Relaxed), 10);
+
+        release_writer(&release);
+        log.flush();
+
+        let bytes = written.lock().expect("written bytes mutex");
+        let text = std::str::from_utf8(&bytes).expect("writer received utf-8");
+        assert!(
+            text.contains(r#"{"type":"stats_drop","lines":10}"#),
+            "overload must be visible in the stats stream"
+        );
+    }
+
+    #[test]
+    fn flush_is_bounded_when_the_writer_never_returns() {
+        let (log, started_rx, release, _) = blocked_log();
+        let log = std::sync::Arc::new(log);
+        log.write_line("lead");
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the writer started");
+        let flush_log = log.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            assert!(!flush_log.flush_for(std::time::Duration::from_millis(10)));
+            let _ = done_tx.send(());
+        });
+
+        let timely = done_rx.recv_timeout(std::time::Duration::from_millis(50));
+        release_writer(&release);
+        caller.join().expect("flush caller");
+        assert!(timely.is_ok(), "flush waited without a deadline");
+    }
+
+    #[test]
+    fn drop_is_bounded_when_the_writer_never_returns() {
+        let (log, started_rx, release, _) = blocked_log();
+        log.write_line("lead");
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the writer started");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            drop(log);
+            let _ = done_tx.send(());
+        });
+
+        let timely = done_rx.recv_timeout(std::time::Duration::from_millis(50));
+        release_writer(&release);
+        caller.join().expect("drop caller");
+        assert!(timely.is_ok(), "drop joined a blocked writer");
+    }
+
+    #[test]
+    fn oversized_records_are_dropped_before_the_bounded_queue() {
+        let (log, started_rx, release, written) = blocked_log();
+        log.write_line(&"x".repeat(MAX_QUEUED_LINE_BYTES + 1));
+        assert_eq!(log.dropped.load(Ordering::Relaxed), 1);
+
+        log.write_line("lead");
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the writer started");
+        release_writer(&release);
+        log.flush();
+
+        let bytes = written.lock().expect("written bytes mutex");
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(output.contains(r#"{"type":"stats_drop","lines":1}"#));
+        assert!(!output.contains(&"x".repeat(MAX_QUEUED_LINE_BYTES + 1)));
+    }
+
+    #[test]
+    fn oversized_server_stats_are_dropped_before_wrapping() {
+        let (log, started_rx, release, written) = blocked_log();
+        log.record_server_line(&vec![b'x'; MAX_SERVER_LINE_BYTES + 1]);
+        assert_eq!(log.dropped.load(Ordering::Relaxed), 1);
+
+        log.write_line("lead");
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the writer started");
+        release_writer(&release);
+        assert!(log.flush());
+
+        let bytes = written.lock().expect("written bytes mutex");
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(output.contains(r#"{"type":"stats_drop","lines":1}"#));
+    }
+
+    #[test]
+    fn a_line_write_failure_is_reported_by_final_flush() {
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = StatsLog::with_writer(Box::new(FailFirstWriter {
+            fail: true,
+            written: written.clone(),
+        }))
+        .expect("start stats writer");
+        log.write_line("lost");
+        log.write_line("kept");
+
+        assert!(!log.flush(), "a failed artifact must invalidate the run");
+        let bytes = written.lock().expect("written bytes mutex");
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(output.contains(r#"{"type":"stats_drop","lines":1}"#));
+        assert!(output.contains("kept"));
+        assert!(!output.contains("lost"));
+    }
+
+    #[test]
+    fn a_late_producer_cannot_cross_the_final_flush_marker() {
+        let (log, started_rx, release, _) = blocked_log();
+        let log = std::sync::Arc::new(log);
+        log.write_line("lead");
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the writer started");
+
+        let flush_log = log.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let _ = done_tx.send(flush_log.flush());
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !log.closed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            log.closed.load(Ordering::SeqCst),
+            "flush did not close producers"
+        );
+
+        log.record_server_line(&vec![b'x'; MAX_SERVER_LINE_BYTES + 1]);
+        assert_eq!(
+            log.dropped.load(Ordering::Relaxed),
+            0,
+            "a producer after closure crossed the final marker"
+        );
+        release_writer(&release);
+        assert!(done_rx.recv().expect("flush result"));
+        caller.join().expect("flush caller");
     }
 }

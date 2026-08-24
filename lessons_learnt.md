@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Instrumentation must drop visibly before it blocks decode (`viewer/stats.rs:StatsLog::enqueue`).
+  Put durable per-line writes on their own thread behind a bounded non-blocking queue. If storage
+  cannot keep up, emit an explicit loss count when it recovers instead of distorting the measured path.
+
 - LC2-before-LC1 needs an explicit average-valid bit (`avc444.rs:Yuv444Buffer::luma_avg_seen`).
   Neutral plane initialization is not an aux-confirmed chroma average. Keep validity separate so
   the first real luma average establishes the baseline instead of suppressing valid chroma detail.

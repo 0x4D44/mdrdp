@@ -659,7 +659,7 @@ impl MessageSink for DecodeSink {
     }
 
     fn on_stats(&mut self, payload: &[u8]) {
-        self.stats.write_line(&crate::stats::server_line(payload));
+        self.stats.record_server_line(payload);
     }
 }
 

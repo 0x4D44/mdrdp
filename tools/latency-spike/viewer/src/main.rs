@@ -7,8 +7,9 @@ use std::process::ExitCode;
 
 #[cfg(target_os = "macos")]
 fn main() -> ExitCode {
-    use std::net::TcpStream;
+    use std::net::{Shutdown, TcpStream};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use spike_viewer::app::{UserEvent, ViewerApp};
     use spike_viewer::clock::Clock;
@@ -55,13 +56,23 @@ fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: video connect to {} failed: {e}", cfg.connect);
+            let _ = stats.flush();
             return ExitCode::FAILURE;
         }
     };
     if let Err(e) = video.set_nodelay(true) {
         eprintln!("error: TCP_NODELAY on the video socket failed: {e}");
+        let _ = stats.flush();
         return ExitCode::FAILURE;
     }
+    let video_shutdown = match video.try_clone() {
+        Ok(socket) => socket,
+        Err(e) => {
+            eprintln!("error: cannot retain the video socket for shutdown: {e}");
+            let _ = stats.flush();
+            return ExitCode::FAILURE;
+        }
+    };
     eprintln!("video: connected {}", cfg.connect);
 
     // The input channel is optional at runtime: a picture with no keystrokes is still
@@ -87,6 +98,7 @@ fn main() -> ExitCode {
         Ok(l) => l,
         Err(e) => {
             eprintln!("error: event loop: {e}");
+            let _ = stats.flush();
             return ExitCode::FAILURE;
         }
     };
@@ -95,6 +107,7 @@ fn main() -> ExitCode {
     let slot = Arc::new(FrameSlot::new());
     let reader_slot = slot.clone();
     let reader_stats = stats.clone();
+    let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
     let reader = std::thread::Builder::new()
         .name("spike-video".to_owned())
         .spawn(move || {
@@ -111,17 +124,30 @@ fn main() -> ExitCode {
             let mut video = video;
             let end = net::pump(&mut video, &Clock::new(), &mut sink);
             eprintln!("video: {end} after {} access units", sink.frames());
+            let _ = reader_done_tx.send(());
         });
-    if let Err(e) = reader {
-        eprintln!("error: cannot start the video thread: {e}");
-        return ExitCode::FAILURE;
-    }
+    let reader = match reader {
+        Ok(reader) => reader,
+        Err(e) => {
+            eprintln!("error: cannot start the video thread: {e}");
+            let _ = stats.flush();
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mut app = ViewerApp::new(cfg.title, slot, stats.clone(), input);
     let outcome = event_loop.run_app(&mut app);
-    stats.flush();
+    let _ = video_shutdown.shutdown(Shutdown::Both);
+    if reader_done_rx.recv_timeout(Duration::from_secs(2)).is_ok() {
+        let _ = reader.join();
+    } else {
+        eprintln!("video: reader did not stop within 2s; final stats may be incomplete");
+        drop(reader);
+    }
+    let stats_ok = stats.flush();
     match outcome {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) if stats_ok => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE

@@ -472,6 +472,5 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
         if let Some(link) = &self.input {
             link.shutdown();
         }
-        self.stats.flush();
     }
 }
