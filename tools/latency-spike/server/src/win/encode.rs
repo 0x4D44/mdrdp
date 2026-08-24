@@ -987,12 +987,38 @@ fn configure(
         if codec == Codec::Hevc && !low_latency {
             return Err("HEVC encoder refused mandatory AVLowLatencyMode".into());
         }
-        settings.set(
-            api,
-            "AVEncCommonRateControlMode",
-            &CODECAPI_AVEncCommonRateControlMode,
-            &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
-        );
+        match codec {
+            Codec::H264 => {
+                let low_delay_vbr = settings.set(
+                    api,
+                    "AVEncCommonRateControlMode=LowDelayVBR",
+                    &CODECAPI_AVEncCommonRateControlMode,
+                    &variant_u32(eAVEncCommonRateControlMode_LowDelayVBR.0 as u32),
+                );
+                if !low_delay_vbr {
+                    settings.set(
+                        api,
+                        "AVEncCommonRateControlMode=PeakConstrainedVBR",
+                        &CODECAPI_AVEncCommonRateControlMode,
+                        &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
+                    );
+                }
+                settings.set(
+                    api,
+                    "AVEncCommonMaxBitRate",
+                    &CODECAPI_AVEncCommonMaxBitRate,
+                    &variant_u32(bitrate_bps),
+                );
+            }
+            Codec::Hevc => {
+                settings.set(
+                    api,
+                    "AVEncCommonRateControlMode=CBR",
+                    &CODECAPI_AVEncCommonRateControlMode,
+                    &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
+                );
+            }
+        }
         settings.set(
             api,
             "AVEncCommonMeanBitRate",
