@@ -198,9 +198,187 @@ impl<T> Assembler<T> {
     }
 }
 
+/// One complete regional frame and the plan that names its paint coverage.
+pub(crate) struct PlannedComplete<P, T> {
+    pub(crate) seq: u64,
+    pub(crate) plan: P,
+    pub(crate) tiles: Vec<(u8, T)>,
+}
+
+pub(crate) struct PlannedPush<P, T> {
+    pub(crate) ready: Vec<PlannedComplete<P, T>>,
+}
+
+struct PlannedPartial<P, T> {
+    plan: P,
+    tiles: Vec<(u8, Option<T>)>,
+}
+
+/// Assemble only the tile IDs selected by each logical update plan.
+pub(crate) struct PlannedAssembler<P, T> {
+    tile_count: usize,
+    max_pending: usize,
+    pending: BTreeMap<u64, PlannedPartial<P, T>>,
+    retired_through: Option<u64>,
+}
+
+impl<P, T> PlannedAssembler<P, T> {
+    pub(crate) fn new(tile_count: usize, max_pending: usize) -> Self {
+        assert!(tile_count > 0);
+        assert!(max_pending > 0);
+        Self {
+            tile_count,
+            max_pending,
+            pending: BTreeMap::new(),
+            retired_through: None,
+        }
+    }
+
+    /// Register a plan before submitting any of its selected tiles. Returns the
+    /// number of older whole plans evicted to preserve the fixed pending budget.
+    pub(crate) fn begin(&mut self, seq: u64, plan: P, expected_tiles: &[u8]) -> u64 {
+        assert!(!expected_tiles.is_empty());
+        assert!(!self.pending.contains_key(&seq));
+        let mut seen = vec![false; self.tile_count];
+        let mut tiles = Vec::with_capacity(expected_tiles.len());
+        for &tile_id in expected_tiles {
+            let index = usize::from(tile_id);
+            assert!(index < self.tile_count);
+            assert!(!std::mem::replace(&mut seen[index], true));
+            tiles.push((tile_id, None));
+        }
+        if self.retired_through.is_some_and(|retired| seq <= retired) {
+            return 0;
+        }
+        self.pending.insert(seq, PlannedPartial { plan, tiles });
+
+        let mut dropped = 0;
+        while self.pending.len() > self.max_pending {
+            let oldest = *self
+                .pending
+                .first_key_value()
+                .expect("pending plan count proved non-empty")
+                .0;
+            self.pending.remove(&oldest);
+            self.retire(oldest);
+            dropped += 1;
+        }
+        dropped
+    }
+
+    pub(crate) fn push(&mut self, seq: u64, tile_id: u8, tile: T) -> PlannedPush<P, T> {
+        if self.retired_through.is_some_and(|retired| seq <= retired) {
+            return PlannedPush { ready: Vec::new() };
+        }
+        let Some(partial) = self.pending.get_mut(&seq) else {
+            return PlannedPush { ready: Vec::new() };
+        };
+        let Some((_, slot)) = partial
+            .tiles
+            .iter_mut()
+            .find(|(expected, _)| *expected == tile_id)
+        else {
+            return PlannedPush { ready: Vec::new() };
+        };
+        if slot.is_some() {
+            return PlannedPush { ready: Vec::new() };
+        }
+        *slot = Some(tile);
+
+        let mut ready = Vec::new();
+        while self
+            .pending
+            .first_key_value()
+            .is_some_and(|(_, partial)| partial.tiles.iter().all(|(_, tile)| tile.is_some()))
+        {
+            let seq = *self
+                .pending
+                .first_key_value()
+                .expect("completeness check found an oldest plan")
+                .0;
+            let partial = self
+                .pending
+                .remove(&seq)
+                .expect("oldest planned frame still exists");
+            let tiles = partial
+                .tiles
+                .into_iter()
+                .map(|(tile_id, tile)| (tile_id, tile.expect("planned completeness checked above")))
+                .collect();
+            self.retire(seq);
+            ready.push(PlannedComplete {
+                seq,
+                plan: partial.plan,
+                tiles,
+            });
+        }
+        PlannedPush { ready }
+    }
+
+    pub(crate) fn discard_through(&mut self, seq: u64) {
+        self.pending.clear();
+        self.retire(seq);
+    }
+
+    fn retire(&mut self, seq: u64) {
+        self.retired_through = Some(self.retired_through.map_or(seq, |old| old.max(seq)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_planned_frame_completes_with_only_its_selected_tile() {
+        let mut assembler = PlannedAssembler::new(2, 3);
+        assert_eq!(assembler.begin(30, "right-only", &[1]), 0);
+
+        let result = assembler.push(30, 1, "right pixels");
+
+        assert_eq!(result.ready.len(), 1);
+        assert_eq!(result.ready[0].seq, 30);
+        assert_eq!(result.ready[0].plan, "right-only");
+        assert_eq!(result.ready[0].tiles, [(1, "right pixels")]);
+    }
+
+    #[test]
+    fn planned_frames_still_retire_in_capture_order() {
+        let mut assembler = PlannedAssembler::new(2, 3);
+        assembler.begin(40, "both", &[0, 1]);
+        assembler.begin(41, "left", &[0]);
+        assert!(assembler.push(41, 0, "41-left").ready.is_empty());
+        assert!(assembler.push(40, 1, "40-right").ready.is_empty());
+
+        let result = assembler.push(40, 0, "40-left");
+
+        assert_eq!(
+            result
+                .ready
+                .iter()
+                .map(|frame| frame.seq)
+                .collect::<Vec<_>>(),
+            [40, 41]
+        );
+    }
+
+    #[test]
+    fn unselected_or_late_tiles_cannot_complete_a_planned_frame() {
+        let mut assembler = PlannedAssembler::new(2, 3);
+        assembler.begin(50, (), &[1]);
+        assert!(assembler.push(50, 0, "wrong").ready.is_empty());
+        assert_eq!(assembler.push(50, 1, "right").ready.len(), 1);
+        assert!(assembler.push(50, 1, "late").ready.is_empty());
+    }
+
+    #[test]
+    fn planned_frame_budget_drops_the_oldest_whole_plan() {
+        let mut assembler = PlannedAssembler::new(2, 2);
+        assert_eq!(assembler.begin(60, (), &[0, 1]), 0);
+        assert_eq!(assembler.begin(61, (), &[0]), 0);
+        assert_eq!(assembler.begin(62, (), &[1]), 1);
+        assert!(assembler.push(60, 0, "late").ready.is_empty());
+    }
 
     #[test]
     fn two_tiles_complete_once_in_tile_order() {
