@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Arm latency clocks before blocking delivery and roll back failed sends (`session.rs:drain_input`).
+  Starting after flush hides encoding and socket backpressure from input-to-paint latency. Preserve
+  the earliest unanswered sample, and restore it if encoding or delivery fails.
+
 - Carry EGFX geometry with raw snapshots; scale outside the store lock (`surface.rs:PresentationMapping`).
   Pair fallback pixels with their mapping so a partial replacement cannot move or rescale old
   pixels. A second composed output canvas would add about 56 MiB at 5K and hold up decoding.

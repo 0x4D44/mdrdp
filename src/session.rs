@@ -318,16 +318,15 @@ fn pump(
         wake_rx.drain();
 
         // --- outbound: input --------------------------------------------------
-        let input_batch_full = match drain_input(input, latest_mouse_move, &mut established.framed)
-        {
+        let input_batch_full = match drain_input(
+            input,
+            latest_mouse_move,
+            &mut established.framed,
+            &mut input_sent_at,
+            Instant::now,
+        ) {
             Ok(Drained::Closed) => return SessionEnd::WindowClosed,
-            Ok(Drained::Sent { batch_full }) => {
-                // Only the first unanswered input starts the clock: overwriting it with
-                // each later keystroke would measure the gap to the *last* one and make a
-                // slow link look fast.
-                input_sent_at.get_or_insert_with(Instant::now);
-                batch_full
-            }
+            Ok(Drained::Sent { batch_full }) => batch_full,
             Ok(Drained::Idle) => false,
             Err(e) => return SessionEnd::Failed(e),
         };
@@ -1075,6 +1074,8 @@ fn drain_input<S: std::io::Read + std::io::Write>(
     input: &Receiver<InputEvent>,
     latest_mouse_move: &LatestMouseMove,
     framed: &mut Framed<S>,
+    input_sent_at: &mut Option<Instant>,
+    now: impl FnOnce() -> Instant,
 ) -> Result<Drained, ConnectError> {
     let mut batch = Vec::new();
     let mut receiver_closed = false;
@@ -1100,10 +1101,23 @@ fn drain_input<S: std::io::Read + std::io::Write>(
     }
 
     let batch_full = batch.len() == FASTPATH_INPUT_BATCH_MAX;
+    // Start before encoding and transport delivery so socket backpressure is part of the
+    // user-visible input-to-paint measurement. Keep the first unanswered input: replacing
+    // it with every later key would make a slow link look fast.
+    let previous_input_sent_at = *input_sent_at;
+    input_sent_at.get_or_insert_with(now);
     // Batched into one PDU: a burst of mouse moves should not become a burst of writes.
-    let encoded = encode_fastpath_input(batch)
-        .map_err(|e| ConnectError::Protocol(format!("encode input: {e}")))?;
-    write_framed(framed, &encoded).map_err(ConnectError::Io)?;
+    let encoded = match encode_fastpath_input(batch) {
+        Ok(encoded) => encoded,
+        Err(e) => {
+            *input_sent_at = previous_input_sent_at;
+            return Err(ConnectError::Protocol(format!("encode input: {e}")));
+        }
+    };
+    if let Err(e) = write_framed(framed, &encoded) {
+        *input_sent_at = previous_input_sent_at;
+        return Err(ConnectError::Io(e));
+    }
     Ok(Drained::Sent { batch_full })
 }
 
@@ -1252,6 +1266,51 @@ mod tests {
         wrote: bool,
     }
 
+    struct WriteObserver {
+        clock_armed: Arc<AtomicBool>,
+        armed_at_first_write: Option<bool>,
+    }
+
+    impl std::io::Read for WriteObserver {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "quiet"))
+        }
+    }
+
+    impl std::io::Write for WriteObserver {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.armed_at_first_write.is_none() {
+                self.armed_at_first_write = Some(self.clock_armed.load(Ordering::SeqCst));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct WriteFailure;
+
+    impl std::io::Read for WriteFailure {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "quiet"))
+        }
+    }
+
+    impl std::io::Write for WriteFailure {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "write failed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("flush must not follow a failed write")
+        }
+    }
+
     impl std::io::Read for FlushFailure {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
             Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "quiet"))
@@ -1278,6 +1337,65 @@ mod tests {
         let error = write_framed(&mut framed, b"frame").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(framed.get_inner().0.wrote, "the write preceded the flush");
+    }
+
+    #[test]
+    fn input_clock_covers_delivery_and_rolls_back_on_failure() {
+        let send_one = || {
+            let (tx, rx) = mpsc::channel();
+            tx.send(InputEvent::MouseMove { x: 1, y: 2 }).unwrap();
+            (tx, rx)
+        };
+        let latest = LatestMouseMove::default();
+
+        let (_tx, rx) = send_one();
+        let clock_armed = Arc::new(AtomicBool::new(false));
+        let mut framed = Framed::new(WriteObserver {
+            clock_armed: Arc::clone(&clock_armed),
+            armed_at_first_write: None,
+        });
+        let mut input_sent_at = None;
+        assert_eq!(
+            drain_input(&rx, &latest, &mut framed, &mut input_sent_at, || {
+                clock_armed.store(true, Ordering::SeqCst);
+                Instant::now()
+            })
+            .unwrap(),
+            Drained::Sent { batch_full: false }
+        );
+        assert!(
+            framed.get_inner().0.armed_at_first_write.unwrap(),
+            "the latency clock must include transport delivery"
+        );
+
+        let prior = Instant::now();
+        let (_tx, rx) = send_one();
+        let mut framed = Framed::new(Sink(Vec::new()));
+        let mut input_sent_at = Some(prior);
+        assert!(drain_input(&rx, &latest, &mut framed, &mut input_sent_at, Instant::now,).is_ok());
+        assert_eq!(
+            input_sent_at,
+            Some(prior),
+            "keep the earliest pending input"
+        );
+
+        let (_tx, rx) = send_one();
+        let mut framed = Framed::new(WriteFailure);
+        let mut input_sent_at = None;
+        assert!(drain_input(&rx, &latest, &mut framed, &mut input_sent_at, Instant::now,).is_err());
+        assert!(
+            input_sent_at.is_none(),
+            "a failed write must not leave an unsent latency sample"
+        );
+
+        let (_tx, rx) = send_one();
+        let mut framed = Framed::new(FlushFailure { wrote: false });
+        let mut input_sent_at = None;
+        assert!(drain_input(&rx, &latest, &mut framed, &mut input_sent_at, Instant::now,).is_err());
+        assert!(
+            input_sent_at.is_none(),
+            "failed delivery must not leave an unsent latency sample"
+        );
     }
 
     fn decode_input(wire: &[u8]) -> Vec<FastPathInputEvent> {
@@ -1420,7 +1538,7 @@ mod tests {
         let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed).unwrap(),
+            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
             Drained::Idle
         );
         assert!(framed.into_inner_no_leftover().0.is_empty());
@@ -1438,7 +1556,7 @@ mod tests {
         let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed).unwrap(),
+            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
             Drained::Sent { batch_full: false },
             "sending is what starts the latency clock"
         );
@@ -1463,7 +1581,7 @@ mod tests {
 
         let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
-        let drained = drain_input(&rx, &latest, &mut framed).unwrap();
+        let drained = drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap();
         assert_eq!(drained, Drained::Sent { batch_full: true });
         let Drained::Sent { batch_full } = drained else {
             unreachable!("asserted sent above")
@@ -1487,7 +1605,7 @@ mod tests {
         let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed).unwrap(),
+            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
             Drained::Closed
         );
     }
@@ -1507,7 +1625,7 @@ mod tests {
 
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed).unwrap(),
+            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
             Drained::Sent { batch_full: false }
         );
         let wire = framed.into_inner_no_leftover().0;
@@ -1537,7 +1655,7 @@ mod tests {
 
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed).unwrap(),
+            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
             Drained::Sent { batch_full: false }
         );
         let wire = framed.into_inner_no_leftover().0;
@@ -1559,14 +1677,14 @@ mod tests {
         let mut framed = Framed::new(Sink(Vec::new()));
 
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed).unwrap(),
+            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
             Drained::Sent { batch_full: false }
         );
         let first_write = framed.get_inner().0.0.clone();
         assert_eq!(decode_input(&first_write).len(), 1);
 
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed).unwrap(),
+            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
             Drained::Idle
         );
         assert_eq!(
