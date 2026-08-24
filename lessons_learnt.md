@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A short/timed-out frameless write must close the link before another record (`viewer/input_link.rs:InputLink::send`).
+  `Write::write` may send only a prefix or time out. Retrying a later input on the same
+  stream corrupts framing, so fail closed and let disconnect release held input.
+
 - A dropped muda menu can stay installed in AppKit; detach first (`window.rs:SessionMenuBar::detach`).
   `muda::Menu::drop` frees its Rust child bookkeeping but does not clear `NSApp.mainMenu`.
   Remove the menu explicitly while its items are live, including a drop fallback for error paths.

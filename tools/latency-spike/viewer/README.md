@@ -128,7 +128,9 @@ Key **repeats are forwarded** as further key-downs. An OS repeat is a genuine ex
 transition and `SendInput` on the far side reproduces exactly that.
 
 Records are written on the window thread inside the key event, not handed to a worker:
-a scheduling hop would land inside the interval being measured.
+a scheduling hop would land inside the interval being measured. Healthy loopback writes
+remain on that direct path. A 10 ms write deadline makes backpressure terminal, so a dead
+input peer cannot wedge presentation or leave a partial frameless record followed by another.
 
 ---
 

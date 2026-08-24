@@ -158,7 +158,7 @@ impl ViewerApp {
     }
 
     /// Forward one key transition, and record that we did.
-    fn forward_key(&self, code: winit::keyboard::KeyCode, state: ElementState) {
+    fn forward_key(&mut self, code: winit::keyboard::KeyCode, state: ElementState) {
         let Some(link) = self.input.as_ref() else {
             return;
         };
@@ -171,11 +171,17 @@ impl ViewerApp {
         };
         // Stamped before the write, so the recorded time can only be early, never late.
         let sent_us = self.clock.now_us();
-        match link.send(kind, vk) {
+        let result = link.send(kind, vk);
+        match result {
             Ok(seq) => self
                 .stats
                 .record(&InputRecord::new(seq, vk, kind.as_str(), sent_us)),
-            Err(e) => eprintln!("input: send failed: {e}"),
+            Err(e) => {
+                eprintln!("input: send failed: {e}; keystrokes are disabled");
+                // The link has already failed closed. Drop our handle so auto-repeat
+                // cannot turn one socket failure into unbounded window-thread logging.
+                self.input = None;
+            }
         }
     }
 
