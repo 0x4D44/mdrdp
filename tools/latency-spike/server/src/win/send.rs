@@ -11,7 +11,7 @@
 
 use super::{qpc, Result};
 use crate::framing;
-use crate::send_schedule::{self, BatchKind};
+use crate::send_schedule::{self, AdmissionGate, BatchKind};
 use crate::stats::{FrameRecord, QpcClock, RectRecord};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -36,7 +36,7 @@ const DRAIN_BATCH: usize = 8;
 pub enum Outbound {
     /// One complete logical video update. Coverage and all selected tile AUs share
     /// one framed payload, so the socket cannot expose a partial 5K update.
-    Video(Vec<FrameTile>, Vec<u8>),
+    Video(Vec<FrameTile>, Vec<u8>, Option<AdmissionGate>),
     /// HEVC remains the explicit full-frame fallback and retains its existing
     /// per-tile envelope; it never claims the AVC regional-update contract.
     FrameSet(Vec<FrameTile>),
@@ -54,6 +54,7 @@ pub struct FrameTile {
 pub struct SparseOutbound {
     pub record: Box<RectRecord>,
     pub payload: Vec<u8>,
+    pub gate: Option<AdmissionGate>,
 }
 
 /// Dedicated raw-final-pixel writer. It has its own socket, queue and thread, so
@@ -122,6 +123,9 @@ impl SparseSender {
     }
 
     fn write(&mut self, update: SparseOutbound) {
+        if update.gate.as_ref().is_some_and(|gate| !gate.admitted()) {
+            return;
+        }
         let Some(client) = self.client.as_mut() else {
             self.connected.store(false, Ordering::Release);
             return;
@@ -347,7 +351,10 @@ impl Sender {
     /// Write one payload and append its rows for the batch's telemetry pass.
     fn handle(&mut self, msg: Outbound, stats_lines: &mut Vec<String>) {
         match msg {
-            Outbound::Video(tiles, payload) => {
+            Outbound::Video(tiles, payload, gate) => {
+                if gate.as_ref().is_some_and(|gate| !gate.admitted()) {
+                    return;
+                }
                 self.write_message(framing::MSG_VIDEO_UPDATE, &payload);
                 for mut tile in tiles {
                     tile.record.send_done_us = self.clock.micros(qpc::now());

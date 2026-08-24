@@ -1,6 +1,40 @@
 //! Portable scheduling rules for the bounded sender batch.
 
+#[cfg(any(windows, test))]
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+#[derive(Clone)]
+#[cfg(any(windows, test))]
+pub struct AdmissionGate(Arc<(Mutex<Option<bool>>, Condvar)>);
+
+#[cfg(any(windows, test))]
+impl AdmissionGate {
+    pub(crate) fn pending() -> Self {
+        Self(Arc::new((Mutex::new(None), Condvar::new())))
+    }
+
+    pub(crate) fn decide(&self, admitted: bool) {
+        let (state, changed) = &*self.0;
+        *state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(admitted);
+        changed.notify_all();
+    }
+
+    pub(crate) fn admitted(&self) -> bool {
+        let (state, changed) = &*self.0;
+        let mut decision = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while decision.is_none() {
+            decision = changed
+                .wait(decision)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        decision.unwrap_or(false)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatchKind {
@@ -26,11 +60,22 @@ pub(crate) fn flush_due(dirty: bool, elapsed: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{flush_due, payload_first, BatchKind, STATS_FLUSH_INTERVAL};
+    use super::{flush_due, payload_first, AdmissionGate, BatchKind, STATS_FLUSH_INTERVAL};
     use std::time::Duration;
 
     #[derive(Debug, PartialEq, Eq)]
     struct Item(BatchKind, u8);
+
+    #[test]
+    fn paired_sender_gate_publishes_only_after_one_shared_decision() {
+        for decision in [false, true] {
+            let gate = AdmissionGate::pending();
+            let waiter = gate.clone();
+            let joined = std::thread::spawn(move || waiter.admitted());
+            gate.decide(decision);
+            assert_eq!(joined.join().unwrap(), decision);
+        }
+    }
 
     #[test]
     fn payloads_are_delivered_before_stats_lines() {

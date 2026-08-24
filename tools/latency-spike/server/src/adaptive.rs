@@ -239,6 +239,59 @@ pub fn partition_blocks(
     Ok(UpdatePlan::Incremental(plan))
 }
 
+/// Partition changed blocks while admitting raw candidates only when their
+/// coalesced block payload fits both sender bounds. Budget overflow is not an
+/// error: every changed block deterministically falls back to video instead.
+#[allow(clippy::too_many_arguments)]
+pub fn partition_budgeted_raw(
+    frame_width: u32,
+    frame_height: u32,
+    block_size: u32,
+    changed: &[Region],
+    raw_candidates: &[Region],
+    max_raw_regions: usize,
+    max_raw_bytes: u64,
+    bytes_per_pixel: u64,
+) -> Result<IncrementalPlan, PlanError> {
+    let UpdatePlan::Incremental(plan) = partition_blocks(
+        frame_width,
+        frame_height,
+        block_size,
+        changed,
+        &[],
+        raw_candidates,
+        false,
+    )?
+    else {
+        unreachable!("full fallback was not requested")
+    };
+    let raw_regions = blocks_to_regions(&plan.raw, frame_width, frame_height, block_size)?;
+    let raw_bytes = raw_regions
+        .iter()
+        .map(|region| {
+            u64::from(region.width)
+                .saturating_mul(u64::from(region.height))
+                .saturating_mul(bytes_per_pixel)
+        })
+        .fold(0u64, u64::saturating_add);
+    if raw_regions.len() <= max_raw_regions && raw_bytes <= max_raw_bytes {
+        return Ok(plan);
+    }
+    let UpdatePlan::Incremental(video_only) = partition_blocks(
+        frame_width,
+        frame_height,
+        block_size,
+        changed,
+        &[],
+        &[],
+        false,
+    )?
+    else {
+        unreachable!("full fallback was not requested")
+    };
+    Ok(video_only)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Owner {
     Unchanged,
@@ -573,5 +626,47 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn budgeted_raw_partition_keeps_typing_disjoint_from_regional_video() {
+        let changed = [
+            Region {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            },
+            Region {
+                x: 16,
+                y: 0,
+                width: 48,
+                height: 16,
+            },
+        ];
+        let plan =
+            partition_budgeted_raw(64, 16, 16, &changed, &changed[..1], 1, 16 * 16 * 4, 4).unwrap();
+        assert_eq!(plan.raw, vec![Block { x: 0, y: 0 }]);
+        assert_eq!(
+            plan.video,
+            vec![
+                Block { x: 1, y: 0 },
+                Block { x: 2, y: 0 },
+                Block { x: 3, y: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_budget_overflow_routes_every_changed_block_to_video() {
+        let changed = [Region {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 16,
+        }];
+        let plan = partition_budgeted_raw(32, 16, 16, &changed, &changed, 1, 0, 4).unwrap();
+        assert!(plan.raw.is_empty());
+        assert_eq!(plan.video, vec![Block { x: 0, y: 0 }, Block { x: 1, y: 0 }]);
     }
 }
