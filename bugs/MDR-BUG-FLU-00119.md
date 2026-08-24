@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00119 — Fixed-coordinate AVC chroma ghosts lack a final-pixel scroll regression
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** testing/graphics
 - **Raised:** 2026-08-24T20:16:01Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T201637Z-2b029615
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00119-run-fix-20260824T201637Z-2b029615
-- **Owner base:** 9a935ea9e5ce233f58936b87aa7e5062f392de00
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T20:16:37Z
-- **Owner until:** 2026-08-24T22:16:37Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T20:16:01Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-24T20:16:01Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T20:29:53Z, deltic:auto role=fix run=fix-20260824T201637Z-2b029615 branch=task/bug-MDR-BUG-FLU-00119-run-fix-20260824T201637Z-2b029615 code=7ccd8ec0d6dda020b3a5fde7c8acb4d19d32dbc1 gate=manual)
 
 ## Observation
 
