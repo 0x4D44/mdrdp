@@ -26,6 +26,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing_subscriber::layer::SubscriberExt as _;
 
+/// A peer that stops reading must not hold the sole session thread forever.
+///
+/// Every logical outbound batch gets one deadline. A partial frame is terminal because
+/// retrying a later frame on the same stream would make the RDP byte stream ambiguous.
+pub(crate) const RDP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct ConnectOptions {
     pub host: String,
     pub port: u16,
@@ -261,29 +267,135 @@ pub fn send_shutdown<S: std::io::Read + std::io::Write>(
     stage: &ironrdp::session::ActiveStage,
     framed: &mut Framed<S>,
 ) -> Result<(), ConnectError> {
+    send_shutdown_with(stage, |frame| {
+        framed.write_all(frame)?;
+        let (stream, _) = framed.get_inner_mut();
+        std::io::Write::flush(stream)
+    })
+}
+
+/// The production transport variant. Unlike the public generic compatibility helper,
+/// this can toggle the live socket and therefore enforce one deadline across every frame.
+pub(crate) fn send_shutdown_bounded<S: std::io::Read + std::io::Write + SetNonblocking>(
+    stage: &ironrdp::session::ActiveStage,
+    framed: &mut Framed<S>,
+) -> Result<(), ConnectError> {
+    let deadline = Instant::now() + RDP_WRITE_TIMEOUT;
+    send_shutdown_with(stage, |frame| write_framed(framed, frame, deadline))
+}
+
+fn send_shutdown_with(
+    stage: &ironrdp::session::ActiveStage,
+    mut send: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> Result<(), ConnectError> {
     let outputs = stage
         .graceful_shutdown()
         .map_err(|e| ConnectError::Protocol(describe(&e)))?;
 
     for output in outputs {
         if let ironrdp::session::ActiveStageOutput::ResponseFrame(frame) = output {
-            write_framed(framed, &frame).map_err(ConnectError::Io)?;
+            send(&frame).map_err(ConnectError::Io)?;
         }
     }
     Ok(())
 }
 
+/// Toggle the nonblocking mode of the transport owned by the live Framed stream.
+pub(crate) trait SetNonblocking {
+    fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()>;
+}
+
+impl SetNonblocking for StreamOwned<ClientConnection, TcpStream> {
+    fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
+        self.sock.set_nonblocking(nonblocking)
+    }
+}
+
 /// Queue one frame and force the underlying transport to report deferred write errors.
 ///
 /// Rustls may accept plaintext while its best-effort socket write fails. `flush` is what
-/// surfaces that failure and makes the socket timeout observable to the session.
-pub(crate) fn write_framed<S: std::io::Read + std::io::Write>(
+/// surfaces that failure and makes the socket timeout observable to the session. The
+/// transport is nonblocking while this helper loops, so each syscall can be checked against
+/// one absolute deadline rather than resetting a socket timeout per partial write.
+pub(crate) fn write_framed<S: std::io::Read + std::io::Write + SetNonblocking>(
     framed: &mut Framed<S>,
     bytes: &[u8],
+    deadline: Instant,
 ) -> std::io::Result<()> {
-    framed.write_all(bytes)?;
-    let (stream, _) = framed.get_inner_mut();
-    std::io::Write::flush(stream)
+    framed.get_inner_mut().0.set_nonblocking(true)?;
+    let result = write_framed_with_clock(framed, bytes, deadline, Instant::now);
+    let restore = framed.get_inner_mut().0.set_nonblocking(false);
+    match restore {
+        Ok(()) => result,
+        Err(e) => Err(e),
+    }
+}
+
+fn write_framed_with_clock<
+    S: std::io::Read + std::io::Write + SetNonblocking,
+    N: FnMut() -> Instant,
+>(
+    framed: &mut Framed<S>,
+    bytes: &[u8],
+    deadline: Instant,
+    mut now: N,
+) -> std::io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        if now() >= deadline {
+            return Err(write_deadline_error());
+        }
+        let result = {
+            let (stream, _) = framed.get_inner_mut();
+            std::io::Write::write(stream, &bytes[written..])
+        };
+        match result {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "RDP framed write made no progress",
+                ));
+            }
+            Ok(count) => written += count,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_write_progress(deadline);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    loop {
+        if now() >= deadline {
+            return Err(write_deadline_error());
+        }
+        let result = {
+            let (stream, _) = framed.get_inner_mut();
+            std::io::Write::flush(stream)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_write_progress(deadline);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn wait_for_write_progress(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+}
+
+fn write_deadline_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "RDP outbound write deadline expired",
+    )
 }
 
 /// Pump the session so the graphics channel can open, for a bounded time.
@@ -292,7 +404,7 @@ pub(crate) fn write_framed<S: std::io::Read + std::io::Write>(
 /// simply says nothing cannot hold us. Both matter — if the server declines to open the
 /// graphics channel (see `crate::egfx` on the missing DYNVC_GFX flag) the correct
 /// outcome is a report saying so, not a hang.
-fn observe_egfx<S: std::io::Read + std::io::Write>(
+fn observe_egfx<S: std::io::Read + std::io::Write + SetNonblocking>(
     stage: &mut ironrdp::session::ActiveStage,
     framed: &mut Framed<S>,
     socket: &TcpStream,
@@ -329,10 +441,16 @@ fn observe_egfx<S: std::io::Read + std::io::Write>(
             .process(&mut image, action, &payload)
             .map_err(|e| ConnectError::Protocol(describe(&e)))?;
 
+        // Every response frame produced for one inbound PDU is one logical outbound
+        // batch. A slow peer gets one bounded chance for the batch, not a fresh timeout
+        // for every response frame.
+        let mut response_deadline = None;
         for out in outputs {
             match out {
                 ActiveStageOutput::ResponseFrame(frame) => {
-                    framed.write_all(&frame).map_err(ConnectError::Io)?
+                    let write_deadline = *response_deadline
+                        .get_or_insert_with(|| (Instant::now() + RDP_WRITE_TIMEOUT).min(deadline));
+                    write_framed(framed, &frame, write_deadline).map_err(ConnectError::Io)?;
                 }
                 ActiveStageOutput::Terminate(_) => return Ok(()),
                 _ => {}
@@ -740,13 +858,75 @@ pub fn connect(opts: &ConnectOptions, secret: &Secret) -> Result<ConnectReport, 
     // Snapshot AFTER observing — snapshotting at establish time would always be empty.
     report.egfx = established.probe.as_ref().map(|p| p.snapshot());
 
-    let shutdown = send_shutdown(&established.stage, &mut established.framed);
+    let shutdown = send_shutdown_bounded(&established.stage, &mut established.framed);
     report.graceful_shutdown = shutdown.is_ok();
     Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::io::{self, Read, Write};
+    use std::time::{Duration, Instant};
+
+    struct DribblingWriter {
+        bytes: Vec<u8>,
+        max_per_write: usize,
+        writes: usize,
+    }
+
+    impl Read for DribblingWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "quiet"))
+        }
+    }
+
+    impl Write for DribblingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let count = buf.len().min(self.max_per_write);
+            self.bytes.extend_from_slice(&buf[..count]);
+            self.writes += 1;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SetNonblocking for DribblingWriter {
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dribbling_writer_honours_one_absolute_deadline() {
+        let base = Instant::now();
+        let mut clock = base;
+        let mut framed = Framed::new(DribblingWriter {
+            bytes: Vec::new(),
+            max_per_write: 1,
+            writes: 0,
+        });
+
+        let error = write_framed_with_clock(
+            &mut framed,
+            b"0123456789",
+            base + Duration::from_millis(5),
+            || {
+                clock += Duration::from_millis(1);
+                clock
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let (writer, _) = framed.get_inner_mut();
+        assert_eq!(writer.bytes.len(), 4);
+        assert_eq!(writer.writes, 4);
+    }
+
     #[test]
     fn window_drag_shows_contents_not_an_outline() {
         use ironrdp::pdu::rdp::client_info::PerformanceFlags;

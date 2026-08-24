@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Share one absolute outbound deadline per batch; reset after inbound waits (`connect.rs:write_framed`).
+  Per-syscall timeouts let a dribbling peer monopolize the session. A partial expiry is terminal
+  because retrying another RDP frame would make the byte stream ambiguous.
+
 - Cancel pending present samples on both occlusion edges (`window.rs:Occluded`, `stats.rs:cancel_pending_present`).
   Suppress Output is asynchronous, so late hidden paints can turn the reveal redraw into fake renderer latency.
 

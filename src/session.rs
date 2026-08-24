@@ -13,7 +13,10 @@
 //! to the pump instead of holding it through the socket timeout.
 
 use crate::clipboard::ClipboardBridge;
-use crate::connect::{ConnectError, Established, describe, send_shutdown, write_framed};
+use crate::connect::{
+    ConnectError, Established, RDP_WRITE_TIMEOUT, SetNonblocking, describe, send_shutdown_bounded,
+    write_framed,
+};
 use crate::disconnect::{self, ServerFarewell};
 use crate::input::{InputEvent, LatestMouseMove, encode_fastpath_input, to_fastpath};
 use crate::stats::{CacheStats, StatsHandle};
@@ -37,12 +40,6 @@ use std::time::{Duration, Instant};
 /// Framed session reads temporarily use nonblocking mode, so this timeout cannot hold the
 /// pump behind a partial TLS/PDU tail. It remains configured for the socket's other users.
 const READ_SLICE: Duration = Duration::from_millis(5);
-/// A peer that stops reading must not hold the sole session thread forever.
-///
-/// Five seconds matches the native side-channel policy: long enough for transient
-/// backpressure, but finite. Any write error is terminal because part of an RDP frame
-/// may already have reached the wire.
-const RDP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Fast-path's event count is one byte. Limiting one pump turn to one valid PDU also
 /// prevents a producer that stays ahead of the wire from starving inbound processing.
 const FASTPATH_INPUT_BATCH_MAX: usize = 255;
@@ -121,6 +118,10 @@ const RESIZE_PATIENCE: Duration = Duration::from_secs(10);
 /// Reactivation is a handful of small PDUs on a link measured in milliseconds; if it has
 /// not completed in this long the session is wedged and failing beats hanging.
 const REACTIVATION_DEADLINE: Duration = Duration::from_secs(15);
+
+fn write_deadline(slot: &mut Option<Instant>) -> Instant {
+    *slot.get_or_insert_with(|| Instant::now() + RDP_WRITE_TIMEOUT)
+}
 
 /// Why the session ended.
 #[derive(Debug)]
@@ -249,7 +250,7 @@ fn run(
     // frame may be partial and another write can only spend the timeout or further corrupt
     // framing; the peer will reap the broken TCP connection instead.
     if !matches!(&outcome, SessionEnd::Failed(ConnectError::Io(_))) {
-        let _ = send_shutdown(&established.stage, &mut established.framed);
+        let _ = send_shutdown_bounded(&established.stage, &mut established.framed);
     }
 
     // Tell the window the session is over — but ONLY when the session ended on its own.
@@ -312,6 +313,10 @@ fn pump(
             return SessionEnd::Graceful;
         }
 
+        // All outbound frames produced by this pump turn share one absolute deadline.
+        // Starting it lazily avoids charging idle decode/read time to a later write.
+        let mut turn_deadline = None;
+
         // Swallow pending doorbell rings first: anything rung after this point
         // stays queued and cuts the coming `wait_readable` short, so a send can
         // never slip between the channel drains below and the sleep.
@@ -323,6 +328,7 @@ fn pump(
             latest_mouse_move,
             &mut established.framed,
             &mut input_sent_at,
+            &mut turn_deadline,
             Instant::now,
         ) {
             Ok(Drained::Closed) => return SessionEnd::WindowClosed,
@@ -345,28 +351,33 @@ fn pump(
                 }
             }
         }
-        if let Err(e) = service_resize(established, &mut pending_resize) {
+        if let Err(e) = service_resize(established, &mut pending_resize, &mut turn_deadline) {
             return SessionEnd::Failed(e);
         }
-        if let Err(e) = service_visibility(established, &mut pending_visibility) {
+        if let Err(e) = service_visibility(established, &mut pending_visibility, &mut turn_deadline)
+        {
             return SessionEnd::Failed(e);
         }
 
         // --- clipboard --------------------------------------------------------
-        let clipboard_batch_full =
-            match service_clipboard(established, services, &mut last_clipboard_poll) {
-                Ok(batch_full) => batch_full,
-                Err(e) => {
-                    if matches!(&e, ConnectError::Io(_)) {
-                        // A failed write may have emitted only part of one static-channel frame.
-                        // Continuing would corrupt ordering, so the bounded transport failure is
-                        // terminal even though OS clipboard and encoding failures remain recoverable.
-                        return SessionEnd::Failed(e);
-                    }
-                    tracing::warn!(error = %e, "clipboard exchange failed; session continues");
-                    false
+        let clipboard_batch_full = match service_clipboard(
+            established,
+            services,
+            &mut last_clipboard_poll,
+            &mut turn_deadline,
+        ) {
+            Ok(batch_full) => batch_full,
+            Err(e) => {
+                if matches!(&e, ConnectError::Io(_)) {
+                    // A failed write may have emitted only part of one static-channel frame.
+                    // Continuing would corrupt ordering, so the bounded transport failure is
+                    // terminal even though OS clipboard and encoding failures remain recoverable.
+                    return SessionEnd::Failed(e);
                 }
-            };
+                tracing::warn!(error = %e, "clipboard exchange failed; session continues");
+                false
+            }
+        };
 
         // --- inbound: server PDUs ---------------------------------------------
         // Only read when something is already decodable client-side or the socket
@@ -425,6 +436,9 @@ fn pump(
             }
             Err(e) => return SessionEnd::Failed(ConnectError::Io(e)),
         };
+        // Outbound work before the server wait belongs to the previous batch. Do not let
+        // its deadline expire a response to this newly received PDU.
+        turn_deadline = None;
 
         bytes_since_flush = bytes_since_flush.saturating_add(payload.len() as u64);
 
@@ -438,7 +452,11 @@ fn pump(
         for output in outputs {
             match output {
                 ActiveStageOutput::ResponseFrame(frame) => {
-                    if let Err(e) = write_framed(&mut established.framed, &frame) {
+                    if let Err(e) = write_framed(
+                        &mut established.framed,
+                        &frame,
+                        write_deadline(&mut turn_deadline),
+                    ) {
                         return SessionEnd::Failed(ConnectError::Io(e));
                     }
                 }
@@ -525,6 +543,7 @@ fn service_clipboard(
     established: &mut Established,
     services: &mut SessionServices,
     last_poll: &mut Instant,
+    turn_deadline: &mut Option<Instant>,
 ) -> Result<bool, ConnectError> {
     let Some(bridge) = services.clipboard.as_mut() else {
         return Ok(false);
@@ -551,7 +570,12 @@ fn service_clipboard(
             .stage
             .process_svc_processor_messages(batch)
             .map_err(|e| ConnectError::Protocol(describe(&e)))?;
-        write_framed(&mut established.framed, &encoded).map_err(ConnectError::Io)?;
+        write_framed(
+            &mut established.framed,
+            &encoded,
+            write_deadline(turn_deadline),
+        )
+        .map_err(ConnectError::Io)?;
     }
     Ok(batch_full)
 }
@@ -746,6 +770,7 @@ fn clamp_to_encodable(
 fn service_resize(
     established: &mut Established,
     pending: &mut Option<(SessionCommand, Instant)>,
+    turn_deadline: &mut Option<Instant>,
 ) -> Result<(), ConnectError> {
     let Some((
         SessionCommand::Resize {
@@ -823,7 +848,12 @@ fn service_resize(
                 );
             }
             eprintln!("resolution: requested {width}x{height} (scale {scale_percent:?})");
-            write_framed(&mut established.framed, &frame).map_err(ConnectError::Io)
+            write_framed(
+                &mut established.framed,
+                &frame,
+                write_deadline(turn_deadline),
+            )
+            .map_err(ConnectError::Io)
         }
         Some(Err(e)) => {
             // Losing one resize is not worth losing the desktop.
@@ -859,6 +889,7 @@ fn service_resize(
 fn service_visibility(
     established: &mut Established,
     pending: &mut Option<bool>,
+    turn_deadline: &mut Option<Instant>,
 ) -> Result<(), ConnectError> {
     let Some(visible) = *pending else {
         return Ok(());
@@ -883,7 +914,12 @@ fn service_visibility(
     } else {
         eprintln!("display: window hidden; asked the server to suppress updates");
     }
-    write_framed(&mut established.framed, buf.filled()).map_err(ConnectError::Io)
+    write_framed(
+        &mut established.framed,
+        buf.filled(),
+        write_deadline(turn_deadline),
+    )
+    .map_err(ConnectError::Io)
 }
 
 /// Build the PDUs a visibility change owes the server.
@@ -975,13 +1011,14 @@ fn advance_reactivation_no_input(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drain_reactivation_input<S: std::io::Read + std::io::Write>(
+fn drain_reactivation_input<S: std::io::Read + std::io::Write + SetNonblocking>(
     enabled: bool,
     stop: &AtomicBool,
     input: &Receiver<InputEvent>,
     latest_mouse_move: &LatestMouseMove,
     framed: &mut Framed<S>,
     input_sent_at: &mut Option<Instant>,
+    turn_deadline: &mut Option<Instant>,
 ) -> Result<ReactivationInput, ConnectError> {
     if stop.load(Ordering::Relaxed) {
         return Ok(ReactivationInput::Stopped);
@@ -995,6 +1032,7 @@ fn drain_reactivation_input<S: std::io::Read + std::io::Write>(
             latest_mouse_move,
             framed,
             input_sent_at,
+            turn_deadline,
             Instant::now,
         )? {
             Drained::Closed => ReactivationInput::WindowClosed,
@@ -1005,7 +1043,7 @@ fn drain_reactivation_input<S: std::io::Read + std::io::Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_reactivation_no_input<S: std::io::Read + std::io::Write>(
+fn write_reactivation_no_input<S: std::io::Read + std::io::Write + SetNonblocking>(
     framed: &mut Framed<S>,
     bytes: &[u8],
     enables_input: bool,
@@ -1013,8 +1051,9 @@ fn write_reactivation_no_input<S: std::io::Read + std::io::Write>(
     input: &Receiver<InputEvent>,
     latest_mouse_move: &LatestMouseMove,
     input_sent_at: &mut Option<Instant>,
+    turn_deadline: &mut Option<Instant>,
 ) -> Result<ReactivationInput, ConnectError> {
-    write_framed(framed, bytes).map_err(ConnectError::Io)?;
+    write_framed(framed, bytes, write_deadline(turn_deadline)).map_err(ConnectError::Io)?;
     drain_reactivation_input(
         enables_input,
         stop,
@@ -1022,6 +1061,7 @@ fn write_reactivation_no_input<S: std::io::Read + std::io::Write>(
         latest_mouse_move,
         framed,
         input_sent_at,
+        turn_deadline,
     )
 }
 
@@ -1105,6 +1145,7 @@ fn drive_reactivation(
         }
 
         let Some(hint) = sequence.next_pdu_hint() else {
+            let mut turn_deadline = None;
             let sends_synchronize = synchronize_pending;
             buf.clear();
             let written = advance_reactivation_no_input(&mut sequence, &mut buf)?;
@@ -1121,6 +1162,7 @@ fn drive_reactivation(
                 input,
                 latest_mouse_move,
                 input_sent_at,
+                &mut turn_deadline,
             )?;
             if sends_synchronize {
                 input_enabled = true;
@@ -1135,6 +1177,7 @@ fn drive_reactivation(
             }
             continue;
         };
+        let mut input_turn_deadline = None;
         let pdu = loop {
             // Clear rings before draining queues. Anything rung after this point remains
             // readable and interrupts the wait, so no input can slip into a 15-second gap.
@@ -1146,6 +1189,7 @@ fn drive_reactivation(
                 latest_mouse_move,
                 &mut established.framed,
                 input_sent_at,
+                &mut input_turn_deadline,
             )? {
                 ReactivationInput::Continue { batch_full } => batch_full,
                 ReactivationInput::WindowClosed => {
@@ -1200,8 +1244,16 @@ fn drive_reactivation(
         let written = sequence
             .step(&pdu, &mut buf)
             .map_err(|e| ConnectError::Protocol(describe(&e)))?;
+        // The PDU arrived after a potentially long server wait. Response frames start a
+        // fresh logical batch; only contiguous writes within that response share a deadline.
+        let mut response_deadline = None;
         if let Some(len) = written.size() {
-            write_framed(&mut established.framed, &buf[..len]).map_err(ConnectError::Io)?;
+            write_framed(
+                &mut established.framed,
+                &buf[..len],
+                write_deadline(&mut response_deadline),
+            )
+            .map_err(ConnectError::Io)?;
         }
         if was_capabilities
             && matches!(
@@ -1270,11 +1322,12 @@ enum Drained {
 }
 
 /// Send one bounded batch of queued input events.
-fn drain_input<S: std::io::Read + std::io::Write>(
+fn drain_input<S: std::io::Read + std::io::Write + SetNonblocking>(
     input: &Receiver<InputEvent>,
     latest_mouse_move: &LatestMouseMove,
     framed: &mut Framed<S>,
     input_sent_at: &mut Option<Instant>,
+    turn_deadline: &mut Option<Instant>,
     now: impl FnOnce() -> Instant,
 ) -> Result<Drained, ConnectError> {
     let mut batch = Vec::new();
@@ -1314,7 +1367,7 @@ fn drain_input<S: std::io::Read + std::io::Write>(
             return Err(ConnectError::Protocol(format!("encode input: {e}")));
         }
     };
-    if let Err(e) = write_framed(framed, &encoded) {
+    if let Err(e) = write_framed(framed, &encoded, write_deadline(turn_deadline)) {
         *input_sent_at = previous_input_sent_at;
         return Err(ConnectError::Io(e));
     }
@@ -1648,10 +1701,35 @@ mod tests {
         }
     }
 
+    impl SetNonblocking for Sink {
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SetNonblocking for WriteObserver {
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SetNonblocking for WriteFailure {
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SetNonblocking for FlushFailure {
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn a_deferred_transport_error_is_observed_by_the_frame_flush() {
         let mut framed = Framed::new(FlushFailure { wrote: false });
-        let error = write_framed(&mut framed, b"frame").unwrap_err();
+        let error =
+            write_framed(&mut framed, b"frame", Instant::now() + RDP_WRITE_TIMEOUT).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(framed.get_inner().0.wrote, "the write preceded the flush");
     }
@@ -1673,10 +1751,17 @@ mod tests {
         });
         let mut input_sent_at = None;
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed, &mut input_sent_at, || {
-                clock_armed.store(true, Ordering::SeqCst);
-                Instant::now()
-            })
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut input_sent_at,
+                &mut None,
+                || {
+                    clock_armed.store(true, Ordering::SeqCst);
+                    Instant::now()
+                },
+            )
             .unwrap(),
             Drained::Sent { batch_full: false }
         );
@@ -1689,7 +1774,17 @@ mod tests {
         let (_tx, rx) = send_one();
         let mut framed = Framed::new(Sink(Vec::new()));
         let mut input_sent_at = Some(prior);
-        assert!(drain_input(&rx, &latest, &mut framed, &mut input_sent_at, Instant::now,).is_ok());
+        assert!(
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut input_sent_at,
+                &mut None,
+                Instant::now,
+            )
+            .is_ok()
+        );
         assert_eq!(
             input_sent_at,
             Some(prior),
@@ -1699,7 +1794,17 @@ mod tests {
         let (_tx, rx) = send_one();
         let mut framed = Framed::new(WriteFailure);
         let mut input_sent_at = None;
-        assert!(drain_input(&rx, &latest, &mut framed, &mut input_sent_at, Instant::now,).is_err());
+        assert!(
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut input_sent_at,
+                &mut None,
+                Instant::now,
+            )
+            .is_err()
+        );
         assert!(
             input_sent_at.is_none(),
             "a failed write must not leave an unsent latency sample"
@@ -1708,7 +1813,17 @@ mod tests {
         let (_tx, rx) = send_one();
         let mut framed = Framed::new(FlushFailure { wrote: false });
         let mut input_sent_at = None;
-        assert!(drain_input(&rx, &latest, &mut framed, &mut input_sent_at, Instant::now,).is_err());
+        assert!(
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut input_sent_at,
+                &mut None,
+                Instant::now,
+            )
+            .is_err()
+        );
         assert!(
             input_sent_at.is_none(),
             "failed delivery must not leave an unsent latency sample"
@@ -1782,18 +1897,35 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut framed = Framed::new(Sink(Vec::new()));
         let mut input_sent_at = None;
+        let mut turn_deadline = None;
 
         assert_eq!(
-            drain_reactivation_input(false, &stop, &rx, &latest, &mut framed, &mut input_sent_at,)
-                .unwrap(),
+            drain_reactivation_input(
+                false,
+                &stop,
+                &rx,
+                &latest,
+                &mut framed,
+                &mut input_sent_at,
+                &mut turn_deadline,
+            )
+            .unwrap(),
             ReactivationInput::Continue { batch_full: false }
         );
         assert!(framed.get_inner().0.0.is_empty());
         assert!(input_sent_at.is_none());
 
         assert_eq!(
-            drain_reactivation_input(true, &stop, &rx, &latest, &mut framed, &mut input_sent_at,)
-                .unwrap(),
+            drain_reactivation_input(
+                true,
+                &stop,
+                &rx,
+                &latest,
+                &mut framed,
+                &mut input_sent_at,
+                &mut turn_deadline,
+            )
+            .unwrap(),
             ReactivationInput::Continue { batch_full: false }
         );
         assert!(!framed.get_inner().0.0.is_empty());
@@ -1801,8 +1933,16 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         assert_eq!(
-            drain_reactivation_input(true, &stop, &rx, &latest, &mut framed, &mut input_sent_at,)
-                .unwrap(),
+            drain_reactivation_input(
+                true,
+                &stop,
+                &rx,
+                &latest,
+                &mut framed,
+                &mut input_sent_at,
+                &mut turn_deadline,
+            )
+            .unwrap(),
             ReactivationInput::Stopped
         );
     }
@@ -1815,6 +1955,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut framed = Framed::new(Sink(Vec::new()));
         let mut input_sent_at = None;
+        let mut turn_deadline = None;
 
         assert_eq!(
             write_reactivation_no_input(
@@ -1825,6 +1966,7 @@ mod tests {
                 &rx,
                 &latest,
                 &mut input_sent_at,
+                &mut turn_deadline,
             )
             .unwrap(),
             ReactivationInput::Continue { batch_full: false }
@@ -1978,7 +2120,15 @@ mod tests {
         let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut None,
+                &mut None,
+                Instant::now,
+            )
+            .unwrap(),
             Drained::Idle
         );
         assert!(framed.into_inner_no_leftover().0.is_empty());
@@ -1996,7 +2146,15 @@ mod tests {
         let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut None,
+                &mut None,
+                Instant::now,
+            )
+            .unwrap(),
             Drained::Sent { batch_full: false },
             "sending is what starts the latency clock"
         );
@@ -2021,7 +2179,15 @@ mod tests {
 
         let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
-        let drained = drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap();
+        let drained = drain_input(
+            &rx,
+            &latest,
+            &mut framed,
+            &mut None,
+            &mut None,
+            Instant::now,
+        )
+        .unwrap();
         assert_eq!(drained, Drained::Sent { batch_full: true });
         let Drained::Sent { batch_full } = drained else {
             unreachable!("asserted sent above")
@@ -2045,7 +2211,15 @@ mod tests {
         let latest = LatestMouseMove::default();
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut None,
+                &mut None,
+                Instant::now,
+            )
+            .unwrap(),
             Drained::Closed
         );
     }
@@ -2065,7 +2239,15 @@ mod tests {
 
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut None,
+                &mut None,
+                Instant::now,
+            )
+            .unwrap(),
             Drained::Sent { batch_full: false }
         );
         let wire = framed.into_inner_no_leftover().0;
@@ -2095,7 +2277,15 @@ mod tests {
 
         let mut framed = Framed::new(Sink(Vec::new()));
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut None,
+                &mut None,
+                Instant::now,
+            )
+            .unwrap(),
             Drained::Sent { batch_full: false }
         );
         let wire = framed.into_inner_no_leftover().0;
@@ -2117,14 +2307,30 @@ mod tests {
         let mut framed = Framed::new(Sink(Vec::new()));
 
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut None,
+                &mut None,
+                Instant::now,
+            )
+            .unwrap(),
             Drained::Sent { batch_full: false }
         );
         let first_write = framed.get_inner().0.0.clone();
         assert_eq!(decode_input(&first_write).len(), 1);
 
         assert_eq!(
-            drain_input(&rx, &latest, &mut framed, &mut None, Instant::now).unwrap(),
+            drain_input(
+                &rx,
+                &latest,
+                &mut framed,
+                &mut None,
+                &mut None,
+                Instant::now,
+            )
+            .unwrap(),
             Drained::Idle
         );
         assert_eq!(
