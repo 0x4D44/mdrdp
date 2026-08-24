@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00090 — AVC stream region masks omit the final row and column
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/AVC
 - **Raised:** 2026-08-24T09:17:01Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T091738Z-b26417bf
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00090-run-fix-20260824T091738Z-b26417bf
-- **Owner base:** 819fb324b8e984f53004d55529a583d984478aca
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T09:17:38Z
-- **Owner until:** 2026-08-24T11:17:38Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T09:17:01Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-24T09:17:01Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T09:24:50Z, deltic:auto role=fix run=fix-20260824T091738Z-b26417bf branch=task/bug-MDR-BUG-FLU-00090-run-fix-20260824T091738Z-b26417bf code=70a5a78 gate=manual)
 
 ## Observation
 
