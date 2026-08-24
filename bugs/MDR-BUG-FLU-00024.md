@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00024 — Cold 5K mode switch outlives native display-status deadline, failing the first connection
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** native/probe
 - **Raised:** 2026-08-20T17:42:01Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T184631Z-eca420fc
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00024-run-fix-20260824T184631Z-eca420fc
-- **Owner base:** 9f56bdb5df6bd93f072dec6349e4686eb05dd5ed
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T18:46:31Z
-- **Owner until:** 2026-08-24T20:46:31Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-20T17:42:01Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-20T17:42:01Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T18:57:46Z, deltic:auto role=fix run=fix-20260824T184631Z-eca420fc branch=task/bug-MDR-BUG-FLU-00024-run-fix-20260824T184631Z-eca420fc code=3180b7f gate=manual)
 
 ## Observation
 
