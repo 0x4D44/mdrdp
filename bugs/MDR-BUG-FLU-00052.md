@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00052 — Spike viewer decode-side stats flushes can delay video processing
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Could
 - **Severity:** Medium
 - **Area:** rhydra/measurement-viewer
 - **Raised:** 2026-08-23T12:09:37Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T084803Z-0a28dbc6
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00052-run-fix-20260824T084803Z-0a28dbc6
-- **Owner base:** 11a53a2ca3aca3ad49939cefb261c96760231d26
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T08:48:03Z
-- **Owner until:** 2026-08-24T10:48:03Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T09:16:17Z, deltic:auto role=fix run=fix-20260824T084803Z-0a28dbc6 branch=task/bug-MDR-BUG-FLU-00052-run-fix-20260824T084803Z-0a28dbc6 code=67e0326 gate=manual)
 
 ## Observation
 
