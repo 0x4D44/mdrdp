@@ -6,15 +6,15 @@
 - **Area:** display/frame-atomicity
 - **Raised:** 2026-08-24T12:03:48Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260824T120451Z-2f52ab07
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00105-run-fix-20260824T120451Z-2f52ab07
+- **Owner base:** 49c95e9b68e95bb239d56d537d818568ccab01cf
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-24T12:04:51Z
+- **Owner until:** 2026-08-24T14:04:51Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
