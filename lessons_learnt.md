@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Damage cadence must read current store dimensions, not the old snapshot (`window.rs:damage_state`).
+  A large frame can remain in the reusable copy while a small replacement is already presentable;
+  sizing the throttle from that stale copy delays the cheap redraw by the full cadence interval.
+
 - A recreated surface ID invalidates its old geometry until remapped (`surface.rs:output_mapping_stale`).
   Retain the last pixels and mapping atomically, but keep the numeric ID association so delete and
   EndFrame can retire the fallback correctly before the replacement receives a fresh MapSurface PDU.

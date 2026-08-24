@@ -1973,23 +1973,40 @@ impl SessionApp {
         store.generation()
     }
 
-    fn cadence_dimensions(&self) -> (u16, u16) {
-        if self.presentation.width != 0 && self.presentation.height != 0 {
-            (self.presentation.width, self.presentation.height)
-        } else {
-            (self.config.session_width, self.config.session_height)
-        }
+    /// Read the generation and the dimensions of the presentation that is current in the
+    /// store as one coherent, short lock. The reusable snapshot can still describe the
+    /// previous frame while a new surface is waiting to be copied.
+    fn damage_state(&self) -> (u64, (u16, u16)) {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            store.generation(),
+            store
+                .presentation_dimensions()
+                .unwrap_or((self.config.session_width, self.config.session_height)),
+        )
     }
 
     /// Ask the window to present the newest generation, subject to the large-canvas
     /// cadence. The event loop remains free to handle input while a deadline is pending.
     fn request_damage_redraw(&mut self, event_loop: &ActiveEventLoop) {
-        if self.occluded || self.presented == Some(self.generation()) {
+        if self.occluded {
+            return;
+        }
+        let (generation, (width, height)) = self.damage_state();
+        if self.presented == Some(generation) {
             return;
         }
         let now = Instant::now();
-        let (width, height) = self.cadence_dimensions();
-        if let Some(deadline) = presentation_deadline(self.last_presented_at, now, width, height) {
+        if let Some(deadline) = damage_redraw_deadline(
+            self.presented,
+            generation,
+            self.last_presented_at,
+            now,
+            (width, height),
+        ) {
             self.redraw_deadline = Some(
                 self.redraw_deadline
                     .map_or(deadline, |current| current.max(deadline)),
@@ -2184,6 +2201,17 @@ impl SessionApp {
             stats.update(|s| s.mark_presented(generation));
         }
     }
+}
+
+fn damage_redraw_deadline(
+    presented: Option<u64>,
+    generation: u64,
+    last_presented: Option<Instant>,
+    now: Instant,
+    dimensions: (u16, u16),
+) -> Option<Instant> {
+    (presented != Some(generation))
+        .then(|| presentation_deadline(last_presented, now, dimensions.0, dimensions.1))?
 }
 
 /// Put one window event on its transport queue.
@@ -2892,6 +2920,42 @@ mod tests {
             (7, 9, 11)
         );
         assert_eq!(snapshot.pixels, vec![0xA5; 3]);
+    }
+
+    #[test]
+    fn damage_cadence_uses_current_dimensions_after_a_large_snapshot() {
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut store = store.lock().unwrap();
+            store.create(1, 2, 1);
+            store
+                .solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED)
+                .expect("paint surface");
+            store.map_to_output(1);
+        }
+        let (input_tx, _input_rx) = mpsc::channel();
+        let mut app = SessionApp::new(
+            WindowConfig::new("cadence", 1920, 1080),
+            Arc::clone(&store),
+            WakingSender::silent(input_tx),
+            None,
+        );
+        app.presentation.width = 5120;
+        app.presentation.height = 2880;
+
+        let (generation, dimensions) = app.damage_state();
+        let now = Instant::now();
+        assert_eq!(
+            damage_redraw_deadline(
+                Some(generation.wrapping_sub(1)),
+                generation,
+                Some(now),
+                now + Duration::from_millis(1),
+                dimensions,
+            ),
+            None,
+            "a current small output must not inherit the old large snapshot's cadence"
+        );
     }
 
     #[test]
