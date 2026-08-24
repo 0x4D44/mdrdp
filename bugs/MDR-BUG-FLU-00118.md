@@ -6,15 +6,15 @@
 - **Area:** rdp/transport-latency
 - **Raised:** 2026-08-24T19:04:27Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260824T190450Z-40f617ac
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00118-run-fix-20260824T190450Z-40f617ac
+- **Owner base:** 950fa3643355ccf366fc1db3ed55612ff55fc0d4
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-24T19:04:50Z
+- **Owner until:** 2026-08-24T21:04:50Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
