@@ -419,20 +419,38 @@ pub fn await_forward_ready(
         if let Some(stderr) = child_exited() {
             return Err(classify_ssh_stderr(&stderr));
         }
-        if Instant::now() >= deadline {
-            return Err(ProbeFailure::Deadline("tunnel readiness"));
-        }
-        match TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+        let connect_budget =
+            bounded_by_deadline(Instant::now(), deadline, Duration::from_millis(250))
+                .ok_or(ProbeFailure::Deadline("tunnel readiness"))?;
+        match TcpStream::connect_timeout(&addr, connect_budget) {
             Ok(stream) => {
+                if Instant::now() >= deadline {
+                    return Err(ProbeFailure::Deadline("tunnel readiness"));
+                }
                 let _ = stream.set_nodelay(true);
                 return Ok(stream);
             }
             Err(_) => {
                 // Refused (ssh not bound yet) or transient — retry until deadline.
-                std::thread::sleep(Duration::from_millis(50));
+                let delay =
+                    bounded_by_deadline(Instant::now(), deadline, Duration::from_millis(50))
+                        .ok_or(ProbeFailure::Deadline("tunnel readiness"))?;
+                std::thread::sleep(delay);
             }
         }
     }
+}
+
+/// Cap one blocking attempt or retry pause at an absolute deadline.
+pub(super) fn bounded_by_deadline(
+    now: Instant,
+    deadline: Instant,
+    cap: Duration,
+) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .map(|remaining| remaining.min(cap))
 }
 
 #[cfg(test)]
@@ -585,9 +603,14 @@ mod tests {
     #[test]
     fn readiness_gives_up_at_the_deadline_when_nothing_listens() {
         let addr: SocketAddr = (Ipv4Addr::LOCALHOST, 1).into();
-        let deadline = Instant::now() + Duration::from_millis(300);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(5);
         let err = await_forward_ready(addr, deadline, || None).unwrap_err();
         assert_eq!(err, ProbeFailure::Deadline("tunnel readiness"));
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "retry sleep exceeded the readiness deadline"
+        );
     }
 
     #[test]

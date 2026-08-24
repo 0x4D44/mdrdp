@@ -20,7 +20,7 @@
 //! the caller maps to fallback (Auto) or a remedy-naming error (`Always`).
 
 use std::io::Read;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use rhydra::framing::{self, Reassembler};
@@ -434,42 +434,60 @@ fn read_header(
 }
 
 fn connect_input(ports: ForwardPorts, deadline: Instant) -> Result<TcpStream, ProbeFailure> {
-    let window_end = (Instant::now() + INPUT_RETRY_WINDOW).min(deadline);
-    loop {
-        match TcpStream::connect_timeout(&ports.input_addr(), Duration::from_millis(250)) {
-            Ok(stream) => {
-                stream
-                    .set_nodelay(true)
-                    .map_err(|e| ProbeFailure::Io(e.to_string()))?;
-                return Ok(stream);
-            }
-            Err(_) if Instant::now() < window_end => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(ProbeFailure::Io(format!(
-                    "input channel refused after the video channel was up: {e}"
-                )));
-            }
-        }
-    }
+    connect_required_channel(ports.input_addr(), deadline, "input")
 }
 
 fn connect_sparse(ports: ForwardPorts, deadline: Instant) -> Result<TcpStream, ProbeFailure> {
+    connect_required_channel(ports.sparse_addr(), deadline, "sparse")
+}
+
+fn connect_required_channel(
+    addr: SocketAddr,
+    deadline: Instant,
+    phase: &'static str,
+) -> Result<TcpStream, ProbeFailure> {
     let window_end = (Instant::now() + INPUT_RETRY_WINDOW).min(deadline);
     loop {
-        match TcpStream::connect_timeout(&ports.sparse_addr(), Duration::from_millis(250)) {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ProbeFailure::Deadline(phase));
+        }
+        if now >= window_end {
+            return Err(ProbeFailure::Io(format!(
+                "{phase} channel refused after the video channel was up: retry window expired"
+            )));
+        }
+        let connect_budget = ssh::bounded_by_deadline(now, window_end, Duration::from_millis(250))
+            .expect("window was checked above");
+        match TcpStream::connect_timeout(&addr, connect_budget) {
             Ok(stream) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(ProbeFailure::Deadline(phase));
+                }
+                if now >= window_end {
+                    return Err(ProbeFailure::Io(format!(
+                        "{phase} channel refused after the video channel was up: retry window expired"
+                    )));
+                }
                 stream
                     .set_nodelay(true)
                     .map_err(|e| ProbeFailure::Io(e.to_string()))?;
                 return Ok(stream);
             }
-            Err(_) if Instant::now() < window_end => std::thread::sleep(Duration::from_millis(50)),
             Err(error) => {
-                return Err(ProbeFailure::Io(format!(
-                    "sparse channel refused after the video channel was up: {error}"
-                )));
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(ProbeFailure::Deadline(phase));
+                }
+                if now >= window_end {
+                    return Err(ProbeFailure::Io(format!(
+                        "{phase} channel refused after the video channel was up: {error}"
+                    )));
+                }
+                let delay = ssh::bounded_by_deadline(now, window_end, Duration::from_millis(50))
+                    .expect("window was checked above");
+                std::thread::sleep(delay);
             }
         }
     }
@@ -924,6 +942,28 @@ mod tests {
         assert!(
             matches!(err, ProbeFailure::Io(ref m) if m.contains("expected the stats header")),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_retry_reports_and_honours_the_probe_deadline() {
+        let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let ports = ForwardPorts {
+            video: port,
+            input: port,
+            control: port,
+            interactive_control: port,
+            aux: port,
+            sparse: port,
+        };
+        let started = Instant::now();
+        let err = connect_input(ports, started + Duration::from_millis(5)).unwrap_err();
+        assert_eq!(err, ProbeFailure::Deadline("input"));
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "input retry exceeded the probe deadline"
         );
     }
 }
