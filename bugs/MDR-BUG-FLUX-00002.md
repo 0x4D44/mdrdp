@@ -6,15 +6,15 @@
 - **Area:** build
 - **Raised:** 2026-08-16T20:34:32Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260824T235727Z-1e06e976
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00002-run-fix-20260824T235727Z-1e06e976
+- **Owner base:** 589df3b0e420a9805264cb64ddb2c0be77130791
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-24T23:57:27Z
+- **Owner until:** 2026-08-25T01:57:27Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
