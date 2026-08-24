@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00109 — Native input writes have no absolute wall-clock deadline
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** native/input-latency
 - **Raised:** 2026-08-24T12:24:25Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T124602Z-f1c450aa
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00109-run-fix-20260824T124602Z-f1c450aa
-- **Owner base:** 88a6e95a556f328a962d3ca4bec7f33af86a3557
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T12:46:02Z
-- **Owner until:** 2026-08-24T14:46:02Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T12:24:25Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-24T12:24:25Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T12:55:46Z, deltic:auto role=fix run=fix-20260824T124602Z-f1c450aa branch=task/bug-MDR-BUG-FLU-00109-run-fix-20260824T124602Z-f1c450aa code=e4e2ba5 gate=manual)
 
 ## Observation
 
