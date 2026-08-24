@@ -478,8 +478,21 @@ fn pump(
                     // The server tore the session layer down — this is how a Display
                     // Control resolution change completes. Run the
                     // Deactivation-Reactivation sequence and carry on at the new size.
-                    if let Err(e) = reactivate(established, image) {
-                        return SessionEnd::Failed(e);
+                    match reactivate(
+                        established,
+                        image,
+                        input,
+                        latest_mouse_move,
+                        wake_rx,
+                        stop,
+                        &mut input_sent_at,
+                    ) {
+                        Ok(ReactivationOutcome::Complete) => {}
+                        Ok(ReactivationOutcome::WindowClosed) => {
+                            return SessionEnd::WindowClosed;
+                        }
+                        Ok(ReactivationOutcome::Stopped) => return SessionEnd::Graceful,
+                        Err(e) => return SessionEnd::Failed(e),
                     }
                 }
                 _ => {}
@@ -934,38 +947,124 @@ fn resize_is_redundant(
 /// again. The MCS channel IDs are invariant across it, so every joined channel — EGFX,
 /// clipboard, audio — survives; only the fast-path processor is rebuilt, because the
 /// share ID can change.
-fn reactivate(established: &mut Established, image: &mut DecodedImage) -> Result<(), ConnectError> {
-    // The pump's 5 ms read slice would make every quiet moment here look like a stall.
-    // Reactivation is a short sequential exchange: give reads a longer slice and bound
-    // the whole sequence with a deadline instead.
-    established
-        .socket
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .map_err(ConnectError::Io)?;
-
-    let outcome = drive_reactivation(established, image);
-
-    // Whatever happened, the pump depends on its short slice being back.
-    established
-        .socket
-        .set_read_timeout(Some(READ_SLICE))
-        .map_err(ConnectError::Io)?;
-
-    outcome
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReactivationOutcome {
+    Complete,
+    WindowClosed,
+    Stopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReactivationInput {
+    Continue { batch_full: bool },
+    WindowClosed,
+    Stopped,
+}
+
+fn advance_reactivation_no_input(
+    sequence: &mut impl ironrdp::connector::Sequence,
+    buf: &mut ironrdp::core::WriteBuf,
+) -> Result<ironrdp::connector::Written, ConnectError> {
+    sequence
+        .step_no_input(buf)
+        .map_err(|e| ConnectError::Protocol(describe(&e)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_reactivation_input<S: std::io::Read + std::io::Write>(
+    enabled: bool,
+    stop: &AtomicBool,
+    input: &Receiver<InputEvent>,
+    latest_mouse_move: &LatestMouseMove,
+    framed: &mut Framed<S>,
+    input_sent_at: &mut Option<Instant>,
+) -> Result<ReactivationInput, ConnectError> {
+    if stop.load(Ordering::Relaxed) {
+        return Ok(ReactivationInput::Stopped);
+    }
+    if !enabled {
+        return Ok(ReactivationInput::Continue { batch_full: false });
+    }
+    Ok(
+        match drain_input(
+            input,
+            latest_mouse_move,
+            framed,
+            input_sent_at,
+            Instant::now,
+        )? {
+            Drained::Closed => ReactivationInput::WindowClosed,
+            Drained::Sent { batch_full } => ReactivationInput::Continue { batch_full },
+            Drained::Idle => ReactivationInput::Continue { batch_full: false },
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_reactivation_no_input<S: std::io::Read + std::io::Write>(
+    framed: &mut Framed<S>,
+    bytes: &[u8],
+    enables_input: bool,
+    stop: &AtomicBool,
+    input: &Receiver<InputEvent>,
+    latest_mouse_move: &LatestMouseMove,
+    input_sent_at: &mut Option<Instant>,
+) -> Result<ReactivationInput, ConnectError> {
+    write_framed(framed, bytes).map_err(ConnectError::Io)?;
+    drain_reactivation_input(
+        enables_input,
+        stop,
+        input,
+        latest_mouse_move,
+        framed,
+        input_sent_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reactivate(
+    established: &mut Established,
+    image: &mut DecodedImage,
+    input: &Receiver<InputEvent>,
+    latest_mouse_move: &LatestMouseMove,
+    wake_rx: &DoorbellReceiver,
+    stop: &AtomicBool,
+    input_sent_at: &mut Option<Instant>,
+) -> Result<ReactivationOutcome, ConnectError> {
+    drive_reactivation(
+        established,
+        image,
+        input,
+        latest_mouse_move,
+        wake_rx,
+        stop,
+        input_sent_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn drive_reactivation(
     established: &mut Established,
     image: &mut DecodedImage,
-) -> Result<(), ConnectError> {
+    input: &Receiver<InputEvent>,
+    latest_mouse_move: &LatestMouseMove,
+    wake_rx: &DoorbellReceiver,
+    stop: &AtomicBool,
+    input_sent_at: &mut Option<Instant>,
+) -> Result<ReactivationOutcome, ConnectError> {
     use ironrdp::connector::Sequence as _;
     use ironrdp::connector::connection_activation::ConnectionActivationState;
 
     let mut sequence = established.activation_factory.create();
     let mut buf = ironrdp::core::WriteBuf::new();
     let deadline = Instant::now() + REACTIVATION_DEADLINE;
+    let mut input_enabled = false;
+    let mut synchronize_pending = false;
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(ReactivationOutcome::Stopped);
+        }
         if let ConnectionActivationState::Finalized {
             desktop_size,
             share_id,
@@ -998,15 +1097,76 @@ fn drive_reactivation(
                 "resolution: session reactivated at {}x{}",
                 desktop_size.width, desktop_size.height
             );
-            return Ok(());
+            return Ok(ReactivationOutcome::Complete);
         }
 
         let Some(hint) = sequence.next_pdu_hint() else {
-            return Err(ConnectError::Protocol(
-                "reactivation stalled: the sequence wants no PDU but is not finalized".to_owned(),
-            ));
+            let sends_synchronize = synchronize_pending;
+            buf.clear();
+            let written = advance_reactivation_no_input(&mut sequence, &mut buf)?;
+            let Some(len) = written.size() else {
+                return Err(ConnectError::Protocol(
+                    "reactivation made no progress on a no-input step".to_owned(),
+                ));
+            };
+            let input_outcome = write_reactivation_no_input(
+                &mut established.framed,
+                &buf[..len],
+                sends_synchronize,
+                stop,
+                input,
+                latest_mouse_move,
+                input_sent_at,
+            )?;
+            if sends_synchronize {
+                input_enabled = true;
+                synchronize_pending = false;
+            }
+            match input_outcome {
+                ReactivationInput::Continue { .. } => {}
+                ReactivationInput::WindowClosed => {
+                    return Ok(ReactivationOutcome::WindowClosed);
+                }
+                ReactivationInput::Stopped => return Ok(ReactivationOutcome::Stopped),
+            }
+            continue;
         };
         let pdu = loop {
+            // Clear rings before draining queues. Anything rung after this point remains
+            // readable and interrupts the wait, so no input can slip into a 15-second gap.
+            wake_rx.drain();
+            let batch_full = match drain_reactivation_input(
+                input_enabled,
+                stop,
+                input,
+                latest_mouse_move,
+                &mut established.framed,
+                input_sent_at,
+            )? {
+                ReactivationInput::Continue { batch_full } => batch_full,
+                ReactivationInput::WindowClosed => {
+                    return Ok(ReactivationOutcome::WindowClosed);
+                }
+                ReactivationInput::Stopped => return Ok(ReactivationOutcome::Stopped),
+            };
+            if !decodable_waiting(&mut established.framed) {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(ConnectError::Protocol(
+                        "reactivation timed out waiting for the server".to_owned(),
+                    ));
+                }
+                let wait = if batch_full {
+                    Duration::ZERO
+                } else {
+                    deadline.saturating_duration_since(now)
+                };
+                let ready = wake::wait_readable(&established.socket, wake_rx, wait)
+                    .map_err(ConnectError::Io)?;
+                if !ready.socket {
+                    continue;
+                }
+            }
             match established.framed.read_by_hint(hint) {
                 Ok(pdu) => break pdu,
                 Err(e)
@@ -1025,11 +1185,23 @@ fn drive_reactivation(
             }
         };
         buf.clear();
+        let was_capabilities = matches!(
+            sequence.connection_activation_state(),
+            ConnectionActivationState::CapabilitiesExchange
+        );
         let written = sequence
             .step(&pdu, &mut buf)
             .map_err(|e| ConnectError::Protocol(describe(&e)))?;
         if let Some(len) = written.size() {
             write_framed(&mut established.framed, &buf[..len]).map_err(ConnectError::Io)?;
+        }
+        if was_capabilities
+            && matches!(
+                sequence.connection_activation_state(),
+                ConnectionActivationState::ConnectionFinalization { .. }
+            )
+        {
+            synchronize_pending = true;
         }
     }
 }
@@ -1396,6 +1568,129 @@ mod tests {
             input_sent_at.is_none(),
             "failed delivery must not leave an unsent latency sample"
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct TestSequenceState;
+
+    impl ironrdp::connector::State for TestSequenceState {
+        fn name(&self) -> &'static str {
+            "test-no-input"
+        }
+
+        fn is_terminal(&self) -> bool {
+            false
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Default)]
+    struct TestNoInputSequence {
+        state: TestSequenceState,
+        steps: usize,
+    }
+
+    impl ironrdp::connector::Sequence for TestNoInputSequence {
+        fn next_pdu_hint(&self) -> Option<&dyn ironrdp::pdu::PduHint> {
+            None
+        }
+
+        fn state(&self) -> &dyn ironrdp::connector::State {
+            &self.state
+        }
+
+        fn step(
+            &mut self,
+            input: &[u8],
+            output: &mut ironrdp::core::WriteBuf,
+        ) -> ironrdp::connector::ConnectorResult<ironrdp::connector::Written> {
+            assert!(input.is_empty(), "no-input transition received input bytes");
+            self.steps += 1;
+            output.write_u8(0xA5);
+            ironrdp::connector::Written::from_size(1)
+        }
+    }
+
+    #[test]
+    fn reactivation_advances_a_sequence_that_wants_no_pdu() {
+        let mut sequence = TestNoInputSequence::default();
+        let mut buf = ironrdp::core::WriteBuf::new();
+
+        assert_eq!(
+            advance_reactivation_no_input(&mut sequence, &mut buf)
+                .unwrap()
+                .size(),
+            Some(1)
+        );
+        assert_eq!(sequence.steps, 1);
+        assert_eq!(&buf[..1], &[0xA5]);
+    }
+
+    #[test]
+    fn reactivation_input_waits_for_synchronize_and_honours_stop() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(InputEvent::MouseMove { x: 4, y: 5 }).unwrap();
+        let latest = LatestMouseMove::default();
+        let stop = AtomicBool::new(false);
+        let mut framed = Framed::new(Sink(Vec::new()));
+        let mut input_sent_at = None;
+
+        assert_eq!(
+            drain_reactivation_input(false, &stop, &rx, &latest, &mut framed, &mut input_sent_at,)
+                .unwrap(),
+            ReactivationInput::Continue { batch_full: false }
+        );
+        assert!(framed.get_inner().0.0.is_empty());
+        assert!(input_sent_at.is_none());
+
+        assert_eq!(
+            drain_reactivation_input(true, &stop, &rx, &latest, &mut framed, &mut input_sent_at,)
+                .unwrap(),
+            ReactivationInput::Continue { batch_full: false }
+        );
+        assert!(!framed.get_inner().0.0.is_empty());
+        assert!(input_sent_at.is_some());
+
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(
+            drain_reactivation_input(true, &stop, &rx, &latest, &mut framed, &mut input_sent_at,)
+                .unwrap(),
+            ReactivationInput::Stopped
+        );
+    }
+
+    #[test]
+    fn synchronize_is_written_before_reactivation_input_is_drained() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(InputEvent::MouseMove { x: 4, y: 5 }).unwrap();
+        let latest = LatestMouseMove::default();
+        let stop = AtomicBool::new(false);
+        let mut framed = Framed::new(Sink(Vec::new()));
+        let mut input_sent_at = None;
+
+        assert_eq!(
+            write_reactivation_no_input(
+                &mut framed,
+                &[0xA5],
+                true,
+                &stop,
+                &rx,
+                &latest,
+                &mut input_sent_at,
+            )
+            .unwrap(),
+            ReactivationInput::Continue { batch_full: false }
+        );
+        let wire = &framed.get_inner().0.0;
+        assert_eq!(wire.first(), Some(&0xA5), "Synchronize must lead the wire");
+        assert!(
+            wire.len() > 1,
+            "queued input must follow Synchronize immediately"
+        );
+        assert!(input_sent_at.is_some());
     }
 
     fn decode_input(wire: &[u8]) -> Vec<FastPathInputEvent> {
