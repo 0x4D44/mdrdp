@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00105 — Mapping an incomplete surface wakes a suppressed presentation
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** display/frame-atomicity
 - **Raised:** 2026-08-24T12:03:48Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T120451Z-2f52ab07
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00105-run-fix-20260824T120451Z-2f52ab07
-- **Owner base:** 49c95e9b68e95bb239d56d537d818568ccab01cf
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T12:04:51Z
-- **Owner until:** 2026-08-24T14:04:51Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T12:11:23Z, deltic:auto role=fix run=fix-20260824T120451Z-2f52ab07 branch=task/bug-MDR-BUG-FLU-00105-run-fix-20260824T120451Z-2f52ab07 code=405368f gate=manual)
 
 ## Observation
 
