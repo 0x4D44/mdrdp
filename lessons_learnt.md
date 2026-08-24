@@ -6,6 +6,11 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Partial framed reads need nonblocking pump slices, not socket timeouts (`session.rs:with_nonblocking_framed_read`).
+  `Framed` and rustls may perform several socket reads for one PDU, and a trickling peer resets a
+  per-call timeout. Preserve their partial buffers, yield on `WouldBlock`, then restore blocking
+  mode before the shared stream can write.
+
 - Damage cadence must read current store dimensions, not the old snapshot (`window.rs:damage_state`).
   A large frame can remain in the reusable copy while a small replacement is already presentable;
   sizing the throttle from that stale copy delays the cheap redraw by the full cadence interval.

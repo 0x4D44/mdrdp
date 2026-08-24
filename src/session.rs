@@ -9,7 +9,8 @@
 //! Input latency does NOT pay for that simplicity: when nothing is decodable the loop
 //! sleeps in [`wake::wait_readable`] on the socket *and* a doorbell every input sender
 //! rings, so a keystroke wakes it immediately instead of waiting out a read timeout.
-//! [`READ_SLICE`] only bounds the rare wait for the rest of an already-started PDU.
+//! Framed reads temporarily use nonblocking mode, so a partial TLS/PDU tail also returns
+//! to the pump instead of holding it through the socket timeout.
 
 use crate::clipboard::ClipboardBridge;
 use crate::connect::{ConnectError, Established, describe, send_shutdown, write_framed};
@@ -31,11 +32,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How long a read blocks when a PDU has started arriving but is not complete yet.
+/// Receive timeout retained on the session socket for non-Framed read paths and diagnostics.
 ///
-/// This is NOT the input-latency bound — input wakes the loop through the doorbell
-/// while the socket is quiet. It only caps the wait for the tail of a PDU whose head
-/// is already buffered, where more socket data is the only thing that can help.
+/// Framed session reads temporarily use nonblocking mode, so this timeout cannot hold the
+/// pump behind a partial TLS/PDU tail. It remains configured for the socket's other users.
 const READ_SLICE: Duration = Duration::from_millis(5);
 /// A peer that stops reading must not hold the sole session thread forever.
 ///
@@ -398,7 +398,11 @@ fn pump(
             }
         }
 
-        let (action, payload) = match established.framed.read_pdu() {
+        let (action, payload) = match with_nonblocking_framed_read(
+            &mut established.framed,
+            |stream, nonblocking| stream.sock.set_nonblocking(nonblocking),
+            |framed| framed.read_pdu(),
+        ) {
             Ok(pdu) => pdu,
             Err(e)
                 if matches!(
@@ -1167,7 +1171,11 @@ fn drive_reactivation(
                     continue;
                 }
             }
-            match established.framed.read_by_hint(hint) {
+            match with_nonblocking_framed_read(
+                &mut established.framed,
+                |stream, nonblocking| stream.sock.set_nonblocking(nonblocking),
+                |framed| framed.read_by_hint(hint),
+            ) {
                 Ok(pdu) => break pdu,
                 Err(e)
                     if matches!(
@@ -1228,6 +1236,26 @@ fn decodable_waiting(framed: &mut Framed<StreamOwned<ClientConnection, TcpStream
         // A TLS-level fault: let read_pdu surface it rather than swallowing it here.
         Err(_) => true,
     }
+}
+
+/// Let a Framed read consume only bytes that are currently available.
+///
+/// `Framed::read_pdu` and `read_by_hint` loop until a complete frame, while rustls may
+/// perform several underlying reads to finish a TLS record. A socket timeout bounds only
+/// each of those reads, so a peer that trickles bytes can otherwise hold this thread forever.
+/// Nonblocking mode makes rustls preserve its partial state and return `WouldBlock`; restore
+/// blocking mode before any caller can write the shared stream.
+fn with_nonblocking_framed_read<S, R>(
+    framed: &mut Framed<S>,
+    set_nonblocking: impl Fn(&mut S, bool) -> std::io::Result<()>,
+    read: impl FnOnce(&mut Framed<S>) -> std::io::Result<R>,
+) -> std::io::Result<R> {
+    set_nonblocking(framed.get_inner_mut().0, true)?;
+    let result = read(framed);
+    // If restoration fails, the socket mode is unknown and the session must not continue
+    // with a Framed writer that may unexpectedly return WouldBlock.
+    set_nonblocking(framed.get_inner_mut().0, false)?;
+    result
 }
 
 /// What a drain of the input queue did.
@@ -1326,7 +1354,124 @@ mod tests {
     use crate::surface::SurfaceStore;
     use ironrdp::core::decode;
     use ironrdp::pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
+    use std::collections::VecDeque;
+    use std::io::{self, Read, Write as _};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (writer, _) = listener.accept().unwrap();
+        (reader, writer)
+    }
+
+    enum ReadStep {
+        Bytes(&'static [u8]),
+        Pending,
+    }
+
+    struct ScriptedReadStream {
+        steps: VecDeque<ReadStep>,
+        nonblocking: bool,
+    }
+
+    impl Read for ScriptedReadStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.steps.pop_front().expect("scripted read step") {
+                ReadStep::Bytes(bytes) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                ReadStep::Pending if self.nonblocking => {
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                }
+                ReadStep::Pending => Err(io::Error::from(io::ErrorKind::TimedOut)),
+            }
+        }
+    }
+
+    #[test]
+    fn partial_pdu_read_returns_would_block_and_resumes_from_framer_state() {
+        let stream = ScriptedReadStream {
+            steps: VecDeque::from([
+                ReadStep::Bytes(&[0x00, 0x06, 0xAA]),
+                ReadStep::Pending,
+                ReadStep::Bytes(&[0xBB, 0xCC, 0xDD]),
+            ]),
+            nonblocking: false,
+        };
+        let mut framed = Framed::new(stream);
+
+        // The first transport read receives only half the frame, then reports WouldBlock.
+        let started = Instant::now();
+        let error = with_nonblocking_framed_read(
+            &mut framed,
+            |stream, nonblocking| {
+                stream.nonblocking = nonblocking;
+                Ok(())
+            },
+            |framed| framed.read_pdu(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a partial frame must return control to the pump"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "partial reads must not wait for the socket timeout"
+        );
+        assert!(!framed.get_inner().0.nonblocking);
+
+        let (action, payload) = with_nonblocking_framed_read(
+            &mut framed,
+            |stream, nonblocking| {
+                stream.nonblocking = nonblocking;
+                Ok(())
+            },
+            |framed| framed.read_pdu(),
+        )
+        .unwrap();
+        assert!(!framed.get_inner().0.nonblocking);
+        assert_eq!(action, ironrdp::pdu::Action::FastPath);
+        assert_eq!(&payload[..], &[0x00, 0x06, 0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn partial_hint_read_returns_would_block_and_restores_mode() {
+        let (reader, mut writer) = tcp_pair();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut framed = Framed::new(reader.try_clone().unwrap());
+
+        writer.write_all(&[0x00, 0x06, 0x11]).unwrap();
+        let started = Instant::now();
+        let error = with_nonblocking_framed_read(
+            &mut framed,
+            |stream, nonblocking| stream.set_nonblocking(nonblocking),
+            |framed| framed.read_by_hint(&ironrdp::pdu::RDP_HINT),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "partial hint reads must not wait for the socket timeout"
+        );
+
+        let started = Instant::now();
+        let error = framed.read_by_hint(&ironrdp::pdu::RDP_HINT).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "restored hint reads must honor the socket timeout"
+        );
+    }
 
     #[test]
     fn the_session_socket_bounds_both_read_and_write_stalls() {
