@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00114 — Partial AVC444 validity lets chroma repaint from zero or stale luma
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/avc444
 - **Raised:** 2026-08-24T17:22:02Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T172235Z-bb368359
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00114-run-fix-20260824T172235Z-bb368359
-- **Owner base:** c64557a154522f3086e0f13c7deffca3e7d4d307
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T17:22:35Z
-- **Owner until:** 2026-08-24T19:54:36Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T17:22:02Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-24T17:22:02Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T17:55:36Z, deltic:auto role=fix run=fix-20260824T172235Z-bb368359 branch=task/bug-MDR-BUG-FLU-00114-run-fix-20260824T172235Z-bb368359 code=ccff9a0 gate=manual)
 
 ## Observation
 
