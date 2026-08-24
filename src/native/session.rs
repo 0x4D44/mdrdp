@@ -22,7 +22,7 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,7 @@ use rhydra::clipboard::{self as clip, Bridge, Policy, TextClipboard};
 /// The surface id the native session paints. There is only ever one.
 pub const OUTPUT_SURFACE: u16 = 0;
 const UPDATE_BLOCK_SIZE: u32 = 16;
+const MOVE_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Decoder selected by the server header. H.264 remains primary; HEVC is kept
 /// as a full-frame fallback when the host cannot construct the tiled AVC path.
@@ -82,6 +83,7 @@ impl NativeDecoder {
 /// The codec label the title bar and HUD show for native frames.
 const CODEC_LABEL: &str = "AVC (rhydra)";
 const SPARSE_CODEC_LABEL: &str = "raw BGRA (rhydra)";
+const MOVE_CODEC_LABEL: &str = "move + raw BGRA (rhydra)";
 
 /// How often the local clipboard is read. Matches the RDP bridge's cadence:
 /// macOS has no change notification worth using, so this is a poll.
@@ -431,6 +433,7 @@ pub fn spawn(
         conn.header.height,
     )));
     let base_ready = Arc::new(AtomicBool::new(false));
+    let move_rendezvous = Arc::new(MoveRendezvous::default());
 
     let net_stop = Arc::clone(&stop);
     let net_input_sock = conn.input.try_clone()?;
@@ -447,6 +450,7 @@ pub fn spawn(
         input_clock.clone(),
         Arc::clone(&fences),
         Arc::clone(&base_ready),
+        Arc::clone(&move_rendezvous),
     );
     let sparse_stop = Arc::clone(&stop);
     let sparse_video_sock = conn.video.try_clone()?;
@@ -458,6 +462,7 @@ pub fn spawn(
         wire_size: (conn.header.width, conn.header.height),
         fences,
         base_ready,
+        move_rendezvous,
         wake: Box::new({
             let sparse_waker = sparse_waker.clone();
             move || {
@@ -868,9 +873,8 @@ fn pump_video(
     }
 }
 
-/// Read the low-latency sparse-pixel channel. This connection intentionally
-/// accepts only raw rectangle messages; widening its dialect would let bulk
-/// traffic recreate the head-of-line blocking the connection removes.
+/// Read raw rectangles plus the tiny move rendezvous fence. Pixel bulk remains
+/// forbidden here, so a compressed access unit cannot recreate head-of-line delay.
 fn pump_sparse(sparse: &mut TcpStream, sink: &mut SparseSink, stop: &AtomicBool) -> SessionEnd {
     let mut reassembler = Reassembler::new(framing::DEFAULT_MAX_PAYLOAD);
     let mut buf = vec![0u8; 64 * 1024];
@@ -881,6 +885,18 @@ fn pump_sparse(sparse: &mut TcpStream, sink: &mut SparseSink, stop: &AtomicBool)
         match reassembler.next_message() {
             Ok(Some(message)) if message.msg_type == framing::MSG_RECTS => {
                 if let Err(reason) = sink.on_rects(&message.payload) {
+                    return SessionEnd::TransportFailed(reason);
+                }
+                continue;
+            }
+            Ok(Some(message)) if message.msg_type == framing::MSG_MOVE_FENCE => {
+                let (baseline_seq, frame_seq) = match framing::decode_move_fence(&message.payload) {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        return SessionEnd::TransportFailed(format!("move fence: {error}"));
+                    }
+                };
+                if let Err(reason) = sink.move_rendezvous.sparse_pause(baseline_seq, frame_seq) {
                     return SessionEnd::TransportFailed(reason);
                 }
                 continue;
@@ -923,7 +939,7 @@ fn dispatch_video_message(
 ) -> Result<(), String> {
     match message.msg_type {
         framing::MSG_RECTS => {
-            Err("raw rectangles arrived on the bulk video channel under wire v7".to_owned())
+            Err("raw rectangles arrived on the bulk video channel under wire v8".to_owned())
         }
         framing::MSG_VIDEO_SEQ => {
             if message.payload.len() < 8 {
@@ -941,6 +957,7 @@ fn dispatch_video_message(
             Ok(update) => sink.on_video_update(update),
             Err(error) => Err(format!("MSG_VIDEO_UPDATE: {error}")),
         },
+        framing::MSG_MOVE_UPDATE => sink.on_move_update(&message.payload),
         framing::MSG_VIDEO => sink.on_au(&message.payload, None),
         framing::MSG_CURSOR => match framing::decode_cursor(&message.payload) {
             Ok(true) => {
@@ -1367,6 +1384,7 @@ pub(crate) struct NativeSink {
     input_clock: InputClock,
     fences: Arc<Mutex<BlockFences>>,
     base_ready: Arc<AtomicBool>,
+    move_rendezvous: Arc<MoveRendezvous>,
     // Visible-behaviour counters (tests and debugging; not user-facing yet).
     pub(crate) suppressed: u64,
     #[cfg(test)]
@@ -1406,11 +1424,141 @@ struct BlockFences {
     seqs: Vec<u64>,
 }
 
+#[derive(Default)]
+struct MoveRendezvous {
+    state: Mutex<MoveRendezvousState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+enum MoveRendezvousState {
+    #[default]
+    Idle,
+    SparseWaiting {
+        baseline_seq: u64,
+        frame_seq: u64,
+    },
+    Failed,
+}
+
+impl MoveRendezvous {
+    fn sparse_pause(&self, baseline_seq: u64, frame_seq: u64) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*state, MoveRendezvousState::Idle) {
+            *state = MoveRendezvousState::Failed;
+            self.changed.notify_all();
+            return Err("overlapping move fences".into());
+        }
+        *state = MoveRendezvousState::SparseWaiting {
+            baseline_seq,
+            frame_seq,
+        };
+        self.changed.notify_all();
+        let deadline = Instant::now() + MOVE_RENDEZVOUS_TIMEOUT;
+        loop {
+            match *state {
+                MoveRendezvousState::Idle => return Ok(()),
+                MoveRendezvousState::Failed => return Err("move rendezvous failed".into()),
+                MoveRendezvousState::SparseWaiting {
+                    baseline_seq: waiting_baseline,
+                    frame_seq: waiting_frame,
+                } if waiting_baseline == baseline_seq && waiting_frame == frame_seq => {}
+                MoveRendezvousState::SparseWaiting { .. } => {
+                    *state = MoveRendezvousState::Failed;
+                    self.changed.notify_all();
+                    return Err("move rendezvous changed while sparse waited".into());
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                *state = MoveRendezvousState::Failed;
+                self.changed.notify_all();
+                return Err("move bulk update did not arrive within 5 seconds".into());
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        }
+    }
+
+    fn bulk_wait(&self, baseline_seq: u64, frame_seq: u64) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = Instant::now() + MOVE_RENDEZVOUS_TIMEOUT;
+        loop {
+            match *state {
+                MoveRendezvousState::SparseWaiting {
+                    baseline_seq: waiting_baseline,
+                    frame_seq: waiting_frame,
+                } if waiting_baseline == baseline_seq && waiting_frame == frame_seq => {
+                    return Ok(());
+                }
+                MoveRendezvousState::SparseWaiting { .. } => {
+                    *state = MoveRendezvousState::Failed;
+                    self.changed.notify_all();
+                    return Err("bulk move does not match sparse fence".into());
+                }
+                MoveRendezvousState::Failed => return Err("move rendezvous failed".into()),
+                MoveRendezvousState::Idle => {}
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                *state = MoveRendezvousState::Failed;
+                self.changed.notify_all();
+                return Err("move sparse fence did not arrive within 5 seconds".into());
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        }
+    }
+
+    fn bulk_complete(&self, frame_seq: u64) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *state {
+            MoveRendezvousState::SparseWaiting {
+                frame_seq: waiting_frame,
+                ..
+            } if waiting_frame == frame_seq => {
+                *state = MoveRendezvousState::Idle;
+                self.changed.notify_all();
+                Ok(())
+            }
+            _ => {
+                *state = MoveRendezvousState::Failed;
+                self.changed.notify_all();
+                Err("bulk move completed without its sparse fence".into())
+            }
+        }
+    }
+
+    fn bulk_abort(&self) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = MoveRendezvousState::Failed;
+        self.changed.notify_all();
+    }
+}
+
 struct SparseSink {
     store: Arc<Mutex<SurfaceStore>>,
     wire_size: (u32, u32),
     fences: Arc<Mutex<BlockFences>>,
     base_ready: Arc<AtomicBool>,
+    move_rendezvous: Arc<MoveRendezvous>,
     wake: Box<dyn Fn() + Send>,
     stats: StatsHandle,
     input_clock: InputClock,
@@ -1571,6 +1719,10 @@ impl BlockFences {
             }
         }
     }
+
+    fn max_seq(&self) -> u64 {
+        self.seqs.iter().copied().max().unwrap_or(0)
+    }
 }
 
 struct TileFrameProgress {
@@ -1606,6 +1758,7 @@ impl NativeSink {
             input_clock,
             fences: Arc::new(Mutex::new(BlockFences::new(wire_size.0, wire_size.1))),
             base_ready: Arc::new(AtomicBool::new(false)),
+            move_rendezvous: Arc::new(MoveRendezvous::default()),
             suppressed: 0,
             #[cfg(test)]
             skipped_stale: 0,
@@ -1628,6 +1781,7 @@ impl NativeSink {
     ) -> Self {
         let fences = Arc::new(Mutex::new(BlockFences::new(wire_size.0, wire_size.1)));
         let base_ready = Arc::new(AtomicBool::new(false));
+        let move_rendezvous = Arc::new(MoveRendezvous::default());
         Self::new_tiled_shared(
             decoders,
             headers,
@@ -1638,6 +1792,7 @@ impl NativeSink {
             input_clock,
             fences,
             base_ready,
+            move_rendezvous,
         )
     }
 
@@ -1652,6 +1807,7 @@ impl NativeSink {
         input_clock: InputClock,
         fences: Arc<Mutex<BlockFences>>,
         base_ready: Arc<AtomicBool>,
+        move_rendezvous: Arc<MoveRendezvous>,
     ) -> Self {
         assert_eq!(
             decoders.len(),
@@ -1686,6 +1842,7 @@ impl NativeSink {
             input_clock,
             fences,
             base_ready,
+            move_rendezvous,
             suppressed: 0,
             #[cfg(test)]
             skipped_stale: 0,
@@ -2113,6 +2270,133 @@ impl NativeSink {
         }
         (self.wake)();
         Ok(())
+    }
+
+    fn on_move_update(&mut self, payload: &[u8]) -> Result<(), String> {
+        let rendezvous = Arc::clone(&self.move_rendezvous);
+        let update = match rects::decode_move_update(payload) {
+            Ok(update) => update,
+            Err(error) => {
+                rendezvous.bulk_abort();
+                return Err(format!("move update payload: {error}"));
+            }
+        };
+        if (update.frame.frame_width, update.frame.frame_height) != self.wire_size {
+            rendezvous.bulk_abort();
+            return Err(format!(
+                "host move geometry changed ({}x{} vs session {}x{}); reconnect",
+                update.frame.frame_width,
+                update.frame.frame_height,
+                self.wire_size.0,
+                self.wire_size.1
+            ));
+        }
+        if !self.has_base {
+            rendezvous.bulk_abort();
+            return Err("move update cannot bootstrap without recovery".into());
+        }
+
+        rendezvous.bulk_wait(update.baseline_seq, update.frame.frame_seq)?;
+        let result = (|| {
+            let move_rects: Vec<_> = update
+                .moves
+                .iter()
+                .map(|movement| {
+                    (
+                        Rect::new(
+                            movement.src_x,
+                            movement.src_y,
+                            movement.src_x + movement.w,
+                            movement.src_y + movement.h,
+                        ),
+                        Rect::new(
+                            movement.dst_x,
+                            movement.dst_y,
+                            movement.dst_x + movement.w,
+                            movement.dst_y + movement.h,
+                        ),
+                    )
+                })
+                .collect();
+            let dirty: Vec<_> = update
+                .frame
+                .rects
+                .iter()
+                .map(|rect| {
+                    (
+                        Rect::new(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h),
+                        rect.pixels.as_slice(),
+                    )
+                })
+                .collect();
+            let mut coverage: Vec<_> = update
+                .moves
+                .iter()
+                .map(|movement| Region {
+                    x: u32::from(movement.dst_x),
+                    y: u32::from(movement.dst_y),
+                    width: u32::from(movement.w),
+                    height: u32::from(movement.h),
+                })
+                .collect();
+            coverage.extend(update.frame.rects.iter().map(|rect| Region {
+                x: u32::from(rect.x),
+                y: u32::from(rect.y),
+                width: u32::from(rect.w),
+                height: u32::from(rect.h),
+            }));
+
+            let mut fences = self
+                .fences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if fences.max_seq() != update.baseline_seq {
+                return Err(format!(
+                    "move baseline {} does not match displayed sequence {}",
+                    update.baseline_seq,
+                    fences.max_seq()
+                ));
+            }
+            let generation = {
+                let mut store = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                store
+                    .move_and_blit_bgra_strict_batch(
+                        OUTPUT_SURFACE,
+                        &move_rects,
+                        dirty.iter().copied(),
+                    )
+                    .map_err(|error| format!("move batch: {error}"))?
+            };
+            fences.commit(update.frame.frame_seq, &coverage);
+            drop(fences);
+            self.exact_through = Some(update.frame.frame_seq);
+            let input_us = self.input_clock.take_us();
+            self.stats.update(|stats| {
+                stats.frames += 1;
+                stats.bytes_in = stats.bytes_in.saturating_add(payload.len() as u64);
+                *stats.codecs.entry(MOVE_CODEC_LABEL.to_owned()).or_insert(0) += 1;
+                *stats
+                    .codec_painted
+                    .entry(MOVE_CODEC_LABEL.to_owned())
+                    .or_insert(0) += payload.len() as u64;
+                if let Some(us) = input_us {
+                    stats.latency.record(us);
+                }
+                stats.mark_painted(generation);
+            });
+            (self.wake)();
+            Ok(())
+        })();
+        match result {
+            Ok(()) => rendezvous.bulk_complete(update.frame.frame_seq),
+            Err(error) => {
+                rendezvous.bulk_abort();
+                Err(error)
+            }
+        }
     }
 
     fn tile_dest(tile_id: u8, header: TileHeader) -> Result<Rect, String> {
@@ -2984,6 +3268,7 @@ mod tests {
         }
         let fences = Arc::new(Mutex::new(BlockFences::new(size.0, size.1)));
         let base_ready = Arc::new(AtomicBool::new(false));
+        let move_rendezvous = Arc::new(MoveRendezvous::default());
         let stats = StatsHandle::new();
         let input_clock = InputClock::default();
         let mut video = NativeSink::new_tiled_shared(
@@ -3002,12 +3287,14 @@ mod tests {
             input_clock.clone(),
             Arc::clone(&fences),
             Arc::clone(&base_ready),
+            Arc::clone(&move_rendezvous),
         );
         let mut sparse = SparseSink {
             store: Arc::clone(&store),
             wire_size: size,
             fences,
             base_ready,
+            move_rendezvous,
             wake: Box::new(|| {}),
             stats,
             input_clock,
@@ -3702,6 +3989,132 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn move_rendezvous_pauses_newer_sparse_work_until_bulk_commit() {
+        let rendezvous = Arc::new(MoveRendezvous::default());
+        let sparse = Arc::clone(&rendezvous);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            sparse.sparse_pause(40, 41).unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        rendezvous.bulk_wait(40, 41).unwrap();
+        assert!(
+            done_rx.try_recv().is_err(),
+            "sparse reader must remain paused while bulk applies the move"
+        );
+        rendezvous.bulk_complete(41).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn move_update_copies_the_baseline_then_paints_exposed_pixels() {
+        let size = (4, 1);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let mut sink = NativeSink::new_tiled(
+            vec![NativeDecoder::H264(Box::new(FakeDecoder { size }))],
+            vec![TileHeader {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: size.0,
+                height: size.1,
+            }],
+            Arc::clone(&store),
+            size,
+            Box::new(|| {}),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+        sink.on_video_update(VideoUpdate {
+            frame_seq: 40,
+            frame_width: size.0,
+            frame_height: size.1,
+            block_size: UPDATE_BLOCK_SIZE as u16,
+            kind: VideoKind::Recovery,
+            tiles: vec![video_update::VideoTile {
+                tile_id: 0,
+                coverage: vec![Region {
+                    x: 0,
+                    y: 0,
+                    width: size.0,
+                    height: size.1,
+                }],
+                au: vec![1],
+            }],
+        })
+        .unwrap();
+        let initial = [1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255];
+        store
+            .lock()
+            .unwrap()
+            .blit_rgba_strict(OUTPUT_SURFACE, Rect::new(0, 0, 4, 1), &initial)
+            .unwrap();
+        let update = rects::MoveUpdate {
+            baseline_seq: 40,
+            frame: rects::RectUpdate {
+                frame_seq: 41,
+                frame_width: size.0,
+                frame_height: size.1,
+                rects: vec![rects::Rect {
+                    x: 3,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                    pixels: vec![30, 20, 10, 255],
+                }],
+            },
+            moves: vec![
+                rects::MoveRect {
+                    src_x: 0,
+                    src_y: 0,
+                    dst_x: 1,
+                    dst_y: 0,
+                    w: 2,
+                    h: 1,
+                },
+                rects::MoveRect {
+                    src_x: 2,
+                    src_y: 0,
+                    dst_x: 0,
+                    dst_y: 0,
+                    w: 2,
+                    h: 1,
+                },
+            ],
+        };
+        let mut payload = Vec::new();
+        rects::encode_move_update(&update, &mut payload);
+        let sparse = Arc::clone(&sink.move_rendezvous);
+        let pause = std::thread::spawn(move || sparse.sparse_pause(40, 41));
+
+        sink.on_move_update(&payload).unwrap();
+        pause.join().unwrap().unwrap();
+
+        assert_eq!(
+            store.lock().unwrap().get(OUTPUT_SURFACE).unwrap().pixels(),
+            [3, 0, 0, 255, 4, 0, 0, 255, 2, 0, 0, 255, 10, 20, 30, 255]
+        );
+
+        let mut stale = update;
+        stale.baseline_seq = 39;
+        stale.frame.frame_seq = 42;
+        let mut stale_payload = Vec::new();
+        rects::encode_move_update(&stale, &mut stale_payload);
+        let sparse = Arc::clone(&sink.move_rendezvous);
+        let pause = std::thread::spawn(move || sparse.sparse_pause(39, 42));
+        let error = sink.on_move_update(&stale_payload).unwrap_err();
+        assert!(error.contains("does not match displayed sequence 41"));
+        assert!(pause.join().unwrap().is_err());
     }
 
     #[test]

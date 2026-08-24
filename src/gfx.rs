@@ -312,6 +312,7 @@ impl GfxHandler {
                 // Native-transport-only errors; the EGFX path never produces them.
                 SurfaceError::SizeMismatch { .. } => "size_mismatch",
                 SurfaceError::OutOfBounds { .. } => "out_of_bounds",
+                SurfaceError::MoveSizeMismatch { .. } => "move_size_mismatch",
             };
             self.note_surface_error(reason, 1);
         }

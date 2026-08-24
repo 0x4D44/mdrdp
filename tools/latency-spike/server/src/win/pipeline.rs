@@ -549,6 +549,13 @@ struct VideoPlan {
     block_size: u16,
     coverage: Vec<(u8, Vec<Region>)>,
     raw: Option<send::SparseOutbound>,
+    move_update: Option<PreparedMove>,
+}
+
+struct PreparedMove {
+    record: Box<stats::RectRecord>,
+    payload: Vec<u8>,
+    fence: send::SparseOutbound,
 }
 
 struct RoutingPlan {
@@ -570,6 +577,7 @@ fn full_video_plan(
         frame_height,
         block_size: CODEC_BLOCK_SIZE as u16,
         raw: None,
+        move_update: None,
         coverage: tiles
             .iter()
             .map(|tile| {
@@ -712,7 +720,7 @@ fn select_routing_plan(
                 h: region.height,
             })
             .collect(),
-        move_rects: 0,
+        moves: Vec::new(),
     });
     let video = (!plan.video.is_empty()).then_some(VideoPlan {
         atomic_avc: true,
@@ -722,6 +730,7 @@ fn select_routing_plan(
         block_size: CODEC_BLOCK_SIZE as u16,
         coverage,
         raw: None,
+        move_update: None,
     });
     Ok(RoutingPlan { raw, video })
 }
@@ -904,71 +913,133 @@ fn admit_emitted(
     recovery: &mut logical_frame::Recovery,
     want_keyframe: &mut bool,
 ) -> Result<()> {
-    for tile in ctx.emitted.drain(..) {
+    let emitted: Vec<_> = ctx.emitted.drain(..).collect();
+    for tile in emitted {
         let assembled = assembler.push(tile.seq, tile.tile_id, tile);
-        for mut frame in assembled.ready {
-            debug_assert!(frame.tiles.iter().all(|(_, tile)| tile.seq == frame.seq));
-            let has_keyframe = frame.tiles.iter().any(|(_, tile)| tile.record.keyframe);
-            let all_keyframes = frame.tiles.iter().all(|(_, tile)| tile.record.keyframe);
-            let is_recovery = frame.plan.kind == VideoKind::Recovery && all_keyframes;
-            match recovery.prepare(has_keyframe, is_recovery) {
-                logical_frame::RecoveryDecision::Admit => {}
-                logical_frame::RecoveryDecision::Suppress => continue,
-                logical_frame::RecoveryDecision::SuppressAndRequest => {
-                    *want_keyframe = true;
-                    continue;
-                }
+        admit_ready_frames(assembled.ready, ctx, tx, recovery, want_keyframe)?;
+    }
+    Ok(())
+}
+
+fn admit_ready_frames(
+    ready: Vec<logical_frame::PlannedComplete<VideoPlan, send::FrameTile>>,
+    ctx: &mut EmitCtx,
+    tx: &SyncSender<send::Outbound>,
+    recovery: &mut logical_frame::Recovery,
+    want_keyframe: &mut bool,
+) -> Result<()> {
+    for mut frame in ready {
+        if let Some(movement) = frame.plan.move_update.take() {
+            debug_assert!(frame.tiles.is_empty());
+            if !recovery.allows_overlays() {
+                continue;
             }
-            let mut records = Vec::with_capacity(frame.tiles.len());
-            let mut wire_tiles = Vec::with_capacity(frame.tiles.len());
-            for (tile_id, mut tile) in frame.tiles {
-                tile.record.dropped_frames = recovery.dropped();
-                let coverage = frame
-                    .plan
-                    .coverage
-                    .iter()
-                    .find(|(planned_id, _)| *planned_id == tile_id)
-                    .map(|(_, coverage)| coverage.clone())
-                    .expect("assembler returned only planned tile ids");
-                wire_tiles.push(VideoTile {
-                    tile_id,
-                    coverage,
-                    au: std::mem::take(&mut tile.au),
-                });
-                records.push(tile);
-            }
-            let outbound = if frame.plan.atomic_avc {
-                let update = VideoUpdate {
-                    frame_seq: frame.seq,
-                    frame_width: frame.plan.frame_width,
-                    frame_height: frame.plan.frame_height,
-                    block_size: frame.plan.block_size,
-                    kind: frame.plan.kind,
-                    tiles: wire_tiles,
-                };
-                let mut payload = Vec::with_capacity(video_update::encoded_len(&update));
-                video_update::encode(&update, &mut payload);
-                send::Outbound::Video(records, payload, None)
+            if admit_move(tx, &ctx.sparse_tx, movement)? {
+                recovery.admitted(false);
             } else {
-                debug_assert_eq!(records.len(), 1, "HEVC fallback is one full-frame tile");
-                send::Outbound::FrameSet(records)
+                ctx.dropped_rects += 1;
+                recovery.queue_full();
+                *want_keyframe = true;
+            }
+            continue;
+        }
+        debug_assert!(frame.tiles.iter().all(|(_, tile)| tile.seq == frame.seq));
+        let has_keyframe = frame.tiles.iter().any(|(_, tile)| tile.record.keyframe);
+        let all_keyframes = frame.tiles.iter().all(|(_, tile)| tile.record.keyframe);
+        let is_recovery = frame.plan.kind == VideoKind::Recovery && all_keyframes;
+        match recovery.prepare(has_keyframe, is_recovery) {
+            logical_frame::RecoveryDecision::Admit => {}
+            logical_frame::RecoveryDecision::Suppress => continue,
+            logical_frame::RecoveryDecision::SuppressAndRequest => {
+                *want_keyframe = true;
+                continue;
+            }
+        }
+        let mut records = Vec::with_capacity(frame.tiles.len());
+        let mut wire_tiles = Vec::with_capacity(frame.tiles.len());
+        for (tile_id, mut tile) in frame.tiles {
+            tile.record.dropped_frames = recovery.dropped();
+            let coverage = frame
+                .plan
+                .coverage
+                .iter()
+                .find(|(planned_id, _)| *planned_id == tile_id)
+                .map(|(_, coverage)| coverage.clone())
+                .expect("assembler returned only planned tile ids");
+            wire_tiles.push(VideoTile {
+                tile_id,
+                coverage,
+                au: std::mem::take(&mut tile.au),
+            });
+            records.push(tile);
+        }
+        let outbound = if frame.plan.atomic_avc {
+            let update = VideoUpdate {
+                frame_seq: frame.seq,
+                frame_width: frame.plan.frame_width,
+                frame_height: frame.plan.frame_height,
+                block_size: frame.plan.block_size,
+                kind: frame.plan.kind,
+                tiles: wire_tiles,
             };
-            let had_raw = frame.plan.raw.is_some();
-            match admit_video_and_raw(tx, &ctx.sparse_tx, outbound, frame.plan.raw.take())? {
-                true => recovery.admitted(is_recovery),
-                false => {
-                    if had_raw {
-                        ctx.dropped_rects += 1;
-                    }
-                    // Even a complete recovery frame may be the item rejected by
-                    // the queue, so every full admission needs a fresh all-tile IRAP.
-                    recovery.queue_full();
-                    *want_keyframe = true;
+            let mut payload = Vec::with_capacity(video_update::encoded_len(&update));
+            video_update::encode(&update, &mut payload);
+            send::Outbound::Video(records, payload, None)
+        } else {
+            debug_assert_eq!(records.len(), 1, "HEVC fallback is one full-frame tile");
+            send::Outbound::FrameSet(records)
+        };
+        let had_raw = frame.plan.raw.is_some();
+        match admit_video_and_raw(tx, &ctx.sparse_tx, outbound, frame.plan.raw.take())? {
+            true => recovery.admitted(is_recovery),
+            false => {
+                if had_raw {
+                    ctx.dropped_rects += 1;
                 }
+                // Even a complete recovery frame may be the item rejected by
+                // the queue, so every full admission needs a fresh all-tile IRAP.
+                recovery.queue_full();
+                *want_keyframe = true;
             }
         }
     }
     Ok(())
+}
+
+fn admit_move(
+    video_tx: &SyncSender<send::Outbound>,
+    sparse_tx: &SyncSender<send::SparseOutbound>,
+    movement: PreparedMove,
+) -> Result<bool> {
+    let gate = AdmissionGate::pending();
+    let mut fence = movement.fence;
+    fence.gate = Some(gate.clone());
+    let outbound = send::Outbound::Move(movement.record, movement.payload, Some(gate.clone()));
+    match video_tx.try_send(outbound) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            gate.decide(false);
+            return Ok(false);
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            gate.decide(false);
+            return Err("sender thread has gone away".to_owned().into());
+        }
+    }
+    match sparse_tx.try_send(fence) {
+        Ok(()) => {
+            gate.decide(true);
+            Ok(true)
+        }
+        Err(TrySendError::Full(_)) => {
+            gate.decide(false);
+            Ok(false)
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            gate.decide(false);
+            Err("sparse sender thread has gone away".to_owned().into())
+        }
+    }
 }
 
 fn admit_video_and_raw(
@@ -1062,7 +1133,7 @@ fn block_aligned_raw_change(
                 h: region.height,
             })
             .collect(),
-        move_rects: 0,
+        moves: Vec::new(),
     };
     Ok(
         (aligned.rects.len() <= RECT_MAX_COUNT && aligned.dirty_bytes() <= RECT_MAX_BYTES)
@@ -1167,9 +1238,79 @@ fn prepare_rects(
     record.from_diff = from_diff;
 
     send::SparseOutbound {
-        record: Box::new(record),
+        msg_type: crate::framing::MSG_RECTS,
+        record: Some(Box::new(record)),
         payload,
         gate: None,
+    }
+}
+
+fn prepare_move(
+    movements: &[super::source::MoveRect],
+    frame: rects::RectUpdate,
+    baseline_seq: u64,
+    pack_start: i64,
+    ctx: &EmitCtx,
+) -> Result<PreparedMove> {
+    let moves = movements
+        .iter()
+        .map(|movement| {
+            Ok(rects::MoveRect {
+                src_x: u16::try_from(movement.src_x)?,
+                src_y: u16::try_from(movement.src_y)?,
+                dst_x: u16::try_from(movement.dst_x)?,
+                dst_y: u16::try_from(movement.dst_y)?,
+                w: u16::try_from(movement.w)?,
+                h: u16::try_from(movement.h)?,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, std::num::TryFromIntError>>()?;
+    let rect_count = frame.rects.len() as u32;
+    let rect_bytes = frame
+        .rects
+        .iter()
+        .map(|rect| rect.pixels.len() as u64)
+        .sum();
+    let frame_seq = frame.frame_seq;
+    let update = rects::MoveUpdate {
+        baseline_seq,
+        frame,
+        moves,
+    };
+    let mut payload = Vec::with_capacity(rects::move_encoded_len(&update));
+    rects::encode_move_update(&update, &mut payload);
+    let mut record = stats::RectRecord::new();
+    record.frame = frame_seq;
+    record.rect_count = rect_count;
+    record.rect_bytes = rect_bytes;
+    record.pack_start_us = ctx.clock.micros(pack_start);
+    record.pack_end_us = ctx.clock.micros(qpc::now());
+    record.dropped_rects = ctx.dropped_rects;
+    Ok(PreparedMove {
+        record: Box::new(record),
+        payload,
+        fence: send::SparseOutbound {
+            msg_type: crate::framing::MSG_MOVE_FENCE,
+            record: None,
+            payload: crate::framing::encode_move_fence(baseline_seq, frame_seq).to_vec(),
+            gate: None,
+        },
+    })
+}
+
+/// Video fallback for a move frame owns the move destinations as final pixels.
+/// Without this expansion, disabling the move path would silently omit them.
+fn final_pixel_coverage(change: &ChangeInfo) -> ChangeInfo {
+    let mut rects = change.rects.clone();
+    rects.extend(change.moves.iter().map(|movement| DirtyRect {
+        x: movement.dst_x,
+        y: movement.dst_y,
+        w: movement.w,
+        h: movement.h,
+    }));
+    ChangeInfo {
+        rects,
+        moves: Vec::new(),
     }
 }
 
@@ -1206,6 +1347,9 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
     // (`Recreated` is a rebuilt duplication under `--source dxgi`, and a rebuilt
     // shared pool under `--source idd`; the reasoning is identical.)
     let mut suppress_rects_once = false;
+    // Sequence of the newest logical update scheduled for this viewer. Capture
+    // sequence gaps with no payload are deliberately absent from this baseline.
+    let mut last_scheduled_seq: Option<u64> = None;
     let mut last_epochs: Vec<u64> = state
         .tiles
         .iter()
@@ -1271,12 +1415,14 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             bootstrap.observe(false);
             recovery.reset();
             assembler.discard_through(frame_seq);
+            last_scheduled_seq = None;
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
         if bootstrap.observe(true) {
             // A new viewer starts mid-GOP and cannot decode a P-frame.
             want_keyframe = true;
+            last_scheduled_seq = None;
         }
         // Drain completed output before waiting for another capture. This keeps a
         // final AU moving on a pointer-only desktop and avoids putting old encode
@@ -1337,6 +1483,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 want_keyframe = true;
                 recovery.reset();
                 assembler.discard_through(frame_seq);
+                last_scheduled_seq = None;
                 suppress_rects_once = true;
                 // The retained frame predates the rebuild, so it is no longer the
                 // baseline the viewer is painting on top of; a diff against it would
@@ -1361,30 +1508,91 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         bootstrap.frame_admitted();
 
         let claimed_changed_pixels = change.as_ref().map(|change| {
-            let bounds: Vec<_> = change
+            let mut bounds: Vec<_> = change
                 .rects
                 .iter()
                 .map(|rect| (rect.x, rect.y, rect.w, rect.h))
                 .collect();
+            bounds.extend(
+                change
+                    .moves
+                    .iter()
+                    .map(|movement| (movement.dst_x, movement.dst_y, movement.w, movement.h)),
+            );
             rects::union_area(&bounds, state.capture.width(), state.capture.height())
         });
         let mut measured_changed_pixels = None;
         let mut raw_rect_attempted = false;
         let mut raw_rect_sent = false;
-        let sparse_allowed =
-            recovery.allows_overlays() && state.sparse_connected.load(Ordering::Acquire);
+        let sparse_allowed = recovery.allows_overlays()
+            && state.sparse_connected.load(Ordering::Acquire)
+            && !assembler.has_complete_pending();
         let force_full_once = suppress_rects_once;
         suppress_rects_once = false;
-        let mut routing = select_routing_plan(
-            state.codec,
-            !recovery.allows_overlays(),
-            force_full_once,
-            state.rects_enabled && sparse_allowed,
-            state.capture.width(),
-            state.capture.height(),
-            change.as_ref(),
-            &state.tiles,
-        )?;
+        let move_change = change.as_ref().filter(|change| {
+            !change.moves.is_empty()
+                && change.moves.len() <= RECT_MAX_COUNT
+                && change.rects.len() <= RECT_MAX_COUNT
+                && change.dirty_bytes() <= RECT_MAX_BYTES
+                && change.moves.iter().fold(0u64, |pixels, movement| {
+                    pixels.saturating_add(u64::from(movement.w) * u64::from(movement.h))
+                }) <= u64::from(state.capture.width()) * u64::from(state.capture.height())
+                && state.codec == encode::Codec::H264
+                && state.rects_enabled
+                && sparse_allowed
+                && !force_full_once
+                && last_scheduled_seq.is_some()
+        });
+        let fallback_change = change
+            .as_ref()
+            .filter(|change| move_change.is_none() && !change.moves.is_empty())
+            .map(final_pixel_coverage);
+        let mut routing =
+            if let (Some(move_change), Some(baseline_seq)) = (move_change, last_scheduled_seq) {
+                raw_rect_attempted = true;
+                raw_rect_sent = true;
+                let pack_start = qpc::now();
+                let dirty_only = ChangeInfo {
+                    rects: move_change.rects.clone(),
+                    moves: Vec::new(),
+                };
+                let rect_pixels = state.capture.read_rects(&texture, &dirty_only)?;
+                RoutingPlan {
+                    raw: None,
+                    video: Some(VideoPlan {
+                        atomic_avc: false,
+                        kind: VideoKind::Regional,
+                        frame_width: state.capture.width(),
+                        frame_height: state.capture.height(),
+                        block_size: CODEC_BLOCK_SIZE as u16,
+                        coverage: Vec::new(),
+                        raw: None,
+                        move_update: Some(prepare_move(
+                            &move_change.moves,
+                            rects::RectUpdate {
+                                frame_seq,
+                                frame_width: state.capture.width(),
+                                frame_height: state.capture.height(),
+                                rects: rect_pixels,
+                            },
+                            baseline_seq,
+                            pack_start,
+                            &contexts[0],
+                        )?),
+                    }),
+                }
+            } else {
+                select_routing_plan(
+                    state.codec,
+                    !recovery.allows_overlays(),
+                    force_full_once,
+                    state.rects_enabled && sparse_allowed,
+                    state.capture.width(),
+                    state.capture.height(),
+                    fallback_change.as_ref().or(change.as_ref()),
+                    &state.tiles,
+                )?
+            };
         let mut raw_only = None;
 
         // Read raw-owned blocks immediately while the capture texture is valid.
@@ -1431,7 +1639,9 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             Some(last) => state.clock.micros(acquire_qpc.saturating_sub(last)) >= DIFF_IDLE_GAP_US,
             None => false,
         };
-        let metadata_claims_no_change = change.as_ref().is_some_and(|c| c.rects.is_empty());
+        let metadata_claims_no_change = change
+            .as_ref()
+            .is_some_and(|change| change.rects.is_empty() && change.moves.is_empty());
         if state.diff_enabled
             && sparse_allowed
             && !force_full_once
@@ -1500,7 +1710,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                                 h: u32::from(rect.h),
                             })
                             .collect(),
-                        move_rects: 0,
+                        moves: Vec::new(),
                     };
                     if let Some(aligned) = block_aligned_raw_change(
                         &measured_change,
@@ -1534,6 +1744,9 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
 
         if let Some(outbound) = raw_only {
             raw_rect_sent = admit_rects(outbound, &mut contexts[0])?;
+            if raw_rect_sent {
+                last_scheduled_seq = Some(frame_seq);
+            }
         }
         // A diff-selected or all-raw update is complete without H.264. A mixed
         // metadata plan continues below with its raw payload attached to `video`.
@@ -1571,6 +1784,22 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         let Some(plan) = routing.video else {
             continue;
         };
+        if plan.move_update.is_some() {
+            let assembled = assembler.begin_complete(frame_seq, plan);
+            if assembled.dropped != 0 {
+                recovery.drop_incomplete(assembled.dropped);
+                want_keyframe = true;
+            }
+            last_scheduled_seq = Some(frame_seq);
+            admit_ready_frames(
+                assembled.ready,
+                &mut contexts[0],
+                &state.tx,
+                &mut recovery,
+                &mut want_keyframe,
+            )?;
+            continue;
+        }
         let planned_coverage = plan.coverage.clone();
         let expected_tiles: Vec<_> = plan.coverage.iter().map(|(tile_id, _)| *tile_id).collect();
         let dropped = assembler.begin(frame_seq, plan, &expected_tiles);
@@ -1578,6 +1807,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             recovery.drop_incomplete(dropped);
             want_keyframe = true;
         }
+        last_scheduled_seq = Some(frame_seq);
 
         for (((tile, ctx), last_epoch), tile_index) in state
             .tiles
@@ -1615,7 +1845,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 meta.change_valid = true;
                 meta.dirty_rect_count = change.rects.len() as u32;
                 meta.dirty_bytes = change.dirty_bytes();
-                meta.move_rect_count = change.move_rects;
+                meta.move_rect_count = change.moves.len() as u32;
             }
             meta.claimed_changed_pixels = claimed_changed_pixels;
             meta.measured_changed_pixels = measured_changed_pixels;

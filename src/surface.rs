@@ -355,7 +355,7 @@ impl Surface {
     /// Decoded native tiles have an exact advertised extent. Clipping one would
     /// hide a decoder or protocol mismatch, so both the rectangle and payload
     /// must match exactly.
-    fn validate_strict(&self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
+    fn validate_rect_strict(&self, dest: Rect) -> Result<(), SurfaceError> {
         if dest.right > self.width || dest.bottom > self.height || dest.is_empty() {
             return Err(SurfaceError::OutOfBounds {
                 rect: dest,
@@ -363,6 +363,11 @@ impl Surface {
                 height: self.height,
             });
         }
+        Ok(())
+    }
+
+    fn validate_strict(&self, dest: Rect, src: &[u8]) -> Result<(), SurfaceError> {
+        self.validate_rect_strict(dest)?;
         let row_bytes = dest.width() as usize * BPP;
         let expected = row_bytes * dest.height() as usize;
         if src.len() != expected {
@@ -480,6 +485,10 @@ pub enum SurfaceError {
         width: u16,
         height: u16,
     },
+    MoveSizeMismatch {
+        source: Rect,
+        destination: Rect,
+    },
 }
 
 impl std::fmt::Display for SurfaceError {
@@ -510,6 +519,17 @@ impl std::fmt::Display for SurfaceError {
                     rect.left, rect.top, rect.right, rect.bottom
                 )
             }
+            SurfaceError::MoveSizeMismatch {
+                source,
+                destination,
+            } => write!(
+                f,
+                "move source {}x{} differs from destination {}x{}",
+                source.width(),
+                source.height(),
+                destination.width(),
+                destination.height()
+            ),
         }
     }
 }
@@ -1239,6 +1259,67 @@ impl SurfaceStore {
             bytes = bytes.saturating_add(src.len() as u64);
         }
         self.cache_stats.bytes_from_wire = self.cache_stats.bytes_from_wire.saturating_add(bytes);
+        self.finish_surface_mutation(id);
+        Ok(self.generation)
+    }
+
+    /// Apply screen-to-screen moves and raw BGRA remainder as one visible update.
+    ///
+    /// Every source is staged from the pre-update surface before any destination is
+    /// written. This is required both for overlapping moves and for separate moves
+    /// whose destinations cover another move's source. Dirty final pixels land last.
+    pub(crate) fn move_and_blit_bgra_strict_batch<'a, I>(
+        &mut self,
+        id: u16,
+        moves: &[(Rect, Rect)],
+        dirty: I,
+    ) -> Result<u64, SurfaceError>
+    where
+        I: Iterator<Item = (Rect, &'a [u8])> + Clone,
+    {
+        let surface = self
+            .surfaces
+            .get(&id)
+            .ok_or(SurfaceError::NoSuchSurface(id))?;
+        for &(source, destination) in moves {
+            if source.width() != destination.width() || source.height() != destination.height() {
+                return Err(SurfaceError::MoveSizeMismatch {
+                    source,
+                    destination,
+                });
+            }
+            surface.validate_rect_strict(source)?;
+            surface.validate_rect_strict(destination)?;
+        }
+        for (destination, pixels) in dirty.clone() {
+            surface.validate_strict(destination, pixels)?;
+        }
+
+        let staged: Vec<_> = moves
+            .iter()
+            .map(|&(source, destination)| {
+                (
+                    destination,
+                    surface
+                        .extract(source)
+                        .expect("strictly validated move source must extract"),
+                )
+            })
+            .collect();
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(SurfaceError::NoSuchSurface(id))?;
+        for (destination, pixels) in staged {
+            surface.blit_rgba_strict(destination, &pixels)?;
+        }
+        let mut wire_bytes = 0u64;
+        for (destination, pixels) in dirty {
+            surface.blit_bgra_strict(destination, pixels)?;
+            wire_bytes = wire_bytes.saturating_add(pixels.len() as u64);
+        }
+        self.cache_stats.bytes_from_wire =
+            self.cache_stats.bytes_from_wire.saturating_add(wire_bytes);
         self.finish_surface_mutation(id);
         Ok(self.generation)
     }
@@ -2608,6 +2689,39 @@ mod tests {
         assert_eq!(generation, before_generation + 1);
         assert_eq!(store.get(1).unwrap().pixels(), [3, 2, 1, 4, 30, 20, 10, 40]);
         assert_eq!(store.cache_stats().bytes_from_wire, before_bytes + 8);
+    }
+
+    #[test]
+    fn a_move_batch_stages_all_sources_then_applies_dirty_pixels_once() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 4, 1);
+        store.map_to_output(1);
+        let initial = [1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255];
+        store
+            .blit_rgba_strict(1, Rect::new(0, 0, 4, 1), &initial)
+            .unwrap();
+        let before_generation = store.generation();
+        let before_bytes = store.cache_stats().bytes_from_wire;
+        let dirty_bgra = [30, 20, 10, 255];
+
+        let generation = store
+            .move_and_blit_bgra_strict_batch(
+                1,
+                &[
+                    (Rect::new(0, 0, 2, 1), Rect::new(1, 0, 3, 1)),
+                    (Rect::new(2, 0, 4, 1), Rect::new(0, 0, 2, 1)),
+                ],
+                [(Rect::new(3, 0, 4, 1), dirty_bgra.as_slice())].into_iter(),
+            )
+            .unwrap();
+
+        assert_eq!(generation, before_generation + 1);
+        assert_eq!(
+            store.get(1).unwrap().pixels(),
+            [3, 0, 0, 255, 4, 0, 0, 255, 2, 0, 0, 255, 10, 20, 30, 255],
+            "both move sources must come from the pre-update canvas, then dirty wins"
+        );
+        assert_eq!(store.cache_stats().bytes_from_wire, before_bytes + 4);
     }
 
     #[test]

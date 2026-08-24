@@ -188,7 +188,7 @@ pub const SCHEMA: u32 = 11;
 /// kinds beside the original VK down/up) — the video/rects wire itself is
 /// unchanged, but the header's `wire_version` couples both dialects together so a
 /// client's video-header gate also gates which input records it may send.
-pub const WIRE_VERSION: u32 = 7;
+pub const WIRE_VERSION: u32 = 8;
 
 impl Header {
     pub fn new() -> Self {

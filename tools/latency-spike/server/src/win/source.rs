@@ -54,6 +54,21 @@ pub struct DirtyRect {
     pub h: u32,
 }
 
+/// One compositor-provided screen-to-screen copy, in desktop coordinates.
+///
+/// Sources refer to the preceding captured canvas. Every move source must therefore
+/// be staged before any destination is written; dirty final pixels then land after
+/// all moves, matching Desktop Duplication's metadata ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveRect {
+    pub src_x: u32,
+    pub src_y: u32,
+    pub dst_x: u32,
+    pub dst_y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
 /// Per-frame change metadata from whichever source produced the frame.
 ///
 /// `None` at the [`FrameSource::acquire`] call site means **unavailable** — the
@@ -61,19 +76,14 @@ pub struct DirtyRect {
 /// list does not describe everything this consumer has missed. The fast-path
 /// predicate must treat that as "assume everything changed", never as "zero rects".
 ///
-/// What both sources put in here is *coverage*, not a replayable sequence: every
-/// pixel that changed since the last delivered frame lies inside some listed rect.
-/// The rect path reads the **final pixels** of the current frame at every covered
-/// rectangle, so order never matters and an accumulated union is complete. Duplication
-/// contributes each move rect's *destination*; the IDD driver unions before it
-/// publishes.
+/// `rects` contains final pixels which must be read from the current texture. `moves`
+/// contains replayable copies from the preceding canvas; their destinations are not
+/// duplicated in `rects`. The IDD driver publishes one already-unioned final-pixel
+/// coverage list, so its `moves` is empty.
 #[derive(Debug, Clone, Default)]
 pub struct ChangeInfo {
     pub rects: Vec<DirtyRect>,
-    /// How many of `rects` came from move regions (diagnostic). The IDD source
-    /// reports 0: its driver publishes one already-unioned coverage list, so the
-    /// split does not survive to us.
-    pub move_rects: u32,
+    pub moves: Vec<MoveRect>,
 }
 
 impl ChangeInfo {

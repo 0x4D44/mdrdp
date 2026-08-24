@@ -25,7 +25,7 @@
 //! texture pool ([`super::idd_source`]); the shapes they both produce
 //! ([`Acquired`], [`ChangeInfo`]) live in [`super::source`].
 
-use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource, RectReadback};
+use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource, MoveRect, RectReadback};
 use super::{qpc, wide_to_string, Result};
 use std::time::Duration;
 use windows::core::Interface;
@@ -138,8 +138,9 @@ pub fn enumerate() -> Result<Vec<OutputInfo>> {
 
 /// The capture stage: a D3D11 device plus the duplication interface for one output.
 ///
-/// Accumulated frames (`AccumulatedFrames > 1`) are accepted deliberately — see
-/// [`ChangeInfo`] for why coverage is order-free. The §5a telemetry showed a
+/// Accumulated frames (`AccumulatedFrames > 1`) are accepted deliberately. Desktop
+/// Duplication returns the accumulated move-before-dirty metadata for the acquired
+/// image. The §5a telemetry showed a
 /// keystroke on the 240 Hz IDD is a ~100 ms burst of presents the ~8 ms capture
 /// loop cannot drain one-by-one, so the first cut's `AccumulatedFrames == 1` gate
 /// starved the fast path to a 4-in-49 hit rate while the accumulated union stayed
@@ -337,9 +338,9 @@ impl Capture {
 
     /// Fetch the frame's dirty/move rects while it is still held. `None` means the
     /// metadata is unavailable: the frame carried none, or a metadata call failed.
-    /// Accumulated frames are accepted — the union is coverage, and coverage is all
-    /// this scheme needs (see [`ChangeInfo`]); the buffers below are sized to
-    /// `TotalMetadataBufferSize`, which spans the whole accumulated set.
+    /// Accumulated frames are accepted because DXGI presents their complete ordered
+    /// move-before-dirty metadata against the preceding acquired canvas. The buffers
+    /// below use `TotalMetadataBufferSize`, which spans the whole accumulated set.
     fn read_change_info(
         &self,
         dupl: &IDXGIOutputDuplication,
@@ -384,8 +385,8 @@ impl Capture {
             .truncate(move_bytes_required as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>());
 
         let mut out = ChangeInfo {
-            rects: Vec::with_capacity(dirty.len() + moves.len()),
-            move_rects: moves.len() as u32,
+            rects: Vec::with_capacity(dirty.len()),
+            moves: Vec::with_capacity(moves.len()),
         };
         for r in &dirty {
             if let Some(dr) = self.clamp(r) {
@@ -393,8 +394,8 @@ impl Capture {
             }
         }
         for m in &moves {
-            if let Some(dr) = self.clamp(&m.DestinationRect) {
-                out.rects.push(dr);
+            if let Some(mr) = self.clamp_move(m) {
+                out.moves.push(mr);
             }
         }
         Some(out)
@@ -414,6 +415,45 @@ impl Capture {
             y: y0,
             w: x1 - x0,
             h: y1 - y0,
+        })
+    }
+
+    /// Clamp a move while preserving the source/destination offset. DXGI normally
+    /// returns in-bounds metadata, but clipping both sides makes a bad compositor
+    /// record harmless instead of turning it into an out-of-bounds wire update.
+    fn clamp_move(&self, m: &DXGI_OUTDUPL_MOVE_RECT) -> Option<MoveRect> {
+        let mut src_x = i64::from(m.SourcePoint.x);
+        let mut src_y = i64::from(m.SourcePoint.y);
+        let mut dst_x = i64::from(m.DestinationRect.left);
+        let mut dst_y = i64::from(m.DestinationRect.top);
+        let mut width = i64::from(m.DestinationRect.right) - dst_x;
+        let mut height = i64::from(m.DestinationRect.bottom) - dst_y;
+        let frame_w = i64::from(self.width);
+        let frame_h = i64::from(self.height);
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+
+        let clip_left = (-dst_x).max(-src_x).max(0).min(width);
+        let clip_top = (-dst_y).max(-src_y).max(0).min(height);
+        src_x += clip_left;
+        dst_x += clip_left;
+        width -= clip_left;
+        src_y += clip_top;
+        dst_y += clip_top;
+        height -= clip_top;
+        width = width.min(frame_w - src_x).min(frame_w - dst_x);
+        height = height.min(frame_h - src_y).min(frame_h - dst_y);
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some(MoveRect {
+            src_x: src_x as u32,
+            src_y: src_y as u32,
+            dst_x: dst_x as u32,
+            dst_y: dst_y as u32,
+            w: width as u32,
+            h: height as u32,
         })
     }
 

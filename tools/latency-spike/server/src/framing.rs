@@ -35,6 +35,32 @@ pub const MSG_CURSOR: u8 = 6;
 /// One atomic regional/full H.264 update. The payload carries every selected
 /// tile AU and the exact desktop coverage those decoded pixels may replace.
 pub const MSG_VIDEO_UPDATE: u8 = 7;
+/// One ordered screen-to-screen copy batch plus its raw final-pixel remainder.
+pub const MSG_MOVE_UPDATE: u8 = 8;
+/// Sparse-lane half of a move rendezvous. The sparse reader pauses after all
+/// earlier raw updates and resumes only after the named bulk move commits.
+pub const MSG_MOVE_FENCE: u8 = 9;
+
+pub const MOVE_FENCE_BYTES: usize = 16;
+
+pub fn encode_move_fence(baseline_seq: u64, frame_seq: u64) -> [u8; MOVE_FENCE_BYTES] {
+    let mut payload = [0; MOVE_FENCE_BYTES];
+    payload[..8].copy_from_slice(&baseline_seq.to_le_bytes());
+    payload[8..].copy_from_slice(&frame_seq.to_le_bytes());
+    payload
+}
+
+pub fn decode_move_fence(payload: &[u8]) -> Result<(u64, u64), &'static str> {
+    if payload.len() != MOVE_FENCE_BYTES {
+        return Err("move fence is not its 16-byte payload");
+    }
+    let baseline_seq = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"));
+    let frame_seq = u64::from_le_bytes(payload[8..].try_into().expect("8 bytes"));
+    if baseline_seq >= frame_seq {
+        return Err("move fence baseline is not older than its update");
+    }
+    Ok((baseline_seq, frame_seq))
+}
 
 /// `[hidden: u8][reserved for later cursor metadata: 11]`.
 pub const CURSOR_PAYLOAD_BYTES: usize = 12;
@@ -257,6 +283,14 @@ mod tests {
         let mut malformed = hidden;
         malformed[0] = 2;
         assert!(decode_cursor(&malformed).is_err());
+    }
+
+    #[test]
+    fn move_fence_names_the_required_baseline_and_the_update_that_releases_it() {
+        let payload = encode_move_fence(41, 44);
+        assert_eq!(decode_move_fence(&payload).unwrap(), (41, 44));
+        assert!(decode_move_fence(&payload[..15]).is_err());
+        assert!(decode_move_fence(&encode_move_fence(44, 44)).is_err());
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub enum Outbound {
     /// One complete logical video update. Coverage and all selected tile AUs share
     /// one framed payload, so the socket cannot expose a partial 5K update.
     Video(Vec<FrameTile>, Vec<u8>, Option<AdmissionGate>),
+    /// Ordered screen copy plus raw exposed pixels. Its sparse-lane fence shares
+    /// the gate, so neither half can become visible after a local queue rejection.
+    Move(Box<RectRecord>, Vec<u8>, Option<AdmissionGate>),
     /// HEVC remains the explicit full-frame fallback and retains its existing
     /// per-tile envelope; it never claims the AVC regional-update contract.
     FrameSet(Vec<FrameTile>),
@@ -52,7 +55,8 @@ pub struct FrameTile {
 }
 
 pub struct SparseOutbound {
-    pub record: Box<RectRecord>,
+    pub msg_type: u8,
+    pub record: Option<Box<RectRecord>>,
     pub payload: Vec<u8>,
     pub gate: Option<AdmissionGate>,
 }
@@ -131,7 +135,7 @@ impl SparseSender {
             return;
         };
         self.scratch.clear();
-        framing::encode(framing::MSG_RECTS, &update.payload, &mut self.scratch);
+        framing::encode(update.msg_type, &update.payload, &mut self.scratch);
         if let Err(error) = client
             .write_all(&self.scratch)
             .and_then(|()| client.flush())
@@ -141,11 +145,12 @@ impl SparseSender {
             self.connected.store(false, Ordering::Release);
             return;
         }
-        let mut record = update.record;
-        record.send_done_us = self.clock.micros(qpc::now());
-        let _ = self
-            .stats_tx
-            .try_send(Outbound::Line(crate::stats::to_line(&*record)));
+        if let Some(mut record) = update.record {
+            record.send_done_us = self.clock.micros(qpc::now());
+            let _ = self
+                .stats_tx
+                .try_send(Outbound::Line(crate::stats::to_line(&*record)));
+        }
     }
 
     pub fn run(mut self, rx: Receiver<SparseOutbound>) {
@@ -361,6 +366,14 @@ impl Sender {
                     stats_lines.push(crate::stats::to_line(&*tile.record));
                 }
             }
+            Outbound::Move(mut record, payload, gate) => {
+                if gate.as_ref().is_some_and(|gate| !gate.admitted()) {
+                    return;
+                }
+                self.write_message(framing::MSG_MOVE_UPDATE, &payload);
+                record.send_done_us = self.clock.micros(qpc::now());
+                stats_lines.push(crate::stats::to_line(&*record));
+            }
             Outbound::FrameSet(tiles) => {
                 for mut tile in tiles {
                     self.write_video(tile.tile_id, tile.seq, &tile.au);
@@ -403,7 +416,9 @@ impl Sender {
             // so stats may follow payloads that arrived later in this bounded batch
             // rather than delaying those payloads.
             send_schedule::payload_first(&mut batch, |msg| match msg {
-                Outbound::Video(..) | Outbound::FrameSet(..) => BatchKind::Payload,
+                Outbound::Video(..) | Outbound::Move(..) | Outbound::FrameSet(..) => {
+                    BatchKind::Payload
+                }
                 Outbound::Line(..) => BatchKind::Line,
             });
             for msg in batch.drain(..) {

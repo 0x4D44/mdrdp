@@ -756,9 +756,8 @@ impl IddSource {
                             h: c.h,
                         })
                         .collect(),
-                    // The driver publishes one already-unioned coverage list, so the
-                    // dirty/move split does not survive to us.
-                    move_rects: 0,
+                    // The driver publishes one already-unioned final-pixel list.
+                    moves: Vec::new(),
                 });
             self.last_consumed = record.frame_seq;
             return Ok(Acquired::Frame {
