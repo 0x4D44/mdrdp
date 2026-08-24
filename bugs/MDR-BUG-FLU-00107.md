@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00107 — Native transport failure leaves a frozen window open
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/session-lifecycle
 - **Raised:** 2026-08-24T12:24:24Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T122528Z-6553d1a4
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00107-run-fix-20260824T122528Z-6553d1a4
-- **Owner base:** 5dec86af0e98bf883f118f17e0454b14b1d16bae
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T12:25:28Z
-- **Owner until:** 2026-08-24T14:25:28Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T12:24:24Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-24T12:24:24Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T12:36:04Z, deltic:auto role=fix run=fix-20260824T122528Z-6553d1a4 branch=task/bug-MDR-BUG-FLU-00107-run-fix-20260824T122528Z-6553d1a4 code=3deb088 gate=manual)
 
 ## Observation
 
