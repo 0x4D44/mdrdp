@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00121 — Driver deploy stores its signing key in the SSH user profile
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/idd-deploy
 - **Raised:** 2026-08-25T06:54:28Z
 - **Discovery source:** Automation
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260825T065502Z-6683973a
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00121-run-fix-20260825T065502Z-6683973a
-- **Owner base:** 265340c946a0f87ada8a03700e641d6c2041fc50
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-25T06:55:02Z
-- **Owner until:** 2026-08-25T08:55:02Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-25T06:54:28Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-25T06:54:28Z, raised via `deltic bugs new`) -> Fixed (2026-08-25T06:58:01Z, deltic:auto role=fix run=fix-20260825T065502Z-6683973a branch=task/bug-MDR-BUG-FLU-00121-run-fix-20260825T065502Z-6683973a code=1412a73 gate=manual)
 
 ## Observation
 
