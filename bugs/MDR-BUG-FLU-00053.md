@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00053 — Spike viewer copies the full 5K canvas for each small rect update
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Could
 - **Severity:** Medium
 - **Area:** rhydra/measurement-viewer
 - **Raised:** 2026-08-23T12:09:37Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260825T063002Z-25dbfdab
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00053-run-fix-20260825T063002Z-25dbfdab
-- **Owner base:** bee6e2f0972d5b40ea99656b82537c3d4359645b
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-25T06:30:02Z
-- **Owner until:** 2026-08-25T08:30:02Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-23T12:09:37Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-25T06:56:34Z, deltic:auto role=fix run=fix-20260825T063002Z-25dbfdab branch=task/bug-MDR-BUG-FLU-00053-run-fix-20260825T063002Z-25dbfdab code=533b3e7 gate=manual)
 
 ## Observation
 
