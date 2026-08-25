@@ -1935,6 +1935,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn layout_v2_uses_a_fresh_driver_package_identity() {
+        let shared_pool = include_str!("../tools/latency-spike/idd/driver/SharedPool.h");
+        let inf = include_str!("../tools/latency-spike/idd/driver/mdrdp-idd.inf");
+
+        assert!(
+            shared_pool.contains("MDRDP_IDD_LAYOUT_VERSION = 2"),
+            "update this package-identity regression when the shared-pool ABI changes"
+        );
+        assert_eq!(driver_ver_from_inf(inf).as_deref(), Some("0.3.0.3"));
+    }
+
     // -- decide() scenarios ---------------------------------------------------
 
     fn test_artifacts(dir: &Path) -> Artifacts {
