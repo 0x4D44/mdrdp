@@ -136,6 +136,23 @@ pub fn wait_writable(socket: &TcpStream, timeout: Duration) -> io::Result<bool> 
     imp::wait_writable(socket, timeout)
 }
 
+/// Read and write readiness observed while an outbound TLS record is blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteReadiness {
+    pub readable: bool,
+    pub writable: bool,
+}
+
+/// Sleep until the TCP socket can make progress in either direction.
+///
+/// rustls drains pending TLS output before it reads. Waiting only for writability can
+/// therefore deadlock against a peer whose own send path must drain before it reads our
+/// output. Reporting inbound readiness lets the caller buffer authenticated TLS plaintext
+/// without dispatching or reordering its RDP payload.
+pub fn wait_write_progress(socket: &TcpStream, timeout: Duration) -> io::Result<WriteReadiness> {
+    imp::wait_write_progress(socket, timeout)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::Ready;
@@ -209,6 +226,42 @@ mod imp {
             return Ok(n > 0);
         }
     }
+
+    pub(super) fn wait_write_progress(
+        socket: &TcpStream,
+        timeout: Duration,
+    ) -> io::Result<super::WriteReadiness> {
+        let deadline = Instant::now() + timeout;
+        let mut fd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(super::WriteReadiness::default());
+            }
+            let n = unsafe { libc::poll(&mut fd, 1, poll_timeout(remaining)) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if n == 0 {
+                return Ok(super::WriteReadiness::default());
+            }
+            let readable = fd.revents & libc::POLLIN != 0;
+            let writable = fd.revents & libc::POLLOUT != 0;
+            let terminal = fd.revents != 0 && !readable && !writable;
+            return Ok(super::WriteReadiness {
+                readable: readable || terminal,
+                writable: writable || terminal,
+            });
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -275,6 +328,42 @@ mod imp {
                 return Err(e);
             }
             return Ok(n > 0);
+        }
+    }
+
+    pub(super) fn wait_write_progress(
+        socket: &TcpStream,
+        timeout: Duration,
+    ) -> io::Result<super::WriteReadiness> {
+        let deadline = Instant::now() + timeout;
+        let mut fd = WSAPOLLFD {
+            fd: socket.as_raw_socket() as usize,
+            events: POLLRDNORM | POLLWRNORM,
+            revents: 0,
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(super::WriteReadiness::default());
+            }
+            let n = unsafe { WSAPoll(&mut fd, 1, poll_timeout(remaining)) };
+            if n == SOCKET_ERROR {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if n == 0 {
+                return Ok(super::WriteReadiness::default());
+            }
+            let readable = fd.revents & POLLRDNORM != 0;
+            let writable = fd.revents & POLLWRNORM != 0;
+            let terminal = fd.revents != 0 && !readable && !writable;
+            return Ok(super::WriteReadiness {
+                readable: readable || terminal,
+                writable: writable || terminal,
+            });
         }
     }
 }

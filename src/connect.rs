@@ -19,7 +19,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
 use serde::Serialize;
 use std::fmt;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -304,6 +304,23 @@ fn send_shutdown_with(
 pub(crate) trait SetNonblocking {
     fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()>;
     fn wait_writable(&mut self, timeout: Duration) -> std::io::Result<bool>;
+
+    fn wait_write_progress(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<crate::wake::WriteReadiness> {
+        Ok(crate::wake::WriteReadiness {
+            readable: false,
+            writable: self.wait_writable(timeout)?,
+        })
+    }
+
+    fn buffer_inbound(
+        &mut self,
+        _append_plaintext: &mut dyn FnMut(&[u8]),
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
 }
 
 impl SetNonblocking for StreamOwned<ClientConnection, TcpStream> {
@@ -313,6 +330,70 @@ impl SetNonblocking for StreamOwned<ClientConnection, TcpStream> {
 
     fn wait_writable(&mut self, timeout: Duration) -> std::io::Result<bool> {
         crate::wake::wait_writable(&self.sock, timeout)
+    }
+
+    fn wait_write_progress(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<crate::wake::WriteReadiness> {
+        crate::wake::wait_write_progress(&self.sock, timeout)
+    }
+
+    fn buffer_inbound(&mut self, append_plaintext: &mut dyn FnMut(&[u8])) -> std::io::Result<bool> {
+        let mut plaintext = [0u8; 16 * 1024];
+        let mut drain_plaintext = |conn: &mut ClientConnection| -> std::io::Result<usize> {
+            let mut total = 0;
+            loop {
+                match conn.reader().read(&mut plaintext) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        append_plaintext(&plaintext[..read]);
+                        total += read;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(total)
+        };
+
+        // Move already-authenticated bytes into Framed's own read buffer first. This
+        // preserves stream order without dispatching a newer RDP PDU while the older
+        // outbound frame is incomplete, and releases rustls's one-record backpressure.
+        let drained = drain_plaintext(&mut self.conn)?;
+        if !self.conn.wants_read() {
+            if drained > 0 {
+                return Ok(true);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "RDP peer closed while an outbound write was blocked",
+            ));
+        }
+
+        let read = loop {
+            match self.conn.read_tls(&mut self.sock) {
+                Ok(read) => break read,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(drained > 0),
+                Err(e) => return Err(e),
+            }
+        };
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "RDP peer closed while an outbound write was blocked",
+            ));
+        }
+        self.conn.process_new_packets().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("TLS inbound record while writing: {e}"),
+            )
+        })?;
+        drain_plaintext(&mut self.conn)?;
+        Ok(true)
     }
 }
 
@@ -364,14 +445,7 @@ fn write_framed_with_clock<
             Ok(count) => written += count,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                let remaining = deadline.saturating_duration_since(now());
-                let writable = {
-                    let (stream, _) = framed.get_inner_mut();
-                    !remaining.is_zero() && stream.wait_writable(remaining)?
-                };
-                if !writable {
-                    return Err(write_deadline_error());
-                }
+                wait_for_write_progress(framed, deadline, &mut now)?;
             }
             Err(e) => return Err(e),
         }
@@ -389,18 +463,42 @@ fn write_framed_with_clock<
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                let remaining = deadline.saturating_duration_since(now());
-                let writable = {
-                    let (stream, _) = framed.get_inner_mut();
-                    !remaining.is_zero() && stream.wait_writable(remaining)?
-                };
-                if !writable {
-                    return Err(write_deadline_error());
-                }
+                wait_for_write_progress(framed, deadline, &mut now)?;
             }
             Err(e) => return Err(e),
         }
     }
+}
+
+fn wait_for_write_progress<
+    S: std::io::Read + std::io::Write + SetNonblocking,
+    N: FnMut() -> Instant,
+>(
+    framed: &mut Framed<S>,
+    deadline: Instant,
+    now: &mut N,
+) -> std::io::Result<()> {
+    let remaining = deadline.saturating_duration_since(now());
+    if remaining.is_zero() {
+        return Err(write_deadline_error());
+    }
+    let readiness = {
+        let (stream, _) = framed.get_inner_mut();
+        stream.wait_write_progress(remaining)?
+    };
+    if readiness.readable {
+        let buffered = {
+            let (stream, buffer) = framed.get_inner_mut();
+            stream.buffer_inbound(&mut |plaintext| buffer.extend_from_slice(plaintext))?
+        };
+        if buffered {
+            return Ok(());
+        }
+    }
+    if readiness.writable {
+        return Ok(());
+    }
+    Err(write_deadline_error())
 }
 
 fn write_deadline_error() -> std::io::Error {
@@ -892,6 +990,81 @@ mod tests {
         waits: usize,
     }
 
+    struct DuplexDeadlockWriter {
+        bytes: Vec<u8>,
+        pending: Vec<u8>,
+        inbound_buffered: bool,
+        can_buffer_inbound: bool,
+        inbound_records: usize,
+        write_ready_on_progress: bool,
+        unblock_on_writable_wait: bool,
+        inbound_drains: usize,
+        writable_waits: usize,
+    }
+
+    impl Read for DuplexDeadlockWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "quiet"))
+        }
+    }
+
+    impl Write for DuplexDeadlockWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.pending.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if !self.inbound_buffered {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "peer cannot read until its pending output is drained",
+                ));
+            }
+            self.bytes.append(&mut self.pending);
+            Ok(())
+        }
+    }
+
+    impl SetNonblocking for DuplexDeadlockWriter {
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn wait_writable(&mut self, _timeout: Duration) -> io::Result<bool> {
+            self.writable_waits += 1;
+            if self.unblock_on_writable_wait {
+                self.inbound_buffered = true;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+
+        fn wait_write_progress(
+            &mut self,
+            _timeout: Duration,
+        ) -> io::Result<crate::wake::WriteReadiness> {
+            if self.write_ready_on_progress {
+                self.inbound_buffered = true;
+            }
+            Ok(crate::wake::WriteReadiness {
+                readable: true,
+                writable: self.write_ready_on_progress,
+            })
+        }
+
+        fn buffer_inbound(&mut self, append_plaintext: &mut dyn FnMut(&[u8])) -> io::Result<bool> {
+            if !self.can_buffer_inbound {
+                return Ok(false);
+            }
+            append_plaintext(b"server frame");
+            self.inbound_drains += 1;
+            self.inbound_buffered = self.inbound_drains == self.inbound_records;
+            Ok(true)
+        }
+    }
+
     impl Read for BlockedWriter {
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "quiet"))
@@ -1003,6 +1176,82 @@ mod tests {
             "a blocked socket must sleep in OS readiness, not retry at 1 kHz"
         );
         assert_eq!(framed.get_inner().0.waits, 1);
+    }
+
+    #[test]
+    fn blocked_write_drains_inbound_tls_to_break_full_duplex_deadlock() {
+        let mut framed = Framed::new(DuplexDeadlockWriter {
+            bytes: Vec::new(),
+            pending: Vec::new(),
+            inbound_buffered: false,
+            can_buffer_inbound: true,
+            inbound_records: 1,
+            write_ready_on_progress: false,
+            unblock_on_writable_wait: false,
+            inbound_drains: 0,
+            writable_waits: 0,
+        });
+
+        write_framed(
+            &mut framed,
+            b"frame",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("reading the peer's pending TLS record must unblock its receive path");
+
+        let writer = &framed.get_inner().0;
+        assert_eq!(writer.bytes, b"frame");
+        assert_eq!(writer.inbound_drains, 1);
+    }
+
+    #[test]
+    fn simultaneous_read_and_write_readiness_retries_the_write() {
+        let mut framed = Framed::new(DuplexDeadlockWriter {
+            bytes: Vec::new(),
+            pending: Vec::new(),
+            inbound_buffered: false,
+            can_buffer_inbound: false,
+            inbound_records: 1,
+            write_ready_on_progress: true,
+            unblock_on_writable_wait: false,
+            inbound_drains: 0,
+            writable_waits: 0,
+        });
+
+        write_framed(
+            &mut framed,
+            b"frame",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("writable readiness must win when TLS cannot buffer more inbound data");
+
+        assert_eq!(framed.get_inner().0.bytes, b"frame");
+    }
+
+    #[test]
+    fn blocked_write_drains_more_than_one_inbound_tls_record() {
+        let mut framed = Framed::new(DuplexDeadlockWriter {
+            bytes: Vec::new(),
+            pending: Vec::new(),
+            inbound_buffered: false,
+            can_buffer_inbound: true,
+            inbound_records: 2,
+            write_ready_on_progress: false,
+            unblock_on_writable_wait: false,
+            inbound_drains: 0,
+            writable_waits: 0,
+        });
+
+        write_framed(
+            &mut framed,
+            b"frame",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("TLS plaintext must move into the framer so another record can be read");
+
+        let writer = &framed.get_inner().0;
+        assert_eq!(writer.bytes, b"frame");
+        assert_eq!(writer.inbound_drains, 2);
     }
 
     #[test]

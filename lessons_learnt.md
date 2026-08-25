@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Drain inbound TLS while writes block; POLLOUT-only waits can deadlock both peers (`connect.rs:write_framed`).
+  rustls drains queued output before reading. Authenticate and buffer inbound TLS without
+  dispatching newer RDP PDUs, then finish the older frame under its original deadline.
+
 - Luma rectangles must retire old AVC444 aux samples; block averages are not content IDs (`avc444.rs:apply_luma`).
   MS-RDPEGFX requires main-view-only YUV420 conversion there. Preserving old odd U/V
   leaves fixed coloured glyphs when new content has the same 2x2 chroma average.
