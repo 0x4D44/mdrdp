@@ -6,15 +6,15 @@
 - **Area:** deploy/driver-signing
 - **Raised:** 2026-08-20T10:05:10Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260825T054543Z-b566a704
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00021-run-fix-20260825T054543Z-b566a704
+- **Owner base:** c4029a1a46a5837379ea54f4c8f20a816c8c6ab3
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-25T05:45:43Z
+- **Owner until:** 2026-08-25T07:45:43Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
