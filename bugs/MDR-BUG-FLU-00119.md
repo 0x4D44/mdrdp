@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00119 — Fixed-coordinate AVC chroma ghosts lack a final-pixel scroll regression
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** testing/graphics
 - **Raised:** 2026-08-24T20:16:01Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260825T215311Z-9b5259fd
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00119-run-fix-20260825T215311Z-9b5259fd
-- **Owner base:** 53526ba25d2907f2df123abc336a22914ac799cf
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-25T21:53:11Z
-- **Owner until:** 2026-08-25T23:53:11Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T20:16:01Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T20:29:53Z, deltic:auto role=fix run=fix-20260824T201637Z-2b029615 branch=task/bug-MDR-BUG-FLU-00119-run-fix-20260824T201637Z-2b029615 code=7ccd8ec0d6dda020b3a5fde7c8acb4d19d32dbc1 gate=manual) -> Open (2026-08-25T10:06:20Z, 0x4D44/Codex: Arthur reproduced the same persistent fixed-coordinate chroma remnants on Kiln with mdrdp v0.1.234; the code=7ccd8ec regression does not cover the live failure)
+- **State history:** Open (2026-08-24T20:16:01Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T20:29:53Z, deltic:auto role=fix run=fix-20260824T201637Z-2b029615 branch=task/bug-MDR-BUG-FLU-00119-run-fix-20260824T201637Z-2b029615 code=7ccd8ec0d6dda020b3a5fde7c8acb4d19d32dbc1 gate=manual) -> Open (2026-08-25T10:06:20Z, 0x4D44/Codex: Arthur reproduced the same persistent fixed-coordinate chroma remnants on Kiln with mdrdp v0.1.234; the code=7ccd8ec regression does not cover the live failure) -> Fixed (2026-08-25T22:06:11Z, deltic:auto role=fix run=fix-20260825T215311Z-9b5259fd branch=task/bug-MDR-BUG-FLU-00119-run-fix-20260825T215311Z-9b5259fd code=dea775e gate=manual)
 
 ## Observation
 
