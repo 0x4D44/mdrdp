@@ -6,15 +6,15 @@
 - **Area:** rdp/input
 - **Raised:** 2026-08-25T10:06:15Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260825T221643Z-587da9f0
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00122-run-fix-20260825T221643Z-587da9f0
+- **Owner base:** d5d749b27ed4ce74bacfe1cec82411b13f8d6434
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-25T22:16:43Z
+- **Owner until:** 2026-08-26T00:16:43Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
