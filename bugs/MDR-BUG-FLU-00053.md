@@ -6,15 +6,15 @@
 - **Area:** rhydra/measurement-viewer
 - **Raised:** 2026-08-23T12:09:37Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260825T063002Z-25dbfdab
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00053-run-fix-20260825T063002Z-25dbfdab
+- **Owner base:** bee6e2f0972d5b40ea99656b82537c3d4359645b
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-25T06:30:02Z
+- **Owner until:** 2026-08-25T08:30:02Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
