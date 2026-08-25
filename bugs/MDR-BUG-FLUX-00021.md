@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00021 — mdrdp deploy signs the IDD driver catalogue without a timestamp, so the signature dies with the certificate
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** deploy/driver-signing
 - **Raised:** 2026-08-20T10:05:10Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260825T054543Z-b566a704
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00021-run-fix-20260825T054543Z-b566a704
-- **Owner base:** c4029a1a46a5837379ea54f4c8f20a816c8c6ab3
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-25T05:45:43Z
-- **Owner until:** 2026-08-25T07:45:43Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-20T10:05:10Z, raised via `deltic bugs new` model=claude-opus-5@high)
+- **State history:** Open (2026-08-20T10:05:10Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-25T05:51:59Z, deltic:auto role=fix run=fix-20260825T054543Z-b566a704 branch=task/bug-MDR-BUG-FLUX-00021-run-fix-20260825T054543Z-b566a704 code=10b1135 gate=manual)
 
 ## Observation
 
