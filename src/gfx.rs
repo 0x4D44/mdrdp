@@ -2061,6 +2061,60 @@ mod tests {
     }
 
     #[test]
+    fn avc444_luma_repaint_retires_old_chroma_with_the_same_block_average() {
+        // MDR-BUG-FLU-00119: a block's YUV420 average is not a content identity.
+        // Old auxiliary samples can describe coloured glyph edges even when their
+        // 2x2 average matches the white main-view block that replaces them.
+        let store = store();
+        let handler = GfxHandler::new(Arc::clone(&store));
+        let mut client =
+            GraphicsPipelineClient::new(Box::new(handler), Some(Box::new(TaggedYuvDecoder)));
+        const FULL: InclusiveRectangle = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 32,
+            bottom: 16,
+        };
+
+        process_pdu(
+            &mut client,
+            GfxPdu::CreateSurface(ironrdp_egfx::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 32,
+                height: 16,
+                pixel_format: PixelFormat::XRgb,
+            }),
+        );
+        process_pdu(
+            &mut client,
+            avc444_pdu(
+                Encoding::LUMA_AND_CHROMA,
+                vec![FULL],
+                &[100, 128, 128, 0],
+                Some((vec![FULL], &[0, 200, 50, 1])),
+            ),
+        );
+        assert_ne!(
+            pixel_at(&store, 1, 1, 1),
+            [100, 100, 100, 0xFF],
+            "fixture must establish old full-resolution chroma"
+        );
+
+        // MS-RDPEGFX requires luma-subframe rectangles to use the main YUV420
+        // view alone. Reusing old auxiliary samples here leaves fixed cyan/yellow
+        // remnants even though the replacement's U/V average is unchanged.
+        process_pdu(
+            &mut client,
+            avc444_pdu(Encoding::LUMA, vec![FULL], &[235, 128, 128, 0], None),
+        );
+        assert_eq!(
+            pixel_at(&store, 1, 1, 1),
+            [235, 235, 235, 0xFF],
+            "the luma repaint must not retain old auxiliary chroma"
+        );
+    }
+
+    #[test]
     fn avc444_scroll_copy_then_partial_lc1_lc2_keeps_old_and_new_rgba_pixels() {
         // MDR-BUG-FLU-00119: a same-surface scroll/copy changes the visible destination
         // without changing the AVC decoder's reference chain. A later partial LC=1/LC=2

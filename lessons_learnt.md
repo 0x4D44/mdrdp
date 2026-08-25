@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Luma rectangles must retire old AVC444 aux samples; block averages are not content IDs (`avc444.rs:apply_luma`).
+  MS-RDPEGFX requires main-view-only YUV420 conversion there. Preserving old odd U/V
+  leaves fixed coloured glyphs when new content has the same 2x2 chroma average.
+
 - Exact visual ACKs need part masks; max watermarks retire unseen lanes (`session.rs:LogicalCompletion`).
   Raw and regional video can complete out of order for one logical update. Carry the required
   parts on both payloads and acknowledge the exact sequence only after every declared part commits.
@@ -45,9 +49,9 @@ Indented lines below the first are detail: kept for lookup, never injected.
   Retain the last pixels and mapping atomically, but keep the numeric ID association so delete and
   EndFrame can retire the fallback correctly before the replacement receives a fresh MapSurface PDU.
 
-- Union unaligned AVC444 rect coverage within one PDU before preserving detail (`avc444.rs:mark_chroma_seen`).
+- Union unaligned AVC444 rect coverage within one PDU before promoting detail (`avc444.rs:mark_chroma_seen`).
   A per-rectangle full-block test loses valid samples when adjacent regions split a 2x2 block.
-  Keep partial coverage PDU-local so a later partial frame cannot falsely clear stale chroma.
+  Keep partial coverage PDU-local so a later partial frame cannot promote using old samples.
 
 - Drive activation states with no PDU hint; they emit output, not stalls (`session.rs:drive_reactivation`).
   Connection finalization sends Synchronize and control PDUs through `step_no_input`. During the
@@ -80,10 +84,6 @@ Indented lines below the first are detail: kept for lookup, never injected.
 - Instrumentation must drop visibly before it blocks decode (`viewer/stats.rs:StatsLog::enqueue`).
   Put durable per-line writes on their own thread behind a bounded non-blocking queue. If storage
   cannot keep up, emit an explicit loss count when it recovers instead of distorting the measured path.
-
-- LC2-before-LC1 needs an explicit average-valid bit (`avc444.rs:Yuv444Buffer::luma_avg_seen`).
-  Neutral plane initialization is not an aux-confirmed chroma average. Keep validity separate so
-  the first real luma average establishes the baseline instead of suppressing valid chroma detail.
 
 - A short/timed-out frameless write must close the link before another record (`viewer/input_link.rs:InputLink::send`).
   `Write::write` may send only a prefix or time out. Retrying a later input on the same
@@ -353,15 +353,6 @@ Indented lines below the first are detail: kept for lookup, never injected.
   the overshoot it removed (2,271 -> 3,603 while the defect went to zero). The decisive metric was
   hue inversion — blue-dominant for one frame on yellow-dominant content — which no correct
   rendering of the block's real colours can produce (MDR-BUG-FLUX-00010).
-- Preserved chroma goes STALE when content changes under LC=1; paint flat avg until catch-up or reconstruction overshoots (`avc444::chroma_stale`).
-  The FLUX-00007 preserve fix made gap frames worse: `4*new_avg - 3*stale` pushed U past any real
-  hue (blue flash on yellow, wrong-colour window restores, up to ~1.4 s). Average-delta detects the
-  change: re-encode noise <= 6, genuine change >= 41 (32 temper payloads) — threshold 10, no tuning.
-- Windows AVC444 alternates LC=1/LC=2; a luma pass must PRESERVE delivered odd chroma or colours pump (`avc444::apply_luma`).
-  FreeRDP replicates the luma frame's averaged chroma into all four 2x2 positions on every luma
-  pass, wiping the aux samples — on dithered content that flips 33k/48k probe pixels by up to 98
-  RGB units at every L↔C transition (measured, temper). The encoder re-sends chroma only when it
-  changed. Repro/attribution recipe: `--capture-failures` + `examples/avcreplay.rs`.
 - Suppress Output "allow" does NOT repaint: EGFX resumes only FUTURE deltas — reveal must send Refresh Rect (`session::visibility_pdus`).
   A session that connects occluded stays black forever: the logon-black connect burst is all it
   ever painted, the desktop appears server-side while suppressed (never sent), and a static desktop
