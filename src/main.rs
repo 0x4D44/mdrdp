@@ -87,6 +87,34 @@ fn settings_after_load_failure() -> mdrdp::settings::Settings {
     settings
 }
 
+fn native_diagnostic_target(
+    positional: &str,
+    ssh_user: Option<&str>,
+    favourites: &Favourites,
+) -> (String, Option<String>) {
+    match favourites.resolve(positional) {
+        Some(favourite) => (
+            favourite.host.clone(),
+            ssh_user
+                .map(str::to_owned)
+                .or_else(|| favourite.ssh_user.clone()),
+        ),
+        None => (positional.to_owned(), ssh_user.map(str::to_owned)),
+    }
+}
+
+fn favourites_for_explicit_target() -> Favourites {
+    match Favourites::load() {
+        Ok(favourites) => favourites,
+        Err(error) => {
+            eprintln!(
+                "warning: could not read favourites ({error}); treating the argument as a host"
+            );
+            Favourites::default()
+        }
+    }
+}
+
 /// A connection whose window is not yet built: the server has told us the desktop
 /// size, nothing is pumping yet. Boxed contents keep the enum pocket-sized.
 enum Connected {
@@ -642,11 +670,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Before --doctor: both are read-only diagnostics, and a run that asked for
     // this one wants its verdict, not a health ladder.
     if let Some(expected) = &clipboard_check {
-        let host = positional
+        let positional = positional
             .as_deref()
             .ok_or("--clipboard-check needs a host: mdrdp <host> --clipboard-check <text>")?;
+        let favourites = favourites_for_explicit_target();
+        let (host, ssh_user) =
+            native_diagnostic_target(positional, ssh_user.as_deref(), &favourites);
         let verdict =
-            mdrdp::native::doctor::clipboard_matches(host, ssh_user.as_deref(), expected)?;
+            mdrdp::native::doctor::clipboard_matches(&host, ssh_user.as_deref(), expected)?;
         println!("clipboard {host}: {verdict}");
         if !verdict.matches {
             std::process::exit(1);
@@ -655,10 +686,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if doctor {
-        let host = positional
+        let positional = positional
             .as_deref()
             .ok_or("--doctor needs a host: mdrdp <host> --doctor")?;
-        let (report, failed) = mdrdp::native::doctor::run(host, ssh_user.as_deref())?;
+        let favourites = favourites_for_explicit_target();
+        let (host, ssh_user) =
+            native_diagnostic_target(positional, ssh_user.as_deref(), &favourites);
+        let (report, failed) = mdrdp::native::doctor::run(&host, ssh_user.as_deref())?;
         print!("{report}");
         if failed {
             std::process::exit(1);
@@ -2170,6 +2204,24 @@ mod tests {
             settings_after_load_failure().clipboard.direction,
             mdrdp::settings::ClipboardDirection::Off,
             "an unreadable restriction must not widen clipboard sharing"
+        );
+    }
+
+    #[test]
+    fn native_diagnostics_resolve_a_saved_favourite_and_its_ssh_user() {
+        let mut favourites = Favourites::default();
+        let mut quench = Favourite::new("Quench", "quench.lan.example");
+        quench.ssh_user = Some("marti".to_owned());
+        favourites.add(quench).expect("valid favourite");
+
+        assert_eq!(
+            native_diagnostic_target("Quench", None, &favourites),
+            ("quench.lan.example".to_owned(), Some("marti".to_owned()))
+        );
+        assert_eq!(
+            native_diagnostic_target("Quench", Some("override"), &favourites),
+            ("quench.lan.example".to_owned(), Some("override".to_owned())),
+            "an explicit SSH user must beat the saved identity"
         );
     }
 
