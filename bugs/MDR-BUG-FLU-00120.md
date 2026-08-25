@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00120 — IDD layout change reuses the installed driver version
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/idd-deploy
 - **Raised:** 2026-08-25T06:47:35Z
 - **Discovery source:** Automation
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260825T064809Z-36a94461
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00120-run-fix-20260825T064809Z-36a94461
-- **Owner base:** cd1ecc21fa8693cf1981b69491cb620f7ab4cf92
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-25T06:48:09Z
-- **Owner until:** 2026-08-25T08:48:09Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-25T06:47:35Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-25T06:47:35Z, raised via `deltic bugs new`) -> Fixed (2026-08-25T06:51:06Z, deltic:auto role=fix run=fix-20260825T064809Z-36a94461 branch=task/bug-MDR-BUG-FLU-00120-run-fix-20260825T064809Z-36a94461 code=809d72f gate=manual)
 
 ## Observation
 
