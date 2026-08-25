@@ -6,15 +6,15 @@
 - **Area:** cli/native diagnostics
 - **Raised:** 2026-08-22T00:29:31Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260825T055227Z-f9c740f9
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00034-run-fix-20260825T055227Z-f9c740f9
+- **Owner base:** 4767b65c831ec8c309e0575fcd5f3b6d1be8b9d2
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-25T05:52:27Z
+- **Owner until:** 2026-08-25T07:52:27Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
