@@ -1318,17 +1318,17 @@ function Find-Tool([string]$name, [string]$fallback) {
 }
 $inf2cat = Find-Tool 'Inf2Cat.exe' 'C:\mdrdp\wdk\bin\10.0.26100.0\x86\Inf2Cat.exe'
 $signtool = Find-Tool 'signtool.exe' 'C:\mdrdp\wdk\bin\10.0.26100.0\x64\signtool.exe'
-$cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert |
+$cert = Get-ChildItem Cert:\LocalMachine\My -CodeSigningCert |
     Where-Object Subject -eq $certSubject | Select-Object -First 1
 if (-not $cert) {
     $cert = New-SelfSignedCertificate -Type CodeSigningCert `
-        -Subject $certSubject -CertStoreLocation Cert:\CurrentUser\My
+        -Subject $certSubject -CertStoreLocation Cert:\LocalMachine\My
 }
 Write-Output "cert: $($cert.Thumbprint) NotAfter $($cert.NotAfter)"
 Export-Certificate -Cert $cert -FilePath $certFile | Out-Null
 & $inf2cat "/driver:$DriverDir" '/os:10_NI_X64'
 if ($LASTEXITCODE -ne 0) { throw 'Inf2Cat failed' }
-& $signtool sign /fd SHA256 /sha1 $cert.Thumbprint /t http://timestamp.digicert.com (Join-Path $DriverDir 'mdrdp-idd.cat')
+& $signtool sign /sm /fd SHA256 /sha1 $cert.Thumbprint /t http://timestamp.digicert.com (Join-Path $DriverDir 'mdrdp-idd.cat')
 if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
 certutil -addstore root $certFile | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'certutil (root) failed' }
@@ -2712,10 +2712,18 @@ mod tests {
     fn driver_catalogue_signature_is_timestamped() {
         assert!(
             DRIVER_INSTALL_PS1.contains(
-                "sign /fd SHA256 /sha1 $cert.Thumbprint /t http://timestamp.digicert.com"
+                "sign /sm /fd SHA256 /sha1 $cert.Thumbprint /t http://timestamp.digicert.com"
             ),
             "the deployed catalogue signature must outlive its signing certificate"
         );
+    }
+
+    #[test]
+    fn driver_signing_key_is_machine_scoped() {
+        assert!(DRIVER_INSTALL_PS1.contains(r"Get-ChildItem Cert:\LocalMachine\My"));
+        assert!(DRIVER_INSTALL_PS1.contains(r"-CertStoreLocation Cert:\LocalMachine\My"));
+        assert!(DRIVER_INSTALL_PS1.contains("sign /sm /fd SHA256"));
+        assert!(!DRIVER_INSTALL_PS1.contains(r"Cert:\CurrentUser\My"));
     }
 
     #[test]
