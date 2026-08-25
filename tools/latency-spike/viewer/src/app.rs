@@ -201,14 +201,13 @@ impl ViewerApp {
         // Consume the newest decoded frame, if one arrived. Its stats line is closed
         // below, after the present; a frame that was displaced before we got here was
         // already recorded as dropped by the decode thread.
-        let fresh = self.slot.take();
-        if fresh_only && fresh.is_none() {
+        let had_fresh = self.slot.take_for_present(&mut self.current);
+        if fresh_only && !had_fresh {
             return;
         }
-        let had_fresh = fresh.is_some();
-        if let Some(frame) = fresh {
+        if had_fresh {
+            let frame = self.current.as_ref().expect("the slot installed a frame");
             let size = (frame.width, frame.height);
-            self.current = Some(frame);
             if self.sized_to != Some(size) {
                 // The window opens at a placeholder size because the coded size is not
                 // known until the first frame decodes. Physical pixels: on a Retina

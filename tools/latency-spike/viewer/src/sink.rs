@@ -119,8 +119,9 @@ pub struct Frame {
 /// part of the picture and the decoded access unit paints all of it, so there has to
 /// be one surface that remembers what the other one did. The canvas lives on the
 /// network/decode thread; each mutation publishes an [`Arc`] snapshot through
-/// [`FrameSlot`] (copy-on-write, so the AU path stays as move-cheap as it was before
-/// the canvas existed).
+/// [`FrameSlot`]. The AU path stays move-cheap, while rect updates alternate between
+/// the canvas retained by the presenter and one recycled surface after a one-copy
+/// bootstrap.
 ///
 /// **The ordering invariant.** `exact_through = Some(e)` means the canvas provably
 /// holds *all* content up to and including capture frame `e`. That is what makes a
@@ -208,9 +209,9 @@ impl Canvas {
     /// [`rects::blit_bgra_to_rgba`] re-checks against the canvas itself, because a
     /// write outside it must be impossible whatever the caller did.
     ///
-    /// `Arc::make_mut` is the copy-on-write: the buffer is cloned only when the
-    /// last published snapshot is still alive in the slot or the window — one copy
-    /// per rect update at typing cadence, instead of one per decoded frame.
+    /// `Arc::make_mut` is a bootstrap fallback. [`FrameSlot`] normally makes the
+    /// canvas unique before this call by reclaiming an untaken snapshot or returning
+    /// the presenter's previous surface.
     pub fn apply_rects(&mut self, update: &rects::RectUpdate) -> Result<(), rects::RectsError> {
         let rgba = Arc::make_mut(&mut self.rgba);
         for r in &update.rects {
@@ -229,8 +230,21 @@ impl Canvas {
 /// pipeline actually is. Displacing an undisplayed frame is recorded as a drop
 /// (`present_done_us: null`), never silently swallowed.
 #[derive(Debug, Default)]
+struct FrameSlotState {
+    latest: Option<Frame>,
+    recycled: Option<RecycledSurface>,
+}
+
+#[derive(Debug)]
+struct RecycledSurface {
+    rgba: Arc<Vec<u8>>,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Default)]
 pub struct FrameSlot {
-    latest: Mutex<Option<Frame>>,
+    state: Mutex<FrameSlotState>,
 }
 
 impl FrameSlot {
@@ -247,23 +261,146 @@ impl FrameSlot {
     /// damage now belongs to the frame that replaced it.
     pub fn put(&self, mut frame: Frame) -> Option<Frame> {
         let mut guard = self
-            .latest
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(displaced) = guard.as_ref() {
+        if let Some(displaced) = guard.latest.as_ref() {
             frame.damage.absorb(&displaced.damage);
         }
-        guard.replace(frame)
+        guard.latest.replace(frame)
     }
 
     /// Take the pending frame, if one arrived since the last call.
     pub fn take(&self) -> Option<Frame> {
         let mut guard = self
-            .latest
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.take()
+        guard.latest.take()
     }
+
+    /// Atomically take the newest frame and return the presenter's old surface for
+    /// the decoder's next rect update.
+    ///
+    /// Keeping the take, damage copy, and recycle under one lock is load-bearing:
+    /// the decoder must never observe both an empty slot and no returned surface,
+    /// because that gap would force another full-canvas copy.
+    pub fn take_for_present(&self, current: &mut Option<Frame>) -> bool {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(fresh) = guard.latest.take() else {
+            return false;
+        };
+
+        guard.recycled = None;
+        if let Some(mut old) = current.take() {
+            if sync_damage_into(&mut old, &fresh) {
+                guard.recycled = Some(RecycledSurface {
+                    rgba: old.rgba,
+                    width: old.width,
+                    height: old.height,
+                });
+            }
+        }
+        *current = Some(fresh);
+        true
+    }
+
+    /// Prepare a unique canvas for a rect blit.
+    ///
+    /// An untaken latest frame shares the live canvas, so removing it makes the
+    /// canvas unique once the returned frame is dropped. Otherwise the presenter
+    /// has taken that frame and atomically left its prior, damage-synchronised
+    /// surface here for the decoder to reuse.
+    fn prepare_rect_surface(
+        &self,
+        canvas: &Arc<Vec<u8>>,
+        width: u32,
+        height: u32,
+    ) -> (Option<Arc<Vec<u8>>>, Option<Frame>) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if guard
+            .latest
+            .as_ref()
+            .is_some_and(|frame| Arc::ptr_eq(&frame.rgba, canvas))
+        {
+            return (None, guard.latest.take());
+        }
+
+        let recycled = guard
+            .recycled
+            .take()
+            .filter(|surface| surface.width == width && surface.height == height)
+            .map(|surface| surface.rgba);
+        (recycled, None)
+    }
+
+    /// A decoded AU rebases every pixel; a surface from the prior base is stale.
+    fn clear_recycled(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recycled = None;
+    }
+}
+
+/// Copy only `fresh`'s accumulated damage into the presenter's old snapshot.
+/// Returns false unless the old allocation is uniquely owned and every row is safe.
+fn sync_damage_into(old: &mut Frame, fresh: &Frame) -> bool {
+    let Damage::Rects(rects) = &fresh.damage else {
+        return false;
+    };
+    if old.width != fresh.width || old.height != fresh.height {
+        return false;
+    }
+
+    let Some(row_bytes) = usize::try_from(fresh.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+    else {
+        return false;
+    };
+    let Some(required_len) = usize::try_from(fresh.height)
+        .ok()
+        .and_then(|height| height.checked_mul(row_bytes))
+    else {
+        return false;
+    };
+    if old.rgba.len() != required_len || fresh.rgba.len() != required_len {
+        return false;
+    }
+
+    for rect in rects {
+        let Some(right) = rect.x.checked_add(rect.w) else {
+            return false;
+        };
+        let Some(bottom) = rect.y.checked_add(rect.h) else {
+            return false;
+        };
+        if right > fresh.width || bottom > fresh.height {
+            return false;
+        }
+    }
+
+    let Some(target) = Arc::get_mut(&mut old.rgba) else {
+        return false;
+    };
+    for rect in rects {
+        let x = rect.x as usize;
+        let width = rect.w as usize;
+        for y in rect.y..rect.y + rect.h {
+            let start = y as usize * row_bytes + x * 4;
+            let end = start + width * 4;
+            target[start..end].copy_from_slice(&fresh.rgba[start..end]);
+        }
+    }
+    true
 }
 
 /// Decodes video messages and composites rect updates into [`FrameSlot`], and writes
@@ -339,8 +476,8 @@ impl DecodeSink {
             .as_ref()
             .expect("publish is only reached once a canvas exists");
         let displaced = self.slot.put(Frame {
-            // An Arc clone: the pixels are shared, not copied. The canvas's next
-            // rect blit is the copy-on-write point.
+            // An Arc clone: the pixels are shared, not copied. Before the next rect
+            // blit the slot either reclaims this ref or supplies its recycled peer.
             rgba: Arc::clone(&canvas.rgba),
             width: canvas.width,
             height: canvas.height,
@@ -370,14 +507,30 @@ impl DecodeSink {
         update: &rects::RectUpdate,
         recv_done_us: u64,
     ) -> Result<(), rects::RectsError> {
-        self.canvas
+        let canvas = self
+            .canvas
+            .as_ref()
+            .expect("painting is gated on a live canvas");
+        let (recycled, reclaimed) =
+            self.slot
+                .prepare_rect_surface(&canvas.rgba, canvas.width, canvas.height);
+        let inherited_damage = reclaimed.map(|old| {
+            self.record_unpresented(&old.stamps);
+            old.damage
+        });
+
+        let canvas = self
+            .canvas
             .as_mut()
-            .expect("painting is gated on a live canvas")
-            .apply_rects(update)?;
+            .expect("painting is gated on a live canvas");
+        if let Some(rgba) = recycled {
+            canvas.rgba = rgba;
+        }
+        canvas.apply_rects(update)?;
         let paint_done_us = self.clock.now_us();
         // Exactly the rectangles just blitted, in the coordinates
         // `blit_bgra_to_rgba` used — the window thread converts these and nothing else.
-        let damage = Damage::Rects(
+        let mut damage = Damage::Rects(
             update
                 .rects
                 .iter()
@@ -389,6 +542,9 @@ impl DecodeSink {
                 })
                 .collect(),
         );
+        if let Some(old) = inherited_damage {
+            damage.absorb(&old);
+        }
         self.publish(
             PaintStamps::Rects(RectStamps {
                 seq: update.frame_seq,
@@ -570,6 +726,7 @@ impl MessageSink for DecodeSink {
             None => true,
         };
         if rebase {
+            self.slot.clear_recycled();
             self.canvas = Some(Canvas::from_frame(
                 Arc::new(decoded.into_data()),
                 width,
@@ -586,6 +743,7 @@ impl MessageSink for DecodeSink {
                 self.stats.record(&FrameRecord::suppressed(&stamps));
                 return;
             }
+            self.slot.clear_recycled();
             canvas.set_frame(Arc::new(decoded.into_data()), seq);
         }
         // A decoded access unit repaints the whole desktop and the bitstream says
@@ -885,6 +1043,7 @@ mod tests {
             frame_seq,
             frame_width,
             frame_height,
+            required_parts: rects::UpdateParts::RAW,
             rects,
         }
     }
@@ -1001,6 +1160,60 @@ mod tests {
         assert!(canvas.accepts_au(Some(10)));
     }
 
+    #[test]
+    fn consecutive_presented_rect_updates_reuse_a_bounded_surface() {
+        let slot = FrameSlot::new();
+        let mut canvas = canvas_8x4(0);
+        let original = Arc::as_ptr(&canvas.rgba);
+
+        let snapshot = |canvas: &Canvas, n: u64| Frame {
+            rgba: Arc::clone(&canvas.rgba),
+            width: canvas.width,
+            height: canvas.height,
+            damage: Damage::Rects(vec![DamageRect {
+                x: n.saturating_sub(1) as u32,
+                y: 0,
+                w: 1,
+                h: 1,
+            }]),
+            ..frame(n)
+        };
+
+        slot.put(snapshot(&canvas, 0));
+        let mut presented = None;
+        assert!(slot.take_for_present(&mut presented));
+
+        let (recycled, reclaimed) =
+            slot.prepare_rect_surface(&canvas.rgba, canvas.width, canvas.height);
+        assert!(recycled.is_none() && reclaimed.is_none());
+        canvas
+            .apply_rects(&update(1, 8, 4, vec![rect(0, 0, 1, 1, 0x20)]))
+            .unwrap();
+        let bootstrap = Arc::as_ptr(&canvas.rgba);
+        assert_ne!(
+            bootstrap, original,
+            "the held base forces one bootstrap copy"
+        );
+        let first_pixel = canvas.rgba[..4].to_vec();
+        slot.put(snapshot(&canvas, 1));
+        assert!(slot.take_for_present(&mut presented));
+
+        let (recycled, reclaimed) =
+            slot.prepare_rect_surface(&canvas.rgba, canvas.width, canvas.height);
+        assert!(reclaimed.is_none());
+        canvas.rgba = recycled.expect("the presenter returns its prior surface");
+        canvas
+            .apply_rects(&update(2, 8, 4, vec![rect(1, 0, 1, 1, 0x40)]))
+            .unwrap();
+        assert_eq!(
+            Arc::as_ptr(&canvas.rgba),
+            original,
+            "the second rect must reuse the returned base surface, not clone the full canvas again"
+        );
+        assert_eq!(&canvas.rgba[..4], first_pixel.as_slice());
+        assert_ne!(&canvas.rgba[4..8], &[0x11; 4]);
+    }
+
     // ---- DecodeSink's rect path, driven with a canvas installed by hand ----
 
     /// A stats log backed by a temp file, so a test can read the lines it wrote.
@@ -1041,6 +1254,70 @@ mod tests {
     /// the point — the fast path must be testable without an HEVC stream.
     fn sink_with(log: &TempLog, slot: Arc<FrameSlot>) -> DecodeSink {
         DecodeSink::new(None, slot, log.log.clone(), Box::new(|| {}))
+    }
+
+    #[test]
+    fn rect_path_reuses_surfaces_whether_the_presenter_keeps_up_or_lags() {
+        let log = TempLog::new("surface-reuse");
+        let slot = Arc::new(FrameSlot::new());
+        let mut sink = sink_with(&log, slot.clone());
+        sink.canvas = Some(canvas_8x4(0));
+        let original = Arc::as_ptr(&sink.canvas.as_ref().unwrap().rgba);
+        sink.publish(PaintStamps::Au(stamps(0)), Damage::Full);
+
+        let mut presented = None;
+        assert!(slot.take_for_present(&mut presented));
+
+        let first = update(1, 8, 4, vec![rect(0, 0, 1, 1, 0x20)]);
+        sink.on_rects(&payload(&first), 100).unwrap();
+        let bootstrap = Arc::as_ptr(&sink.canvas.as_ref().unwrap().rgba);
+        assert_ne!(
+            bootstrap, original,
+            "the first held snapshot bootstraps the pair"
+        );
+        assert!(slot.take_for_present(&mut presented));
+
+        let second = update(2, 8, 4, vec![rect(1, 0, 1, 1, 0x40)]);
+        sink.on_rects(&payload(&second), 200).unwrap();
+        assert_eq!(Arc::as_ptr(&sink.canvas.as_ref().unwrap().rgba), original);
+
+        // Do not present frame 2. The decoder must reclaim that untaken snapshot,
+        // keep its damage, and mutate the same allocation for frame 3.
+        let third = update(3, 8, 4, vec![rect(2, 0, 1, 1, 0x60)]);
+        sink.on_rects(&payload(&third), 300).unwrap();
+        assert_eq!(Arc::as_ptr(&sink.canvas.as_ref().unwrap().rgba), original);
+
+        let published = slot.take().expect("the newest frame remains pending");
+        assert_eq!(
+            published.damage,
+            Damage::Rects(vec![
+                DamageRect {
+                    x: 2,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+                DamageRect {
+                    x: 1,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+            ]),
+            "reclaiming an untaken frame must preserve all unseen damage"
+        );
+        assert_ne!(&published.rgba[..4], &[0x11; 4]);
+        assert_ne!(&published.rgba[4..8], &[0x11; 4]);
+        assert_ne!(&published.rgba[8..12], &[0x11; 4]);
+
+        let lines = log.lines();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the reclaimed frame is recorded as unpresented"
+        );
+        assert_eq!(lines[0]["seq"], 2);
+        assert!(lines[0]["present_done_us"].is_null());
     }
 
     #[test]
