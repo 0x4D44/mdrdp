@@ -476,7 +476,7 @@ pub struct Plan {
     pub notes: Vec<String>,
 }
 
-fn quiesce_actions(evidence: &Evidence) -> Result<Vec<Action>, String> {
+fn quiesce_actions(evidence: &Evidence, target_dir: &str) -> Result<Vec<Action>, String> {
     // Presence-keyed, never gated on the control port answering (review
     // finding): use the exact executable registered with the service when one
     // exists. A legacy flat binary may predate service-aware uninstall and must
@@ -494,10 +494,13 @@ fn quiesce_actions(evidence: &Evidence) -> Result<Vec<Action>, String> {
         },
     };
 
-    Ok(vec![Action::Run {
-        label: "quiesce existing agent".to_owned(),
-        command: format!("\"{executable}\" uninstall"),
-    }])
+    Ok(vec![
+        Action::Run {
+            label: "quiesce existing agent".to_owned(),
+            command: format!("\"{executable}\" uninstall"),
+        },
+        verify_quiescence_action(target_dir),
+    ])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,6 +546,14 @@ fn configure_audio_action(remote_dir: &str) -> Action {
     Action::Run {
         label: "configure audio".to_owned(),
         command: format!("\"{remote_dir}\\rhydra-agent.exe\" configure-audio"),
+    }
+}
+
+fn verify_quiescence_action(target_dir: &str) -> Action {
+    Action::Script {
+        label: "verify quiescence".to_owned(),
+        script: "quiesce.ps1".to_owned(),
+        args: format!("-TargetDir \"{target_dir}\" -WaitSeconds 30"),
     }
 }
 
@@ -684,7 +695,7 @@ pub fn decide(cfg: &Config, artifacts: &Artifacts, evidence: &Evidence) -> Resul
     // Copy-collision: replacing the same version dir the running agent lives in
     // means quiescing first; a fresh version dir keeps copy-first atomicity.
     let target_exists = evidence.version_dirs.iter().any(|d| d == &vdir);
-    let quiesce = quiesce_actions(evidence)?;
+    let quiesce = quiesce_actions(evidence, &remote_dir)?;
     let quiesce_first = target_exists && !quiesce.is_empty();
     if quiesce_first {
         plan.notes.push(format!(
@@ -1180,6 +1191,102 @@ Write-Output (ConvertTo-Json -InputObject $last -Compress -Depth 5)
 Write-Output 'RHYDRA-OK'
 "#;
 
+/// Waits for the old Rhydra stack to be genuinely replaceable. Uninstall is an
+/// external executable, including an older installed version during a
+/// same-version redeploy, so its zero exit is not itself a quiescence proof.
+pub const QUIESCE_PS1: &str = r#"
+param(
+    [Parameter(Mandatory=$true)][string]$TargetDir,
+    [int]$WaitSeconds = 30
+)
+$ErrorActionPreference = 'Stop'
+if ($WaitSeconds -le 0) { throw "WaitSeconds must be positive" }
+
+$root = [IO.Path]::GetFullPath('C:\mdrdp').TrimEnd('\')
+$target = [IO.Path]::GetFullPath($TargetDir).TrimEnd('\')
+$ownedNames = @('rhydra-agent.exe', 'rhydra-server.exe', 'mdrdp-idd-create.exe')
+
+function Owned-Processes {
+    $unreadable = @()
+    $owned = @()
+    foreach ($process in @(Get-CimInstance Win32_Process -OperationTimeoutSec 2)) {
+        $name = "$($process.Name)".ToLowerInvariant()
+        if ($ownedNames -notcontains $name) { continue }
+        $path = "$($process.ExecutablePath)"
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            $unreadable += "$($process.ProcessId):$name"
+            continue
+        }
+        $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+        if ($full.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) {
+            $owned += "$($process.ProcessId):$full"
+        }
+    }
+    [pscustomobject]@{ owned = @($owned); unreadable = @($unreadable) }
+}
+
+function Can-OpenExclusive([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $true }
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+$deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+$last = $null
+do {
+    $services = @(Get-CimInstance Win32_Service -Filter "Name='RhydraAgent'" -OperationTimeoutSec 2)
+    if ($services.Count -gt 1) { throw 'RhydraAgent service query returned multiple rows' }
+    $service = $services | Select-Object -First 1
+    $serviceState = if ($null -eq $service) { 'Absent' } else { "$($service.State)" }
+    $serviceReady = $null -eq $service
+
+    $processes = Owned-Processes
+    $ports = @(Get-NetTCPConnection -State Listen -LocalPort @(9500, 9502) -ErrorAction SilentlyContinue)
+    $locked = @()
+    foreach ($name in $ownedNames) {
+        $path = Join-Path $target $name
+        if ((Test-Path -LiteralPath $path -PathType Leaf) -and -not (Can-OpenExclusive $path)) {
+            $locked += $path
+        }
+    }
+
+    $last = [ordered]@{
+        service = $serviceState
+        owned_processes = @($processes.owned)
+        unreadable_processes = @($processes.unreadable)
+        listening_ports = @($ports | ForEach-Object LocalPort)
+        locked_files = @($locked)
+    }
+    $ready = $serviceReady -and
+        $processes.owned.Count -eq 0 -and
+        $processes.unreadable.Count -eq 0 -and
+        $ports.Count -eq 0 -and
+        $locked.Count -eq 0
+    if ($ready) {
+        break
+    }
+    if ([DateTime]::UtcNow -ge $deadline) {
+        throw "Rhydra quiescence did not converge: $(ConvertTo-Json -InputObject $last -Compress -Depth 4)"
+    }
+    Start-Sleep -Milliseconds 250
+} while ($true)
+
+Write-Output (ConvertTo-Json -InputObject $last -Compress -Depth 4)
+Write-Output 'RHYDRA-OK'
+"#;
+
 /// Prints name->size JSON for a directory, then the sentinel. Used after the
 /// copies to verify what actually landed (a truncated scp otherwise surfaces
 /// as an opaque verify failure much later).
@@ -1329,6 +1436,7 @@ fn upload_scripts(ssh: &Ssh) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     for (name, body) in [
         ("probe.ps1", PROBE_PS1),
+        ("quiesce.ps1", QUIESCE_PS1),
         ("driver-status.ps1", DRIVER_STATUS_PS1),
         ("sizes.ps1", SIZES_PS1),
         ("driver-install.ps1", DRIVER_INSTALL_PS1),
@@ -1952,12 +2060,47 @@ mod tests {
         );
 
         assert_eq!(
-            quiesce_actions(&evidence).unwrap(),
-            vec![Action::Run {
-                label: "quiesce existing agent".to_owned(),
-                command: r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" uninstall"#.to_owned(),
-            }]
+            quiesce_actions(&evidence, r"C:\mdrdp\v0.2.0").unwrap(),
+            vec![
+                Action::Run {
+                    label: "quiesce existing agent".to_owned(),
+                    command: r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" uninstall"#.to_owned(),
+                },
+                verify_quiescence_action(r"C:\mdrdp\v0.2.0"),
+            ]
         );
+    }
+
+    #[test]
+    fn quiesce_script_is_bounded_and_checks_every_replaceability_predicate() {
+        for required in [
+            "[Parameter(Mandatory=$true)][string]$TargetDir",
+            "[int]$WaitSeconds = 30",
+            "Get-CimInstance Win32_Service",
+            "RhydraAgent",
+            "Get-CimInstance Win32_Process",
+            "rhydra-agent.exe",
+            "rhydra-server.exe",
+            "mdrdp-idd-create.exe",
+            "Get-NetTCPConnection -State Listen -LocalPort @(9500, 9502) -ErrorAction SilentlyContinue",
+            "9500",
+            "9502",
+            "[IO.File]::Open",
+            "[IO.FileShare]::None",
+            "[DateTime]::UtcNow",
+            "Start-Sleep -Milliseconds 250",
+            "Write-Output 'RHYDRA-OK'",
+        ] {
+            assert!(QUIESCE_PS1.contains(required), "missing {required}");
+        }
+        assert!(QUIESCE_PS1.contains("$serviceReady = $null -eq $service"));
+        assert!(!QUIESCE_PS1.contains("$serviceReady = $null -eq $service -or"));
+        for forbidden in ["Stop-Process", "taskkill", "Remove-Item"] {
+            assert!(
+                !QUIESCE_PS1.contains(forbidden),
+                "quiesce verification must not mutate the host: found {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -2099,7 +2242,7 @@ mod tests {
             r#""C:\mdrdp\v0.5.0\rhydra-agent.exe" service --display 0 2880 240 200"#.to_owned(),
         );
 
-        let error = quiesce_actions(&evidence).unwrap_err();
+        let error = quiesce_actions(&evidence, r"C:\mdrdp\v0.2.0").unwrap_err();
         assert!(
             error.contains("service command") && error.contains("legacy"),
             "{error}"
@@ -2110,11 +2253,14 @@ mod tests {
     fn quiesce_uses_legacy_agent_only_without_service_evidence() {
         let evidence = healthy_evidence();
         assert_eq!(
-            quiesce_actions(&evidence).unwrap(),
-            vec![Action::Run {
-                label: "quiesce existing agent".to_owned(),
-                command: r#""C:\mdrdp\v0.1.0\rhydra-agent.exe" uninstall"#.to_owned(),
-            }]
+            quiesce_actions(&evidence, r"C:\mdrdp\v0.2.0").unwrap(),
+            vec![
+                Action::Run {
+                    label: "quiesce existing agent".to_owned(),
+                    command: r#""C:\mdrdp\v0.1.0\rhydra-agent.exe" uninstall"#.to_owned(),
+                },
+                verify_quiescence_action(r"C:\mdrdp\v0.2.0"),
+            ]
         );
     }
 
@@ -2269,7 +2415,12 @@ mod tests {
             .collect();
         assert_eq!(
             labels,
-            ["quiesce existing agent", "install agent", "configure audio"],
+            [
+                "quiesce existing agent",
+                "verify quiescence",
+                "install agent",
+                "configure audio"
+            ],
             "the new version directory must receive its own loopback source selector"
         );
         assert_eq!(plan.copies.len(), 5);
@@ -2286,6 +2437,10 @@ mod tests {
             panic!("expected a full plan");
         };
         assert!(matches!(&plan.pre[0], Action::Run { label, .. } if label.contains("quiesce")));
+        assert!(matches!(
+            &plan.pre[1],
+            Action::Script { label, .. } if label == "verify quiescence"
+        ));
     }
 
     #[test]
@@ -2527,6 +2682,7 @@ mod tests {
     fn scripts_end_with_the_sentinel() {
         for (name, body) in [
             ("probe", PROBE_PS1),
+            ("quiesce", QUIESCE_PS1),
             ("driver-status", DRIVER_STATUS_PS1),
             ("sizes", SIZES_PS1),
             ("driver-install", DRIVER_INSTALL_PS1),
