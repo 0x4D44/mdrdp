@@ -58,9 +58,24 @@ pub(crate) fn flush_due(dirty: bool, elapsed: Duration) -> bool {
     dirty && elapsed >= STATS_FLUSH_INTERVAL
 }
 
+/// Apply sender telemetry only when the payload write and flush succeeded.
+pub(crate) fn emit_if_delivered<T>(
+    delivered: bool,
+    record: &mut T,
+    stamp: impl FnOnce(&mut T),
+    emit: impl FnOnce(&T),
+) {
+    if delivered {
+        stamp(record);
+        emit(record);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{flush_due, payload_first, AdmissionGate, BatchKind, STATS_FLUSH_INTERVAL};
+    use super::{
+        emit_if_delivered, flush_due, payload_first, AdmissionGate, BatchKind, STATS_FLUSH_INTERVAL,
+    };
     use std::time::Duration;
 
     #[derive(Debug, PartialEq, Eq)]
@@ -107,5 +122,35 @@ mod tests {
         assert!(!flush_due(true, Duration::from_millis(199)));
         assert!(flush_due(true, STATS_FLUSH_INTERVAL));
         assert!(!flush_due(false, Duration::from_secs(1)));
+    }
+
+    #[derive(Default)]
+    struct Record {
+        send_done_us: i64,
+    }
+
+    #[test]
+    fn delivery_telemetry_requires_successful_write_and_flush() {
+        let mut failed = Record::default();
+        let mut failed_lines = Vec::new();
+        emit_if_delivered(
+            false,
+            &mut failed,
+            |record| record.send_done_us = 42,
+            |record| failed_lines.push(record.send_done_us),
+        );
+        assert_eq!(failed.send_done_us, 0);
+        assert!(failed_lines.is_empty());
+
+        let mut delivered = Record::default();
+        let mut delivered_lines = Vec::new();
+        emit_if_delivered(
+            true,
+            &mut delivered,
+            |record| record.send_done_us = 42,
+            |record| delivered_lines.push(record.send_done_us),
+        );
+        assert_eq!(delivered.send_done_us, 42);
+        assert_eq!(delivered_lines, [42]);
     }
 }

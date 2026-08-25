@@ -263,17 +263,21 @@ impl Sender {
 
     /// Frame one message and push it. A write failure ends the connection; the
     /// listener goes straight back to accepting.
-    fn write_message(&mut self, msg_type: u8, payload: &[u8]) {
+    fn write_message(&mut self, msg_type: u8, payload: &[u8]) -> bool {
         let Some(client) = self.client.as_mut() else {
-            return;
+            return false;
         };
         self.scratch.clear();
         framing::encode(msg_type, payload, &mut self.scratch);
         let outcome = client
             .write_all(&self.scratch)
             .and_then(|()| client.flush());
-        if let Err(e) = outcome {
-            self.drop_client(&e.to_string());
+        match outcome {
+            Ok(()) => true,
+            Err(error) => {
+                self.drop_client(&error.to_string());
+                false
+            }
         }
     }
 
@@ -291,9 +295,9 @@ impl Sender {
         }
     }
 
-    fn write_video(&mut self, tile_id: u8, seq: u64, au: &[u8]) {
+    fn write_video(&mut self, tile_id: u8, seq: u64, au: &[u8]) -> bool {
         let payload = framing::encode_tile_au(tile_id, seq, au);
-        self.write_message(framing::MSG_VIDEO_TILE, &payload);
+        self.write_message(framing::MSG_VIDEO_TILE, &payload)
     }
 
     /// Notice a viewer that closed its end without waiting for a write to fail.
@@ -360,25 +364,37 @@ impl Sender {
                 if gate.as_ref().is_some_and(|gate| !gate.admitted()) {
                     return;
                 }
-                self.write_message(framing::MSG_VIDEO_UPDATE, &payload);
+                let delivered = self.write_message(framing::MSG_VIDEO_UPDATE, &payload);
                 for mut tile in tiles {
-                    tile.record.send_done_us = self.clock.micros(qpc::now());
-                    stats_lines.push(crate::stats::to_line(&*tile.record));
+                    send_schedule::emit_if_delivered(
+                        delivered,
+                        &mut tile.record,
+                        |record| record.send_done_us = self.clock.micros(qpc::now()),
+                        |record| stats_lines.push(crate::stats::to_line(&*record)),
+                    );
                 }
             }
             Outbound::Move(mut record, payload, gate) => {
                 if gate.as_ref().is_some_and(|gate| !gate.admitted()) {
                     return;
                 }
-                self.write_message(framing::MSG_MOVE_UPDATE, &payload);
-                record.send_done_us = self.clock.micros(qpc::now());
-                stats_lines.push(crate::stats::to_line(&*record));
+                let delivered = self.write_message(framing::MSG_MOVE_UPDATE, &payload);
+                send_schedule::emit_if_delivered(
+                    delivered,
+                    &mut record,
+                    |record| record.send_done_us = self.clock.micros(qpc::now()),
+                    |record| stats_lines.push(crate::stats::to_line(&*record)),
+                );
             }
             Outbound::FrameSet(tiles) => {
                 for mut tile in tiles {
-                    self.write_video(tile.tile_id, tile.seq, &tile.au);
-                    tile.record.send_done_us = self.clock.micros(qpc::now());
-                    stats_lines.push(crate::stats::to_line(&*tile.record));
+                    let delivered = self.write_video(tile.tile_id, tile.seq, &tile.au);
+                    send_schedule::emit_if_delivered(
+                        delivered,
+                        &mut tile.record,
+                        |record| record.send_done_us = self.clock.micros(qpc::now()),
+                        |record| stats_lines.push(crate::stats::to_line(&*record)),
+                    );
                 }
             }
             Outbound::Line(line) => stats_lines.push(line),
