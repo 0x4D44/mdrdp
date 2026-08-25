@@ -78,6 +78,15 @@ fn main() -> ExitCode {
     }
 }
 
+fn settings_after_load_failure() -> mdrdp::settings::Settings {
+    let mut settings = mdrdp::settings::Settings::default();
+    // A settings failure may hide an explicit clipboard restriction. Keep all
+    // ordinary defaults, but never turn that restriction into bidirectional
+    // sharing merely because the rest of the file could not be read.
+    settings.clipboard.direction = mdrdp::settings::ClipboardDirection::Off;
+    settings
+}
+
 /// A connection whose window is not yet built: the server has told us the desktop
 /// size, nothing is pumping yet. Boxed contents keep the enum pocket-sized.
 enum Connected {
@@ -740,8 +749,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             s
         }
         Err(e) => {
-            eprintln!("warning: {e}; using default settings");
-            mdrdp::settings::Settings::default()
+            eprintln!("warning: {e}; using default settings with clipboard sharing disabled");
+            settings_after_load_failure()
         }
     };
     install_diagnostics_subscriber(
@@ -2154,6 +2163,15 @@ fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_settings_fail_closed_for_clipboard_sharing() {
+        assert_eq!(
+            settings_after_load_failure().clipboard.direction,
+            mdrdp::settings::ClipboardDirection::Off,
+            "an unreadable restriction must not widen clipboard sharing"
+        );
+    }
 
     #[test]
     fn resource_report_uses_session_cpu_delta_and_process_peak_memory() {
