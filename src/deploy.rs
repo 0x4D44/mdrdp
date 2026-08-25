@@ -1221,7 +1221,7 @@ Write-Output "cert: $($cert.Thumbprint) NotAfter $($cert.NotAfter)"
 Export-Certificate -Cert $cert -FilePath $certFile | Out-Null
 & $inf2cat "/driver:$DriverDir" '/os:10_NI_X64'
 if ($LASTEXITCODE -ne 0) { throw 'Inf2Cat failed' }
-& $signtool sign /fd SHA256 /sha1 $cert.Thumbprint (Join-Path $DriverDir 'mdrdp-idd.cat')
+& $signtool sign /fd SHA256 /sha1 $cert.Thumbprint /t http://timestamp.digicert.com (Join-Path $DriverDir 'mdrdp-idd.cat')
 if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
 certutil -addstore root $certFile | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'certutil (root) failed' }
@@ -2538,6 +2538,16 @@ mod tests {
                 "{name}.ps1 must end by printing the sentinel, ends with {last:?}"
             );
         }
+    }
+
+    #[test]
+    fn driver_catalogue_signature_is_timestamped() {
+        assert!(
+            DRIVER_INSTALL_PS1.contains(
+                "sign /fd SHA256 /sha1 $cert.Thumbprint /t http://timestamp.digicert.com"
+            ),
+            "the deployed catalogue signature must outlive its signing certificate"
+        );
     }
 
     #[test]
