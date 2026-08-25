@@ -115,6 +115,9 @@ pub trait AgentOps {
     /// 2026-08-18: the agent's first server attached to the dying section and
     /// captured nothing, with no error, forever).
     fn device_id(&mut self) -> Option<String>;
+    /// Whether this process runs in the active console session. `None` means the
+    /// platform could not determine the session relationship.
+    fn agent_session_is_console(&mut self) -> Option<bool>;
     /// Whether this host has an audio render endpoint to capture from.
     ///
     /// `Some(true)` an endpoint exists, `Some(false)` there is none, `None` the
@@ -330,6 +333,10 @@ pub struct Reconciler {
     desired: Mode,
     desired_scale_percent: u32,
     device_present: bool,
+    /// Whether this process runs in the active console session. `None` means
+    /// the platform could not answer, so an absent session-local display is
+    /// reported as unknown rather than as a host-wide device failure.
+    agent_session_is_console: Option<bool>,
     /// Last answer from `audio_endpoint`; `None` until first sampled.
     audio_endpoint: Option<bool>,
     /// The identity last observed, for spotting swaps and blinks (see
@@ -380,6 +387,7 @@ impl Reconciler {
             desired: DESIRED_MODE,
             desired_scale_percent: 100,
             device_present: false,
+            agent_session_is_console: None,
             audio_endpoint: None,
             last_device_id: None,
             actual_mode: None,
@@ -460,6 +468,7 @@ impl Reconciler {
             // device's lifetime. Both are idempotent.
             ops.kill_server();
             ops.kill_creator();
+            self.agent_session_is_console = ops.agent_session_is_console();
             self.device_present = ops.device_id().is_some();
             self.pool = ops.pool();
             if !self.device_present {
@@ -494,6 +503,7 @@ impl Reconciler {
 
         let device_id = ops.device_id();
         self.device_present = device_id.is_some();
+        self.agent_session_is_console = ops.agent_session_is_console();
         self.audio_endpoint = ops.audio_endpoint();
         // A server that attached to one device instance's section captures nothing
         // once that instance dies — silently, forever. Restart it whenever the
@@ -777,11 +787,7 @@ impl Reconciler {
                 state: ok_or_fail(self.creator.running),
                 detail: None,
             },
-            RungReport {
-                rung: Rung::Device,
-                state: ok_or_fail(self.device_present),
-                detail: None,
-            },
+            self.device_rung(),
             self.pool_rung(),
             RungReport {
                 rung: Rung::DisplayMode,
@@ -827,6 +833,37 @@ impl Reconciler {
             self.liveness_rung(),
             self.audio_rung(),
         ]
+    }
+
+    /// A session-local display query cannot distinguish a disconnected worker
+    /// from a missing IDD. If the worker is not in the active console session,
+    /// keep the device rung honest and point the operator at session repair.
+    fn device_rung(&self) -> RungReport {
+        let (state, detail) = match (self.device_present, self.agent_session_is_console) {
+            (true, _) => (RungState::Ok, None),
+            (false, Some(true)) => (RungState::Fail, None),
+            (false, Some(false)) => (
+                RungState::Unknown,
+                Some(
+                    "the agent is not attached to the active console session; the display is \
+                     invisible from here — attach the session with tscon before cycling the device"
+                        .to_owned(),
+                ),
+            ),
+            (false, None) => (
+                RungState::Unknown,
+                Some(
+                    "could not determine whether the agent is in the console session; \
+                     check the session and use tscon before cycling the device"
+                        .to_owned(),
+                ),
+            ),
+        };
+        RungReport {
+            rung: Rung::Device,
+            state,
+            detail,
+        }
     }
 
     /// The `audio` rung: can this host capture audio at all?
@@ -977,6 +1014,9 @@ mod tests {
         creator_running: bool,
         creator_pending_exit: Option<i32>,
         device_id: Option<String>,
+        /// What `agent_session_is_console()` reports. `None` here means use the
+        /// healthy default so existing tests remain about their stated concern.
+        agent_session_is_console: Option<bool>,
         /// What `audio_endpoint()` reports. `None` (the Default) means "could
         /// not judge", which keeps every pre-existing test's ladder unchanged
         /// apart from one new Unknown rung that gates nothing.
@@ -1018,6 +1058,9 @@ mod tests {
         }
         fn device_id(&mut self) -> Option<String> {
             self.device_id.clone()
+        }
+        fn agent_session_is_console(&mut self) -> Option<bool> {
+            Some(self.agent_session_is_console.unwrap_or(true))
         }
         fn audio_endpoint(&mut self) -> Option<bool> {
             self.audio_endpoint
@@ -1207,6 +1250,29 @@ mod tests {
         rec.tick(&mut ops);
         assert_eq!(rung_state(&rec, Rung::InputDesktop), RungState::Unknown);
         assert_eq!(rec.status(1).stuck, None);
+    }
+
+    #[test]
+    fn a_device_hidden_by_a_disconnected_agent_session_is_unknown_not_absent() {
+        let (mut rec, mut ops) = settled();
+        ops.agent_session_is_console = Some(false);
+        ops.device_id = None;
+
+        rec.tick(&mut ops);
+
+        let device = rec
+            .status(1)
+            .rungs
+            .into_iter()
+            .find(|report| report.rung == Rung::Device)
+            .expect("device rung exists");
+        assert_eq!(device.state, RungState::Unknown);
+        assert!(
+            device.detail.as_deref().is_some_and(|detail| {
+                detail.contains("console session") && detail.contains("tscon")
+            }),
+            "the report must distinguish session topology from an absent device: {device:?}"
+        );
     }
 
     #[test]

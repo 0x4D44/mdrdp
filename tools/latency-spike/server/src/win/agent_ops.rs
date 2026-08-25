@@ -33,6 +33,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -1040,6 +1041,24 @@ impl AgentOps for WinOps {
         // The GDI name (`\\.\DISPLAYn`) changes when the device is re-created,
         // which is exactly the identity signal the reconciler keys on.
         Self::find_display().map(|name| wide_to_string(&name))
+    }
+
+    fn agent_session_is_console(&mut self) -> Option<bool> {
+        const NO_CONSOLE_SESSION: u32 = u32::MAX;
+
+        // `EnumDisplayDevicesW` is scoped to this process's window station and
+        // session. Compare that session with the active console before treating
+        // an absent display as evidence that the IDD itself is gone.
+        let console_session = unsafe { WTSGetActiveConsoleSessionId() };
+        if console_session == NO_CONSOLE_SESSION {
+            return None;
+        }
+        let mut agent_session = 0u32;
+        // SAFETY: `agent_session` is valid writable storage for this process's
+        // session id, and the process id is the current process.
+        unsafe { ProcessIdToSessionId(std::process::id(), &mut agent_session) }
+            .ok()
+            .map(|()| agent_session == console_session)
     }
 
     fn display_mode(&mut self) -> Option<Mode> {
