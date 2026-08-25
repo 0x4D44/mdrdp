@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00017 — rhydra health ladder: a disconnected agent session reports as a missing IDD device, pointing the operator at the wrong remedy
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** rhydra/agent
 - **Raised:** 2026-08-19T16:57:07Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260824T235840Z-9b6d5b75
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00017-run-fix-20260824T235840Z-9b6d5b75
-- **Owner base:** a956d71b6029b58fc60d7df3fe2ac95db15d2731
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-24T23:58:40Z
-- **Owner until:** 2026-08-25T01:58:40Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T16:57:07Z, raised via `deltic bugs new` model=claude-fable-5@high)
+- **State history:** Open (2026-08-19T16:57:07Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-25T00:09:07Z, deltic:auto role=fix run=fix-20260824T235840Z-9b6d5b75 branch=task/bug-MDR-BUG-FLUX-00017-run-fix-20260824T235840Z-9b6d5b75 code=4794a4e gate=manual)
 
 ## Observation
 
