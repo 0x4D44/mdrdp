@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00018 — A malformed settings.toml silently falls back to defaults, which turns the clipboard direction gate fully permissive
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** settings
 - **Raised:** 2026-08-19T18:33:08Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260825T054444Z-13d987ad
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00018-run-fix-20260825T054444Z-13d987ad
-- **Owner base:** e474e641b0bd06f03c6a32b2aa7b57371c8ba521
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-25T05:44:44Z
-- **Owner until:** 2026-08-25T07:44:44Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T18:33:08Z, raised via `deltic bugs new` model=claude-fable-5@high)
+- **State history:** Open (2026-08-19T18:33:08Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-25T05:45:08Z, deltic:auto role=fix run=fix-20260825T054444Z-13d987ad branch=task/bug-MDR-BUG-FLUX-00018-run-fix-20260825T054444Z-13d987ad code=a300ec1 gate=manual)
 
 ## Observation
 
