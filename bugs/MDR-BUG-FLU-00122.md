@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00122 — RDP keystrokes can stall until the Kiln session reconnects
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/input
 - **Raised:** 2026-08-25T10:06:15Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260825T221643Z-587da9f0
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00122-run-fix-20260825T221643Z-587da9f0
-- **Owner base:** d5d749b27ed4ce74bacfe1cec82411b13f8d6434
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-25T22:16:43Z
-- **Owner until:** 2026-08-26T00:16:43Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-25T10:06:15Z, raised via `deltic bugs new` model=gpt-5.6-sol@high)
+- **State history:** Open (2026-08-25T10:06:15Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-25T23:00:44Z, deltic:auto role=fix run=fix-20260825T221643Z-587da9f0 branch=task/bug-MDR-BUG-FLU-00122-run-fix-20260825T221643Z-587da9f0 code=2dc13af4107778571be01676b027596229b62bba gate=manual)
 
 ## Observation
 
