@@ -36,3 +36,10 @@ session ended gracefully after 12,708 frames with AVC444v2 active, zero decode e
 zero undecoded regions, and zero surface errors. This points away from a reported codec
 failure and towards stale-but-valid pixel state or incomplete damage/copy coverage, but
 does not yet identify which layer owns the retained remnants.
+
+A second v0.1.234 report includes visual evidence of pale cyan and yellow glyph-shaped
+remnants spread across large white regions of the desktop, behind and between current
+black text and controls. The leakage preserves recognizable fragments of older text at
+fixed coordinates rather than merely reducing colour resolution inside the current
+update. The screenshot itself is not stored in the repository because it contains
+document content.
