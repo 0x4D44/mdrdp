@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00111 — Same-version deploy returns from Rhydra quiesce while its images remain in use
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** deploy/rhydra
 - **Raised:** 2026-08-24T15:13:36Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260825T061032Z-b14210bd
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00111-run-fix-20260825T061032Z-b14210bd
-- **Owner base:** 400be6a541fc95085e25b65ba30711b4408b6d12
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-25T06:10:32Z
-- **Owner until:** 2026-08-25T08:10:32Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T15:13:36Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-24T15:13:36Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-25T06:29:21Z, deltic:auto role=fix run=fix-20260825T061032Z-b14210bd branch=task/bug-MDR-BUG-FLU-00111-run-fix-20260825T061032Z-b14210bd code=d7dab631c0fc2b963d1819f473c96ba1b6641586 gate=manual)
 
 ## Observation
 
