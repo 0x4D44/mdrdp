@@ -13,13 +13,15 @@ use super::{qpc, Result};
 use crate::framing;
 use crate::send_schedule::{self, AdmissionGate, BatchKind};
 use crate::stats::{FrameRecord, QpcClock, RectRecord};
+use crate::visual_flow::{Epoch, VisualFlow};
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::io::{BufWriter, Read, Write};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// How long a blocked socket write is allowed to stall the sender before the client
@@ -171,6 +173,12 @@ pub struct Sender {
     connected: Arc<AtomicBool>,
     sparse_connected: Arc<AtomicBool>,
     session_epoch: Arc<AtomicU64>,
+    accepted_epoch: Epoch,
+    visual_flow: Arc<VisualFlow>,
+    feedback_tx: mpsc::Sender<FeedbackEnd>,
+    feedback_rx: mpsc::Receiver<FeedbackEnd>,
+    feedback_join: Option<JoinHandle<()>>,
+    viewer_socket: Arc<ViewerSocket>,
     cursor_hidden: Arc<AtomicBool>,
     sent_cursor_hidden: Option<bool>,
     stats: Option<BufWriter<File>>,
@@ -183,6 +191,47 @@ pub struct Sender {
     scratch: Vec<u8>,
 }
 
+struct FeedbackEnd {
+    epoch: Epoch,
+    why: String,
+}
+
+#[derive(Default)]
+pub struct ViewerSocket {
+    current: Mutex<Option<(Epoch, TcpStream)>>,
+}
+
+impl ViewerSocket {
+    fn install(&self, epoch: Epoch, stream: TcpStream) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((epoch, stream));
+    }
+
+    fn clear(&self, epoch: Epoch) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.as_ref().is_some_and(|(owned, _)| *owned == epoch) {
+            *current = None;
+        }
+    }
+
+    pub fn shutdown(&self, epoch: Epoch) {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((owned, stream)) = current.as_ref() {
+            if *owned == epoch {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
 impl Sender {
     pub fn new(
         port: u16,
@@ -193,6 +242,8 @@ impl Sender {
         sparse_connected: Arc<AtomicBool>,
         session_epoch: Arc<AtomicU64>,
         cursor_hidden: Arc<AtomicBool>,
+        visual_flow: Arc<VisualFlow>,
+        viewer_socket: Arc<ViewerSocket>,
     ) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         listener.set_nonblocking(true)?;
@@ -205,12 +256,19 @@ impl Sender {
             file.flush()?;
         }
         eprintln!("video: listening on 127.0.0.1:{port}");
+        let (feedback_tx, feedback_rx) = mpsc::channel();
         Ok(Self {
             listener,
             client: None,
             connected,
             sparse_connected,
             session_epoch,
+            accepted_epoch: 0,
+            visual_flow,
+            feedback_tx,
+            feedback_rx,
+            feedback_join: None,
+            viewer_socket,
             cursor_hidden,
             sent_cursor_hidden: None,
             stats,
@@ -237,8 +295,48 @@ impl Sender {
                     return;
                 }
                 eprintln!("video: connected {peer}");
+                let epoch = self.visual_flow.begin_epoch();
+                let feedback_stream = match stream.try_clone() {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        let _ = self.visual_flow.disconnect(epoch);
+                        eprintln!("video: rejecting {peer}: feedback clone failed: {error}");
+                        return;
+                    }
+                };
+                let feedback_flow = Arc::clone(&self.visual_flow);
+                let feedback_tx = self.feedback_tx.clone();
+                let feedback_join = match std::thread::Builder::new()
+                    .name("spike-feedback".into())
+                    .spawn(move || {
+                        feedback_loop(feedback_stream, epoch, feedback_flow, feedback_tx)
+                    }) {
+                    Ok(join) => join,
+                    Err(error) => {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        let _ = self.visual_flow.disconnect(epoch);
+                        eprintln!("video: rejecting {peer}: feedback thread failed: {error}");
+                        return;
+                    }
+                };
                 self.client = Some(stream);
-                self.session_epoch.fetch_add(1, Ordering::AcqRel);
+                self.accepted_epoch = epoch;
+                self.feedback_join = Some(feedback_join);
+                let cancel_stream = match self
+                    .client
+                    .as_ref()
+                    .expect("accepted viewer socket")
+                    .try_clone()
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        self.drop_client(&format!("cancellation clone failed: {error}"));
+                        return;
+                    }
+                };
+                self.viewer_socket.install(epoch, cancel_stream);
+                self.session_epoch.store(epoch, Ordering::Release);
                 self.sparse_connected.store(false, Ordering::Release);
                 self.connected.store(true, Ordering::Release);
                 // The header goes first so a viewer knows the QPC frequency before
@@ -253,11 +351,31 @@ impl Sender {
     }
 
     fn drop_client(&mut self, why: &str) {
-        if self.client.take().is_some() {
+        if let Some(client) = self.client.take() {
+            let _ = client.shutdown(Shutdown::Both);
             eprintln!("video: disconnected ({why})");
         }
+        let _ = self.visual_flow.disconnect(self.accepted_epoch);
+        self.viewer_socket.clear(self.accepted_epoch);
+        if let Some(join) = self.feedback_join.take() {
+            let _ = join.join();
+        }
         self.connected.store(false, Ordering::Release);
+        self.sparse_connected.store(false, Ordering::Release);
+        self.accepted_epoch = 0;
         self.sent_cursor_hidden = None;
+    }
+
+    fn poll_feedback(&mut self) {
+        while let Ok(end) = self.feedback_rx.try_recv() {
+            if self.client.is_some() && end.epoch == self.accepted_epoch {
+                self.drop_client(&end.why);
+                return;
+            }
+        }
+        if self.client.is_some() && self.visual_flow.current_epoch() != self.accepted_epoch {
+            self.drop_client("viewer flow cancelled");
+        }
     }
 
     /// Frame one message and push it. A write failure ends the connection; the
@@ -297,32 +415,6 @@ impl Sender {
     fn write_video(&mut self, tile_id: u8, seq: u64, au: &[u8]) -> bool {
         let payload = framing::encode_tile_au(tile_id, seq, au);
         self.write_message(framing::MSG_VIDEO_TILE, &payload)
-    }
-
-    /// Notice a viewer that closed its end without waiting for a write to fail.
-    /// On a static desktop nothing is ever written, so without this poll a
-    /// departed client holds the single slot forever and `poll_accept` refuses
-    /// every successor.
-    fn poll_client_eof(&mut self) {
-        let Some(client) = self.client.as_ref() else {
-            return;
-        };
-        let mut probe = [0u8; 1];
-        if client.set_nonblocking(true).is_err() {
-            return;
-        }
-        let outcome = client.peek(&mut probe);
-        let _ = client.set_nonblocking(false);
-        match outcome {
-            Ok(0) => self.drop_client("viewer closed"),
-            // The viewer never sends on this socket; inbound bytes are ignored.
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => {
-                let why = e.to_string();
-                self.drop_client(&why);
-            }
-        }
     }
 
     fn write_stats(&mut self, line: &str) {
@@ -403,7 +495,7 @@ impl Sender {
         let mut batch: Vec<Outbound> = Vec::with_capacity(DRAIN_BATCH + 1);
         let mut stats_lines: Vec<String> = Vec::with_capacity(DRAIN_BATCH + 1);
         loop {
-            self.poll_client_eof();
+            self.poll_feedback();
             self.poll_accept();
             self.write_cursor_if_changed();
             self.flush_stats_if_due(Instant::now());
@@ -439,5 +531,49 @@ impl Sender {
             self.flush_stats_if_due(Instant::now());
         }
         self.flush_stats();
+        self.drop_client("sender stopped");
     }
+}
+
+fn feedback_loop(
+    mut stream: TcpStream,
+    epoch: Epoch,
+    visual_flow: Arc<VisualFlow>,
+    end_tx: mpsc::Sender<FeedbackEnd>,
+) {
+    let mut reassembler = framing::Reassembler::new(framing::FRAME_ACK_BYTES);
+    let mut bytes = [0u8; 64];
+    let why = 'reading: loop {
+        match stream.read(&mut bytes) {
+            Ok(0) => break 'reading "viewer closed".to_owned(),
+            Ok(count) => {
+                reassembler.push(&bytes[..count]);
+                loop {
+                    match reassembler.next_message() {
+                        Ok(Some(message)) if message.msg_type == framing::MSG_FRAME_ACK => {
+                            let frame_seq = match framing::decode_frame_ack(&message.payload) {
+                                Ok(frame_seq) => frame_seq,
+                                Err(error) => break 'reading format!("invalid frame ACK: {error}"),
+                            };
+                            if let Err(error) = visual_flow.ack(epoch, frame_seq) {
+                                break 'reading error.to_string();
+                            }
+                        }
+                        Ok(Some(message)) => {
+                            break 'reading format!(
+                                "unexpected viewer message type {} on video feedback",
+                                message.msg_type
+                            );
+                        }
+                        Ok(None) => break,
+                        Err(error) => break 'reading error.to_string(),
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break 'reading error.to_string(),
+        }
+    };
+    let _ = visual_flow.disconnect(epoch);
+    let _ = end_tx.send(FeedbackEnd { epoch, why });
 }

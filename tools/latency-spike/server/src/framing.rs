@@ -41,6 +41,58 @@ pub const MSG_MOVE_UPDATE: u8 = 8;
 /// Bulk-lane baseline barrier for a move prelude. It ensures every earlier bulk
 /// update is visible before the screen-to-screen copy reads its source.
 pub const MSG_MOVE_FENCE: u8 = 9;
+/// Exact acknowledgement of one complete logical visual update on wire v10.
+pub const MSG_FRAME_ACK: u8 = 10;
+
+pub const FRAME_ACK_BYTES: usize = 8;
+
+/// The logical lanes required to complete one visual update.
+///
+/// Wire-v10 permits a raw leg, a video leg, or both. Bits outside the two
+/// defined lanes, and the empty mask, are invalid on the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UpdateParts(u8);
+
+/// Descriptive alias used by the wire/protocol documentation.
+pub type RequiredParts = UpdateParts;
+
+impl UpdateParts {
+    pub const RAW: Self = Self(0b01);
+    pub const VIDEO: Self = Self(0b10);
+    pub const BOTH: Self = Self(Self::RAW.0 | Self::VIDEO.0);
+    pub const ALL: Self = Self::BOTH;
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            1..=3 => Some(Self(bits)),
+            _ => None,
+        }
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for UpdateParts {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl TryFrom<u8> for UpdateParts {
+    type Error = u8;
+
+    fn try_from(bits: u8) -> Result<Self, Self::Error> {
+        Self::from_bits(bits).ok_or(bits)
+    }
+}
 
 pub const MOVE_FENCE_BYTES: usize = 16;
 
@@ -61,6 +113,21 @@ pub fn decode_move_fence(payload: &[u8]) -> Result<(u64, u64), &'static str> {
         return Err("move fence baseline is not older than its update");
     }
     Ok((baseline_seq, frame_seq))
+}
+
+/// Encode the exact logical frame sequence acknowledged by the viewer.
+pub fn encode_frame_ack(frame_seq: u64) -> [u8; FRAME_ACK_BYTES] {
+    frame_seq.to_le_bytes()
+}
+
+/// Decode one strict wire-v10 frame acknowledgement.
+pub fn decode_frame_ack(payload: &[u8]) -> Result<u64, &'static str> {
+    if payload.len() != FRAME_ACK_BYTES {
+        return Err("frame acknowledgement is not its 8-byte payload");
+    }
+    Ok(u64::from_le_bytes(
+        payload.try_into().expect("checked 8-byte acknowledgement"),
+    ))
 }
 
 /// `[hidden: u8][reserved for later cursor metadata: 11]`.
@@ -292,6 +359,40 @@ mod tests {
         assert_eq!(decode_move_fence(&payload).unwrap(), (41, 44));
         assert!(decode_move_fence(&payload[..15]).is_err());
         assert!(decode_move_fence(&encode_move_fence(44, 44)).is_err());
+    }
+
+    #[test]
+    fn frame_ack_round_trips_as_exact_little_endian_u64() {
+        let payload = encode_frame_ack(0x0102_0304_0506_0708);
+        assert_eq!(payload, [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(decode_frame_ack(&payload), Ok(0x0102_0304_0506_0708));
+    }
+
+    #[test]
+    fn frame_ack_rejects_every_non_exact_payload_size() {
+        let payload = encode_frame_ack(44);
+        for size in 0..=FRAME_ACK_BYTES + 1 {
+            if size > payload.len() {
+                let mut too_long = payload.to_vec();
+                too_long.push(0);
+                assert!(decode_frame_ack(&too_long).is_err());
+            } else if size != FRAME_ACK_BYTES {
+                assert!(
+                    decode_frame_ack(&payload[..size]).is_err(),
+                    "accepted {size} bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_parts_accepts_only_nonempty_raw_video_bits() {
+        assert_eq!(UpdateParts::from_bits(0), None);
+        assert_eq!(UpdateParts::from_bits(1), Some(UpdateParts::RAW));
+        assert_eq!(UpdateParts::from_bits(2), Some(UpdateParts::VIDEO));
+        assert_eq!(UpdateParts::from_bits(3), Some(UpdateParts::BOTH));
+        assert_eq!(UpdateParts::from_bits(4), None);
+        assert_eq!(UpdateParts::from_bits(0xff), None);
     }
 
     #[test]

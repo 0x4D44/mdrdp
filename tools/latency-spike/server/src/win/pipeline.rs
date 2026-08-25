@@ -10,11 +10,9 @@
 //! * **Sparse sender thread** — raw final pixels on their own socket.
 //! * **Input thread** — the keystroke channel ([`super::input`]).
 //!
-//! The queue between capture and sender is bounded and **lossy on purpose**. When
-//! the socket cannot keep up, the newest frame is dropped rather than queued: a
-//! queued frame is a stale frame, and the entire point of this spike is the latency
-//! number. Every drop is counted and published as `dropped_frames`, so the loss is
-//! never silent.
+//! The client-applied flow window stops capture before these bounded queues can
+//! accumulate a stale visual tail. Queue rejection remains a fail-closed recovery
+//! path; it never licenses dropping an admitted H.264 dependency.
 
 use super::source::{Acquired, ChangeInfo, DirtyRect, FrameSource};
 use super::{convert, dxgi, encode, idd_source, input, pixel_diff, qpc, send, Result};
@@ -24,11 +22,15 @@ use crate::bootstrap::ViewerBootstrap;
 use crate::channel_listeners::BoundChannels;
 use crate::cli::{Config, Source, DECLARED_FPS};
 use crate::diff;
+use crate::framing::UpdateParts;
 use crate::logical_frame;
 use crate::rects;
 use crate::send_schedule::AdmissionGate;
 use crate::stats::{self, FrameRecord, Header, QpcClock};
 use crate::video_update::{self, VideoKind, VideoTile, VideoUpdate};
+use crate::visual_flow::{
+    Reservation, ReservationError, ReservationState, ReserveError, VisualFlow, WAIT_SLICE,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -59,6 +61,7 @@ const ACQUIRE_TIMEOUT_MS: u32 = 8;
 /// A low-latency encoder that retires no submission for this long is unhealthy.
 /// Exit so the session agent rebuilds it instead of leaving the viewer frozen.
 const SURFACE_STALL_TIMEOUT: Duration = Duration::from_millis(500);
+const CLIENT_APPLY_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// 100-nanosecond units per second — Media Foundation's time base.
 const HNS_PER_SECOND: i64 = 10_000_000;
@@ -234,6 +237,8 @@ pub fn run(cfg: &Config) -> Result<()> {
     let sparse_connected = Arc::new(AtomicBool::new(false));
     let session_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cursor_hidden = Arc::new(AtomicBool::new(source.hide_local_cursor()));
+    let visual_flow = Arc::new(VisualFlow::new());
+    let viewer_socket = Arc::new(send::ViewerSocket::default());
     let (tx, rx) = sync_channel::<send::Outbound>(QUEUE_DEPTH);
     let sender = send::Sender::new(
         cfg.video_port,
@@ -244,6 +249,8 @@ pub fn run(cfg: &Config) -> Result<()> {
         Arc::clone(&sparse_connected),
         Arc::clone(&session_epoch),
         Arc::clone(&cursor_hidden),
+        Arc::clone(&visual_flow),
+        Arc::clone(&viewer_socket),
     )?;
     std::thread::Builder::new()
         .name("spike-send".into())
@@ -334,6 +341,9 @@ pub fn run(cfg: &Config) -> Result<()> {
         diff_enabled,
         sparse_tx,
         sparse_connected,
+        session_epoch,
+        visual_flow,
+        viewer_socket,
     });
     // Only reached when the loop fails; the happy path never returns. Draining the
     // MFT before `MFShutdown` runs (via `_mf`'s Drop) keeps the driver's own logs
@@ -450,6 +460,9 @@ struct CaptureState<'a> {
     diff_enabled: bool,
     sparse_tx: SyncSender<send::SparseOutbound>,
     sparse_connected: Arc<AtomicBool>,
+    session_epoch: Arc<std::sync::atomic::AtomicU64>,
+    visual_flow: Arc<VisualFlow>,
+    viewer_socket: Arc<send::ViewerSocket>,
 }
 
 fn build_header(
@@ -506,6 +519,7 @@ fn build_header(
     } else {
         0
     };
+    h.max_unacknowledged_updates = crate::visual_flow::MAX_OUTSTANDING as u32;
     h.sequence_header_available = encoder.parameter_sets().is_some();
     h
 }
@@ -515,6 +529,7 @@ fn build_header(
 /// `CaptureState`) is itself mutably borrowed by `encode`/`pump`.
 struct EmitCtx {
     clock: QpcClock,
+    visual_flow: Arc<VisualFlow>,
     sparse_tx: SyncSender<send::SparseOutbound>,
     sparse_connected: Arc<AtomicBool>,
     tile_id: u8,
@@ -542,6 +557,9 @@ struct EmitCtx {
     awaiting_keyframe: Option<u32>,
     /// Set inside the sink; acted on by the loop (which owns the encoder).
     rerequest_keyframe: bool,
+    /// A post-acquire update was withheld. The next capture must not use the
+    /// retained image or sparse/move baseline until full recovery is scheduled.
+    baseline_invalidated: bool,
     /// AUs prepared by this encoder callback. The capture loop drains them into the
     /// shared logical-frame assembler after the encoder borrow ends.
     emitted: Vec<send::FrameTile>,
@@ -556,6 +574,7 @@ struct VideoPlan {
     coverage: Vec<(u8, Vec<Region>)>,
     raw: Option<send::SparseOutbound>,
     move_remainder: bool,
+    reservation: Option<Reservation>,
 }
 
 struct PreparedMove {
@@ -583,6 +602,7 @@ fn full_video_plan(
         block_size: CODEC_BLOCK_SIZE as u16,
         raw: None,
         move_remainder: false,
+        reservation: None,
         coverage: tiles
             .iter()
             .map(|tile| {
@@ -736,6 +756,7 @@ fn select_routing_plan(
         coverage,
         raw: None,
         move_remainder: false,
+        reservation: None,
     });
     Ok(RoutingPlan { raw, video })
 }
@@ -777,6 +798,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
             if idr && sets.is_none() {
                 ctx.param_set_failures += 1;
                 ctx.rerequest_keyframe = true;
+                ctx.baseline_invalidated = true;
                 return Ok(());
             }
             let (bytes, prepended) = annexb::ensure_avc_parameter_sets(&au.data, sets, idr);
@@ -829,6 +851,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
             }
             if *awaiting_epoch_irap && !irap {
                 *config_wait_drops += 1;
+                ctx.baseline_invalidated = true;
                 return Ok(());
             }
             let (bytes, prepended) =
@@ -837,6 +860,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
                     Err(_) => {
                         ctx.param_set_failures += 1;
                         ctx.rerequest_keyframe = true;
+                        ctx.baseline_invalidated = true;
                         return Ok(());
                     }
                 };
@@ -887,6 +911,7 @@ fn emit_au(au: encode::EncodedAu, ctx: &mut EmitCtx) -> Result<()> {
     );
     record.raw_rect_attempted = au.meta.raw_rect_attempted;
     record.raw_rect_sent = au.meta.raw_rect_sent;
+    record.visual_flow = visual_flow_record(&ctx.visual_flow);
     if au.meta.change_valid {
         record.dirty_rect_count = Some(au.meta.dirty_rect_count);
         record.dirty_bytes = Some(au.meta.dirty_bytes);
@@ -948,12 +973,16 @@ fn admit_ready_frames(
             logical_frame::RecoveryDecision::Suppress if frame.plan.move_remainder => {
                 return Err("move video remainder was suppressed after its prelude".into());
             }
-            logical_frame::RecoveryDecision::Suppress => continue,
+            logical_frame::RecoveryDecision::Suppress => {
+                ctx.baseline_invalidated = true;
+                continue;
+            }
             logical_frame::RecoveryDecision::SuppressAndRequest => {
                 if frame.plan.move_remainder {
                     return Err("move video remainder requested recovery after its prelude".into());
                 }
                 *want_keyframe = true;
+                ctx.baseline_invalidated = true;
                 continue;
             }
         }
@@ -976,12 +1005,18 @@ fn admit_ready_frames(
             records.push(tile);
         }
         let outbound = if frame.plan.atomic_avc {
+            let required_parts = if frame.plan.raw.is_some() {
+                UpdateParts::BOTH
+            } else {
+                UpdateParts::VIDEO
+            };
             let update = VideoUpdate {
                 frame_seq: frame.seq,
                 frame_width: frame.plan.frame_width,
                 frame_height: frame.plan.frame_height,
                 block_size: frame.plan.block_size,
                 kind: frame.plan.kind,
+                required_parts,
                 tiles: wire_tiles,
             };
             let mut payload = Vec::with_capacity(video_update::encoded_len(&update));
@@ -992,9 +1027,29 @@ fn admit_ready_frames(
             send::Outbound::FrameSet(records)
         };
         let had_raw = frame.plan.raw.is_some();
+        let mut reservation = frame
+            .plan
+            .reservation
+            .take()
+            .ok_or_else(|| "encoded visual update has no flow reservation".to_owned())?;
+        if reservation.is_armed() {
+            match reservation.admit() {
+                Ok(()) => {}
+                Err(ReservationError::StaleEpoch { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
         match admit_video_and_raw(tx, &ctx.sparse_tx, outbound, frame.plan.raw.take())? {
-            true => recovery.admitted(is_recovery),
+            true => {
+                drop(reservation);
+                recovery.admitted(is_recovery)
+            }
             false => {
+                if let Err(error) = reservation.cancel() {
+                    if !matches!(error, ReservationError::StaleEpoch { .. }) {
+                        return Err(error.into());
+                    }
+                }
                 if frame.plan.move_remainder {
                     return Err("move video remainder was rejected after its prelude".into());
                 }
@@ -1005,6 +1060,7 @@ fn admit_ready_frames(
                 // the queue, so every full admission needs a fresh all-tile IRAP.
                 recovery.queue_full();
                 *want_keyframe = true;
+                ctx.baseline_invalidated = true;
             }
         }
     }
@@ -1207,6 +1263,7 @@ fn send_rects(
         frame_height,
         pack_start,
         from_diff,
+        UpdateParts::RAW,
         ctx,
     );
     admit_rects(outbound, ctx)
@@ -1219,6 +1276,7 @@ fn prepare_rects(
     frame_height: u32,
     pack_start: i64,
     from_diff: bool,
+    required_parts: UpdateParts,
     ctx: &EmitCtx,
 ) -> send::SparseOutbound {
     let rect_count = rect_pixels.len() as u32;
@@ -1227,6 +1285,7 @@ fn prepare_rects(
         frame_seq,
         frame_width,
         frame_height,
+        required_parts,
         rects: rect_pixels,
     };
     let mut payload = Vec::with_capacity(rects::encoded_len(&update));
@@ -1241,6 +1300,7 @@ fn prepare_rects(
     record.pack_end_us = ctx.clock.micros(pack_end);
     record.dropped_rects = ctx.dropped_rects;
     record.from_diff = from_diff;
+    record.visual_flow = visual_flow_record(&ctx.visual_flow);
 
     send::SparseOutbound {
         msg_type: crate::framing::MSG_RECTS,
@@ -1292,6 +1352,7 @@ fn prepare_move(
     record.pack_end_us = ctx.clock.micros(qpc::now());
     record.dropped_rects = ctx.dropped_rects;
     record.move_inferred = inferred;
+    record.visual_flow = visual_flow_record(&ctx.visual_flow);
     Ok(PreparedMove {
         prelude: send::SparseOutbound {
             msg_type: crate::framing::MSG_MOVE_UPDATE,
@@ -1301,6 +1362,36 @@ fn prepare_move(
         },
         fence: crate::framing::encode_move_fence(baseline_seq, frame_seq).to_vec(),
     })
+}
+
+fn visual_flow_record(flow: &VisualFlow) -> stats::VisualFlowRecord {
+    let snapshot = flow.snapshot();
+    stats::VisualFlowRecord {
+        visual_outstanding: snapshot.outstanding as u32,
+        visual_outstanding_max: snapshot.observed_max as u32,
+        visual_acks: snapshot.acknowledged,
+        visual_waits: snapshot.waits,
+        visual_wait_us_total: snapshot.wait_time.as_micros().min(u128::from(u64::MAX)) as u64,
+        visual_capture_skips: snapshot.captures_avoided,
+        visual_oldest_age_ms: snapshot.oldest_age.as_millis().min(u128::from(u64::MAX)) as u64,
+        visual_unemitted: snapshot.tentative as u32,
+    }
+}
+
+fn admit_current(reservation: &mut Reservation) -> Result<bool> {
+    match reservation.admit() {
+        Ok(()) => Ok(true),
+        Err(ReservationError::StaleEpoch { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cancel_current(reservation: &mut Reservation) -> Result<bool> {
+    match reservation.cancel() {
+        Ok(_) => Ok(true),
+        Err(ReservationError::StaleEpoch { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Video fallback for a move frame owns the move destinations as final pixels.
@@ -1374,6 +1465,7 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         .zip(last_epochs.iter().copied())
         .map(|(tile, epoch)| EmitCtx {
             clock: state.clock,
+            visual_flow: Arc::clone(&state.visual_flow),
             sparse_tx: state.sparse_tx.clone(),
             sparse_connected: Arc::clone(&state.sparse_connected),
             tile_id: tile.header.id,
@@ -1410,11 +1502,12 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             clean_point_mismatches: 0,
             awaiting_keyframe: None,
             rerequest_keyframe: false,
+            baseline_invalidated: false,
             emitted: Vec::new(),
         })
         .collect();
 
-    loop {
+    'capture: loop {
         state
             .cursor_hidden
             .store(state.capture.hide_local_cursor(), Ordering::Release);
@@ -1446,6 +1539,21 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             &mut recovery,
             &mut want_keyframe,
         )?;
+        if contexts.iter().any(|ctx| ctx.baseline_invalidated) {
+            for ctx in &mut contexts {
+                ctx.baseline_invalidated = false;
+            }
+            let epoch = state.session_epoch.load(Ordering::Acquire);
+            if state.visual_flow.snapshot().admitted != 0 {
+                state.viewer_socket.shutdown(epoch);
+                let _ = state.visual_flow.disconnect(epoch);
+                continue;
+            }
+            pixel_diff.invalidate();
+            last_acquire_qpc = None;
+            last_scheduled_seq = None;
+            suppress_rects_once = true;
+        }
         let pool_saturated = state
             .tiles
             .iter()
@@ -1456,6 +1564,30 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 SURFACE_STALL_TIMEOUT.as_millis()
             )
             .into());
+        }
+        let viewer_epoch = state.session_epoch.load(Ordering::Acquire);
+        if state.visual_flow.current_epoch() != viewer_epoch {
+            continue;
+        }
+        if state.visual_flow.is_full_for(viewer_epoch) {
+            let snapshot = state.visual_flow.snapshot();
+            if snapshot.oldest_age >= CLIENT_APPLY_TIMEOUT {
+                let phase = match snapshot.oldest_state {
+                    Some(ReservationState::Tentative) => "before emission",
+                    Some(ReservationState::Admitted) => "after emission",
+                    None => "without outstanding work",
+                };
+                eprintln!(
+                    "video: viewer epoch {viewer_epoch} made no canvas progress for {} ms ({phase}); disconnecting viewer",
+                    snapshot.oldest_age.as_millis()
+                );
+                state.viewer_socket.shutdown(viewer_epoch);
+                let _ = state.visual_flow.disconnect(viewer_epoch);
+                continue;
+            }
+            state.visual_flow.note_capture_skipped();
+            state.visual_flow.wait_slice(viewer_epoch, WAIT_SLICE);
+            continue;
         }
         let keyframe_requested =
             request_keyframes(&mut state.tiles, &mut contexts, &mut want_keyframe);
@@ -1515,6 +1647,16 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             suppress_rects_once = true;
             continue;
         }
+        let mut reservation = match state.visual_flow.reserve(viewer_epoch, frame_seq) {
+            Ok(reservation) => Some(reservation),
+            Err(ReserveError::StaleEpoch { .. }) => continue,
+            Err(ReserveError::Full) => {
+                recovery.drop_before_encode();
+                suppress_rects_once = true;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         bootstrap.frame_admitted();
 
         let claimed_changed_pixels = change.as_ref().map(|change| {
@@ -1667,6 +1809,13 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                     qpc::now(),
                     &contexts[0],
                 )?;
+                if !admit_current(
+                    reservation
+                        .as_mut()
+                        .expect("captured move must own a flow reservation"),
+                )? {
+                    continue 'capture;
+                }
                 if admit_move(&state.tx, &contexts[0].sparse_tx, prepared)? {
                     if inferred_move {
                         contexts[0].inferred_moves += move_change.moves.len() as u64;
@@ -1676,10 +1825,13 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                     move_remainder_active = true;
                     last_scheduled_seq = Some(frame_seq);
                     match remainder {
-                        rects::MoveRemainder::None => RoutingPlan {
-                            raw: None,
-                            video: None,
-                        },
+                        rects::MoveRemainder::None => {
+                            drop(reservation.take());
+                            RoutingPlan {
+                                raw: None,
+                                video: None,
+                            }
+                        }
                         rects::MoveRemainder::Raw => RoutingPlan {
                             raw: raw_remainder,
                             video: None,
@@ -1704,6 +1856,18 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                         }
                     }
                 } else {
+                    if !cancel_current(
+                        reservation
+                            .as_mut()
+                            .expect("rejected move must retain its reservation"),
+                    )? {
+                        continue 'capture;
+                    }
+                    reservation = match state.visual_flow.reserve(viewer_epoch, frame_seq) {
+                        Ok(reservation) => Some(reservation),
+                        Err(ReserveError::StaleEpoch { .. }) => continue 'capture,
+                        Err(error) => return Err(error.into()),
+                    };
                     let final_pixels = final_pixel_coverage(move_change);
                     select_routing_plan(
                         state.codec,
@@ -1744,6 +1908,11 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 state.capture.height(),
                 pack_start,
                 false,
+                if routing.video.is_some() {
+                    UpdateParts::BOTH
+                } else {
+                    UpdateParts::RAW
+                },
                 &contexts[0],
             );
             if let Some(video) = routing.video.as_mut() {
@@ -1854,6 +2023,14 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                     )? {
                         raw_rect_attempted = true;
                         let rect_pixels = state.capture.read_rects(&texture, &aligned)?;
+                        let diff_reservation = reservation
+                            .as_mut()
+                            .expect("diff update must own a flow reservation");
+                        if diff_reservation.is_armed() {
+                            if !admit_current(diff_reservation)? {
+                                continue 'capture;
+                            }
+                        }
                         raw_rect_sent = send_rects(
                             rect_pixels,
                             frame_seq,
@@ -1863,6 +2040,13 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                             true,
                             &mut contexts[0],
                         )?;
+                        if raw_rect_sent {
+                            drop(reservation.take());
+                        } else if let Some(mut rejected) = reservation.take() {
+                            if !cancel_current(&mut rejected)? {
+                                continue 'capture;
+                            }
+                        }
                         routing.video = None;
                     }
                 }
@@ -1878,12 +2062,30 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
         last_acquire_qpc = Some(acquire_qpc);
 
         if let Some(outbound) = raw_only {
+            let raw_reservation = reservation
+                .as_mut()
+                .expect("raw update must own a flow reservation");
+            if raw_reservation.is_armed() {
+                if !admit_current(raw_reservation)? {
+                    continue 'capture;
+                }
+            }
             raw_rect_sent = admit_rects(outbound, &mut contexts[0])?;
             if move_remainder_active && !raw_rect_sent {
-                return Err("move raw remainder was rejected after its prelude".into());
+                if let Some(mut rejected) = reservation.take() {
+                    let _ = cancel_current(&mut rejected)?;
+                }
+                state.viewer_socket.shutdown(viewer_epoch);
+                let _ = state.visual_flow.disconnect(viewer_epoch);
+                continue;
             }
             if raw_rect_sent {
+                drop(reservation.take());
                 last_scheduled_seq = Some(frame_seq);
+            } else if let Some(mut rejected) = reservation.take() {
+                if !cancel_current(&mut rejected)? {
+                    continue 'capture;
+                }
             }
         }
         // A diff-selected or all-raw update is complete without H.264. A mixed
@@ -1893,6 +2095,9 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
                 recovery.queue_full();
                 want_keyframe = true;
                 suppress_rects_once = true;
+                pixel_diff.invalidate();
+                last_acquire_qpc = None;
+                last_scheduled_seq = None;
             }
             continue;
         }
@@ -1929,18 +2134,27 @@ fn capture_loop(mut state: CaptureState<'_>) -> Result<()> {
             ) = shared;
         }
 
-        let Some(plan) = routing.video else {
+        let Some(mut plan) = routing.video else {
             continue;
         };
+        plan.reservation = reservation.take();
         let planned_coverage = plan.coverage.clone();
         let expected_tiles: Vec<_> = plan.coverage.iter().map(|(tile_id, _)| *tile_id).collect();
         let dropped = assembler.begin(frame_seq, plan, &expected_tiles);
         if dropped != 0 && move_remainder_active {
-            return Err("move video remainder assembler dropped a frame after its prelude".into());
+            pixel_diff.invalidate();
+            last_acquire_qpc = None;
+            last_scheduled_seq = None;
+            state.viewer_socket.shutdown(viewer_epoch);
+            let _ = state.visual_flow.disconnect(viewer_epoch);
+            continue;
         }
         if dropped != 0 {
             recovery.drop_incomplete(dropped);
             want_keyframe = true;
+            pixel_diff.invalidate();
+            last_acquire_qpc = None;
+            suppress_rects_once = true;
         }
         last_scheduled_seq = Some(frame_seq);
 

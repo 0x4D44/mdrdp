@@ -103,6 +103,12 @@ const NATIVE_INPUT_WRITE_TIMEOUT: Duration = auxchan::WRITE_TIMEOUT;
 /// without making a keyboard burst pay a sleep between batches.
 const NATIVE_INPUT_BATCH_MAX: usize = 32;
 
+/// Feedback is deliberately tiny and bounded. Two in-flight server permits
+/// plus one write in progress fit comfortably; a full queue is a terminal
+/// protocol failure, never a reason for a visual reader to block.
+const FRAME_ACK_QUEUE_CAPACITY: usize = 4;
+const FRAME_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
 trait NativeTimedWrite: Write {
     fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
 }
@@ -110,6 +116,82 @@ trait NativeTimedWrite: Write {
 impl NativeTimedWrite for TcpStream {
     fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+struct AckWriter {
+    sender: Option<SyncSender<u64>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl AckWriter {
+    fn spawn(video: &TcpStream, stop: Arc<AtomicBool>) -> io::Result<(Self, SyncSender<u64>)> {
+        let mut socket = video.try_clone()?;
+        socket.set_write_timeout(Some(FRAME_ACK_WRITE_TIMEOUT))?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(FRAME_ACK_QUEUE_CAPACITY);
+        let thread_sender = sender.clone();
+        let join = std::thread::Builder::new()
+            .name("native-frame-ack".to_owned())
+            .spawn(move || run_ack_writer(&mut socket, receiver, &stop))?;
+        Ok((
+            Self {
+                sender: Some(thread_sender),
+                join: Some(join),
+            },
+            sender,
+        ))
+    }
+
+    fn shutdown(mut self) {
+        // All sink-owned clones have been dropped before NativeHandle reaches
+        // this point. Dropping the last sender lets the writer exit even when
+        // the session was intentionally stopped before it wrote its backlog.
+        self.sender.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn run_ack_writer(
+    socket: &mut TcpStream,
+    receiver: std::sync::mpsc::Receiver<u64>,
+    stop: &AtomicBool,
+) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let frame_seq = match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(seq) => seq,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        let payload = framing::encode_frame_ack(frame_seq);
+        let mut frame = Vec::with_capacity(framing::encoded_len(payload.len()));
+        framing::encode(framing::MSG_FRAME_ACK, &payload, &mut frame);
+        if let Err(error) = socket.write_all(&frame) {
+            // Closing this duplex clone interrupts the sole video reader and
+            // makes an ACK writer failure a normal terminal session failure.
+            if !stop.load(Ordering::Relaxed) {
+                stop.store(true, Ordering::Release);
+                let _ = socket.shutdown(Shutdown::Both);
+                eprintln!("native: frame acknowledgement write failed: {error}");
+            }
+            return;
+        }
+    }
+}
+
+fn enqueue_frame_ack(sender: &SyncSender<u64>, frame_seq: u64) -> Result<(), String> {
+    match sender.try_send(frame_seq) {
+        Ok(()) => Ok(()),
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            Err("frame acknowledgement queue is full".to_owned())
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            Err("frame acknowledgement writer stopped".to_owned())
+        }
     }
 }
 
@@ -397,6 +479,7 @@ pub struct NativeHandle {
     video_join: JoinHandle<SessionEnd>,
     input_join: JoinHandle<Option<String>>,
     sparse_join: JoinHandle<SessionEnd>,
+    ack_writer: AckWriter,
     aux: Option<AuxChannel>,
     tunnel: Tunnel,
 }
@@ -418,6 +501,7 @@ impl NativeHandle {
         let input_end = self.input_join.join().unwrap_or(None);
         let sparse_end = self.sparse_join.join().unwrap_or(SessionEnd::WindowClosed);
         let end = self.video_join.join().unwrap_or(SessionEnd::WindowClosed);
+        self.ack_writer.shutdown();
         self.tunnel.kill();
         match end {
             // The window closing is the normal path; an input-side failure only
@@ -496,6 +580,11 @@ pub fn spawn(
     let video = conn.video.try_clone()?;
     let input = conn.input.try_clone()?;
     let sparse = conn.sparse.try_clone()?;
+    let net_input_sock = conn.input.try_clone()?;
+    let sparse_video_sock = conn.video.try_clone()?;
+    let sparse_input_sock = conn.input.try_clone()?;
+    let input_video_sock = video.try_clone()?;
+    let (ack_writer, ack_sender) = AckWriter::spawn(&video, Arc::clone(&stop))?;
 
     // A previous native session may have ended while the host cursor was hidden.
     // Reset immediately; the host's initial cursor message then states the truth.
@@ -513,7 +602,6 @@ pub fn spawn(
     let move_rendezvous = Arc::new(MoveRendezvous::default());
 
     let net_stop = Arc::clone(&stop);
-    let net_input_sock = conn.input.try_clone()?;
     let damage_waker = waker.clone();
     let mut sink = NativeSink::new_tiled_shared(
         decoders,
@@ -529,9 +617,9 @@ pub fn spawn(
         Arc::clone(&base_ready),
         Arc::clone(&move_rendezvous),
     );
+    sink.completion = Arc::new(LogicalCompletion::default());
+    sink.ack_sender = Some(ack_sender.clone());
     let sparse_stop = Arc::clone(&stop);
-    let sparse_video_sock = conn.video.try_clone()?;
-    let sparse_input_sock = conn.input.try_clone()?;
     let sparse_waker = waker.clone();
     let mut sparse_sock = conn.sparse.try_clone()?;
     let mut sparse_sink = SparseSink {
@@ -548,6 +636,8 @@ pub fn spawn(
         }),
         stats: sink.stats.clone(),
         input_clock: input_clock.clone(),
+        completion: Arc::clone(&sink.completion),
+        ack_sender: Some(ack_sender),
     };
     let sparse_join = std::thread::Builder::new()
         .name("native-sparse".to_owned())
@@ -587,7 +677,6 @@ pub fn spawn(
         })?;
 
     let input_stop = Arc::clone(&stop);
-    let input_video_sock = video.try_clone()?;
     let input_sock = conn.input;
     let input_waker = waker.clone();
     let input_join = std::thread::Builder::new()
@@ -620,6 +709,7 @@ pub fn spawn(
         video_join,
         input_join,
         sparse_join,
+        ack_writer,
         aux,
         tunnel,
     })
@@ -1041,7 +1131,7 @@ fn dispatch_video_message(
 ) -> Result<(), String> {
     match message.msg_type {
         framing::MSG_RECTS => {
-            Err("raw rectangles arrived on the bulk video channel under wire v9".to_owned())
+            Err("raw rectangles arrived on the bulk video channel under wire v10".to_owned())
         }
         framing::MSG_VIDEO_SEQ => {
             if message.payload.len() < 8 {
@@ -1061,9 +1151,11 @@ fn dispatch_video_message(
         },
         framing::MSG_MOVE_FENCE => sink.on_move_fence(&message.payload),
         framing::MSG_MOVE_UPDATE => {
-            Err("move prelude arrived on the bulk channel under wire v9".to_owned())
+            Err("move prelude arrived on the bulk channel under wire v10".to_owned())
         }
-        framing::MSG_VIDEO => sink.on_au(&message.payload, None),
+        framing::MSG_VIDEO => {
+            Err("seqless video access units are not valid under wire v10".to_owned())
+        }
         framing::MSG_CURSOR => match framing::decode_cursor(&message.payload) {
             Ok(true) => {
                 on_cursor(CursorUpdate::Hidden);
@@ -1490,6 +1582,8 @@ pub(crate) struct NativeSink {
     fences: Arc<Mutex<BlockFences>>,
     base_ready: Arc<BaseReady>,
     move_rendezvous: Arc<MoveRendezvous>,
+    completion: Arc<LogicalCompletion>,
+    ack_sender: Option<SyncSender<u64>>,
     // Visible-behaviour counters (tests and debugging; not user-facing yet).
     pub(crate) suppressed: u64,
     #[cfg(test)]
@@ -1529,6 +1623,197 @@ struct BlockFences {
     seqs: Vec<u64>,
     #[cfg(test)]
     inspected_blocks: std::cell::Cell<usize>,
+}
+
+/// The two normal-pixel legs that may make up one logical visual update.
+///
+/// Wire v10 puts this mask on every raw and regional-video payload.  A mixed
+/// update therefore has the same mask on both lanes, and the first lane to
+/// arrive owns no special privilege: the rendezvous below records each
+/// successful leg until the declared mask is complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogicalParts(u8);
+
+impl LogicalParts {
+    const RAW: Self = Self(0x01);
+    const VIDEO: Self = Self(0x02);
+    const VALID: Self = Self(Self::RAW.0 | Self::VIDEO.0);
+
+    const fn is_valid(self) -> bool {
+        self.0 != 0 && self.0 & !Self::VALID.0 == 0
+    }
+
+    const fn contains(self, part: Self) -> bool {
+        self.0 & part.0 == part.0
+    }
+
+    fn is_single(self) -> bool {
+        self == Self::RAW || self == Self::VIDEO
+    }
+}
+
+impl std::ops::BitOr for LogicalParts {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+#[derive(Default)]
+struct LogicalCompletion {
+    state: Mutex<LogicalCompletionState>,
+}
+
+#[derive(Default)]
+struct LogicalCompletionState {
+    pending: std::collections::HashMap<u64, LogicalProgress>,
+    completed: std::collections::BTreeSet<u64>,
+    failed: std::collections::BTreeSet<u64>,
+}
+
+struct LogicalProgress {
+    required: LogicalParts,
+    done: LogicalParts,
+}
+
+impl LogicalCompletion {
+    const HISTORY_LIMIT: usize = 16;
+
+    fn remember(history: &mut std::collections::BTreeSet<u64>, seq: u64) {
+        history.insert(seq);
+        while history.len() > Self::HISTORY_LIMIT {
+            history.pop_first();
+        }
+    }
+
+    /// Register one valid normal update before touching the canvas.
+    fn register(&self, seq: u64, required: LogicalParts) -> Result<(), String> {
+        if !required.is_valid() {
+            return Err(format!(
+                "logical update {seq} has an invalid required-part mask"
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.completed.contains(&seq) {
+            return Err(format!("logical update {seq} arrived after completion"));
+        }
+        if state.failed.contains(&seq) {
+            return Err(format!("logical update {seq} was already failed"));
+        }
+        match state.pending.get(&seq) {
+            Some(progress) if progress.required != required => {
+                Err(format!("logical update {seq} changed required-part mask"))
+            }
+            Some(_) => Ok(()),
+            None => {
+                state.pending.insert(
+                    seq,
+                    LogicalProgress {
+                        required,
+                        done: LogicalParts(0),
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Mark a successfully applied or fully suppressed lane. `Some(seq)` is
+    /// returned exactly once, at the transition to the complete required mask.
+    fn complete(&self, seq: u64, part: LogicalParts) -> Result<Option<u64>, String> {
+        if !part.is_single() {
+            return Err(format!("logical update {seq} completed an invalid part"));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.failed.contains(&seq) {
+            return Err("logical update failed".to_owned());
+        }
+        let Some(progress) = state.pending.get_mut(&seq) else {
+            return Err(format!(
+                "logical update {seq} completed without registration"
+            ));
+        };
+        if !progress.required.contains(part) || progress.done.contains(part) {
+            Self::remember(&mut state.failed, seq);
+            state.pending.remove(&seq);
+            return Err(format!(
+                "logical update {seq} completed an undeclared or duplicate part"
+            ));
+        }
+        progress.done = progress.done | part;
+        if progress.done == progress.required {
+            state.pending.remove(&seq);
+            Self::remember(&mut state.completed, seq);
+            Ok(Some(seq))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Mark a decode, copy, or validation failure. No acknowledgement can be
+    /// emitted for this sequence; the caller then terminates the v10 session.
+    fn fail(&self, seq: u64) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending.remove(&seq);
+        Self::remember(&mut state.failed, seq);
+        Ok(())
+    }
+
+    fn is_completed(&self, seq: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .completed
+            .contains(&seq)
+    }
+
+    #[cfg(test)]
+    fn history_sizes(&self) -> (usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.completed.len(), state.failed.len())
+    }
+}
+
+fn logical_parts_from_wire(required: rhydra::framing::UpdateParts) -> Result<LogicalParts, String> {
+    LogicalParts::from_bits(required.bits())
+        .ok_or_else(|| format!("invalid required-part mask {:#04x}", required.bits()))
+}
+
+impl LogicalParts {
+    fn from_bits(bits: u8) -> Option<Self> {
+        let parts = Self(bits);
+        parts.is_valid().then_some(parts)
+    }
+}
+
+/// Complete a normal raw/video leg, then enqueue its exact ACK only after the
+/// caller has released canvas and fence locks. A missing sender is used by
+/// focused sink tests; the live session always supplies one.
+fn complete_normal_part(
+    completion: &LogicalCompletion,
+    ack_sender: Option<&SyncSender<u64>>,
+    seq: u64,
+    part: LogicalParts,
+) -> Result<(), String> {
+    if let Some(frame_seq) = completion.complete(seq, part)?
+        && let Some(sender) = ack_sender
+    {
+        enqueue_frame_ack(sender, frame_seq)?;
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1827,7 +2112,7 @@ impl MoveRendezvous {
         }
     }
 
-    fn complete(&self, frame_seq: u64) -> Result<(), String> {
+    fn complete(&self, frame_seq: u64) -> Result<bool, String> {
         let mut state = self
             .state
             .lock()
@@ -1840,7 +2125,7 @@ impl MoveRendezvous {
             } if prelude.frame_seq == frame_seq => {
                 *state = MoveRendezvousState::Idle;
                 self.changed.notify_all();
-                Ok(())
+                Ok(true)
             }
             _ => {
                 *state = MoveRendezvousState::Failed;
@@ -1902,6 +2187,8 @@ struct SparseSink {
     wake: Box<dyn Fn() + Send>,
     stats: StatsHandle,
     input_clock: InputClock,
+    completion: Arc<LogicalCompletion>,
+    ack_sender: Option<SyncSender<u64>>,
 }
 
 impl SparseSink {
@@ -1929,11 +2216,27 @@ impl SparseSink {
         let move_coverage = self
             .move_rendezvous
             .completion_coverage(update.frame_seq, rects::MoveRemainder::Raw)?;
+        let required = logical_parts_from_wire(update.required_parts)?;
+        if !required.contains(LogicalParts::RAW) {
+            return Err(format!(
+                "raw update {} does not declare the raw part",
+                update.frame_seq
+            ));
+        }
+        if move_coverage.is_none() {
+            self.completion.register(update.frame_seq, required)?;
+        }
         if update.rects.is_empty() {
             if move_coverage.is_some() {
                 self.move_rendezvous.abort();
                 return Err("move declared a raw remainder but sent no pixels".into());
             }
+            complete_normal_part(
+                &self.completion,
+                self.ack_sender.as_ref(),
+                update.frame_seq,
+                LogicalParts::RAW,
+            )?;
             return Ok(());
         }
         let coverage: Vec<_> = update
@@ -1990,9 +2293,21 @@ impl SparseSink {
         }
         if staged.is_empty() {
             if move_coverage.is_some() {
-                self.move_rendezvous.abort();
-                return Err("move raw remainder was entirely suppressed".into());
+                drop(fences);
+                if self.move_rendezvous.complete(update.frame_seq)?
+                    && let Some(sender) = self.ack_sender.as_ref()
+                {
+                    enqueue_frame_ack(sender, update.frame_seq)?;
+                }
+                return Ok(());
             }
+            drop(fences);
+            complete_normal_part(
+                &self.completion,
+                self.ack_sender.as_ref(),
+                update.frame_seq,
+                LogicalParts::RAW,
+            )?;
             return Ok(());
         }
         let updates: Vec<_> = staged
@@ -2032,7 +2347,18 @@ impl SparseSink {
         });
         (self.wake)();
         if move_coverage.is_some() {
-            self.move_rendezvous.complete(update.frame_seq)?;
+            if self.move_rendezvous.complete(update.frame_seq)?
+                && let Some(sender) = self.ack_sender.as_ref()
+            {
+                enqueue_frame_ack(sender, update.frame_seq)?;
+            }
+        } else {
+            complete_normal_part(
+                &self.completion,
+                self.ack_sender.as_ref(),
+                update.frame_seq,
+                LogicalParts::RAW,
+            )?;
         }
         Ok(())
     }
@@ -2182,6 +2508,8 @@ impl NativeSink {
             fences: Arc::new(Mutex::new(BlockFences::new(wire_size.0, wire_size.1))),
             base_ready: Arc::new(BaseReady::default()),
             move_rendezvous: Arc::new(MoveRendezvous::default()),
+            completion: Arc::new(LogicalCompletion::default()),
+            ack_sender: None,
             suppressed: 0,
             #[cfg(test)]
             skipped_stale: 0,
@@ -2266,6 +2594,8 @@ impl NativeSink {
             fences,
             base_ready,
             move_rendezvous,
+            completion: Arc::new(LogicalCompletion::default()),
+            ack_sender: None,
             suppressed: 0,
             #[cfg(test)]
             skipped_stale: 0,
@@ -2317,22 +2647,32 @@ impl NativeSink {
 
     pub(crate) fn on_au(&mut self, au: &[u8], seq: Option<u64>) -> Result<(), String> {
         let started = Instant::now();
+        let already_complete = seq.is_some_and(|frame_seq| self.completion.is_completed(frame_seq));
+        if let Some(frame_seq) = seq
+            && !already_complete
+        {
+            self.completion.register(frame_seq, LogicalParts::VIDEO)?;
+        }
         let Some(decoder) = self.decoder.as_mut() else {
             return Err("this build has no hardware H.264 decoder".to_owned());
         };
         let decoded = match decoder.decode(au) {
             Ok(d) => d,
             Err(_) => {
-                // One bad AU is not terminal — the next keyframe recovers the
-                // stream. Counted so the HUD's decode_errors line shows it.
                 self.stats.update(|s| s.decode_errors += 1);
-                return Ok(());
+                if let Some(frame_seq) = seq {
+                    let _ = self.completion.fail(frame_seq);
+                }
+                return Err("video access unit failed to decode".to_owned());
             }
         };
         let (w, h) = (decoded.width(), decoded.height());
         if (w, h) != self.wire_size {
             // The host's display mode changed under the session. Never a silent
             // crop (review S-m8).
+            if let Some(frame_seq) = seq {
+                let _ = self.completion.fail(frame_seq);
+            }
             return Err(format!(
                 "host display mode changed ({w}x{h} vs session {}x{}); reconnect",
                 self.wire_size.0, self.wire_size.1
@@ -2340,6 +2680,16 @@ impl NativeSink {
         }
         if self.has_base && !self.accepts_au(seq) {
             self.suppressed += 1;
+            if let Some(frame_seq) = seq
+                && !already_complete
+            {
+                complete_normal_part(
+                    &self.completion,
+                    self.ack_sender.as_ref(),
+                    frame_seq,
+                    LogicalParts::VIDEO,
+                )?;
+            }
             return Ok(());
         }
         let bytes = au.len() as u64;
@@ -2359,11 +2709,25 @@ impl NativeSink {
         self.has_base = true;
         self.base_ready.signal();
         (self.wake)();
+        if let Some(frame_seq) = seq
+            && !already_complete
+        {
+            complete_normal_part(
+                &self.completion,
+                self.ack_sender.as_ref(),
+                frame_seq,
+                LogicalParts::VIDEO,
+            )?;
+        }
         Ok(())
     }
 
     pub(crate) fn on_tile_au(&mut self, tile_id: u8, au: &[u8], seq: u64) -> Result<(), String> {
         let started = Instant::now();
+        let already_complete = self.completion.is_completed(seq);
+        if !already_complete && self.tile_frame.is_none() {
+            self.completion.register(seq, LogicalParts::VIDEO)?;
+        }
         let Some(tile_index) = self
             .tile_decoders
             .iter()
@@ -2379,12 +2743,14 @@ impl NativeSink {
                 Ok(decoded) => decoded,
                 Err(_) => {
                     self.stats.update(|stats| stats.decode_errors += 1);
-                    return Ok(());
+                    let _ = self.completion.fail(seq);
+                    return Err(format!("tile {tile_id} failed to decode"));
                 }
             };
             (tile.header, decoded, suppress_paint)
         };
         if (decoded.width(), decoded.height()) != (header.width, header.height) {
+            let _ = self.completion.fail(seq);
             return Err(format!(
                 "tile {tile_id} decoded at {}x{}, expected {}x{}",
                 decoded.width(),
@@ -2393,7 +2759,9 @@ impl NativeSink {
                 header.height
             ));
         }
-        let dest = Self::tile_dest(tile_id, header)?;
+        let dest = Self::tile_dest(tile_id, header).inspect_err(|_| {
+            let _ = self.completion.fail(seq);
+        })?;
         if suppress_paint {
             self.suppressed += 1;
         }
@@ -2407,9 +2775,21 @@ impl NativeSink {
             Some(progress) if progress.seq == seq => progress,
             Some(progress) if progress.seq > seq => {
                 self.tile_frame = Some(progress);
-                return Ok(());
+                let _ = self.completion.fail(seq);
+                return Err(format!(
+                    "tiled frame set {seq} arrived after newer set {}",
+                    self.tile_frame.as_ref().map_or(seq, |frame| frame.seq)
+                ));
             }
-            Some(_) | None => TileFrameProgress {
+            Some(progress) => {
+                let old_seq = progress.seq;
+                let _ = self.completion.fail(old_seq);
+                let _ = self.completion.fail(seq);
+                return Err(format!(
+                    "tiled frame set {old_seq} was superseded before commit by {seq}"
+                ));
+            }
+            None => TileFrameProgress {
                 seen: vec![false; self.tile_decoders.len()],
                 changed: false,
                 tiles: (0..self.tile_decoders.len()).map(|_| None).collect(),
@@ -2421,6 +2801,12 @@ impl NativeSink {
 
         // A repeated tile in one sequence still has to be decoded, but it must
         // not replace the first staged pixels or inflate one logical frame.
+        // Once a set is still pending, however, a duplicate is malformed and
+        // cannot be allowed to turn a partial set into a false completion.
+        if progress.seen[tile_index] && !already_complete {
+            let _ = self.completion.fail(seq);
+            return Err(format!("tiled frame set {seq} repeated tile {tile_id}"));
+        }
         if !progress.seen[tile_index] {
             progress.seen[tile_index] = true;
             progress.bytes = progress.bytes.saturating_add(bytes);
@@ -2494,6 +2880,14 @@ impl NativeSink {
         if generation.is_some() {
             (self.wake)();
         }
+        if !already_complete {
+            complete_normal_part(
+                &self.completion,
+                self.ack_sender.as_ref(),
+                seq,
+                LogicalParts::VIDEO,
+            )?;
+        }
         Ok(())
     }
 
@@ -2521,6 +2915,16 @@ impl NativeSink {
         let move_coverage = self
             .move_rendezvous
             .completion_coverage(update.frame_seq, rects::MoveRemainder::Video)?;
+        let required = logical_parts_from_wire(update.required_parts)?;
+        if !required.contains(LogicalParts::VIDEO) {
+            return Err(format!(
+                "video update {} does not declare the video part",
+                update.frame_seq
+            ));
+        }
+        if move_coverage.is_none() {
+            self.completion.register(update.frame_seq, required)?;
+        }
 
         // Validate the advertised layout before advancing any decoder reference.
         let mut selected = Vec::with_capacity(update.tiles.len());
@@ -2576,12 +2980,18 @@ impl NativeSink {
                     self.stats.update(|stats| stats.decode_errors += 1);
                     if move_coverage.is_some() {
                         self.move_rendezvous.abort();
-                        return Err("move video remainder failed to decode".into());
+                    } else {
+                        let _ = self.completion.fail(update.frame_seq);
                     }
-                    return Ok(());
+                    return Err("video update failed to decode".into());
                 }
             };
             if (decoded.width(), decoded.height()) != (tile.header.width, tile.header.height) {
+                if move_coverage.is_some() {
+                    self.move_rendezvous.abort();
+                } else {
+                    let _ = self.completion.fail(update.frame_seq);
+                }
                 return Err(format!(
                     "tile {} decoded at {}x{}, expected {}x{}",
                     tile.header.id,
@@ -2651,9 +3061,15 @@ impl NativeSink {
 
         if staged.is_empty() {
             if move_coverage.is_some() {
-                self.move_rendezvous.abort();
-                return Err("move video remainder was entirely suppressed".into());
+                drop(fences);
+                if self.move_rendezvous.complete(update.frame_seq)?
+                    && let Some(sender) = self.ack_sender.as_ref()
+                {
+                    enqueue_frame_ack(sender, update.frame_seq)?;
+                }
+                return Ok(());
             }
+            drop(fences);
             self.suppressed += 1;
             self.has_base = self.tile_decoders.iter().all(|tile| tile.has_base);
             if self.has_base {
@@ -2670,6 +3086,12 @@ impl NativeSink {
                         .map_or(update.frame_seq, |seq| seq.max(update.frame_seq)),
                 );
             }
+            complete_normal_part(
+                &self.completion,
+                self.ack_sender.as_ref(),
+                update.frame_seq,
+                LogicalParts::VIDEO,
+            )?;
             return Ok(());
         }
         let updates: Vec<_> = staged
@@ -2711,7 +3133,18 @@ impl NativeSink {
         }
         (self.wake)();
         if move_coverage.is_some() {
-            self.move_rendezvous.complete(update.frame_seq)?;
+            if self.move_rendezvous.complete(update.frame_seq)?
+                && let Some(sender) = self.ack_sender.as_ref()
+            {
+                enqueue_frame_ack(sender, update.frame_seq)?;
+            }
+        } else {
+            complete_normal_part(
+                &self.completion,
+                self.ack_sender.as_ref(),
+                update.frame_seq,
+                LogicalParts::VIDEO,
+            )?;
         }
         Ok(())
     }
@@ -2809,7 +3242,12 @@ impl NativeSink {
             match prelude.remainder {
                 rects::MoveRemainder::None => {
                     self.exact_through = Some(prelude.frame_seq);
-                    rendezvous.complete(prelude.frame_seq)
+                    if rendezvous.complete(prelude.frame_seq)?
+                        && let Some(sender) = self.ack_sender.as_ref()
+                    {
+                        enqueue_frame_ack(sender, prelude.frame_seq)?;
+                    }
+                    Ok(())
                 }
                 rects::MoveRemainder::Raw => rendezvous.wait_complete(prelude.frame_seq),
                 rects::MoveRemainder::Video => Ok(()),
@@ -4114,6 +4552,7 @@ mod tests {
             frame_height: size.1,
             block_size: UPDATE_BLOCK_SIZE as u16,
             kind: VideoKind::Recovery,
+            required_parts: rects::UpdateParts::VIDEO,
             tiles: vec![VideoTile {
                 tile_id: 0,
                 coverage: vec![Region {
@@ -4132,6 +4571,7 @@ mod tests {
             frame_height: size.1,
             block_size: UPDATE_BLOCK_SIZE as u16,
             kind: VideoKind::Regional,
+            required_parts: rects::UpdateParts::VIDEO,
             tiles: vec![VideoTile {
                 tile_id: 0,
                 coverage: vec![Region {
@@ -4199,11 +4639,14 @@ mod tests {
             wake: Box::new(|| {}),
             stats,
             input_clock,
+            completion: Arc::new(LogicalCompletion::default()),
+            ack_sender: None,
         };
         let raw = RectUpdate {
             frame_seq: 2,
             frame_width: size.0,
             frame_height: size.1,
+            required_parts: rects::UpdateParts::RAW,
             rects: vec![WireRect {
                 x: 0,
                 y: 0,
@@ -4220,6 +4663,7 @@ mod tests {
             frame_seq: 2,
             frame_width: size.0 + 1,
             frame_height: size.1,
+            required_parts: rects::UpdateParts::RAW,
             rects: vec![WireRect {
                 x: 0,
                 y: 0,
@@ -4258,6 +4702,7 @@ mod tests {
                 frame_height: size.1,
                 block_size: UPDATE_BLOCK_SIZE as u16,
                 kind: VideoKind::Recovery,
+                required_parts: rects::UpdateParts::VIDEO,
                 tiles: vec![VideoTile {
                     tile_id: 0,
                     coverage: vec![Region {
@@ -4355,6 +4800,8 @@ mod tests {
             wake: Box::new(|| {}),
             stats,
             input_clock,
+            completion: Arc::new(LogicalCompletion::default()),
+            ack_sender: None,
         };
 
         video
@@ -4364,6 +4811,7 @@ mod tests {
                 frame_height: size.1,
                 block_size: UPDATE_BLOCK_SIZE as u16,
                 kind: VideoKind::Recovery,
+                required_parts: rects::UpdateParts::VIDEO,
                 tiles: vec![VideoTile {
                     tile_id: 0,
                     coverage: vec![Region {
@@ -4380,6 +4828,7 @@ mod tests {
             frame_seq: 3,
             frame_width: size.0,
             frame_height: size.1,
+            required_parts: rects::UpdateParts::RAW,
             rects: vec![WireRect {
                 x: 0,
                 y: 0,
@@ -4399,6 +4848,7 @@ mod tests {
                 frame_height: size.1,
                 block_size: UPDATE_BLOCK_SIZE as u16,
                 kind: VideoKind::Regional,
+                required_parts: rects::UpdateParts::VIDEO,
                 tiles: vec![VideoTile {
                     tile_id: 0,
                     coverage: vec![Region {
@@ -4493,6 +4943,7 @@ mod tests {
             frame_seq: seq,
             frame_width: size.0,
             frame_height: size.1,
+            required_parts: rects::UpdateParts::RAW,
             rects: vec![WireRect {
                 x: 0,
                 y: 0,
@@ -4544,6 +4995,7 @@ mod tests {
             frame_seq: 11,
             frame_width: size.0,
             frame_height: size.1,
+            required_parts: rects::UpdateParts::RAW,
             rects: vec![
                 WireRect {
                     x: 0,
@@ -4601,6 +5053,7 @@ mod tests {
             frame_seq: 11,
             frame_width: 4,
             frame_height: 2,
+            required_parts: rects::UpdateParts::RAW,
             rects: vec![],
         };
         sink.apply_update(empty).unwrap();
@@ -5051,6 +5504,7 @@ mod tests {
     #[test]
     fn move_rendezvous_releases_only_the_declared_remainder_lane() {
         let rendezvous = Arc::new(MoveRendezvous::default());
+        let (ack_sender, ack_receiver) = std::sync::mpsc::sync_channel(4);
         let sparse = Arc::clone(&rendezvous);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let prelude = rects::MovePrelude {
@@ -5086,8 +5540,241 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        rendezvous.complete(41).unwrap();
+        assert!(
+            ack_receiver
+                .recv_timeout(Duration::from_millis(25))
+                .is_err(),
+            "a provisional move must not ACK"
+        );
+        if rendezvous.complete(41).unwrap() {
+            enqueue_frame_ack(&ack_sender, 41).unwrap();
+        }
+        assert_eq!(ack_receiver.recv_timeout(Duration::from_secs(1)), Ok(41));
         join.join().unwrap();
+    }
+
+    #[test]
+    fn logical_completion_ack_waits_for_mixed_parts_in_either_order() {
+        let completion = LogicalCompletion::default();
+        assert_eq!(
+            completion.register(77, LogicalParts::RAW | LogicalParts::VIDEO),
+            Ok(())
+        );
+        assert_eq!(completion.complete(77, LogicalParts::RAW), Ok(None));
+        assert_eq!(completion.complete(77, LogicalParts::VIDEO), Ok(Some(77)));
+
+        let reverse = LogicalCompletion::default();
+        assert_eq!(
+            reverse.register(78, LogicalParts::RAW | LogicalParts::VIDEO),
+            Ok(())
+        );
+        assert_eq!(reverse.complete(78, LogicalParts::VIDEO), Ok(None));
+        assert_eq!(reverse.complete(78, LogicalParts::RAW), Ok(Some(78)));
+    }
+
+    #[test]
+    fn logical_completion_ack_accepts_fully_suppressed_parts_but_not_failures() {
+        let completion = LogicalCompletion::default();
+        assert_eq!(completion.register(79, LogicalParts::RAW), Ok(()));
+        assert_eq!(completion.complete(79, LogicalParts::RAW), Ok(Some(79)));
+
+        let failed = LogicalCompletion::default();
+        assert_eq!(failed.register(80, LogicalParts::VIDEO), Ok(()));
+        assert_eq!(failed.fail(80), Ok(()));
+        assert_eq!(
+            failed.complete(80, LogicalParts::VIDEO),
+            Err("logical update failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn logical_completion_duplicate_history_stays_bounded_for_long_sessions() {
+        let completion = LogicalCompletion::default();
+        for seq in 1..=100 {
+            completion.register(seq, LogicalParts::VIDEO).unwrap();
+            assert_eq!(completion.complete(seq, LogicalParts::VIDEO), Ok(Some(seq)));
+        }
+        for seq in 101..=200 {
+            completion.register(seq, LogicalParts::VIDEO).unwrap();
+            completion.fail(seq).unwrap();
+        }
+        assert_eq!(completion.history_sizes(), (16, 16));
+    }
+
+    #[test]
+    fn frame_ack_writer_emits_one_framed_ack_and_stops_cleanly() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let mut peer = listener.accept().unwrap().0;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (writer, sender) = AckWriter::spawn(&client, Arc::clone(&stop)).unwrap();
+
+        enqueue_frame_ack(&sender, 0x0102_0304_0506_0708).unwrap();
+        let mut framed = [0u8; framing::HEADER_LEN + framing::FRAME_ACK_BYTES];
+        peer.read_exact(&mut framed).unwrap();
+        assert_eq!(&framed[..4], &9u32.to_le_bytes());
+        assert_eq!(framed[4], framing::MSG_FRAME_ACK);
+        assert_eq!(
+            framing::decode_frame_ack(&framed[5..]).unwrap(),
+            0x0102_0304_0506_0708
+        );
+
+        stop.store(true, Ordering::Release);
+        writer.shutdown();
+    }
+
+    #[test]
+    fn a_full_ack_queue_is_terminal_without_blocking_the_visual_reader() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(FRAME_ACK_QUEUE_CAPACITY);
+        for seq in 0..FRAME_ACK_QUEUE_CAPACITY as u64 {
+            enqueue_frame_ack(&sender, seq).unwrap();
+        }
+        assert_eq!(
+            enqueue_frame_ack(&sender, 99),
+            Err("frame acknowledgement queue is full".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_ack_writer_socket_failure_sets_stop_and_closes_its_video_clone() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let peer = listener.accept().unwrap().0;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (writer, sender) = AckWriter::spawn(&client, Arc::clone(&stop)).unwrap();
+        peer.shutdown(Shutdown::Both).unwrap();
+        drop(peer);
+        let feed_stop = Arc::clone(&stop);
+        let feed = std::thread::spawn(move || {
+            for seq in 0..100_000u64 {
+                if feed_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if sender.send(seq).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !stop.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "ACK writer did not report socket failure"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        feed.join().unwrap();
+        writer.shutdown();
+    }
+
+    #[test]
+    fn a_tiled_frame_ack_waits_for_the_complete_set() {
+        let size = (2, 1);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let (ack_sender, ack_receiver) = std::sync::mpsc::sync_channel(4);
+        let mut sink = NativeSink::new_tiled(
+            vec![
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (1, 1) })),
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (1, 1) })),
+            ],
+            vec![
+                TileHeader {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                TileHeader {
+                    id: 1,
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            ],
+            store,
+            size,
+            Box::new(|| {}),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+        sink.ack_sender = Some(ack_sender);
+        sink.on_tile_au(0, &[1], 55).unwrap();
+        assert!(
+            ack_receiver
+                .recv_timeout(Duration::from_millis(25))
+                .is_err()
+        );
+        sink.on_tile_au(1, &[2], 55).unwrap();
+        assert_eq!(ack_receiver.recv_timeout(Duration::from_secs(1)), Ok(55));
+    }
+
+    #[test]
+    fn a_failed_video_apply_never_enqueues_an_ack() {
+        let (mut sink, _store) = sink_with_store((1, 1));
+        let (ack_sender, ack_receiver) = std::sync::mpsc::sync_channel(4);
+        sink.ack_sender = Some(ack_sender);
+        sink.decoder = Some(Box::new(FakeDecoder { size: (2, 2) }));
+
+        let error = sink.on_au(&[7], Some(91)).unwrap_err();
+        assert!(
+            error.contains("display mode changed"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            ack_receiver.try_recv().is_err(),
+            "failed video must not ACK"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_tiled_set_is_terminal_when_a_newer_set_arrives() {
+        let size = (2, 1);
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        {
+            let mut surface = store.lock().unwrap();
+            surface.create(OUTPUT_SURFACE, size.0 as u16, size.1 as u16);
+            surface.map_to_output(OUTPUT_SURFACE);
+        }
+        let mut sink = NativeSink::new_tiled(
+            vec![
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (1, 1) })),
+                NativeDecoder::H264(Box::new(FakeDecoder { size: (1, 1) })),
+            ],
+            vec![
+                TileHeader {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                TileHeader {
+                    id: 1,
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            ],
+            store,
+            size,
+            Box::new(|| {}),
+            StatsHandle::new(),
+            InputClock::default(),
+        );
+        sink.on_tile_au(0, &[1], 92).unwrap();
+        let error = sink.on_tile_au(0, &[2], 93).unwrap_err();
+        assert!(error.contains("superseded"), "unexpected error: {error}");
     }
 
     #[test]
@@ -5120,6 +5807,7 @@ mod tests {
             frame_height: size.1,
             block_size: UPDATE_BLOCK_SIZE as u16,
             kind: VideoKind::Recovery,
+            required_parts: rects::UpdateParts::VIDEO,
             tiles: vec![video_update::VideoTile {
                 tile_id: 0,
                 coverage: vec![Region {

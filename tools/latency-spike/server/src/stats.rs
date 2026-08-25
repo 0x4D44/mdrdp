@@ -85,6 +85,8 @@ pub struct Header {
     /// terms as `rect_max_count`: a measurement compared against another must be
     /// able to say which threshold each ran under.
     pub diff_idle_gap_ms: u32,
+    /// Maximum logical visual updates admitted but not yet applied by the viewer.
+    pub max_unacknowledged_updates: u32,
     /// How SPS/PPS (or VPS/SPS/PPS for HEVC fallback) reach the wire: see `annexb`.
     pub parameter_set_route: &'static str,
     /// Whether the out-of-band `MF_MT_MPEG_SEQUENCE_HEADER` was available as a
@@ -157,6 +159,8 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
     }]
 }
 
+/// Schema 13: the header and update rows expose the client-applied visual window,
+/// waits, avoided captures, and acknowledgement progress.
 /// Schema 12: frame rows expose native/inferred move counts and bounded inference
 /// attempts, hits, and elapsed microseconds; move-prelude rows identify inference.
 /// Schema 11: headers name the dedicated sparse-pixel listener.
@@ -181,7 +185,8 @@ pub fn hevc_fallback_layout(width: u32, height: u32) -> Vec<TileHeader> {
 /// (Schema 4: the header gained `source`, naming which capture path the run used.
 /// Schema 3: the header gained `rect_max_count`/`rect_max_bytes`, frame rows
 /// gained `dropped_rects`, and `record: "rects"` rows exist at all.)
-pub const SCHEMA: u32 = 12;
+pub const SCHEMA: u32 = 13;
+/// Bumped 9 → 10 by required logical-part masks and client-applied acknowledgements.
 /// Bumped 8 → 9 by metadata-first moves and independently routed remainders.
 /// Bumped 6 → 7 by the mandatory dedicated sparse-pixel connection.
 /// Bumped 5 → 6 by the atomic coverage-bearing `MSG_VIDEO_UPDATE` envelope.
@@ -191,7 +196,7 @@ pub const SCHEMA: u32 = 12;
 /// kinds beside the original VK down/up) — the video/rects wire itself is
 /// unchanged, but the header's `wire_version` couples both dialects together so a
 /// client's video-header gate also gates which input records it may send.
-pub const WIRE_VERSION: u32 = 9;
+pub const WIRE_VERSION: u32 = 10;
 
 impl Header {
     pub fn new() -> Self {
@@ -221,6 +226,7 @@ impl Header {
             rect_max_count: 0,
             rect_max_bytes: 0,
             diff_idle_gap_ms: 0,
+            max_unacknowledged_updates: 0,
             parameter_set_route: "in-band, out-of-band fallback",
             sequence_header_available: false,
             // Off until something actually binds 9503. Defaulting this true
@@ -336,6 +342,8 @@ pub struct FrameRecord {
     /// keyframe actually arrived. Present only on the keyframe that answered one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyframe_wait_frames: Option<u32>,
+    #[serde(flatten)]
+    pub visual_flow: VisualFlowRecord,
 }
 
 /// Proportional estimate of compressed AU bytes attributable to unchanged pixels.
@@ -387,6 +395,21 @@ pub struct RectRecord {
     pub from_diff: bool,
     /// This row is a pixel-free move prelude produced by frame inference.
     pub move_inferred: bool,
+    #[serde(flatten)]
+    pub visual_flow: VisualFlowRecord,
+}
+
+/// Cumulative visual-flow state copied onto either video or sparse update rows.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+pub struct VisualFlowRecord {
+    pub visual_outstanding: u32,
+    pub visual_outstanding_max: u32,
+    pub visual_acks: u64,
+    pub visual_waits: u64,
+    pub visual_wait_us_total: u64,
+    pub visual_capture_skips: u64,
+    pub visual_oldest_age_ms: u64,
+    pub visual_unemitted: u32,
 }
 
 impl RectRecord {
@@ -644,6 +667,16 @@ mod tests {
         r.raw_rect_attempted = true;
         r.raw_rect_sent = true;
         r.keyframe_wait_frames = Some(17);
+        r.visual_flow = VisualFlowRecord {
+            visual_outstanding: 2,
+            visual_outstanding_max: 3,
+            visual_acks: 5,
+            visual_waits: 7,
+            visual_wait_us_total: 11_000,
+            visual_capture_skips: 13,
+            visual_oldest_age_ms: 17,
+            visual_unemitted: 1,
+        };
 
         let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
         assert_eq!(v["record"], "frame");
@@ -683,9 +716,17 @@ mod tests {
         assert_eq!(v["raw_rect_attempted"], true);
         assert_eq!(v["raw_rect_sent"], true);
         assert_eq!(v["keyframe_wait_frames"], 17);
+        assert_eq!(v["visual_outstanding"], 2);
+        assert_eq!(v["visual_outstanding_max"], 3);
+        assert_eq!(v["visual_acks"], 5);
+        assert_eq!(v["visual_waits"], 7);
+        assert_eq!(v["visual_wait_us_total"], 11_000);
+        assert_eq!(v["visual_capture_skips"], 13);
+        assert_eq!(v["visual_oldest_age_ms"], 17);
+        assert_eq!(v["visual_unemitted"], 1);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 37, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 45, "unexpected field count: {keys:?}");
     }
 
     #[test]
@@ -730,6 +771,7 @@ mod tests {
         // fixture sets the value that a forgotten assignment would not produce.
         r.from_diff = true;
         r.move_inferred = true;
+        r.visual_flow.visual_acks = 9;
 
         let v: Value = serde_json::from_str(&to_line(&r)).unwrap();
         assert_eq!(v["record"], "rects");
@@ -743,11 +785,12 @@ mod tests {
         assert_eq!(v["dropped_rects"], 4);
         assert_eq!(v["from_diff"], true);
         assert_eq!(v["move_inferred"], true);
+        assert_eq!(v["visual_acks"], 9);
         // A fresh record is the metadata arm until something says otherwise.
         assert!(to_line(&RectRecord::new()).contains(r#""from_diff":false"#));
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 11, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 19, "unexpected field count: {keys:?}");
     }
 
     #[test]
@@ -834,6 +877,7 @@ mod tests {
         h.rect_max_count = 32;
         h.rect_max_bytes = 98_304;
         h.diff_idle_gap_ms = 100;
+        h.max_unacknowledged_updates = 2;
         // Set true here rather than left at the default, so the assertion below
         // cannot pass against a header that hardcodes false.
         h.clipboard = true;
@@ -854,12 +898,13 @@ mod tests {
         assert_eq!(v["rect_max_count"], 32);
         assert_eq!(v["rect_max_bytes"], 98_304);
         assert_eq!(v["diff_idle_gap_ms"], 100);
+        assert_eq!(v["max_unacknowledged_updates"], 2);
 
         // The client's safety gate reads this and nothing else. A header that
         // omitted it would silently disable clipboard on every session.
         assert_eq!(v["clipboard"], true);
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 28, "unexpected field count: {keys:?}");
+        assert_eq!(keys.len(), 29, "unexpected field count: {keys:?}");
     }
 }

@@ -1,9 +1,15 @@
 //! Atomic regional/full video update payloads.
+//!
+//! The fixed header is `frame_seq`, geometry, `kind`, `tile_count`,
+//! `block_size`, then the wire-v10 `required_parts` mask (`RAW=1`,
+//! `VIDEO=2`, or both). Move preludes use their unchanged independent format.
 
 use crate::adaptive::{Region, MAX_PLAN_BLOCKS};
 use crate::framing::DEFAULT_MAX_PAYLOAD;
 
-const HEADER_LEN: usize = 8 + 4 + 4 + 1 + 1 + 2;
+pub use crate::framing::{RequiredParts, UpdateParts};
+
+const HEADER_LEN: usize = 8 + 4 + 4 + 1 + 1 + 2 + 1;
 const TILE_HEADER_LEN: usize = 1 + 1 + 2 + 4;
 const REGION_LEN: usize = 4 * 2;
 pub const MAX_VIDEO_TILES: usize = 16;
@@ -31,6 +37,8 @@ pub struct VideoUpdate {
     pub frame_height: u32,
     pub block_size: u16,
     pub kind: VideoKind,
+    /// Wire-v10 lanes that must complete this logical update.
+    pub required_parts: UpdateParts,
     pub tiles: Vec<VideoTile>,
 }
 
@@ -53,6 +61,7 @@ pub enum VideoError {
     IncompleteFullCoverage { covered: u64, required: u64 },
     RegionalCoversFullFrame,
     RecoveryNotIdr { tile_id: u8 },
+    InvalidRequiredParts { bits: u8 },
 }
 
 impl std::fmt::Display for VideoError {
@@ -82,6 +91,12 @@ pub fn encode(update: &VideoUpdate, out: &mut Vec<u8>) {
     out.push(update.kind as u8);
     out.push(update.tiles.len() as u8);
     out.extend_from_slice(&update.block_size.to_le_bytes());
+    assert!(
+        UpdateParts::from_bits(update.required_parts.bits()).is_some(),
+        "video update: invalid required-parts mask {:#04x}",
+        update.required_parts.bits()
+    );
+    out.push(update.required_parts.bits());
     for tile in &update.tiles {
         assert!(!tile.coverage.is_empty() && tile.coverage.len() <= u16::MAX as usize);
         assert!(tile.au.len() <= u32::MAX as usize);
@@ -118,6 +133,11 @@ pub fn decode(payload: &[u8]) -> Result<VideoUpdate, VideoError> {
     };
     let tile_count = reader.u8("tile_count")? as usize;
     let block_size = reader.u16("block_size")?;
+    let required_parts_bits = reader.u8("required_parts")?;
+    let required_parts =
+        UpdateParts::from_bits(required_parts_bits).ok_or(VideoError::InvalidRequiredParts {
+            bits: required_parts_bits,
+        })?;
     if frame_width == 0
         || frame_height == 0
         || frame_width > u16::MAX as u32
@@ -252,6 +272,7 @@ pub fn decode(payload: &[u8]) -> Result<VideoUpdate, VideoError> {
         frame_height,
         block_size,
         kind,
+        required_parts,
         tiles,
     })
 }
@@ -317,6 +338,7 @@ mod tests {
             frame_height: 32,
             block_size: 16,
             kind: VideoKind::Regional,
+            required_parts: UpdateParts::VIDEO,
             tiles: vec![
                 VideoTile {
                     tile_id: 0,
@@ -355,6 +377,28 @@ mod tests {
     }
 
     #[test]
+    fn wire_v10_required_parts_round_trip_and_rejects_empty_or_unknown_masks() {
+        let mut update = regional();
+        update.required_parts = UpdateParts::VIDEO;
+        let bytes = payload(&update);
+        assert_eq!(decode(&bytes).unwrap().required_parts, UpdateParts::VIDEO);
+
+        let mut empty = bytes.clone();
+        empty[20] = 0;
+        assert!(matches!(
+            decode(&empty),
+            Err(VideoError::InvalidRequiredParts { bits: 0 })
+        ));
+
+        let mut unknown = bytes;
+        unknown[20] = 0x80;
+        assert!(matches!(
+            decode(&unknown),
+            Err(VideoError::InvalidRequiredParts { bits: 0x80 })
+        ));
+    }
+
+    #[test]
     fn header_and_first_tile_fields_have_fixed_independent_offsets() {
         let payload = payload(&regional());
         assert_eq!(u64::from_le_bytes(payload[0..8].try_into().unwrap()), 90);
@@ -363,9 +407,10 @@ mod tests {
         assert_eq!(payload[16], VideoKind::Regional as u8);
         assert_eq!(payload[17], 2);
         assert_eq!(u16::from_le_bytes(payload[18..20].try_into().unwrap()), 16);
-        assert_eq!(payload[20], 0);
-        assert_eq!(u16::from_le_bytes(payload[22..24].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(payload[24..28].try_into().unwrap()), 5);
+        assert_eq!(payload[20], UpdateParts::VIDEO.bits());
+        assert_eq!(payload[21], 0);
+        assert_eq!(u16::from_le_bytes(payload[23..25].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(payload[25..29].try_into().unwrap()), 5);
     }
 
     #[test]
@@ -422,7 +467,7 @@ mod tests {
     #[test]
     fn aggregate_access_unit_limit_is_checked_before_allocation() {
         let mut payload = payload(&regional());
-        payload[24..28].copy_from_slice(&((DEFAULT_MAX_PAYLOAD as u32) + 1).to_le_bytes());
+        payload[25..29].copy_from_slice(&((DEFAULT_MAX_PAYLOAD as u32) + 1).to_le_bytes());
 
         assert_eq!(
             decode(&payload),
@@ -441,6 +486,7 @@ mod tests {
             frame_height: 16,
             block_size: 16,
             kind: VideoKind::Recovery,
+            required_parts: UpdateParts::VIDEO,
             tiles: vec![VideoTile {
                 tile_id: 0,
                 coverage: vec![Region {

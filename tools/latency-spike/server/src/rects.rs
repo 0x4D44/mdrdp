@@ -13,6 +13,7 @@
 //! u64 frame_seq
 //! u32 frame_width, u32 frame_height
 //! u16 rect_count
+//! u8  required_parts             # wire v10: RAW=1, VIDEO=2, or both
 //! rect_count ×:
 //!   u16 x, u16 y, u16 w, u16 h
 //!   u8  encoding            # 0 = raw BGRA8, top-down, tightly packed
@@ -32,6 +33,8 @@
 //! does not cover the other. A malformed message is terminal for the connection,
 //! exactly like a framing error.
 
+pub use crate::framing::{RequiredParts, UpdateParts};
+
 /// One batch of dirty rectangles, all belonging to the same captured frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RectUpdate {
@@ -39,6 +42,8 @@ pub struct RectUpdate {
     /// Desktop size these rects were captured against, as in the stats header.
     pub frame_width: u32,
     pub frame_height: u32,
+    /// Wire-v10 lanes that must complete this logical update.
+    pub required_parts: UpdateParts,
     pub rects: Vec<Rect>,
 }
 
@@ -94,7 +99,7 @@ pub struct MovePrelude {
 pub const ENCODING_RAW_BGRA: u8 = 0;
 
 /// Fixed-size prefix: `frame_seq`, `frame_width`, `frame_height`, `rect_count`.
-const UPDATE_HEADER_LEN: usize = 8 + 4 + 4 + 2;
+const UPDATE_HEADER_LEN: usize = 8 + 4 + 4 + 2 + 1;
 /// Per-rect prefix ahead of the pixels: `x`, `y`, `w`, `h`, `encoding`, `pixel_bytes`.
 const RECT_HEADER_LEN: usize = 2 + 2 + 2 + 2 + 1 + 4;
 /// `baseline_seq`, `frame_seq`, geometry, remainder, reserved, and `move_count`.
@@ -165,6 +170,8 @@ pub enum RectsError {
     UnknownMoveRemainder(u8),
     /// Reserved move-prelude bits must remain zero.
     MoveReserved(u8),
+    /// The wire-v10 required-part mask is empty or contains an undefined bit.
+    InvalidRequiredParts { bits: u8 },
 }
 
 impl std::fmt::Display for RectsError {
@@ -258,6 +265,10 @@ impl std::fmt::Display for RectsError {
             RectsError::MoveReserved(value) => {
                 write!(f, "rects: move prelude reserved byte is {value}, not zero")
             }
+            RectsError::InvalidRequiredParts { bits } => write!(
+                f,
+                "rects: required-parts mask {bits:#04x} is empty or has unknown bits"
+            ),
         }
     }
 }
@@ -291,6 +302,12 @@ pub fn encode(update: &RectUpdate, out: &mut Vec<u8>) {
     out.extend_from_slice(&update.frame_width.to_le_bytes());
     out.extend_from_slice(&update.frame_height.to_le_bytes());
     out.extend_from_slice(&(update.rects.len() as u16).to_le_bytes());
+    assert!(
+        UpdateParts::from_bits(update.required_parts.bits()).is_some(),
+        "rects: invalid required-parts mask {:#04x}",
+        update.required_parts.bits()
+    );
+    out.push(update.required_parts.bits());
     for (i, r) in update.rects.iter().enumerate() {
         let expected = r.w as usize * r.h as usize * BPP;
         assert_eq!(
@@ -412,6 +429,11 @@ pub fn decode(payload: &[u8]) -> Result<RectUpdate, RectsError> {
     let frame_width = r.u32("frame_width")?;
     let frame_height = r.u32("frame_height")?;
     let rect_count = r.u16("rect_count")? as usize;
+    let required_parts_bits = r.u8("required_parts")?;
+    let required_parts =
+        UpdateParts::from_bits(required_parts_bits).ok_or(RectsError::InvalidRequiredParts {
+            bits: required_parts_bits,
+        })?;
 
     let canvas_pixels = u64::from(frame_width) * u64::from(frame_height);
     let mut raw_pixels = 0u64;
@@ -481,6 +503,7 @@ pub fn decode(payload: &[u8]) -> Result<RectUpdate, RectsError> {
         frame_seq,
         frame_width,
         frame_height,
+        required_parts,
         rects,
     })
 }
@@ -815,6 +838,7 @@ mod tests {
             frame_seq: 0x0102_0304_0506_0708,
             frame_width: 1920,
             frame_height: 1080,
+            required_parts: UpdateParts::RAW,
             rects: vec![rect(10, 20, 3, 2, 0x40), rect(100, 200, 5, 7, 0x90)],
         }
     }
@@ -835,6 +859,28 @@ mod tests {
     }
 
     #[test]
+    fn wire_v10_required_parts_round_trip_and_rejects_empty_or_unknown_masks() {
+        let mut update = sample_update();
+        update.required_parts = UpdateParts::RAW;
+        let bytes = wire(&update);
+        assert_eq!(decode(&bytes).unwrap().required_parts, UpdateParts::RAW);
+
+        let mut empty = bytes.clone();
+        empty[18] = 0;
+        assert!(matches!(
+            decode(&empty),
+            Err(RectsError::InvalidRequiredParts { bits: 0 })
+        ));
+
+        let mut unknown = bytes;
+        unknown[18] = 0x80;
+        assert!(matches!(
+            decode(&unknown),
+            Err(RectsError::InvalidRequiredParts { bits: 0x80 })
+        ));
+    }
+
+    #[test]
     fn the_header_fields_land_at_their_declared_offsets() {
         let update = sample_update();
         let bytes = wire(&update);
@@ -842,13 +888,14 @@ mod tests {
         assert_eq!(&bytes[8..12], &1920u32.to_le_bytes());
         assert_eq!(&bytes[12..16], &1080u32.to_le_bytes());
         assert_eq!(&bytes[16..18], &2u16.to_le_bytes());
+        assert_eq!(bytes[18], UpdateParts::RAW.bits());
         // First rect header: 10, 20, 3x2, raw, 24 bytes.
-        assert_eq!(&bytes[18..20], &10u16.to_le_bytes());
-        assert_eq!(&bytes[20..22], &20u16.to_le_bytes());
-        assert_eq!(&bytes[22..24], &3u16.to_le_bytes());
-        assert_eq!(&bytes[24..26], &2u16.to_le_bytes());
-        assert_eq!(bytes[26], ENCODING_RAW_BGRA);
-        assert_eq!(&bytes[27..31], &24u32.to_le_bytes());
+        assert_eq!(&bytes[19..21], &10u16.to_le_bytes());
+        assert_eq!(&bytes[21..23], &20u16.to_le_bytes());
+        assert_eq!(&bytes[23..25], &3u16.to_le_bytes());
+        assert_eq!(&bytes[25..27], &2u16.to_le_bytes());
+        assert_eq!(bytes[27], ENCODING_RAW_BGRA);
+        assert_eq!(&bytes[28..32], &24u32.to_le_bytes());
     }
 
     #[test]
@@ -857,6 +904,7 @@ mod tests {
             frame_seq: 42,
             frame_width: 800,
             frame_height: 600,
+            required_parts: UpdateParts::RAW,
             rects: Vec::new(),
         };
         let bytes = wire(&update);
@@ -882,7 +930,7 @@ mod tests {
     #[test]
     fn an_unknown_encoding_byte_is_refused() {
         let mut bytes = wire(&sample_update());
-        bytes[26] = 1; // LZ4's reserved value: reserved is not implemented.
+        bytes[27] = 1; // LZ4's reserved value: reserved is not implemented.
         assert_eq!(
             decode(&bytes),
             Err(RectsError::UnknownEncoding {
@@ -913,7 +961,7 @@ mod tests {
     fn a_rect_hanging_off_the_frame_is_refused() {
         let mut bytes = wire(&sample_update());
         // First rect is 3 wide at x=10; move it to x=1918 and it overruns 1920.
-        bytes[18..20].copy_from_slice(&1918u16.to_le_bytes());
+        bytes[19..21].copy_from_slice(&1918u16.to_le_bytes());
         assert_eq!(
             decode(&bytes),
             Err(RectsError::OutOfFrame {
@@ -936,6 +984,7 @@ mod tests {
             frame_seq: 9,
             frame_width: 65535,
             frame_height: 65535,
+            required_parts: UpdateParts::RAW,
             rects: vec![rect(65535, 3, 2, 4, 0x11)],
         };
         let bytes = wire(&update);
@@ -962,6 +1011,7 @@ mod tests {
         bytes.extend_from_slice(&640u32.to_le_bytes());
         bytes.extend_from_slice(&480u32.to_le_bytes());
         bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.push(UpdateParts::RAW.bits());
         bytes.extend_from_slice(&5u16.to_le_bytes()); // x
         bytes.extend_from_slice(&6u16.to_le_bytes()); // y
         bytes.extend_from_slice(&0u16.to_le_bytes()); // w
@@ -1110,6 +1160,7 @@ mod tests {
             frame_seq: 5,
             frame_width: 8,
             frame_height: 4,
+            required_parts: UpdateParts::RAW,
             rects: vec![rect(0, 0, 2, 1, 0x20), rect(5, 2, 3, 2, 0xC0)],
         };
         let back = decode(&wire(&update)).unwrap();
@@ -1355,6 +1406,7 @@ mod tests {
             frame_seq: 1,
             frame_width: 8,
             frame_height: 4,
+            required_parts: UpdateParts::RAW,
             rects: vec![rect(0, 0, 8, 4, 1), rect(0, 0, 1, 1, 2)],
         };
 

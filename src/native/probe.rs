@@ -29,8 +29,8 @@ use super::ssh::{self, ForwardPorts, ProbeFailure, Tunnel, TunnelSpec};
 
 /// The wire dialects this client speaks. A range, not an equality, so the day a
 /// compatible v5 exists the gate loosens without a format break (review S-m4).
-pub const WIRE_VERSION_MIN: u32 = 9;
-pub const WIRE_VERSION_MAX: u32 = 9;
+pub const WIRE_VERSION_MIN: u32 = 10;
+pub const WIRE_VERSION_MAX: u32 = 10;
 
 /// The IDD backing-pixel mode and Windows UI scale selected by the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -581,6 +581,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_wire_range_is_strict_v10() {
+        assert_eq!(WIRE_VERSION_MIN, 10);
+        assert_eq!(WIRE_VERSION_MAX, 10);
+    }
+
     /// A header from a host that predates the auxiliary channel: the
     /// `clipboard` field is **absent**, not false. That is the shape a deployed
     /// 0.4.0 host actually sends, and the one the safety gate must survive.
@@ -760,7 +766,7 @@ mod tests {
             vec![
                 (STAGE_TUNNEL_UP, None),
                 (STAGE_PROBE, None),
-                (STAGE_HANDSHAKE, Some("wire v9".to_owned())),
+                (STAGE_HANDSHAKE, Some("wire v10".to_owned())),
             ]
         );
     }

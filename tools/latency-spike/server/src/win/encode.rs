@@ -974,8 +974,12 @@ fn configure(
         refused: Vec::new(),
     };
     let bitrate_bps = bitrate_kbps.saturating_mul(1000);
-    if codec == Codec::Hevc && codec_api.is_none() {
-        return Err("HEVC encoder exposes no ICodecAPI; cannot require AVLowLatencyMode".into());
+    if codec_api.is_none() {
+        return Err(format!(
+            "{} encoder exposes no ICodecAPI; cannot require AVLowLatencyMode",
+            codec.wire_name()
+        )
+        .into());
     }
     if let Some(api) = codec_api.as_ref() {
         let low_latency = settings.set(
@@ -984,8 +988,12 @@ fn configure(
             &CODECAPI_AVLowLatencyMode,
             &variant_bool(true),
         );
-        if codec == Codec::Hevc && !low_latency {
-            return Err("HEVC encoder refused mandatory AVLowLatencyMode".into());
+        if !low_latency {
+            return Err(format!(
+                "{} encoder refused mandatory AVLowLatencyMode",
+                codec.wire_name()
+            )
+            .into());
         }
         match codec {
             Codec::H264 => {

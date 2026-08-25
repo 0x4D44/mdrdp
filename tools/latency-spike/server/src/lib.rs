@@ -44,6 +44,8 @@ pub mod stats;
 #[cfg(any(all(feature = "host", windows), test))]
 pub(crate) mod surface_pool;
 pub mod video_update;
+#[cfg(any(feature = "host", test))]
+pub(crate) mod visual_flow;
 
 #[cfg(feature = "host")]
 pub mod agent;
