@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00123 — AVC444 animation flickers between 4:2:0 and chroma-refined output
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** Medium
 - **Area:** graphics/avc444
 - **Raised:** 2026-08-26T07:01:57Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260826T070341Z-002f10ac
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00123-run-fix-20260826T070341Z-002f10ac
-- **Owner base:** b4abba6095cf5fc8991d0e7f9893350b4cbb198c
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-26T07:03:41Z
-- **Owner until:** 2026-08-26T09:03:41Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-26T07:01:57Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh)
+- **State history:** Open (2026-08-26T07:01:57Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-26T07:26:26Z, deltic:auto role=fix run=fix-20260826T070341Z-002f10ac branch=task/bug-MDR-BUG-FLU-00123-run-fix-20260826T070341Z-002f10ac code=f96fe83 gate=manual)
 
 ## Observation
 
