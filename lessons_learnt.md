@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Fresh presentation state must replace stale deadlines; max-merging restores latency (`window.rs:request_damage_redraw`).
+  A durable freshness stamp is insufficient if the event loop keeps the older LC2 wake.
+  Recompute the latest state's full deadline, and carry platform retries separately from damage.
+
 - Debounce AVC444 LC2 quality refinement; never delay LC1 or preserve stale aux (`gfx.rs:on_bitmap_updated`).
   MS-RDPEGFX permits LC2 in a later frame. Showing it immediately during motion flashes
   4:4:4 between required 4:2:0 luma frames; a short settle deadline hides only that refinement.
