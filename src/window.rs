@@ -2554,6 +2554,13 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 // the size may have been changed while the screen was off, and no further
                 // `Resized` is guaranteed to arrive to prompt us.
                 if !occluded && let Some(window) = self.window.clone() {
+                    // Nothing saw the hidden-window transition, so showing the latest
+                    // committed pixels cannot cause the 4:2:0-to-4:4:4 flicker that the
+                    // refinement delay prevents. Do not make a reveal wait on an old timer.
+                    self.store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .release_presentation_delay();
                     if !self.fullscreen {
                         let size = window.inner_size();
                         self.hold_geometry(event_loop, Geometry::new(size.width, size.height));

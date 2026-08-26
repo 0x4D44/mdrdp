@@ -707,6 +707,10 @@ impl SurfaceStore {
         self.presentation_not_before
     }
 
+    pub(crate) fn release_presentation_delay(&mut self) {
+        self.presentation_not_before = None;
+    }
+
     fn touch_presentation(&mut self) {
         self.presentation_not_before = None;
         self.generation = self.generation.wrapping_add(1);
@@ -2177,6 +2181,47 @@ mod tests {
             .blit_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, RED), 2)
             .unwrap();
         assert!(store.commit_frame(9));
+        assert_eq!(store.presentation_not_before(), None);
+    }
+
+    #[test]
+    fn revealing_a_surface_releases_its_chroma_refinement_delay() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        store.begin_frame(10);
+        store
+            .blit_rgba_deferred(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2, deadline)
+            .unwrap();
+        assert!(store.commit_frame(10));
+        let generation = store.generation();
+
+        store.release_presentation_delay();
+
+        assert_eq!(store.presentation_not_before(), None);
+        assert_eq!(store.generation(), generation);
+    }
+
+    #[test]
+    fn fresh_content_in_the_same_frame_cancels_a_chroma_refinement_delay() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        store.begin_frame(11);
+        store
+            .blit_rgba_deferred(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2, deadline)
+            .unwrap();
+        store
+            .blit_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, RED), 2)
+            .unwrap();
+        assert!(store.commit_frame(11));
+
         assert_eq!(store.presentation_not_before(), None);
     }
 

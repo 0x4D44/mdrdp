@@ -891,6 +891,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                 stride,
                 Instant::now() + CHROMA_REFINEMENT_SETTLE_DELAY,
             ),
+            _ => store.blit_rgba(update.surface_id, dest, &update.data, stride),
         });
         if result.is_ok() {
             // Painted bytes are attributed per rect for every codec on this path
@@ -2353,6 +2354,39 @@ mod tests {
             crate::surface::PresentationCopy::Copied
         );
         assert_eq!(snapshot.pixels, vec![0, 0, 255, 255, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn chroma_refinement_metadata_reaches_the_surface_presenter() {
+        let store = store();
+        let mut handler = GfxHandler::new(Arc::clone(&store));
+        handler.on_surface_created(&egfx_surface(1, 2, 1));
+        handler.on_surface_mapped(1, 0, 0);
+        handler.on_solid_fill(&SolidFillPdu {
+            surface_id: 1,
+            fill_pixel: Color {
+                b: 0,
+                g: 0,
+                r: 255,
+                xa: 0,
+            },
+            rectangles: vec![rect(0, 0, 2, 1)],
+        });
+        let mut update = BitmapUpdate::new(
+            1,
+            rect(0, 0, 2, 1),
+            Codec1Type::Avc444,
+            vec![0, 0, 255, 255, 0, 0, 255, 255],
+            2,
+            1,
+        );
+        update.presentation = BitmapUpdatePresentation::ChromaRefinement;
+
+        handler.on_frame_start(22);
+        handler.on_bitmap_updated(&update);
+        handler.on_frame_complete(22);
+
+        assert!(store.lock().unwrap().presentation_not_before().is_some());
     }
 
     /// Output mapping PDUs must display a surface; unsupported RAIL mappings must not

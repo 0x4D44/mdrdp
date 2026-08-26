@@ -181,6 +181,7 @@ impl CodecCapabilities {
 
 /// How urgently a decoded bitmap update needs to reach the presenter.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BitmapUpdatePresentation {
     /// The update carries fresh picture content and should be shown immediately.
     #[default]
