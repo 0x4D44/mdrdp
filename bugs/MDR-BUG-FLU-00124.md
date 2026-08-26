@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00124 — AVC444 refinement debounce starves continuous-motion presentation
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/presentation
 - **Raised:** 2026-08-26T13:20:26Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260826T132111Z-fdc36f77
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00124-run-fix-20260826T132111Z-fdc36f77
-- **Owner base:** 0fcd31139209df0f890f951400b74223d900ae9f
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-08-26T13:21:11Z
-- **Owner until:** 2026-08-26T16:02:40Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-26T13:20:26Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-26T13:20:26Z, raised via `deltic bugs new`) -> Fixed (2026-08-26T14:07:48Z, deltic:auto role=fix run=fix-20260826T132111Z-fdc36f77 branch=task/bug-MDR-BUG-FLU-00124-run-fix-20260826T132111Z-fdc36f77 code=4ba656c2588a654d2c5a250bbbe713029e476c3c gate=manual)
 
 ## Observation
 
