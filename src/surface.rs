@@ -15,6 +15,7 @@
 //! region.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::stats::CacheStats;
 use ironrdp_graphics::clearcodec::MAX_DECODE_DIM;
@@ -637,6 +638,11 @@ pub struct SurfaceStore {
     /// Whether the active frame, or a dirty frame that was aborted, touched presentation
     /// state. Offscreen/cache-only work must not manufacture a redraw at EndFrame.
     frame_visible_dirty: bool,
+    /// A frame remains deferable only while every visible mutation is a chroma refinement.
+    /// Any fresh picture mutation clears this deadline before commit.
+    frame_presentation_not_before: Option<Instant>,
+    /// Earliest time the latest committed generation should be copied by the presenter.
+    presentation_not_before: Option<Instant>,
     generation: u64,
     /// Cache effectiveness, counted where the cache is actually used. Counting it here
     /// rather than in the EGFX handler means it measures what reached the pixels, not
@@ -697,13 +703,27 @@ impl SurfaceStore {
         self.generation
     }
 
+    pub(crate) fn presentation_not_before(&self) -> Option<Instant> {
+        self.presentation_not_before
+    }
+
     fn touch_presentation(&mut self) {
+        self.presentation_not_before = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn touch_presentation_deferred(&mut self, not_before: Instant) {
+        self.presentation_not_before = Some(
+            self.presentation_not_before
+                .map_or(not_before, |current| current.max(not_before)),
+        );
         self.generation = self.generation.wrapping_add(1);
     }
 
     fn mark_frame_visible_dirty(&mut self) {
         if !matches!(self.frame_state, FrameState::Idle) {
             self.frame_visible_dirty = true;
+            self.frame_presentation_not_before = None;
         }
     }
 
@@ -716,6 +736,7 @@ impl SurfaceStore {
         }
         if matches!(self.frame_state, FrameState::Idle) {
             self.frame_visible_dirty = false;
+            self.frame_presentation_not_before = None;
         }
         self.frame_state = FrameState::Active(frame_id);
     }
@@ -725,16 +746,22 @@ impl SurfaceStore {
             return false;
         }
         let frame_visible_dirty = self.frame_visible_dirty;
+        let frame_presentation_not_before = self.frame_presentation_not_before;
         let had_fallback = self.presentation_fallback.is_some();
         let had_suppressed_presentation = self.presentation_suppressed;
         let output_complete = self.output_surface().is_some_and(Surface::is_complete);
         self.frame_state = FrameState::Idle;
         self.frame_visible_dirty = false;
+        self.frame_presentation_not_before = None;
         if output_complete {
             self.presentation_fallback = None;
             self.presentation_suppressed = false;
             if had_fallback || had_suppressed_presentation || frame_visible_dirty {
-                self.touch_presentation();
+                if let Some(not_before) = frame_presentation_not_before {
+                    self.touch_presentation_deferred(not_before);
+                } else {
+                    self.touch_presentation();
+                }
             }
         } else if self.output.is_none() {
             // A frame that terminally deletes the mapped surface publishes an empty
@@ -783,11 +810,23 @@ impl SurfaceStore {
     }
 
     fn finish_surface_mutation(&mut self, id: u16) {
+        self.finish_surface_mutation_with_deadline(id, None);
+    }
+
+    fn finish_surface_mutation_with_deadline(&mut self, id: u16, not_before: Option<Instant>) {
         if !matches!(self.frame_state, FrameState::Idle) {
             let is_current_output = !self.output_mapping_stale
                 && self.output.is_some_and(|mapping| mapping.surface_id == id);
             let is_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
             if is_current_output && (self.presentation_fallback.is_none() || is_complete) {
+                self.frame_presentation_not_before = if self.frame_visible_dirty {
+                    match (self.frame_presentation_not_before, not_before) {
+                        (Some(current), Some(next)) => Some(current.max(next)),
+                        _ => None,
+                    }
+                } else {
+                    not_before
+                };
                 self.frame_visible_dirty = true;
             }
             return;
@@ -802,7 +841,11 @@ impl SurfaceStore {
             self.presentation_fallback = None;
             if self.presentation_suppressed {
                 self.presentation_suppressed = false;
-                self.touch_presentation();
+                if let Some(not_before) = not_before {
+                    self.touch_presentation_deferred(not_before);
+                } else {
+                    self.touch_presentation();
+                }
                 return;
             }
         }
@@ -814,7 +857,11 @@ impl SurfaceStore {
         if self.presentation_suppressed {
             return;
         }
-        self.touch_presentation();
+        if let Some(not_before) = not_before {
+            self.touch_presentation_deferred(not_before);
+        } else {
+            self.touch_presentation();
+        }
     }
 
     pub fn create(&mut self, id: u16, width: u16, height: u16) {
@@ -1125,6 +1172,17 @@ impl SurfaceStore {
         src: &[u8],
         src_stride_px: u16,
     ) -> Result<(), SurfaceError> {
+        self.blit_rgba_with_deadline(id, dest, src, src_stride_px, None)
+    }
+
+    fn blit_rgba_with_deadline(
+        &mut self,
+        id: u16,
+        dest: Rect,
+        src: &[u8],
+        src_stride_px: u16,
+        not_before: Option<Instant>,
+    ) -> Result<(), SurfaceError> {
         let surface = self
             .surfaces
             .get_mut(&id)
@@ -1136,8 +1194,21 @@ impl SurfaceStore {
         if written == 0 {
             return Ok(());
         }
-        self.finish_surface_mutation(id);
+        self.finish_surface_mutation_with_deadline(id, not_before);
         Ok(())
+    }
+
+    /// Blit an AVC444 chroma-only refinement without immediately presenting its transient
+    /// quality change. Fresh luma can supersede the deadline through the normal blit path.
+    pub(crate) fn blit_rgba_deferred(
+        &mut self,
+        id: u16,
+        dest: Rect,
+        src: &[u8],
+        src_stride_px: u16,
+        not_before: Instant,
+    ) -> Result<(), SurfaceError> {
+        self.blit_rgba_with_deadline(id, dest, src, src_stride_px, Some(not_before))
     }
 
     /// Blit a complete decoded rectangle while retiring coverage only for the exact
@@ -2065,6 +2136,48 @@ mod tests {
             PresentationCopy::Copied
         );
         assert_eq!(snapshot.pixels, solid(2, 1, BLUE));
+    }
+
+    #[test]
+    fn a_chroma_refinement_commit_is_deferred_until_its_settle_deadline() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        let before = store.generation();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        store.begin_frame(8);
+        store
+            .blit_rgba_deferred(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2, deadline)
+            .unwrap();
+        assert!(store.commit_frame(8));
+
+        assert_eq!(store.generation(), before + 1);
+        assert_eq!(store.presentation_not_before(), Some(deadline));
+    }
+
+    #[test]
+    fn fresh_picture_content_cancels_a_pending_chroma_refinement_deadline() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
+        store.map_to_output(1);
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        store.begin_frame(8);
+        store
+            .blit_rgba_deferred(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2, deadline)
+            .unwrap();
+        assert!(store.commit_frame(8));
+        assert_eq!(store.presentation_not_before(), Some(deadline));
+
+        store.begin_frame(9);
+        store
+            .blit_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, RED), 2)
+            .unwrap();
+        assert!(store.commit_frame(9));
+        assert_eq!(store.presentation_not_before(), None);
     }
 
     #[test]

@@ -28,9 +28,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ironrdp::pdu::geometry::ExclusiveRectangle;
-use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface as EgfxSurface};
+use ironrdp_egfx::client::{
+    BitmapUpdate, BitmapUpdatePresentation, GraphicsPipelineHandler, Surface as EgfxSurface,
+};
 use ironrdp_egfx::pdu::{
     CacheToSurfacePdu, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
     EvictCacheEntryPdu, GfxPdu, Point, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu,
@@ -55,6 +58,10 @@ pub fn rect_from_egfx(rect: &ExclusiveRectangle) -> Rect {
 
 /// Side of a progressive tile, in pixels. MS-RDPRFX fixes the tile grid at 64x64.
 pub const PROGRESSIVE_TILE: u16 = 64;
+
+/// Keep chroma-only AVC444 refinements off screen briefly. Continuous animation replaces
+/// them with fresh luma; a settled image still gains its full chroma detail after the pause.
+const CHROMA_REFINEMENT_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 /// Where a progressive tile lands on its surface.
 ///
@@ -873,8 +880,18 @@ impl GraphicsPipelineHandler for GfxHandler {
             return;
         }
         let stride = dest.width();
-        let result =
-            self.with_store(|store| store.blit_rgba(update.surface_id, dest, &update.data, stride));
+        let result = self.with_store(|store| match update.presentation {
+            BitmapUpdatePresentation::Immediate => {
+                store.blit_rgba(update.surface_id, dest, &update.data, stride)
+            }
+            BitmapUpdatePresentation::ChromaRefinement => store.blit_rgba_deferred(
+                update.surface_id,
+                dest,
+                &update.data,
+                stride,
+                Instant::now() + CHROMA_REFINEMENT_SETTLE_DELAY,
+            ),
+        });
         if result.is_ok() {
             // Painted bytes are attributed per rect for every codec on this path
             // (AVC444 included) — the one-per-PDU rule above is about codec_ids_seen

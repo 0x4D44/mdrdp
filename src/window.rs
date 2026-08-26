@@ -337,6 +337,22 @@ fn presentation_deadline(
     (now < deadline).then_some(deadline)
 }
 
+fn pending_presentation_deadline(
+    last_presented: Option<Instant>,
+    now: Instant,
+    width: u16,
+    height: u16,
+    not_before: Option<Instant>,
+) -> Option<Instant> {
+    [
+        presentation_deadline(last_presented, now, width, height),
+        not_before.filter(|deadline| now < *deadline),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
 fn copy_presentation_when_due(
     store: &SurfaceStore,
     snapshot: &mut PresentationSnapshot,
@@ -350,7 +366,13 @@ fn copy_presentation_when_due(
         .presentation_dimensions()
         .unwrap_or(fallback_dimensions);
     if presented != Some(generation)
-        && let Some(deadline) = presentation_deadline(last_presented, now, width, height)
+        && let Some(deadline) = pending_presentation_deadline(
+            last_presented,
+            now,
+            width,
+            height,
+            store.presentation_not_before(),
+        )
     {
         return Err(deadline);
     }
@@ -1976,7 +1998,7 @@ impl SessionApp {
     /// Read the generation and the dimensions of the presentation that is current in the
     /// store as one coherent, short lock. The reusable snapshot can still describe the
     /// previous frame while a new surface is waiting to be copied.
-    fn damage_state(&self) -> (u64, (u16, u16)) {
+    fn damage_state(&self) -> (u64, (u16, u16), Option<Instant>) {
         let store = self
             .store
             .lock()
@@ -1986,6 +2008,7 @@ impl SessionApp {
             store
                 .presentation_dimensions()
                 .unwrap_or((self.config.session_width, self.config.session_height)),
+            store.presentation_not_before(),
         )
     }
 
@@ -1995,7 +2018,7 @@ impl SessionApp {
         if self.occluded {
             return;
         }
-        let (generation, (width, height)) = self.damage_state();
+        let (generation, (width, height), not_before) = self.damage_state();
         if self.presented == Some(generation) {
             return;
         }
@@ -2006,6 +2029,7 @@ impl SessionApp {
             self.last_presented_at,
             now,
             (width, height),
+            not_before,
         ) {
             self.redraw_deadline = Some(
                 self.redraw_deadline
@@ -2209,9 +2233,11 @@ fn damage_redraw_deadline(
     last_presented: Option<Instant>,
     now: Instant,
     dimensions: (u16, u16),
+    not_before: Option<Instant>,
 ) -> Option<Instant> {
-    (presented != Some(generation))
-        .then(|| presentation_deadline(last_presented, now, dimensions.0, dimensions.1))?
+    (presented != Some(generation)).then(|| {
+        pending_presentation_deadline(last_presented, now, dimensions.0, dimensions.1, not_before)
+    })?
 }
 
 /// Put one window event on its transport queue.
@@ -2928,6 +2954,47 @@ mod tests {
     }
 
     #[test]
+    fn a_chroma_refinement_waits_for_settling_even_on_a_small_surface() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store
+            .solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED)
+            .expect("paint surface");
+        store.map_to_output(1);
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let presented = Some(snapshot.generation);
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(100);
+
+        store.begin_frame(23);
+        store
+            .blit_rgba_deferred(
+                1,
+                Rect::new(0, 0, 2, 1),
+                &[BLUE, BLUE].concat(),
+                2,
+                deadline,
+            )
+            .expect("paint chroma refinement");
+        assert!(store.commit_frame(23));
+
+        assert_eq!(
+            copy_presentation_when_due(&store, &mut snapshot, presented, None, now, (2, 1),),
+            Err(deadline)
+        );
+        assert_eq!(snapshot.pixels, [RED, RED].concat());
+        assert_eq!(
+            copy_presentation_when_due(&store, &mut snapshot, presented, None, deadline, (2, 1),),
+            Ok(PresentationCopy::Copied)
+        );
+        assert_eq!(snapshot.pixels, [BLUE, BLUE].concat());
+    }
+
+    #[test]
     fn damage_cadence_uses_current_dimensions_after_a_large_snapshot() {
         let store = Arc::new(Mutex::new(SurfaceStore::new()));
         {
@@ -2948,7 +3015,7 @@ mod tests {
         app.presentation.width = 5120;
         app.presentation.height = 2880;
 
-        let (generation, dimensions) = app.damage_state();
+        let (generation, dimensions, not_before) = app.damage_state();
         let now = Instant::now();
         assert_eq!(
             damage_redraw_deadline(
@@ -2957,6 +3024,7 @@ mod tests {
                 Some(now),
                 now + Duration::from_millis(1),
                 dimensions,
+                not_before,
             ),
             None,
             "a current small output must not inherit the old large snapshot's cadence"

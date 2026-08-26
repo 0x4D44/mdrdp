@@ -179,6 +179,16 @@ impl CodecCapabilities {
 // Bitmap Update
 // ============================================================================
 
+/// How urgently a decoded bitmap update needs to reach the presenter.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum BitmapUpdatePresentation {
+    /// The update carries fresh picture content and should be shown immediately.
+    #[default]
+    Immediate,
+    /// The update only restores AVC444 chroma detail for luma already on screen.
+    ChromaRefinement,
+}
+
 /// Decoded bitmap data for a surface region
 ///
 /// Delivered to [`GraphicsPipelineHandler::on_bitmap_updated`] when
@@ -192,6 +202,8 @@ pub struct BitmapUpdate {
     pub destination_rectangle: ExclusiveRectangle,
     /// Codec that produced this update
     pub codec_id: Codec1Type,
+    /// Whether this update is fresh picture content or a later quality refinement.
+    pub presentation: BitmapUpdatePresentation,
     /// RGBA pixel data (4 bytes per pixel), row-major
     ///
     /// Dimensions match `width * height * 4` bytes.
@@ -218,6 +230,7 @@ impl BitmapUpdate {
             surface_id,
             destination_rectangle,
             codec_id,
+            presentation: BitmapUpdatePresentation::Immediate,
             data,
             width,
             height,
@@ -1161,6 +1174,7 @@ impl GraphicsPipelineClient {
             surface_id,
             destination_rectangle: dest_rect.clone(),
             codec_id: Codec1Type::Avc420,
+            presentation: BitmapUpdatePresentation::Immediate,
             data: cropped_data,
             width: dest_width,
             height: dest_height,
@@ -1335,6 +1349,7 @@ impl GraphicsPipelineClient {
         // avc444_decompress. NOTE: Encoding is a bitflags type whose
         // LUMA_AND_CHROMA value is 0, so dispatch MUST be by equality, never
         // `.contains()`.
+        #[derive(Clone, Copy)]
         enum Passes {
             LumaAndChroma,
             LumaOnly,
@@ -1596,6 +1611,11 @@ impl GraphicsPipelineClient {
                 surface_id,
                 destination_rectangle: rect,
                 codec_id,
+                presentation: if matches!(passes, Passes::ChromaOnly) {
+                    BitmapUpdatePresentation::ChromaRefinement
+                } else {
+                    BitmapUpdatePresentation::Immediate
+                },
                 data,
                 width,
                 height,
@@ -1638,6 +1658,7 @@ impl GraphicsPipelineClient {
             surface_id: pdu.surface_id,
             destination_rectangle: pdu.destination_rectangle.clone(),
             codec_id: Codec1Type::Uncompressed,
+            presentation: BitmapUpdatePresentation::Immediate,
             data: rgba_data,
             width: dest_width,
             height: dest_height,
@@ -2324,6 +2345,7 @@ mod tests {
         Update {
             rect: (u16, u16, u16, u16),
             data_len: usize,
+            presentation: BitmapUpdatePresentation,
         },
         Failure(String),
     }
@@ -2336,6 +2358,7 @@ mod tests {
             let _ = self.0.send(Event::Update {
                 rect: (r.left, r.top, r.right, r.bottom),
                 data_len: update.data.len(),
+                presentation: update.presentation,
             });
         }
 
@@ -2634,10 +2657,10 @@ mod tests {
             .collect();
         assert_eq!(updates.len(), 2, "one update per distinct rect: {events:?}");
         assert!(
-            matches!(updates[0], Event::Update { rect: (0, 0, 32, 16), data_len } if *data_len == 32 * 16 * 4)
+            matches!(updates[0], Event::Update { rect: (0, 0, 32, 16), data_len, .. } if *data_len == 32 * 16 * 4)
         );
         assert!(
-            matches!(updates[1], Event::Update { rect: (32, 16, 64, 48), data_len } if *data_len == 32 * 32 * 4)
+            matches!(updates[1], Event::Update { rect: (32, 16, 64, 48), data_len, .. } if *data_len == 32 * 32 * 4)
         );
         assert!(
             !events.iter().any(|e| matches!(e, Event::Failure(_))),
@@ -2669,6 +2692,33 @@ mod tests {
             20u8.wrapping_add((17 * 64 + 32 + 16) as u8),
             "chroma rect: odd column V from the aux Y plane's second half"
         );
+    }
+
+    #[test]
+    fn avc444_lc2_marks_its_bitmap_as_a_chroma_refinement() {
+        let (mut client, rx) = avc444_client(64, 48);
+        let luma = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &luma);
+        let _: Vec<Event> = rx.try_iter().collect();
+
+        let chroma = Avc444BitmapStream {
+            encoding: Encoding::CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[20, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &chroma);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Event::Update {
+                presentation: BitmapUpdatePresentation::ChromaRefinement,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3171,7 +3221,8 @@ mod tests {
                 events.as_slice(),
                 [Event::Update {
                     rect: (0, 0, 32, 24),
-                    data_len
+                    data_len,
+                    ..
                 }] if *data_len == 32 * 24 * 4
             ),
             "a covered ROI should still paint: {events:?}"

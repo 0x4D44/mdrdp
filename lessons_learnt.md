@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Debounce AVC444 LC2 quality refinement; never delay LC1 or preserve stale aux (`gfx.rs:on_bitmap_updated`).
+  MS-RDPEGFX permits LC2 in a later frame. Showing it immediately during motion flashes
+  4:4:4 between required 4:2:0 luma frames; a short settle deadline hides only that refinement.
+
 - Drain inbound TLS while writes block; POLLOUT-only waits can deadlock both peers (`connect.rs:write_framed`).
   rustls drains queued output before reading. Authenticate and buffer inbound TLS without
   dispatching newer RDP PDUs, then finish the older frame under its original deadline.
