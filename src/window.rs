@@ -329,6 +329,14 @@ fn present_failure_retry_deadline(failures: u32, now: Instant) -> Option<Instant
     (failures < MAX_CONSECUTIVE_PRESENT_FAILURES).then_some(now + PRESENT_RETRY)
 }
 
+fn should_service_deferred_redraw(
+    retry: bool,
+    presented: Option<PresentationStamp>,
+    current: PresentationStamp,
+) -> bool {
+    retry || presented != Some(current)
+}
+
 fn large_presentation(width: u16, height: u16) -> bool {
     width > 2560 || height > 1440
 }
@@ -1414,8 +1422,11 @@ struct SessionApp {
     /// Completion time of the last successful present, used to pace 5K redraws without
     /// sleeping the event-loop thread.
     last_presented_at: Option<Instant>,
-    /// A deferred 5K redraw waiting for the cadence deadline.
+    /// The next timed redraw for cadence, settling, or a platform/frame retry.
     redraw_deadline: Option<Instant>,
+    /// The deadline represents a platform/active-frame retry, not only changed store
+    /// state. This keeps resize and reveal redraws live when their stamp is unchanged.
+    redraw_retry: bool,
 }
 
 impl SessionApp {
@@ -1485,6 +1496,7 @@ impl SessionApp {
             presentation: PresentationSnapshot::default(),
             last_presented_at: None,
             redraw_deadline: None,
+            redraw_retry: false,
         }
     }
 
@@ -1975,6 +1987,12 @@ impl SessionApp {
         }
     }
 
+    fn schedule_redraw_retry(&mut self, event_loop: &ActiveEventLoop, deadline: Instant) {
+        self.redraw_deadline = Some(deadline);
+        self.redraw_retry = true;
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+    }
+
     /// A frame we could not present. Survivable until it stops being occasional.
     ///
     /// The session is the expensive thing here: reconnecting costs the user a logon and,
@@ -1984,8 +2002,7 @@ impl SessionApp {
         if let Some(deadline) =
             present_failure_retry_deadline(self.present_failures, Instant::now())
         {
-            self.redraw_deadline = Some(deadline);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            self.schedule_redraw_retry(event_loop, deadline);
         } else {
             self.fail(event_loop, WindowError::Present(detail));
         }
@@ -2059,7 +2076,7 @@ impl SessionApp {
         }
     }
 
-    /// Fire one deferred redraw once its cadence deadline arrives.
+    /// Fire one timed redraw once its cadence, settling, or retry deadline arrives.
     fn service_deferred_redraw(&mut self) {
         let Some(deadline) = self.redraw_deadline else {
             return;
@@ -2068,8 +2085,9 @@ impl SessionApp {
             return;
         }
         self.redraw_deadline = None;
+        let retry = std::mem::take(&mut self.redraw_retry);
         if !self.occluded
-            && self.presented != Some(self.presentation_stamp())
+            && should_service_deferred_redraw(retry, self.presented, self.presentation_stamp())
             && let Some(window) = &self.window
         {
             window.request_redraw();
@@ -2099,8 +2117,7 @@ impl SessionApp {
             .is_some_and(|presenter| presenter.can_start_frame(width, height))
         {
             let deadline = Instant::now() + PRESENT_BACKPRESSURE_RETRY;
-            self.redraw_deadline = Some(deadline);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            self.schedule_redraw_retry(event_loop, deadline);
             return;
         }
 
@@ -2128,8 +2145,7 @@ impl SessionApp {
             // and do no conversion or platform rendering while it remains active.
             Ok(PresentationCopy::Pending) => {
                 let deadline = Instant::now() + PRESENT_RETRY;
-                self.redraw_deadline = Some(deadline);
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                self.schedule_redraw_retry(event_loop, deadline);
                 return;
             }
             // An aborted or suppressed logical frame leaves the existing snapshot intact.
@@ -2230,8 +2246,7 @@ impl SessionApp {
             Ok(crate::present::PresentStatus::Presented) => {}
             Ok(crate::present::PresentStatus::Busy) => {
                 let deadline = Instant::now() + PRESENT_BACKPRESSURE_RETRY;
-                self.redraw_deadline = Some(deadline);
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                self.schedule_redraw_retry(event_loop, deadline);
                 return;
             }
             Err(e) => {
@@ -2242,6 +2257,7 @@ impl SessionApp {
         // Streak counts CONSECUTIVE failures: without this reset, 30 unrelated hiccups
         // across a long session would close a perfectly healthy window.
         self.present_failures = 0;
+        self.redraw_retry = false;
         if acknowledge {
             self.presented = Some(stamp);
         }
@@ -2963,6 +2979,16 @@ mod tests {
             present_failure_retry_deadline(MAX_CONSECUTIVE_PRESENT_FAILURES, now),
             None
         );
+    }
+
+    #[test]
+    fn a_platform_retry_is_serviced_even_when_the_store_stamp_is_unchanged() {
+        let stamp = PresentationStamp {
+            generation: 7,
+            fresh_content_epoch: 3,
+        };
+        assert!(should_service_deferred_redraw(true, Some(stamp), stamp));
+        assert!(!should_service_deferred_redraw(false, Some(stamp), stamp));
     }
 
     #[test]

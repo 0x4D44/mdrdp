@@ -727,10 +727,11 @@ impl SurfaceStore {
         &self,
         presented: Option<PresentationStamp>,
     ) -> Option<Instant> {
-        presented
-            .is_some_and(|stamp| stamp.fresh_content_epoch == self.fresh_content_epoch)
-            .then_some(self.presentation_not_before)
-            .flatten()
+        if presented.is_some_and(|stamp| stamp.fresh_content_epoch == self.fresh_content_epoch) {
+            self.presentation_not_before
+        } else {
+            None
+        }
     }
 
     pub(crate) fn release_presentation_delay(&mut self) {
@@ -2094,7 +2095,7 @@ mod tests {
     }
 
     #[test]
-    fn presentation_snapshot_copies_pixels_dimensions_and_generation_together() {
+    fn presentation_snapshot_copies_pixels_dimensions_and_stamp_together() {
         let mut store = SurfaceStore::new();
         store.create(1, 2, 1);
         store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
