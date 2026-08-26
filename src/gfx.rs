@@ -2343,7 +2343,7 @@ mod tests {
         assert_eq!(store.lock().unwrap().generation(), before);
         assert_eq!(
             store.lock().unwrap().copy_presentation_state(&mut snapshot),
-            crate::surface::PresentationCopy::Retained
+            crate::surface::PresentationCopy::Pending
         );
         assert_eq!(snapshot.pixels, vec![255, 0, 0, 255, 255, 0, 0, 255]);
 
@@ -2382,11 +2382,19 @@ mod tests {
         );
         update.presentation = BitmapUpdatePresentation::ChromaRefinement;
 
+        let presented = store.lock().unwrap().presentation_stamp();
+
         handler.on_frame_start(22);
         handler.on_bitmap_updated(&update);
         handler.on_frame_complete(22);
 
-        assert!(store.lock().unwrap().presentation_not_before().is_some());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .presentation_not_before(Some(presented))
+                .is_some()
+        );
     }
 
     /// Output mapping PDUs must display a surface; unsupported RAIL mappings must not

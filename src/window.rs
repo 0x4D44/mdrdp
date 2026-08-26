@@ -42,7 +42,9 @@ use winit::window::{CustomCursor, Fullscreen, Window, WindowAttributes, WindowId
 use crate::input::{self, InputEvent, PointerMap};
 use crate::session::SessionCommand;
 use crate::stats::{SessionStats, StatsHandle};
-use crate::surface::{PresentationCopy, PresentationMapping, PresentationSnapshot, SurfaceStore};
+use crate::surface::{
+    PresentationCopy, PresentationMapping, PresentationSnapshot, PresentationStamp, SurfaceStore,
+};
 use crate::ui::font;
 use crate::window_policy::{Geometry, ResizeVerdict, WindowPolicy};
 
@@ -319,6 +321,14 @@ pub(crate) const DAMAGE_PRESENT_INTERVAL: Duration = Duration::from_millis(33);
 /// to stay below one 240 Hz refresh interval without spinning the event loop.
 const PRESENT_BACKPRESSURE_RETRY: Duration = Duration::from_millis(2);
 
+/// Keep transient platform failures and active logical frames on the existing roughly
+/// frame-paced policy. Unlike compositor `Busy`, neither condition benefits from spinning.
+const PRESENT_RETRY: Duration = DAMAGE_PRESENT_INTERVAL;
+
+fn present_failure_retry_deadline(failures: u32, now: Instant) -> Option<Instant> {
+    (failures < MAX_CONSECUTIVE_PRESENT_FAILURES).then_some(now + PRESENT_RETRY)
+}
+
 fn large_presentation(width: u16, height: u16) -> bool {
     width > 2560 || height > 1440
 }
@@ -356,22 +366,22 @@ fn pending_presentation_deadline(
 fn copy_presentation_when_due(
     store: &SurfaceStore,
     snapshot: &mut PresentationSnapshot,
-    presented: Option<u64>,
+    presented: Option<PresentationStamp>,
     last_presented: Option<Instant>,
     now: Instant,
     fallback_dimensions: (u16, u16),
 ) -> Result<PresentationCopy, Instant> {
-    let generation = store.generation();
+    let stamp = store.presentation_stamp();
     let (width, height) = store
         .presentation_dimensions()
         .unwrap_or(fallback_dimensions);
-    if presented != Some(generation)
+    if presented != Some(stamp)
         && let Some(deadline) = pending_presentation_deadline(
             last_presented,
             now,
             width,
             height,
-            store.presentation_not_before(),
+            store.presentation_not_before(presented),
         )
     {
         return Err(deadline);
@@ -1320,8 +1330,8 @@ struct SessionApp {
     /// server never keeps a modifier the OS stole the release of. See
     /// [`input::KeyLedger`].
     keys: input::KeyLedger,
-    /// The store generation last put on screen. `None` until the first frame.
-    presented: Option<u64>,
+    /// The coherent store state last copied and successfully put on screen.
+    presented: Option<PresentationStamp>,
     failure: Option<WindowError>,
     /// Consecutive failed presents; reset by any successful one.
     present_failures: u32,
@@ -1971,7 +1981,12 @@ impl SessionApp {
     /// on a workstation host, can wedge the server. A dropped frame costs one repaint.
     fn note_present_failure(&mut self, event_loop: &ActiveEventLoop, detail: String) {
         self.present_failures = self.present_failures.saturating_add(1);
-        if self.present_failures >= MAX_CONSECUTIVE_PRESENT_FAILURES {
+        if let Some(deadline) =
+            present_failure_retry_deadline(self.present_failures, Instant::now())
+        {
+            self.redraw_deadline = Some(deadline);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        } else {
             self.fail(event_loop, WindowError::Present(detail));
         }
     }
@@ -1983,32 +1998,32 @@ impl SessionApp {
         event_loop.exit();
     }
 
-    /// Read the store's generation, surviving a poisoned lock.
+    /// Read the store's presentation stamp, surviving a poisoned lock.
     ///
     /// A panic in a decoder thread must not freeze the display: the pixels are still
     /// whatever the last complete write left, which is exactly what we want to show.
-    fn generation(&self) -> u64 {
+    fn presentation_stamp(&self) -> PresentationStamp {
         let store = self
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.generation()
+        store.presentation_stamp()
     }
 
     /// Read the generation and the dimensions of the presentation that is current in the
     /// store as one coherent, short lock. The reusable snapshot can still describe the
     /// previous frame while a new surface is waiting to be copied.
-    fn damage_state(&self) -> (u64, (u16, u16), Option<Instant>) {
+    fn damage_state(&self) -> (PresentationStamp, (u16, u16), Option<Instant>) {
         let store = self
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
-            store.generation(),
+            store.presentation_stamp(),
             store
                 .presentation_dimensions()
                 .unwrap_or((self.config.session_width, self.config.session_height)),
-            store.presentation_not_before(),
+            store.presentation_not_before(self.presented),
         )
     }
 
@@ -2018,23 +2033,23 @@ impl SessionApp {
         if self.occluded {
             return;
         }
-        let (generation, (width, height), not_before) = self.damage_state();
-        if self.presented == Some(generation) {
+        let (stamp, (width, height), not_before) = self.damage_state();
+        if self.presented == Some(stamp) {
             return;
         }
         let now = Instant::now();
         if let Some(deadline) = damage_redraw_deadline(
             self.presented,
-            generation,
+            stamp,
             self.last_presented_at,
             now,
             (width, height),
             not_before,
         ) {
-            self.redraw_deadline = Some(
-                self.redraw_deadline
-                    .map_or(deadline, |current| current.max(deadline)),
-            );
+            // This is the deadline for the latest coherent store stamp. Replace an older
+            // LC2 wake so fresh content can shorten 100 ms settling to the 33 ms canvas
+            // cadence; repeated refinements already carry their `max` in the store.
+            self.redraw_deadline = Some(deadline);
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             return;
         }
@@ -2054,7 +2069,7 @@ impl SessionApp {
         }
         self.redraw_deadline = None;
         if !self.occluded
-            && self.presented != Some(self.generation())
+            && self.presented != Some(self.presentation_stamp())
             && let Some(window) = &self.window
         {
             window.request_redraw();
@@ -2106,24 +2121,33 @@ impl SessionApp {
                 (self.config.session_width, self.config.session_height),
             )
         };
-        let blank = match copy_result {
-            Ok(PresentationCopy::Copied) => false,
-            Ok(PresentationCopy::Empty) => true,
-            // An active or aborted logical frame leaves the existing snapshot intact.
+        let (blank, acknowledge) = match copy_result {
+            Ok(PresentationCopy::Copied) => (false, true),
+            Ok(PresentationCopy::Empty) => (true, true),
+            // An active logical frame is not publishable yet. Rate-limit the state check
+            // and do no conversion or platform rendering while it remains active.
+            Ok(PresentationCopy::Pending) => {
+                let deadline = Instant::now() + PRESENT_RETRY;
+                self.redraw_deadline = Some(deadline);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                return;
+            }
+            // An aborted or suppressed logical frame leaves the existing snapshot intact.
             // If this is the first ever expose there is no snapshot to retain, so the
             // normal empty-window path still paints black until the first commit.
-            Ok(PresentationCopy::Retained) => {
+            Ok(PresentationCopy::Retained) => (
                 self.presentation.width == 0
                     || self.presentation.height == 0
-                    || self.presentation.pixels.is_empty()
-            }
+                    || self.presentation.pixels.is_empty(),
+                false,
+            ),
             Err(deadline) => {
                 self.redraw_deadline = Some(deadline);
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                 return;
             }
         };
-        let generation = self.presentation.generation;
+        let stamp = self.presentation.stamp;
         self.redraw_deadline = None;
 
         let Some(presenter) = self.presenter.as_mut() else {
@@ -2218,24 +2242,26 @@ impl SessionApp {
         // Streak counts CONSECUTIVE failures: without this reset, 30 unrelated hiccups
         // across a long session would close a perfectly healthy window.
         self.present_failures = 0;
-        self.presented = Some(generation);
+        if acknowledge {
+            self.presented = Some(stamp);
+        }
         self.last_presented_at = Some(Instant::now());
         // Close the paint→present handoff measurement for this generation.
         if let Some(stats) = &self.stats {
-            stats.update(|s| s.mark_presented(generation));
+            stats.update(|s| s.mark_presented(stamp.generation));
         }
     }
 }
 
 fn damage_redraw_deadline(
-    presented: Option<u64>,
-    generation: u64,
+    presented: Option<PresentationStamp>,
+    stamp: PresentationStamp,
     last_presented: Option<Instant>,
     now: Instant,
     dimensions: (u16, u16),
     not_before: Option<Instant>,
 ) -> Option<Instant> {
-    (presented != Some(generation)).then(|| {
+    (presented != Some(stamp)).then(|| {
         pending_presentation_deadline(last_presented, now, dimensions.0, dimensions.1, not_before)
     })?
 }
@@ -2927,6 +2953,19 @@ mod tests {
     }
 
     #[test]
+    fn transient_present_failures_retry_at_frame_cadence_until_the_fatal_threshold() {
+        let now = Instant::now();
+        assert_eq!(
+            present_failure_retry_deadline(MAX_CONSECUTIVE_PRESENT_FAILURES - 1, now),
+            Some(now + DAMAGE_PRESENT_INTERVAL)
+        );
+        assert_eq!(
+            present_failure_retry_deadline(MAX_CONSECUTIVE_PRESENT_FAILURES, now),
+            None
+        );
+    }
+
+    #[test]
     fn an_early_large_redraw_does_not_copy_the_presentation_snapshot() {
         let mut store = SurfaceStore::new();
         store.create(1, 2561, 1);
@@ -2939,14 +2978,19 @@ mod tests {
             width: 7,
             height: 9,
             pixels: vec![0xA5; 3],
-            generation: 11,
+            stamp: PresentationStamp {
+                generation: 11,
+                fresh_content_epoch: 11,
+            },
             ..PresentationSnapshot::default()
         };
         let now = Instant::now();
+        let mut stale_stamp = store.presentation_stamp();
+        stale_stamp.generation = stale_stamp.generation.wrapping_sub(1);
         let result = copy_presentation_when_due(
             &store,
             &mut snapshot,
-            Some(store.generation().wrapping_sub(1)),
+            Some(stale_stamp),
             Some(now),
             now + Duration::from_millis(1),
             (1920, 1080),
@@ -2954,7 +2998,7 @@ mod tests {
 
         assert_eq!(result, Err(now + DAMAGE_PRESENT_INTERVAL));
         assert_eq!(
-            (snapshot.width, snapshot.height, snapshot.generation),
+            (snapshot.width, snapshot.height, snapshot.stamp.generation),
             (7, 9, 11)
         );
         assert_eq!(snapshot.pixels, vec![0xA5; 3]);
@@ -2973,7 +3017,7 @@ mod tests {
             store.copy_presentation_state(&mut snapshot),
             PresentationCopy::Copied
         );
-        let presented = Some(snapshot.generation);
+        let presented = Some(snapshot.stamp);
         let now = Instant::now();
         let deadline = now + Duration::from_millis(100);
 
@@ -3002,6 +3046,133 @@ mod tests {
     }
 
     #[test]
+    fn a_coalesced_chroma_refinement_cannot_delay_unpresented_fresh_content() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        store
+            .solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED)
+            .expect("paint initial surface");
+        store.map_to_output(1);
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let presented = Some(snapshot.stamp);
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(100);
+
+        store.begin_frame(24);
+        store
+            .blit_rgba_strict(1, Rect::new(0, 0, 2, 1), &[BLUE, BLUE].concat())
+            .expect("paint fresh luma content");
+        assert!(store.commit_frame(24));
+
+        store.begin_frame(25);
+        store
+            .blit_rgba_deferred(
+                1,
+                Rect::new(0, 0, 2, 1),
+                &[GREEN, GREEN].concat(),
+                2,
+                deadline,
+            )
+            .expect("paint late chroma refinement");
+        assert!(store.commit_frame(25));
+
+        let later_deadline = now + Duration::from_millis(200);
+        store.begin_frame(26);
+        store
+            .blit_rgba_deferred(
+                1,
+                Rect::new(0, 0, 2, 1),
+                &[WHITE, WHITE].concat(),
+                2,
+                later_deadline,
+            )
+            .expect("paint another late chroma refinement");
+        assert!(store.commit_frame(26));
+
+        assert_eq!(
+            copy_presentation_when_due(&store, &mut snapshot, presented, None, now, (2, 1),),
+            Ok(PresentationCopy::Copied),
+            "a later chroma refinement must not hide fresh content that was never presented"
+        );
+        assert_eq!(
+            snapshot.pixels,
+            [WHITE, WHITE].concat(),
+            "the immediate present should still use the latest refined pixels"
+        );
+
+        let presented = Some(snapshot.stamp);
+        let final_deadline = now + Duration::from_millis(300);
+        store.begin_frame(27);
+        store
+            .blit_rgba_deferred(
+                1,
+                Rect::new(0, 0, 2, 1),
+                &[GREEN, GREEN].concat(),
+                2,
+                final_deadline,
+            )
+            .expect("paint refinement after successful presentation");
+        assert!(store.commit_frame(27));
+        assert_eq!(
+            copy_presentation_when_due(&store, &mut snapshot, presented, None, now, (2, 1),),
+            Err(final_deadline),
+            "quality-only work should settle again after the fresh epoch is presented"
+        );
+    }
+
+    #[test]
+    fn fresh_content_bypasses_chroma_settling_but_keeps_large_canvas_cadence() {
+        let mut store = SurfaceStore::new();
+        assert!(store.set_graphics_output_size(5120, 2880));
+        store.create(1, 2, 1);
+        store
+            .solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED)
+            .expect("paint initial surface");
+        store.map_to_output(1);
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let presented = Some(snapshot.stamp);
+        let now = Instant::now();
+
+        store.begin_frame(28);
+        store
+            .blit_rgba_strict(1, Rect::new(0, 0, 2, 1), &[BLUE, BLUE].concat())
+            .expect("paint fresh picture");
+        assert!(store.commit_frame(28));
+        store.begin_frame(29);
+        store
+            .blit_rgba_deferred(
+                1,
+                Rect::new(0, 0, 2, 1),
+                &[GREEN, GREEN].concat(),
+                2,
+                now + Duration::from_millis(100),
+            )
+            .expect("paint chroma refinement");
+        assert!(store.commit_frame(29));
+
+        assert_eq!(
+            copy_presentation_when_due(
+                &store,
+                &mut snapshot,
+                presented,
+                Some(now),
+                now + Duration::from_millis(1),
+                (1920, 1080),
+            ),
+            Err(now + DAMAGE_PRESENT_INTERVAL),
+            "freshness removes only the 100 ms refinement term"
+        );
+    }
+
+    #[test]
     fn damage_cadence_uses_current_dimensions_after_a_large_snapshot() {
         let store = Arc::new(Mutex::new(SurfaceStore::new()));
         {
@@ -3022,12 +3193,14 @@ mod tests {
         app.presentation.width = 5120;
         app.presentation.height = 2880;
 
-        let (generation, dimensions, not_before) = app.damage_state();
+        let (stamp, dimensions, not_before) = app.damage_state();
         let now = Instant::now();
+        let mut stale_stamp = stamp;
+        stale_stamp.generation = stale_stamp.generation.wrapping_sub(1);
         assert_eq!(
             damage_redraw_deadline(
-                Some(generation.wrapping_sub(1)),
-                generation,
+                Some(stale_stamp),
+                stamp,
                 Some(now),
                 now + Duration::from_millis(1),
                 dimensions,
@@ -3039,7 +3212,7 @@ mod tests {
     }
 
     #[test]
-    fn an_expose_during_a_frame_retains_the_last_snapshot() {
+    fn an_expose_during_a_frame_defers_the_snapshot_copy() {
         let mut store = SurfaceStore::new();
         store.create(1, 2, 1);
         store
@@ -3053,6 +3226,7 @@ mod tests {
             PresentationCopy::Copied
         );
         let generation = store.generation();
+        let presented = store.presentation_stamp();
 
         store.begin_frame(17);
         store
@@ -3063,14 +3237,14 @@ mod tests {
         let result = copy_presentation_when_due(
             &store,
             &mut snapshot,
-            Some(generation),
+            Some(presented),
             None,
             Instant::now(),
             (2, 1),
         );
-        assert_eq!(result, Ok(PresentationCopy::Retained));
+        assert_eq!(result, Ok(PresentationCopy::Pending));
         assert_eq!(snapshot.pixels, [RED, RED].concat());
-        assert_eq!(snapshot.generation, generation);
+        assert_eq!(snapshot.stamp.generation, generation);
     }
 
     #[test]

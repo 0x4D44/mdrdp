@@ -644,6 +644,9 @@ pub struct SurfaceStore {
     /// Earliest time the latest committed generation should be copied by the presenter.
     presentation_not_before: Option<Instant>,
     generation: u64,
+    /// Bumped only by an immediate visible commit. Deferred chroma refinements retain the
+    /// epoch so they cannot erase an unacknowledged fresh-picture transition.
+    fresh_content_epoch: u64,
     /// Cache effectiveness, counted where the cache is actually used. Counting it here
     /// rather than in the EGFX handler means it measures what reached the pixels, not
     /// what the protocol asked for.
@@ -660,14 +663,22 @@ enum FrameState {
 
 /// Result of asking the store to refresh a reusable presentation snapshot.
 ///
-/// `Retained` is distinct from `Empty`: a frame transaction is in progress (or was
-/// aborted), so the caller must keep presenting its existing snapshot rather than turn
-/// the window black because the in-place surface is not yet publishable.
+/// `Pending` means an active transaction may become publishable and should be checked
+/// again. `Retained` means aborted or suppressed state is intentionally keeping the last
+/// snapshot; unlike `Empty`, neither result turns the window black.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PresentationCopy {
     Copied,
+    Pending,
     Retained,
     Empty,
+}
+
+/// Producer state that identifies one coherent presentation candidate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PresentationStamp {
+    pub(crate) generation: u64,
+    pub(crate) fresh_content_epoch: u64,
 }
 
 /// A complete, immutable presentation copy of the surface currently mapped to output.
@@ -683,7 +694,7 @@ pub(crate) struct PresentationSnapshot {
     pub(crate) pixel_height: u16,
     pub(crate) mapping: PresentationMapping,
     pub(crate) pixels: Vec<u8>,
-    pub(crate) generation: u64,
+    pub(crate) stamp: PresentationStamp,
 }
 
 impl SurfaceStore {
@@ -703,8 +714,23 @@ impl SurfaceStore {
         self.generation
     }
 
-    pub(crate) fn presentation_not_before(&self) -> Option<Instant> {
-        self.presentation_not_before
+    pub(crate) fn presentation_stamp(&self) -> PresentationStamp {
+        PresentationStamp {
+            generation: self.generation,
+            fresh_content_epoch: self.fresh_content_epoch,
+        }
+    }
+
+    /// Return the quality-only settle deadline only after this fresh-content epoch has
+    /// reached the platform. A later refinement cannot hide an unpresented picture.
+    pub(crate) fn presentation_not_before(
+        &self,
+        presented: Option<PresentationStamp>,
+    ) -> Option<Instant> {
+        presented
+            .is_some_and(|stamp| stamp.fresh_content_epoch == self.fresh_content_epoch)
+            .then_some(self.presentation_not_before)
+            .flatten()
     }
 
     pub(crate) fn release_presentation_delay(&mut self) {
@@ -714,6 +740,7 @@ impl SurfaceStore {
     fn touch_presentation(&mut self) {
         self.presentation_not_before = None;
         self.generation = self.generation.wrapping_add(1);
+        self.fresh_content_epoch = self.fresh_content_epoch.wrapping_add(1);
     }
 
     fn touch_presentation_deferred(&mut self, not_before: Instant) {
@@ -1128,17 +1155,19 @@ impl SurfaceStore {
 
     /// Copy the current presentation surface into a reusable snapshot.
     ///
-    /// The dimensions, pixels, and generation are read under the caller's store lock,
-    /// making them one coherent view. A `Retained` result means an active or aborted frame
-    /// still owns the store; the snapshot is intentionally left untouched.
+    /// The dimensions, pixels, and stamp are read under the caller's store lock, making
+    /// them one coherent view. `Pending` and `Retained` leave the snapshot untouched.
     pub(crate) fn copy_presentation_state(
         &self,
         snapshot: &mut PresentationSnapshot,
     ) -> PresentationCopy {
-        if self.presentation_suppressed || !matches!(self.frame_state, FrameState::Idle) {
+        if matches!(self.frame_state, FrameState::Active(_)) {
+            return PresentationCopy::Pending;
+        }
+        if self.presentation_suppressed || matches!(self.frame_state, FrameState::Aborted) {
             return PresentationCopy::Retained;
         }
-        snapshot.generation = self.generation;
+        snapshot.stamp = self.presentation_stamp();
         let Some((surface, mapping)) = self.presentation_frame() else {
             snapshot.width = 0;
             snapshot.height = 0;
@@ -2006,7 +2035,7 @@ mod tests {
         );
         let mut after = PresentationSnapshot::default();
         assert!(store.copy_presentation(&mut after));
-        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.stamp, before.stamp);
         assert_eq!(after.pixels, before.pixels);
     }
 
@@ -2080,12 +2109,12 @@ mod tests {
         assert_eq!(snapshot.width, 2);
         assert_eq!(snapshot.height, 1);
         assert_eq!(snapshot.pixels, solid(2, 1, RED));
-        assert_eq!(snapshot.generation, expected_generation);
+        assert_eq!(snapshot.stamp.generation, expected_generation);
 
         store
             .blit_rgba_strict(1, Rect::new(1, 0, 2, 1), &solid(1, 1, BLUE))
             .unwrap();
-        assert_ne!(store.generation(), snapshot.generation);
+        assert_ne!(store.generation(), snapshot.stamp.generation);
         assert_eq!(
             snapshot.pixels,
             solid(2, 1, RED),
@@ -2097,7 +2126,7 @@ mod tests {
             PresentationCopy::Copied
         );
         assert_eq!(snapshot.pixels, [RED, BLUE].concat());
-        assert_eq!(snapshot.generation, store.generation());
+        assert_eq!(snapshot.stamp, store.presentation_stamp());
     }
 
     #[test]
@@ -2121,7 +2150,7 @@ mod tests {
         assert_eq!(store.generation(), before);
         assert_eq!(
             store.copy_presentation_state(&mut snapshot),
-            PresentationCopy::Retained
+            PresentationCopy::Pending
         );
         assert_eq!(snapshot.pixels, solid(2, 1, RED));
 
@@ -2131,7 +2160,7 @@ mod tests {
         assert_eq!(store.generation(), before);
         assert_eq!(
             store.copy_presentation_state(&mut snapshot),
-            PresentationCopy::Retained
+            PresentationCopy::Pending
         );
         assert!(store.commit_frame(7));
         assert_eq!(store.generation(), before + 1);
@@ -2148,6 +2177,7 @@ mod tests {
         store.create(1, 2, 1);
         store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
         store.map_to_output(1);
+        let presented = store.presentation_stamp();
         let before = store.generation();
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
 
@@ -2158,7 +2188,10 @@ mod tests {
         assert!(store.commit_frame(8));
 
         assert_eq!(store.generation(), before + 1);
-        assert_eq!(store.presentation_not_before(), Some(deadline));
+        assert_eq!(
+            store.presentation_not_before(Some(presented)),
+            Some(deadline)
+        );
     }
 
     #[test]
@@ -2167,6 +2200,7 @@ mod tests {
         store.create(1, 2, 1);
         store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
         store.map_to_output(1);
+        let presented = store.presentation_stamp();
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
 
         store.begin_frame(8);
@@ -2174,14 +2208,17 @@ mod tests {
             .blit_rgba_deferred(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2, deadline)
             .unwrap();
         assert!(store.commit_frame(8));
-        assert_eq!(store.presentation_not_before(), Some(deadline));
+        assert_eq!(
+            store.presentation_not_before(Some(presented)),
+            Some(deadline)
+        );
 
         store.begin_frame(9);
         store
             .blit_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, RED), 2)
             .unwrap();
         assert!(store.commit_frame(9));
-        assert_eq!(store.presentation_not_before(), None);
+        assert_eq!(store.presentation_not_before(Some(presented)), None);
     }
 
     #[test]
@@ -2190,6 +2227,7 @@ mod tests {
         store.create(1, 2, 1);
         store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
         store.map_to_output(1);
+        let presented = store.presentation_stamp();
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
 
         store.begin_frame(10);
@@ -2201,7 +2239,7 @@ mod tests {
 
         store.release_presentation_delay();
 
-        assert_eq!(store.presentation_not_before(), None);
+        assert_eq!(store.presentation_not_before(Some(presented)), None);
         assert_eq!(store.generation(), generation);
     }
 
@@ -2211,6 +2249,7 @@ mod tests {
         store.create(1, 2, 1);
         store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
         store.map_to_output(1);
+        let presented = store.presentation_stamp();
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
 
         store.begin_frame(11);
@@ -2222,7 +2261,7 @@ mod tests {
             .unwrap();
         assert!(store.commit_frame(11));
 
-        assert_eq!(store.presentation_not_before(), None);
+        assert_eq!(store.presentation_not_before(Some(presented)), None);
     }
 
     #[test]
@@ -2471,7 +2510,7 @@ mod tests {
         assert_eq!(store.generation(), before);
         assert_eq!(
             store.copy_presentation_state(&mut snapshot),
-            PresentationCopy::Retained
+            PresentationCopy::Pending
         );
         assert_eq!(snapshot.pixels, solid(2, 1, RED));
 
@@ -2680,7 +2719,7 @@ mod tests {
         assert_eq!(store.generation(), before);
         assert_eq!(
             store.copy_presentation_state(&mut snapshot),
-            PresentationCopy::Retained
+            PresentationCopy::Pending
         );
 
         assert!(store.commit_frame(7));

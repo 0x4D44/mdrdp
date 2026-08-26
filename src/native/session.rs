@@ -4268,7 +4268,7 @@ mod tests {
         let guard = store.lock().unwrap();
         assert_eq!(guard.generation(), before);
         assert!(guard.copy_presentation(&mut snapshot));
-        assert_eq!(snapshot.generation, before);
+        assert_eq!(snapshot.stamp.generation, before);
         assert_eq!(snapshot.pixels, vec![7; 32]);
     }
 
