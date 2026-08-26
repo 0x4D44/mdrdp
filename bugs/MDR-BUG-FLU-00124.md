@@ -6,15 +6,15 @@
 - **Area:** graphics/presentation
 - **Raised:** 2026-08-26T13:20:26Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20260826T132111Z-fdc36f77
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00124-run-fix-20260826T132111Z-fdc36f77
+- **Owner base:** 0fcd31139209df0f890f951400b74223d900ae9f
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-08-26T13:21:11Z
+- **Owner until:** 2026-08-26T15:21:11Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
