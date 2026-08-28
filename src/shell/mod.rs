@@ -550,6 +550,9 @@ impl LauncherApp {
                 Some(menus::MenuAction::CopyAvc444Script) => {
                     ctx.copy_text(crate::hostscripts::ENABLE_AVC444.to_owned());
                 }
+                Some(menus::MenuAction::CopyClearCodecScript) => {
+                    ctx.copy_text(crate::hostscripts::RESET_CLEARCODEC.to_owned());
+                }
                 Some(menus::MenuAction::Copy60FpsScript) => {
                     ctx.copy_text(crate::hostscripts::ENABLE_60FPS.to_owned());
                 }
@@ -1299,6 +1302,7 @@ mod menus {
         Remove,
         CopyCommandLine,
         CopyAvc444Script,
+        CopyClearCodecScript,
         Copy60FpsScript,
         CopySshSetupScript,
         CloseWindow,
@@ -1369,6 +1373,10 @@ mod menus {
             let remove = item("Remove…", MenuAction::Remove);
             let copy_cli = item("Copy command line", MenuAction::CopyCommandLine);
             let copy_avc444 = item("Copy AVC444 enable script", MenuAction::CopyAvc444Script);
+            let copy_clearcodec = item(
+                "Copy ClearCodec reset script",
+                MenuAction::CopyClearCodecScript,
+            );
             let copy_60fps = item("Copy 60 fps enable script", MenuAction::Copy60FpsScript);
             let copy_ssh = item("Copy SSH setup script", MenuAction::CopySshSetupScript);
             let _ = connection.append_items(&[
@@ -1379,6 +1387,7 @@ mod menus {
                 &PredefinedMenuItem::separator(),
                 &copy_cli,
                 &copy_avc444,
+                &copy_clearcodec,
                 &copy_60fps,
                 &copy_ssh,
             ]);

@@ -1658,6 +1658,13 @@ impl SessionApp {
                     eprintln!("could not copy the AVC444 script: {e}");
                 }
             }
+            session_menu::COPY_CLEARCODEC => {
+                let copied = arboard::Clipboard::new()
+                    .and_then(|mut c| c.set_text(crate::hostscripts::RESET_CLEARCODEC));
+                if let Err(e) = copied {
+                    eprintln!("could not copy the ClearCodec reset script: {e}");
+                }
+            }
             session_menu::COPY_60FPS => {
                 let copied = arboard::Clipboard::new()
                     .and_then(|mut c| c.set_text(crate::hostscripts::ENABLE_60FPS));
@@ -2715,6 +2722,7 @@ mod session_menu {
 
     pub const DISCONNECT: &str = "session.disconnect";
     pub const COPY_AVC444: &str = "session.copy_avc444_script";
+    pub const COPY_CLEARCODEC: &str = "session.copy_clearcodec_script";
     pub const COPY_60FPS: &str = "session.copy_60fps_script";
     pub const COPY_SSH_SETUP: &str = "session.copy_ssh_setup_script";
     pub const FULLSCREEN: &str = "view.fullscreen";
@@ -2773,6 +2781,7 @@ mod session_menu {
         let session = Submenu::new("Session", true);
         let _ = session.append_items(&[
             &MenuItem::with_id(COPY_AVC444, "Copy AVC444 enable script", true, None),
+            &MenuItem::with_id(COPY_CLEARCODEC, "Copy ClearCodec reset script", true, None),
             &MenuItem::with_id(COPY_60FPS, "Copy 60 fps enable script", true, None),
             &MenuItem::with_id(COPY_SSH_SETUP, "Copy SSH setup script", true, None),
             &PredefinedMenuItem::separator(),

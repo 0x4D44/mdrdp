@@ -25,6 +25,21 @@ $cmd = "New-Item -Path '$k' -Force | Out-Null; " +
 Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-NoExit','-Command',$cmd
 "#;
 
+/// Restores the Windows RDP host's default ClearCodec/RFX graphics path.
+///
+/// Removes the two policy values written by [`ENABLE_AVC444`], returning both
+/// policies to Not Configured, then refreshes policy. Only new connections pick
+/// up the change.
+pub const RESET_CLEARCODEC: &str = r#"# mdrdp: restore ClearCodec/RFX for RDP on this host (run on the REMOTE host).
+# Paste into any PowerShell window; it re-launches itself elevated (one UAC
+# prompt). Applies to NEW connections - reconnect after it finishes.
+$k = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+$cmd = "Remove-ItemProperty -Path '$k' -Name AVC444ModePreferred -ErrorAction SilentlyContinue; " +
+       "Remove-ItemProperty -Path '$k' -Name AVCHardwareEncodePreferred -ErrorAction SilentlyContinue; " +
+       "gpupdate /force"
+Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-NoExit','-Command',$cmd
+"#;
+
 /// Raises the host's RDP frame-rate cap from the ~30 fps default to 60 fps.
 ///
 /// Sets `DWMFRAMEINTERVAL` under the Terminal Server WinStations key. Measured on
@@ -125,6 +140,7 @@ mod tests {
         let setup_ssh = setup_ssh(SAMPLE_KEY);
         for (name, script) in [
             ("ENABLE_AVC444", ENABLE_AVC444),
+            ("RESET_CLEARCODEC", RESET_CLEARCODEC),
             ("ENABLE_60FPS", ENABLE_60FPS),
             ("setup_ssh", setup_ssh.as_str()),
         ] {
@@ -142,6 +158,18 @@ mod tests {
             );
             assert!(script.is_ascii(), "{name} must survive any clipboard hop");
         }
+    }
+
+    #[test]
+    fn the_clearcodec_reset_removes_both_avc_policy_values() {
+        assert!(RESET_CLEARCODEC.contains("Remove-ItemProperty"));
+        assert!(RESET_CLEARCODEC.contains("AVC444ModePreferred"));
+        assert!(RESET_CLEARCODEC.contains("AVCHardwareEncodePreferred"));
+        assert!(RESET_CLEARCODEC.contains("gpupdate /force"));
+        assert!(
+            !RESET_CLEARCODEC.contains("Set-ItemProperty"),
+            "resetting means restoring both policies to Not Configured"
+        );
     }
 
     #[test]
