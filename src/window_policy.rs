@@ -62,6 +62,69 @@ pub const SETTLE_MS: u64 = 2_000;
 /// How many times we will re-assert the geometry before accepting the system's answer.
 pub const MAX_RESTORES: u32 = 3;
 
+/// A monitor change must settle together with its window before we resize the session.
+/// `T` is a snapshot of monitor identity, dimensions, and scale, supplied by the platform.
+pub(crate) struct DisplayFollow<T> {
+    baseline: Option<T>,
+    candidate: Option<(T, Geometry, u64)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DisplayVerdict {
+    Unchanged,
+    Settling,
+    Changed,
+}
+
+impl<T: PartialEq> DisplayFollow<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            baseline: None,
+            candidate: None,
+        }
+    }
+
+    pub(crate) fn pending(&self) -> bool {
+        self.candidate.is_some()
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        monitor: Option<T>,
+        geometry: Geometry,
+        visible: bool,
+        now_ms: u64,
+    ) -> DisplayVerdict {
+        let Some(monitor) =
+            monitor.filter(|_| visible && geometry.width > 0 && geometry.height > 0)
+        else {
+            self.candidate = None;
+            return DisplayVerdict::Unchanged;
+        };
+        let Some(baseline) = &self.baseline else {
+            self.baseline = Some(monitor);
+            return DisplayVerdict::Unchanged;
+        };
+        if *baseline == monitor {
+            self.candidate = None;
+            return DisplayVerdict::Unchanged;
+        }
+        if let Some((candidate, size, since)) = &self.candidate
+            && *candidate == monitor
+            && *size == geometry
+        {
+            if now_ms.saturating_sub(*since) >= SETTLE_MS {
+                self.baseline = Some(monitor);
+                self.candidate = None;
+                return DisplayVerdict::Changed;
+            }
+        } else {
+            self.candidate = Some((monitor, geometry, now_ms));
+        }
+        DisplayVerdict::Settling
+    }
+}
+
 /// What a resize event turned out to be, once read in context.
 ///
 /// The caller needs more than "argue or not": a resize judged to be the user's own act
@@ -405,5 +468,176 @@ mod tests {
         p.note_occluded(false, 1_200);
         // Now visible: the reveal is the display event, so this shrink is suspect.
         assert_eq!(p.on_resize(SMALL, 1_250, None), ResizeVerdict::Restore(BIG));
+    }
+
+    type FakeMonitor = (u32, u32, u32, u32);
+
+    const MONITOR_GEOMETRY: Geometry = Geometry {
+        width: 1920,
+        height: 1080,
+    };
+    const MONITOR_A: FakeMonitor = (1, 1920, 1080, 100);
+
+    fn settled_monitor_change(from: FakeMonitor, to: FakeMonitor) {
+        let mut follow = DisplayFollow::new();
+        assert_eq!(
+            follow.observe(Some(from), MONITOR_GEOMETRY, true, 0),
+            DisplayVerdict::Unchanged,
+            "the first monitor observation seeds the baseline"
+        );
+        assert_eq!(
+            follow.observe(Some(to), MONITOR_GEOMETRY, true, 1),
+            DisplayVerdict::Settling,
+            "a changed monitor must debounce before adapting"
+        );
+        assert!(follow.pending());
+        assert_eq!(
+            follow.observe(Some(to), MONITOR_GEOMETRY, true, SETTLE_MS + 1),
+            DisplayVerdict::Changed,
+            "a stable changed monitor emits one adaptation"
+        );
+        assert!(!follow.pending());
+        assert_eq!(
+            follow.observe(Some(to), MONITOR_GEOMETRY, true, SETTLE_MS + 2),
+            DisplayVerdict::Unchanged,
+            "the settled monitor cannot emit duplicate adaptations"
+        );
+    }
+
+    #[test]
+    fn display_follow_seeds_initial_monitor_and_ignores_an_unchanged_snapshot() {
+        let mut follow = DisplayFollow::new();
+        assert_eq!(
+            follow.observe(Some(MONITOR_A), MONITOR_GEOMETRY, true, 0),
+            DisplayVerdict::Unchanged
+        );
+        assert!(!follow.pending());
+        assert_eq!(
+            follow.observe(Some(MONITOR_A), MONITOR_GEOMETRY, true, SETTLE_MS + 1),
+            DisplayVerdict::Unchanged,
+            "same identity, physical dimensions, and scale need no request"
+        );
+        assert!(!follow.pending());
+    }
+
+    #[test]
+    fn display_follow_detects_identity_dimension_and_scale_changes() {
+        // Keep each field distinct: an implementation comparing only dimensions or scale
+        // must fail at least one of these swaps.
+        settled_monitor_change(MONITOR_A, (2, 1920, 1080, 100));
+        settled_monitor_change(MONITOR_A, (1, 2560, 1440, 100));
+        settled_monitor_change(MONITOR_A, (1, 1920, 1080, 200));
+    }
+
+    #[test]
+    fn display_follow_resets_settle_delay_when_window_geometry_moves() {
+        let mut follow = DisplayFollow::new();
+        let monitor_b = (2, 2560, 1440, 100);
+        let first_geometry = Geometry::new(1600, 900);
+        let second_geometry = Geometry::new(1920, 1080);
+        assert_eq!(
+            follow.observe(Some(MONITOR_A), first_geometry, true, 0),
+            DisplayVerdict::Unchanged
+        );
+        assert_eq!(
+            follow.observe(Some(monitor_b), first_geometry, true, 0),
+            DisplayVerdict::Settling
+        );
+        // The monitor remains different, but its window geometry changed at the edge of
+        // the original deadline. The settle clock must start over from this observation.
+        assert_eq!(
+            follow.observe(
+                Some(monitor_b),
+                second_geometry,
+                true,
+                SETTLE_MS.saturating_sub(1)
+            ),
+            DisplayVerdict::Settling
+        );
+        assert!(follow.pending());
+        assert_eq!(
+            follow.observe(Some(monitor_b), second_geometry, true, SETTLE_MS),
+            DisplayVerdict::Settling,
+            "the old candidate deadline must not leak through a window resize"
+        );
+        assert_eq!(
+            follow.observe(
+                Some(monitor_b),
+                second_geometry,
+                true,
+                SETTLE_MS.saturating_add(SETTLE_MS)
+            ),
+            DisplayVerdict::Changed
+        );
+    }
+
+    #[test]
+    fn display_follow_defers_hidden_missing_and_zero_sized_observations() {
+        let monitor_b = (2, 2560, 1440, 100);
+        for (monitor, geometry, visible) in [
+            (Some(monitor_b), MONITOR_GEOMETRY, false),
+            (None, MONITOR_GEOMETRY, true),
+            (Some(monitor_b), Geometry::new(0, 1080), true),
+            (Some(monitor_b), Geometry::new(1920, 0), true),
+        ] {
+            let mut follow = DisplayFollow::new();
+            assert_eq!(
+                follow.observe(Some(MONITOR_A), MONITOR_GEOMETRY, true, 0),
+                DisplayVerdict::Unchanged
+            );
+            assert_eq!(
+                follow.observe(monitor, geometry, visible, SETTLE_MS + 1),
+                DisplayVerdict::Unchanged,
+                "invalid or hidden observations must not request adaptation"
+            );
+            assert!(!follow.pending());
+            assert_eq!(
+                follow.observe(Some(monitor_b), MONITOR_GEOMETRY, true, SETTLE_MS + 2),
+                DisplayVerdict::Settling,
+                "a valid visible observation starts a fresh settle window"
+            );
+        }
+    }
+
+    #[test]
+    fn display_follow_does_not_adapt_when_sleep_reveal_returns_to_same_monitor() {
+        let mut follow = DisplayFollow::new();
+        assert_eq!(
+            follow.observe(Some(MONITOR_A), MONITOR_GEOMETRY, true, 0),
+            DisplayVerdict::Unchanged
+        );
+        // A sleeping display can make current_monitor unavailable. Keep the stable
+        // baseline so its later reveal is not mistaken for a dock transition.
+        assert_eq!(
+            follow.observe(None, MONITOR_GEOMETRY, false, SETTLE_MS + 1),
+            DisplayVerdict::Unchanged
+        );
+        assert_eq!(
+            follow.observe(Some(MONITOR_A), MONITOR_GEOMETRY, true, SETTLE_MS + 2),
+            DisplayVerdict::Unchanged,
+            "same monitor after reveal must preserve geometry without a resolution request"
+        );
+        assert!(!follow.pending());
+    }
+
+    #[test]
+    fn display_follow_cancels_a_candidate_when_the_baseline_returns() {
+        let mut follow = DisplayFollow::new();
+        let monitor_b = (2, 2560, 1440, 100);
+        assert_eq!(
+            follow.observe(Some(MONITOR_A), MONITOR_GEOMETRY, true, 0),
+            DisplayVerdict::Unchanged
+        );
+        assert_eq!(
+            follow.observe(Some(monitor_b), MONITOR_GEOMETRY, true, 1),
+            DisplayVerdict::Settling
+        );
+        assert!(follow.pending());
+        assert_eq!(
+            follow.observe(Some(MONITOR_A), MONITOR_GEOMETRY, true, SETTLE_MS + 1),
+            DisplayVerdict::Unchanged,
+            "a transient candidate must not replace the stable monitor"
+        );
+        assert!(!follow.pending());
     }
 }

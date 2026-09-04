@@ -2,20 +2,15 @@
 //!
 //! Three decisions worth stating up front, because each is load-bearing:
 //!
-//! - **Only the user resizes the session.** `CLAUDE.md` is explicit: a
-//!   display-configuration change must never reflow the remote desktop. Every `Resized`
-//!   event first changes only the [`Viewport`] — the letterboxed rectangle the session
-//!   image is scaled into — and is then read by the [`WindowPolicy`], the one component
-//!   able to tell the user dragging from the system rearranging. A resize the policy
-//!   judges to be the user's own act renegotiates the session resolution to match, after
-//!   a settle delay so a drag costs one renegotiation, not a stream of them. A system
-//!   imposition is argued with (the geometry is requested back) and never reaches the
-//!   protocol. Fullscreen toggles renegotiate directly — they are user acts by
-//!   construction.
+//! - **Follow settled monitor changes and user resizes.** Dock/undock changes are
+//!   detected from monitor identity, dimensions, and scale. Once the display and window
+//!   settle, the session follows. Sleep/reveal on the same monitor still goes through
+//!   [`WindowPolicy`] to protect the user's chosen geometry.
 //! - **Redraw is driven by change, not by a clock.** [`SurfaceStore::generation`] exists
 //!   precisely so the presenter can tell "changed" from "unchanged". A producer nudges
 //!   the loop with [`Waker::damaged`]; if the generation has not moved we do not even ask
-//!   for a redraw. The event loop otherwise sits in `ControlFlow::Wait` and burns nothing.
+//!   for a redraw. A low-frequency monitor check also catches display swaps with no
+//!   resize or scale event; it never redraws an unchanged desktop.
 //! - **Input leaves through a channel.** The window builds `crate::input::InputEvent`
 //!   values and sends them. It never sees a PDU, a socket, or a credential.
 //!
@@ -46,7 +41,7 @@ use crate::surface::{
     PresentationCopy, PresentationMapping, PresentationSnapshot, PresentationStamp, SurfaceStore,
 };
 use crate::ui::font;
-use crate::window_policy::{Geometry, ResizeVerdict, WindowPolicy};
+use crate::window_policy::{DisplayFollow, DisplayVerdict, Geometry, ResizeVerdict, WindowPolicy};
 
 /// What the caller must decide before a window exists.
 #[derive(Debug, Clone)]
@@ -66,7 +61,7 @@ pub struct WindowConfig {
     pub negotiate_native_on_start: bool,
     /// Show the stats overlay from the first frame (Settings ▸ Diagnostics).
     pub overlay_on_start: bool,
-    /// Allow fullscreen transitions to renegotiate the session resolution
+    /// Allow user resizes and settled monitor changes to renegotiate the session resolution
     /// (Settings ▸ Graphics ▸ Dynamic resolution). Off = letterbox only, ever.
     pub dynamic_resolution: bool,
     /// On a monitor past the H.264 encoder ceiling, fullscreen asks for an integer
@@ -111,7 +106,7 @@ impl WindowConfig {
         self
     }
 
-    /// Permit or forbid resolution renegotiation on fullscreen transitions.
+    /// Permit or forbid resolution renegotiation, including monitor changes.
     pub fn with_dynamic_resolution(mut self, on: bool) -> Self {
         self.dynamic_resolution = on;
         self
@@ -153,6 +148,12 @@ const MAX_CONSECUTIVE_PRESENT_FAILURES: u32 = 30;
 /// Deactivate All round, an encoder re-init, and (EGFX state dying with the surface) a
 /// decoder re-init here — so exactly one is sent, once the size has stopped moving.
 const RESIZE_FOLLOW_SETTLE: Duration = Duration::from_millis(500);
+
+const MONITOR_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+// Capture values: a retained MonitorHandle queries live size/scale and is not itself
+// a snapshot. Handle equality distinguishes different displays with identical modes.
+type MonitorSnapshot = (winit::monitor::MonitorHandle, PhysicalSize<u32>, u64);
 
 /// How often the title-bar diagnostics refresh.
 ///
@@ -1377,6 +1378,8 @@ struct SessionApp {
     /// and cancelled by anything that says otherwise (a display event, a restore, a
     /// fullscreen transition).
     resize_settle: Option<Instant>,
+    display_follow: DisplayFollow<MonitorSnapshot>,
+    monitor_check: Option<Instant>,
     /// Title diagnostics bookkeeping: last refresh, and the counters at that refresh so
     /// fps and bitrate are deltas rather than lifetime averages.
     last_title_refresh: Instant,
@@ -1476,6 +1479,8 @@ impl SessionApp {
             fullscreen_state: Arc::new(AtomicBool::new(fullscreen)),
             windowed_session,
             resize_settle: None,
+            display_follow: DisplayFollow::new(),
+            monitor_check: None,
             last_title_refresh: Instant::now(),
             title_frames: 0,
             title_bytes: 0,
@@ -1787,11 +1792,8 @@ impl SessionApp {
 
     /// Enter or leave fullscreen, renegotiating the session resolution to match.
     ///
-    /// This is the *only* place the session resolution follows the display, and it runs
-    /// solely on the user's say-so — the hotkey, the startup restore of a fullscreen
-    /// close, or the OS fullscreen button. A display-configuration change never lands
-    /// here; those keep going through the geometry policy, which never touches the
-    /// session (see the module note and CLAUDE.md).
+    /// Explicit transitions request immediately; dock/undock changes use the settled
+    /// monitor path below.
     fn set_fullscreen_mode(&mut self, on: bool) {
         let Some(window) = self.window.clone() else {
             return;
@@ -1899,6 +1901,79 @@ impl SessionApp {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// Returns true while display adaptation owns geometry, or it is unusable.
+    fn observe_display(&mut self) -> bool {
+        if !self.config.dynamic_resolution || !self.config.follow_window_resize {
+            self.monitor_check = None;
+            return false;
+        }
+        let Some(window) = self.window.clone() else {
+            return false;
+        };
+        let now = Instant::now();
+        self.monitor_check = Some(now + MONITOR_CHECK_INTERVAL);
+        let monitor = window.current_monitor().and_then(|monitor| {
+            let size = monitor.size();
+            let scale = monitor.scale_factor();
+            (size.width > 0 && size.height > 0 && scale.is_finite() && scale > 0.0).then_some((
+                monitor,
+                size,
+                scale.to_bits(),
+            ))
+        });
+        let size = window.inner_size();
+        let geometry = Geometry::new(size.width, size.height);
+        let usable = monitor.is_some()
+            && !self.occluded
+            && !window.is_minimized().unwrap_or(false)
+            && size.width > 0
+            && size.height > 0;
+        let verdict = self
+            .display_follow
+            .observe(monitor, geometry, usable, self.now_ms());
+        if !usable {
+            self.resize_settle = None;
+            return true;
+        }
+        match verdict {
+            DisplayVerdict::Unchanged => false,
+            DisplayVerdict::Settling => {
+                self.resize_settle = None;
+                true
+            }
+            DisplayVerdict::Changed => {
+                self.resize_settle = None;
+                if self.fullscreen {
+                    self.request_native_resolution(&window);
+                } else {
+                    // The dock transition's final geometry becomes the new windowed
+                    // intent, so a later reveal cannot restore the old display's size.
+                    self.policy = WindowPolicy::new(geometry);
+                    self.follow_current_window_size();
+                }
+                true
+            }
+        }
+    }
+
+    fn arm_timed_work(&self, event_loop: &ActiveEventLoop) {
+        let diag_active =
+            !self.aux.is_empty() || !self.toasts.is_empty() || self.repaint_awaited.is_some();
+        let next = [
+            diag_active.then(|| self.last_diag_refresh + DIAG_REFRESH),
+            self.resize_settle,
+            self.redraw_deadline,
+            self.monitor_check,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        event_loop.set_control_flow(match next {
+            Some(deadline) => ControlFlow::WaitUntil(deadline),
+            None => ControlFlow::Wait,
+        });
+    }
+
     /// Consult the geometry policy about a size: ask it back if the system chose it,
     /// arm the resolution-follow timer if the user did.
     ///
@@ -1957,9 +2032,13 @@ impl SessionApp {
         self.resize_settle = None;
         // Belt and braces: transitions cancel the timer, but a fullscreen window's size
         // is the monitor's, never a drag's.
-        if self.fullscreen {
+        if self.fullscreen || self.occluded || self.display_follow.pending() {
             return;
         }
+        self.follow_current_window_size();
+    }
+
+    fn follow_current_window_size(&mut self) {
         let Some(window) = &self.window else {
             return;
         };
@@ -2368,6 +2447,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         self.window = Some(window.clone());
         self.presenter = Some(presenter);
         self.menu = Some(session_menu::install(&window));
+        self.observe_display();
 
         // Scripted runs cannot click a native menu, so `MDRDP_OPEN_DIAG=cache,latency,
         // channels,about,shortcuts` opens the named windows at startup — the automated
@@ -2420,10 +2500,15 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         }
     }
 
-    /// Drive the timed work — the 1 Hz refresh for open diagnostics windows and live
-    /// toasts, and the settled-resize follow — and arm the wake for whichever is due
-    /// next. With neither pending the loop returns to plain `Wait`.
+    /// Drive diagnostics, settled resizes, presentation retries, and monitor checks.
+    /// Arm the earliest deadline even when the remote desktop is idle.
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        if self
+            .monitor_check
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.observe_display();
+        }
         self.service_settled_resize();
         self.service_deferred_redraw();
 
@@ -2451,17 +2536,13 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             }
         }
 
-        let diag_next = diag_active.then(|| self.last_diag_refresh + DIAG_REFRESH);
-        let next = [diag_next, self.resize_settle, self.redraw_deadline]
-            .into_iter()
-            .flatten()
-            .min();
-        match next {
-            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
-            // A stale `WaitUntil` left set would spin the loop the moment its instant
-            // passed, so the quiet state is restored explicitly.
-            None => event_loop.set_control_flow(ControlFlow::Wait),
-        }
+        self.arm_timed_work(event_loop);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Event handlers can replace ControlFlow after new_events. Always preserve
+        // the earliest outstanding timer, including idle monitor detection.
+        self.arm_timed_work(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -2527,9 +2608,8 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             WindowEvent::RedrawRequested => self.redraw(event_loop),
 
             // A resize changes the viewport immediately; whether it may also change the
-            // session resolution is the geometry policy's call, made in `hold_geometry`
-            // below — only a resize judged to be the user's own act arms the debounced
-            // follow. See the module note and CLAUDE.md.
+            // session resolution follows a settled monitor change or a user resize.
+            // Other system geometry changes go through `hold_geometry` below.
             WindowEvent::Resized(size) => {
                 self.viewport = Viewport::letterbox(
                     size.width,
@@ -2560,7 +2640,8 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 // Fullscreen geometry belongs to the OS; the policy only defends the
                 // size of a *windowed* window. Feeding it fullscreen sizes would teach
                 // it that the monitor size is what the user wants.
-                if !self.fullscreen {
+                let display_change = self.observe_display();
+                if !self.fullscreen && !display_change {
                     self.hold_geometry(event_loop, Geometry::new(size.width, size.height));
                 }
                 if let Some(window) = &self.window {
@@ -2599,6 +2680,9 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                     };
                     self.clear_stall();
                 }
+                if occluded {
+                    self.observe_display();
+                }
                 // Becoming visible is the first moment anything can actually be fixed:
                 // the size may have been changed while the screen was off, and no further
                 // `Resized` is guaranteed to arrive to prompt us.
@@ -2610,7 +2694,8 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .release_presentation_delay();
-                    if !self.fullscreen {
+                    let display_change = self.observe_display();
+                    if !self.fullscreen && !display_change {
                         let size = window.inner_size();
                         self.hold_geometry(event_loop, Geometry::new(size.width, size.height));
                     }
@@ -2627,6 +2712,10 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 self.resize_settle = None;
                 let now = self.now_ms();
                 self.policy.note_display_event(now);
+            }
+
+            WindowEvent::Moved(_) => {
+                self.observe_display();
             }
 
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),

@@ -38,14 +38,15 @@ needs Arthur, not a design-phase judgment call.
 - **Portable by default, platform-specific only at the edges.** Core logic is
   `cfg`-free. Platform code is confined to named modules behind a trait
   (window policy, credential store, hardware video decode).
-- **Only the user resizes the session.** A display-configuration change must never
-  reflow the remote desktop — `window_policy` classifies every `Resized` event, and
-  system-imposed geometry is argued with, never forwarded. A *user-initiated* resize
-  (window drag, fullscreen toggle) renegotiates the session resolution to match, after
-  a settle delay for drags; scale/letterbox in the renderer covers the rest. An
+- **Follow settled display changes and user resizes.** Docking, undocking, or moving
+  the session to a different monitor must adapt the remote resolution after the
+  monitor and window settle. Fullscreen follows the current monitor; windowed mode
+  follows the available inner window size. Sleep/reveal without a monitor change
+  still preserves the chosen window geometry through `window_policy`. A user resize
+  (window drag, fullscreen toggle) also renegotiates the session resolution. An
   explicit `--size` pins the resolution (drags then letterbox only), and Settings ▸
-  Graphics ▸ Dynamic resolution off means letterbox always. (Decided 2026-08-17;
-  before that, windowed drags never renegotiated.)
+  Graphics ▸ Dynamic resolution off means letterbox always. (Dock/undock adaptation
+  requested by Arthur on 2026-09-04; supersedes the blanket display-change exclusion.)
 - **Choose the planned DPI scale in the GCC before logon.** A later RDPEDISP scale change
   makes Windows bitmap-stretch non-DPI-aware apps until they restart; the client cannot
   remove that server-side blur.

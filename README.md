@@ -112,7 +112,8 @@ leave a plausible-looking partial report.
 - Connect over NLA/CredSSP with trust-on-first-use certificate pinning
 - EGFX graphics — ClearCodec and RFX Progressive, keyboard, mouse and scroll
 - Favourites launcher with a graphical New connection form and secure password storage
-- Real borderless fullscreen with a fixed remote resolution
+- Borderless fullscreen and automatic remote resolution adjustment after docking,
+  undocking, or moving between displays (with Dynamic resolution enabled)
 - Clipboard Unicode text, empty content, and bounded CF_DIB images in both directions,
   with explicit timeouts so one failed transfer cannot wedge later transfers
 - Audio playback (PCM 16-bit, 44.1/48kHz, mono or stereo)
