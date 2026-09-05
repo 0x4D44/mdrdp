@@ -31,7 +31,11 @@ Trigger sequence for a regression: keep the window/session active, make the ACK 
 
 ## Fix
 
-<unfixed — raised only>
+Integrated as `e6f5e55`, version 0.1.241, on 2026-09-05. ACK failure now atomically claims terminal notification, shuts down the socket, and returns its reason to native teardown as `TransportFailed`. Video/input completion shares the same claim, so competing failures notify once. Intentional shutdown remains quiet.
+
+Regression evidence: restoring the old ACK behavior failed the expected `TransportFailed` assertion. Replacing the shared claim with unconditional success failed intentional-shutdown classification and observed three notifications instead of one. Mutations were restored; all 60 native-session tests passed. Windows type-check, formatting, library/test clippy, and CLI help smoke passed. The contention test passed 20 repeat runs. No live GUI disconnect was tested.
+
+Detailed evidence: [native review fix journal](~/language/mdrdp/wrk_journals/2026.09.05%20-%20JRN%20-%20native%20review%20fixes.md). Fixed, awaiting independent verification; this fixing session does not close its own record.
 
 ## Notes
 

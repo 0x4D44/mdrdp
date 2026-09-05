@@ -31,7 +31,11 @@ The helper also grants the full supplied duration independently to connect and r
 
 ## Fix
 
-<unfixed — raised only>
+Integrated as `aff1e45`, version 0.1.242, on 2026-09-05. Status and command requests share one exchange helper with a 64 KiB reply limit and one absolute socket deadline. Partial writes and reads receive only the remaining time, interrupted operations retry, and oversized replies are rejected after at most limit + 1 bytes. Existing JSON shapes are unchanged. Synchronous hostname resolution is still uninterruptible; native numeric loopback callers avoid it.
+
+Six new regression tests cover both helpers' oversized and dripping replies, blocked partial writes, and expired budgets without byte transfer. Each failed on an assertion under a targeted mutation, then passed after restoration. The lead reran 43 selected control-related tests, 15 native-probe tests, the Windows guard for mdrdp and Rhydra host, formatting, and CLI help smoke successfully. Existing unrelated warnings remain.
+
+Live host compatibility is UNVERIFIED: Quench was unreachable over SSH and Temper refused SSH authentication. Neither attempt opened a desktop or changed credentials/configuration. Detailed mutation evidence and commands: [native review fix journal](~/language/mdrdp/wrk_journals/2026.09.05%20-%20JRN%20-%20native%20review%20fixes.md). Fixed, awaiting independent verification.
 
 ## Notes
 
