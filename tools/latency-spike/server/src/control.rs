@@ -11,7 +11,7 @@
 //! shutdown and keeps a bounded process-termination fallback for a wedged child.
 
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Write};
 
 /// Where the agent's control listener binds, next to video (9500) and input (9501).
 pub const CONTROL_PORT: u16 = 9502;
@@ -22,6 +22,16 @@ pub const CONTROL_PORT: u16 = 9502;
 /// channel's largest legal clipboard value after worst-case JSON `\u00xx` escaping,
 /// plus the request envelope, while still bounding an unterminated line strictly.
 pub const MAX_REQUEST_LINE_BYTES: usize = crate::aux_proto::MAX_CLIPBOARD_BYTES * 6 + 256;
+
+/// Maximum bytes in one control reply, including its line ending.
+///
+/// Replies contain status and acknowledgement metadata, never clipboard
+/// content. 64 KiB leaves ample room for a status report while making a
+/// newline-free reply a bounded allocation rather than a memory exhaustion
+/// path.
+pub const MAX_REPLY_LINE_BYTES: usize = 64 * 1024;
+
+const CONTROL_READ_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Read one control request without ever growing `line` beyond the protocol bound.
 pub fn read_request_line(reader: &mut impl BufRead) -> io::Result<Option<String>> {
@@ -544,42 +554,170 @@ pub enum QueryError {
     Bad(String),
 }
 
-/// One blocking status query against an agent control port.
+fn remaining_until(deadline: std::time::Instant) -> io::Result<std::time::Duration> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "control exchange deadline expired",
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+/// Write a complete control line while refreshing the socket timeout before
+/// every write syscall. A socket write may accept only a prefix, and retrying
+/// the remainder under a fresh timeout would let a slow peer extend the
+/// caller's budget indefinitely.
+fn write_all_until(
+    stream: &mut std::net::TcpStream,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        stream.set_write_timeout(Some(remaining_until(deadline)?))?;
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "control peer closed while writing",
+                ));
+            }
+            Ok(written) => offset += written,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Read one reply line with a byte ceiling and one absolute deadline.
 ///
-/// `timeout` bounds both the TCP connect and the read of the reply line — the read
-/// timeout is derived from it rather than the previous hardcoded 5 s, which could
-/// alone exceed a caller's overall budget (HLD tranche 3 §4.3/review S-M3: the
-/// native-connect probe runs its whole four-step sequence under one 8 s deadline).
-pub fn query_status(
+/// Reading directly from the stream, rather than through `BufRead::read_line`,
+/// lets us refresh the timeout before each underlying read. The final read is
+/// capped at `MAX_REPLY_LINE_BYTES + 1`, so an unterminated oversized reply is
+/// rejected after at most one byte beyond the protocol limit.
+fn read_reply_line(
+    stream: &mut std::net::TcpStream,
+    deadline: std::time::Instant,
+) -> io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(CONTROL_READ_CHUNK_BYTES.min(MAX_REPLY_LINE_BYTES + 1));
+    let mut chunk = [0_u8; CONTROL_READ_CHUNK_BYTES];
+
+    loop {
+        let remaining_bytes = MAX_REPLY_LINE_BYTES + 1 - bytes.len();
+        let read_len = remaining_bytes.min(chunk.len());
+        stream.set_read_timeout(Some(remaining_until(deadline)?))?;
+        let read = match stream.read(&mut chunk[..read_len]) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+        }
+
+        let chunk_start = bytes.len();
+        bytes.extend_from_slice(&chunk[..read]);
+        if let Some(offset) = chunk[..read].iter().position(|&byte| byte == b'\n') {
+            let newline = chunk_start + offset;
+            if newline + 1 > MAX_REPLY_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("control reply exceeds the {MAX_REPLY_LINE_BYTES}-byte line limit"),
+                ));
+            }
+            bytes.truncate(newline + 1);
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+        }
+        if bytes.len() > MAX_REPLY_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("control reply exceeds the {MAX_REPLY_LINE_BYTES}-byte line limit"),
+            ));
+        }
+    }
+}
+
+/// Perform the request/write/reply exchange shared by status and command
+/// calls. The standard-library hostname resolver is synchronous and cannot be
+/// interrupted; it remains available for compatibility, but the absolute
+/// deadline starts before resolution and covers every socket operation after
+/// it. Native callers use numeric loopback addresses and therefore avoid that
+/// resolver caveat.
+fn control_exchange(
     addr: (&str, u16),
+    line: &str,
     timeout: std::time::Duration,
-) -> Result<StatusReport, QueryError> {
-    use std::io::{BufRead, BufReader, Write};
+) -> Result<String, QueryError> {
     use std::net::{TcpStream, ToSocketAddrs};
 
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(std::time::Instant::now);
     let sock_addr = addr
         .to_socket_addrs()
-        .map_err(|e| QueryError::NoAnswer(format!("resolve {}:{}: {e}", addr.0, addr.1)))?
+        .map_err(|error| QueryError::NoAnswer(format!("resolve {}:{}: {error}", addr.0, addr.1)))?
         .next()
         .ok_or_else(|| {
             QueryError::NoAnswer(format!("resolve {}:{}: no addresses", addr.0, addr.1))
         })?;
-    let stream = TcpStream::connect_timeout(&sock_addr, timeout)
-        .map_err(|e| QueryError::NoAnswer(format!("connect {}:{}: {e}", addr.0, addr.1)))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| QueryError::NoAnswer(e.to_string()))?;
-    let mut writer = stream
-        .try_clone()
-        .map_err(|e| QueryError::NoAnswer(e.to_string()))?;
-    writeln!(writer, r#"{{"cmd":"status"}}"#).map_err(|e| QueryError::NoAnswer(e.to_string()))?;
-    let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .map_err(|e| QueryError::NoAnswer(format!("read: {e}")))?;
-    if line.trim().is_empty() {
+    let connect_budget = remaining_until(deadline)
+        .map_err(|error| QueryError::NoAnswer(format!("connect {}:{}: {error}", addr.0, addr.1)))?;
+    let mut stream = TcpStream::connect_timeout(&sock_addr, connect_budget)
+        .map_err(|error| QueryError::NoAnswer(format!("connect {}:{}: {error}", addr.0, addr.1)))?;
+    stream.set_nodelay(true).map_err(|error| {
+        QueryError::NoAnswer(format!("configure {}:{}: {error}", addr.0, addr.1))
+    })?;
+    write_all_until(&mut stream, line.trim().as_bytes(), deadline)
+        .and_then(|_| write_all_until(&mut stream, b"\n", deadline))
+        .map_err(|error| QueryError::NoAnswer(format!("write: {error}")))?;
+
+    let reply = match read_reply_line(&mut stream, deadline) {
+        Ok(Some(reply)) => reply,
+        Ok(None) => return Err(QueryError::NoAnswer("empty reply".to_owned())),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            return Err(QueryError::Bad(format!("invalid reply: {error}")));
+        }
+        Err(error) => return Err(QueryError::NoAnswer(format!("read: {error}"))),
+    };
+    if reply.trim().is_empty() {
         return Err(QueryError::NoAnswer("empty reply".to_owned()));
     }
+    Ok(reply)
+}
+
+/// One blocking status query against an agent control port.
+///
+/// `timeout` is one absolute budget shared by TCP connect, request write, and
+/// reply read — no individual socket operation receives a fresh full timeout.
+/// The standard-library hostname resolver remains synchronous for compatibility;
+/// numeric addresses avoid that uninterruptible lookup on native call paths.
+pub fn query_status(
+    addr: (&str, u16),
+    timeout: std::time::Duration,
+) -> Result<StatusReport, QueryError> {
+    let line = control_exchange(addr, r#"{"cmd":"status"}"#, timeout)?;
     let value: serde_json::Value =
         serde_json::from_str(&line).map_err(|e| QueryError::Bad(format!("not JSON: {e}")))?;
     if value["ok"] != true {
@@ -593,7 +731,7 @@ pub fn query_status(
 ///
 /// The write counterpart of [`query_status`], and it carries the same hazards, so
 /// it takes the same explicit `timeout` rather than hiding a constant: the caller
-/// owns the budget. `line` is the request JSON, already serialised by the caller —
+/// owns one absolute connect/write/read budget. `line` is the request JSON, already serialised by the caller —
 /// the client crate builds these by hand rather than depending on a serialiser for
 /// three shapes.
 ///
@@ -606,32 +744,7 @@ pub fn send_request(
     line: &str,
     timeout: std::time::Duration,
 ) -> Result<String, QueryError> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
-
-    let sock_addr = addr
-        .to_socket_addrs()
-        .map_err(|e| QueryError::NoAnswer(format!("resolve {}:{}: {e}", addr.0, addr.1)))?
-        .next()
-        .ok_or_else(|| {
-            QueryError::NoAnswer(format!("resolve {}:{}: no addresses", addr.0, addr.1))
-        })?;
-    let stream = TcpStream::connect_timeout(&sock_addr, timeout)
-        .map_err(|e| QueryError::NoAnswer(format!("connect {}:{}: {e}", addr.0, addr.1)))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| QueryError::NoAnswer(e.to_string()))?;
-    let mut writer = stream
-        .try_clone()
-        .map_err(|e| QueryError::NoAnswer(e.to_string()))?;
-    writeln!(writer, "{}", line.trim()).map_err(|e| QueryError::NoAnswer(e.to_string()))?;
-    let mut reply = String::new();
-    BufReader::new(stream)
-        .read_line(&mut reply)
-        .map_err(|e| QueryError::NoAnswer(format!("read: {e}")))?;
-    if reply.trim().is_empty() {
-        return Err(QueryError::NoAnswer("empty reply".to_owned()));
-    }
+    let reply = control_exchange(addr, line, timeout)?;
     let value: serde_json::Value =
         serde_json::from_str(&reply).map_err(|e| QueryError::Bad(format!("not JSON: {e}")))?;
     if value["ok"] != true {
@@ -1299,6 +1412,53 @@ mod tests {
         (port, handle)
     }
 
+    /// Serve one arbitrary reply after consuming the request line.
+    fn raw_reply_server(reply: Vec<u8>) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port is available");
+        let port = listener.local_addr().expect("bound").port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("one client");
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().expect("clone"))
+                .read_line(&mut request)
+                .expect("read request");
+            let mut writer = stream;
+            writer.write_all(&reply).expect("write reply");
+        });
+        (port, handle)
+    }
+
+    /// Drip one byte at a time without a newline. A per-read timeout lets this
+    /// peer stay alive indefinitely; a shared exchange deadline must not.
+    fn dripping_reply_server(
+        bytes: usize,
+        interval: std::time::Duration,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port is available");
+        let port = listener.local_addr().expect("bound").port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("one client");
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().expect("clone"))
+                .read_line(&mut request)
+                .expect("read request");
+            let mut writer = stream;
+            writer.set_nodelay(true).expect("disable Nagle");
+            for _ in 0..bytes {
+                if writer.write_all(b"x").is_err() {
+                    return;
+                }
+                writer.flush().expect("flush reply byte");
+                std::thread::sleep(interval);
+            }
+        });
+        (port, handle)
+    }
+
     #[test]
     fn send_request_writes_the_line_and_accepts_an_ack() {
         let (port, handle) = one_shot_server(r#"{"ok":true,"schema":3}"#);
@@ -1379,6 +1539,131 @@ mod tests {
             "took {:?}, so the timeout was not honoured",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn send_request_rejects_an_oversized_unterminated_reply() {
+        use std::time::Duration;
+        let (port, handle) = raw_reply_server(vec![b'x'; MAX_REPLY_LINE_BYTES + 1]);
+        let result = send_request(
+            ("127.0.0.1", port),
+            r#"{"cmd":"status"}"#,
+            Duration::from_secs(2),
+        );
+        handle.join().expect("server");
+        assert!(
+            matches!(&result, Err(QueryError::Bad(message)) if message.contains("line limit")),
+            "oversized replies must be rejected before JSON parsing: {result:?}"
+        );
+    }
+
+    #[test]
+    fn query_status_rejects_an_oversized_unterminated_reply() {
+        use std::time::Duration;
+        let (port, handle) = raw_reply_server(vec![b'x'; MAX_REPLY_LINE_BYTES + 1]);
+        let result = query_status(("127.0.0.1", port), Duration::from_secs(2));
+        handle.join().expect("server");
+        assert!(
+            matches!(&result, Err(QueryError::Bad(message)) if message.contains("line limit")),
+            "oversized replies must be rejected before JSON parsing: {result:?}"
+        );
+    }
+
+    #[test]
+    fn send_request_does_not_renew_its_deadline_for_a_dripping_reply() {
+        use std::time::{Duration, Instant};
+        let (port, handle) = dripping_reply_server(32, Duration::from_millis(20));
+        let start = Instant::now();
+        let result = send_request(
+            ("127.0.0.1", port),
+            r#"{"cmd":"status"}"#,
+            Duration::from_millis(120),
+        );
+        let elapsed = start.elapsed();
+        handle.join().expect("server");
+        assert!(
+            matches!(&result, Err(QueryError::NoAnswer(_))),
+            "got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "dripping reply renewed the timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn query_status_does_not_renew_its_deadline_for_a_dripping_reply() {
+        use std::time::{Duration, Instant};
+        let (port, handle) = dripping_reply_server(32, Duration::from_millis(20));
+        let start = Instant::now();
+        let result = query_status(("127.0.0.1", port), Duration::from_millis(120));
+        let elapsed = start.elapsed();
+        handle.join().expect("server");
+        assert!(
+            matches!(&result, Err(QueryError::NoAnswer(_))),
+            "got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "dripping reply renewed the timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn send_request_applies_its_deadline_to_a_blocked_partial_write() {
+        use std::time::{Duration, Instant};
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port is available");
+        let port = listener.local_addr().expect("bound").port();
+        let handle = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("one client");
+            // Do not consume the request. The client must time out while its
+            // large line fills the kernel send window, rather than waiting for
+            // this peer to close the connection.
+            std::thread::sleep(Duration::from_millis(750));
+        });
+
+        let request = "x".repeat(8 * 1024 * 1024);
+        let start = Instant::now();
+        let result = send_request(("127.0.0.1", port), &request, Duration::from_millis(120));
+        let elapsed = start.elapsed();
+        handle.join().expect("server");
+        assert!(
+            matches!(&result, Err(QueryError::NoAnswer(message)) if message.starts_with("write:")),
+            "blocked write should fail during writing: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "blocked write exceeded its absolute deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn expired_exchange_budget_rejects_write_and_read_before_transfer() {
+        use std::io::Read;
+        use std::net::TcpStream;
+        use std::time::{Duration, Instant};
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port is available");
+        let port = listener.local_addr().expect("bound").port();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (mut peer, _) = listener.accept().expect("accept");
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the test deadline is representable");
+
+        let write_error = write_all_until(&mut client, b"x", expired).expect_err("expired write");
+        assert_eq!(write_error.kind(), std::io::ErrorKind::TimedOut);
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let mut received = [0_u8; 1];
+        match peer.read(&mut received) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(read) => panic!("expired write transferred {read} bytes"),
+            Err(error) => panic!("unexpected peer read error: {error}"),
+        }
+
+        let read_error = read_reply_line(&mut client, expired).expect_err("expired read");
+        assert_eq!(read_error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
