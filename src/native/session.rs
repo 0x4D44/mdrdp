@@ -121,18 +121,22 @@ impl NativeTimedWrite for TcpStream {
 
 struct AckWriter {
     sender: Option<SyncSender<u64>>,
-    join: Option<JoinHandle<()>>,
+    join: Option<JoinHandle<Option<String>>>,
 }
 
 impl AckWriter {
-    fn spawn(video: &TcpStream, stop: Arc<AtomicBool>) -> io::Result<(Self, SyncSender<u64>)> {
+    fn spawn(
+        video: &TcpStream,
+        stop: Arc<AtomicBool>,
+        close_window: impl FnOnce() + Send + 'static,
+    ) -> io::Result<(Self, SyncSender<u64>)> {
         let mut socket = video.try_clone()?;
         socket.set_write_timeout(Some(FRAME_ACK_WRITE_TIMEOUT))?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(FRAME_ACK_QUEUE_CAPACITY);
         let thread_sender = sender.clone();
         let join = std::thread::Builder::new()
             .name("native-frame-ack".to_owned())
-            .spawn(move || run_ack_writer(&mut socket, receiver, &stop))?;
+            .spawn(move || run_ack_writer(&mut socket, receiver, &stop, Box::new(close_window)))?;
         Ok((
             Self {
                 sender: Some(thread_sender),
@@ -142,14 +146,12 @@ impl AckWriter {
         ))
     }
 
-    fn shutdown(mut self) {
+    fn shutdown(mut self) -> Option<String> {
         // All sink-owned clones have been dropped before NativeHandle reaches
         // this point. Dropping the last sender lets the writer exit even when
         // the session was intentionally stopped before it wrote its backlog.
         self.sender.take();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        self.join.take().and_then(|join| join.join().ok().flatten())
     }
 }
 
@@ -157,15 +159,16 @@ fn run_ack_writer(
     socket: &mut TcpStream,
     receiver: std::sync::mpsc::Receiver<u64>,
     stop: &AtomicBool,
-) {
+    close_window: Box<dyn FnOnce() + Send>,
+) -> Option<String> {
     loop {
         if stop.load(Ordering::Relaxed) {
-            return;
+            return None;
         }
         let frame_seq = match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(seq) => seq,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
         };
         let payload = framing::encode_frame_ack(frame_seq);
         let mut frame = Vec::with_capacity(framing::encoded_len(payload.len()));
@@ -173,12 +176,14 @@ fn run_ack_writer(
         if let Err(error) = socket.write_all(&frame) {
             // Closing this duplex clone interrupts the sole video reader and
             // makes an ACK writer failure a normal terminal session failure.
-            if !stop.load(Ordering::Relaxed) {
-                stop.store(true, Ordering::Release);
+            let failure = finish_ack_writer(error, stop, || {
                 let _ = socket.shutdown(Shutdown::Both);
-                eprintln!("native: frame acknowledgement write failed: {error}");
+                close_window();
+            });
+            if let Some(reason) = &failure {
+                eprintln!("native: {reason}");
             }
-            return;
+            return failure;
         }
     }
 }
@@ -501,14 +506,26 @@ impl NativeHandle {
         let input_end = self.input_join.join().unwrap_or(None);
         let sparse_end = self.sparse_join.join().unwrap_or(SessionEnd::WindowClosed);
         let end = self.video_join.join().unwrap_or(SessionEnd::WindowClosed);
-        self.ack_writer.shutdown();
+        let ack_end = self.ack_writer.shutdown();
         self.tunnel.kill();
-        match end {
-            // The window closing is the normal path; an input-side failure only
-            // matters when the video side did not already explain the end.
-            SessionEnd::WindowClosed => input_end.map_or(sparse_end, SessionEnd::TransportFailed),
-            other => other,
-        }
+        resolve_native_end(end, input_end, sparse_end, ack_end)
+    }
+}
+
+fn resolve_native_end(
+    end: SessionEnd,
+    input_end: Option<String>,
+    sparse_end: SessionEnd,
+    ack_end: Option<String>,
+) -> SessionEnd {
+    if let Some(reason) = ack_end {
+        return SessionEnd::TransportFailed(reason);
+    }
+    match end {
+        // The window closing is the normal path; an input-side failure only
+        // matters when the video side did not already explain the end.
+        SessionEnd::WindowClosed => input_end.map_or(sparse_end, SessionEnd::TransportFailed),
+        other => other,
     }
 }
 
@@ -584,7 +601,10 @@ pub fn spawn(
     let sparse_video_sock = conn.video.try_clone()?;
     let sparse_input_sock = conn.input.try_clone()?;
     let input_video_sock = video.try_clone()?;
-    let (ack_writer, ack_sender) = AckWriter::spawn(&video, Arc::clone(&stop))?;
+    let ack_waker = waker.clone();
+    let (ack_writer, ack_sender) = AckWriter::spawn(&video, Arc::clone(&stop), move || {
+        let _ = ack_waker.close();
+    })?;
 
     // A previous native session may have ended while the host cursor was hidden.
     // Reset immediately; the host's initial cursor message then states the truth.
@@ -972,6 +992,32 @@ fn report(message: &str) {
 /// arbitrary number of messages ahead of an earlier frame.
 const VIDEO_DISPATCH_BATCH_MESSAGES: usize = 16;
 
+/// Claim the one terminal failure that is allowed to notify the window.
+///
+/// The stop flag also cancels sibling readers and rendezvous waiters. Using one
+/// compare-and-exchange for both jobs keeps competing worker failures from
+/// sending duplicate close events while still letting an intentional stop win.
+fn claim_terminal_failure(stop: &AtomicBool) -> bool {
+    stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Turn an ACK write error into the same terminal signal as the socket workers.
+/// The caller closes the ACK socket clone before invoking the window callback.
+fn finish_ack_writer(
+    error: io::Error,
+    stop: &AtomicBool,
+    close_window: impl FnOnce(),
+) -> Option<String> {
+    let reason = format!("frame acknowledgement write failed: {error}");
+    if claim_terminal_failure(stop) {
+        close_window();
+        Some(reason)
+    } else {
+        None
+    }
+}
+
 /// Turn a failed video worker into a window close, but leave an intentional shutdown alone.
 ///
 /// The worker owns the transport and can be the first party to discover that the session has
@@ -982,10 +1028,11 @@ fn finish_video_worker(
     stop: &AtomicBool,
     close_window: impl FnOnce(),
 ) -> SessionEnd {
-    if matches!(&end, SessionEnd::TransportFailed(_)) && !stop.load(Ordering::Relaxed) {
+    if matches!(&end, SessionEnd::TransportFailed(_)) && claim_terminal_failure(stop) {
         close_window();
+    } else {
+        stop.store(true, Ordering::Relaxed);
     }
-    stop.store(true, Ordering::Relaxed);
     end
 }
 
@@ -1009,10 +1056,11 @@ fn finish_input_worker(
     stop: &AtomicBool,
     close_window: impl FnOnce(),
 ) -> Option<String> {
-    if failure.is_some() && !stop.load(Ordering::Relaxed) {
+    if failure.is_some() && claim_terminal_failure(stop) {
         close_window();
+    } else {
+        stop.store(true, Ordering::Relaxed);
     }
-    stop.store(true, Ordering::Relaxed);
     failure
 }
 
@@ -5608,7 +5656,11 @@ mod tests {
         let client = TcpStream::connect(address).unwrap();
         let mut peer = listener.accept().unwrap().0;
         let stop = Arc::new(AtomicBool::new(false));
-        let (writer, sender) = AckWriter::spawn(&client, Arc::clone(&stop)).unwrap();
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        let (writer, sender) = AckWriter::spawn(&client, Arc::clone(&stop), move || {
+            closed_tx.send(()).unwrap();
+        })
+        .unwrap();
 
         enqueue_frame_ack(&sender, 0x0102_0304_0506_0708).unwrap();
         let mut framed = [0u8; framing::HEADER_LEN + framing::FRAME_ACK_BYTES];
@@ -5621,7 +5673,8 @@ mod tests {
         );
 
         stop.store(true, Ordering::Release);
-        writer.shutdown();
+        assert_eq!(writer.shutdown(), None);
+        assert!(closed_rx.try_recv().is_err());
     }
 
     #[test]
@@ -5643,7 +5696,11 @@ mod tests {
         let client = TcpStream::connect(address).unwrap();
         let peer = listener.accept().unwrap().0;
         let stop = Arc::new(AtomicBool::new(false));
-        let (writer, sender) = AckWriter::spawn(&client, Arc::clone(&stop)).unwrap();
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        let (writer, sender) = AckWriter::spawn(&client, Arc::clone(&stop), move || {
+            closed_tx.send(()).unwrap();
+        })
+        .unwrap();
         peer.shutdown(Shutdown::Both).unwrap();
         drop(peer);
         let feed_stop = Arc::clone(&stop);
@@ -5667,7 +5724,108 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         feed.join().unwrap();
-        writer.shutdown();
+        let failure = writer.shutdown();
+        assert!(matches!(
+            failure,
+            Some(reason) if reason.starts_with("frame acknowledgement write failed:")
+        ));
+        assert_eq!(closed_rx.try_recv(), Ok(()));
+        assert!(closed_rx.try_recv().is_err(), "ACK failure must close once");
+    }
+
+    #[test]
+    fn an_ack_failure_maps_to_transport_failed_and_notifies_once() {
+        let stop = AtomicBool::new(false);
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(2);
+        let ack_end = finish_ack_writer(
+            io::Error::new(io::ErrorKind::BrokenPipe, "peer closed"),
+            &stop,
+            || closed_tx.send(()).unwrap(),
+        );
+        let end = resolve_native_end(
+            SessionEnd::WindowClosed,
+            None,
+            SessionEnd::WindowClosed,
+            ack_end,
+        );
+
+        assert!(matches!(
+            end,
+            SessionEnd::TransportFailed(reason)
+                if reason == "frame acknowledgement write failed: peer closed"
+        ));
+        assert_eq!(closed_rx.try_recv(), Ok(()));
+        assert!(closed_rx.try_recv().is_err());
+        assert!(stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn intentional_ack_shutdown_does_not_report_or_close() {
+        let stop = AtomicBool::new(true);
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        let ack_end = finish_ack_writer(
+            io::Error::new(io::ErrorKind::BrokenPipe, "late peer close"),
+            &stop,
+            || closed_tx.send(()).unwrap(),
+        );
+        let end = resolve_native_end(
+            SessionEnd::WindowClosed,
+            None,
+            SessionEnd::WindowClosed,
+            ack_end,
+        );
+
+        assert!(matches!(end, SessionEnd::WindowClosed));
+        assert!(closed_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn competing_native_failures_emit_exactly_one_close_notification() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(4);
+
+        let ack_stop = Arc::clone(&stop);
+        let ack_barrier = Arc::clone(&barrier);
+        let ack_closed = closed_tx.clone();
+        let ack = std::thread::spawn(move || {
+            ack_barrier.wait();
+            finish_ack_writer(
+                io::Error::new(io::ErrorKind::BrokenPipe, "ACK peer closed"),
+                &ack_stop,
+                || ack_closed.send(()).unwrap(),
+            )
+        });
+
+        let video_stop = Arc::clone(&stop);
+        let video_barrier = Arc::clone(&barrier);
+        let video_closed = closed_tx.clone();
+        let video = std::thread::spawn(move || {
+            video_barrier.wait();
+            finish_video_worker(
+                SessionEnd::TransportFailed("video peer closed".to_owned()),
+                &video_stop,
+                || video_closed.send(()).unwrap(),
+            )
+        });
+
+        let input_stop = Arc::clone(&stop);
+        let input_barrier = Arc::clone(&barrier);
+        let input_closed = closed_tx;
+        let input = std::thread::spawn(move || {
+            input_barrier.wait();
+            finish_input_worker(Some("input peer closed".to_owned()), &input_stop, || {
+                input_closed.send(()).unwrap()
+            })
+        });
+
+        barrier.wait();
+        let _ = ack.join().unwrap();
+        let _ = video.join().unwrap();
+        let _ = input.join().unwrap();
+
+        assert_eq!(closed_rx.try_iter().count(), 1);
+        assert!(stop.load(Ordering::Acquire));
     }
 
     #[test]
