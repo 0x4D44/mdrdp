@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00128 — Partial auxiliary startup leaves detached workers without cleanup ownership
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Could
 - **Severity:** Low
 - **Area:** native/startup
 - **Raised:** 2026-09-04T22:01:28Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260905T063843Z-5bd66c1a
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00128-run-fix-20260905T063843Z-5bd66c1a
-- **Owner base:** 8cc1ad16bd8785f03e25fd1d035979ea46626f0a
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-09-05T06:38:43Z
-- **Owner until:** 2026-09-05T08:38:43Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-04T22:01:28Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-09-04T22:01:28Z, raised via `deltic bugs new`) -> Fixed (2026-09-05T07:01:55Z, deltic:auto role=fix run=fix-20260905T063843Z-5bd66c1a branch=task/bug-MDR-BUG-FLU-00128-run-fix-20260905T063843Z-5bd66c1a code=da33f3e gate=manual)
 
 ## Observation
 
