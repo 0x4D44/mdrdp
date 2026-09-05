@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00126 — Native ACK writer failure suppresses the window close notification
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** native/session-lifecycle
 - **Raised:** 2026-09-04T22:00:20Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260905T060401Z-97098776
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00126-run-fix-20260905T060401Z-97098776
-- **Owner base:** 27b4b081adb30e119d573537ba1b0ab16027b095
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-09-05T06:04:01Z
-- **Owner until:** 2026-09-05T08:04:01Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-04T22:00:20Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-09-04T22:00:20Z, raised via `deltic bugs new`) -> Fixed (2026-09-05T06:19:18Z, deltic:auto role=fix run=fix-20260905T060401Z-97098776 branch=task/bug-MDR-BUG-FLU-00126-run-fix-20260905T060401Z-97098776 code=e6f5e55 gate=manual)
 
 ## Observation
 
