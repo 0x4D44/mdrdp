@@ -382,7 +382,49 @@ struct AuxChannel {
     socket: TcpStream,
     slot: Arc<Outbox>,
     stop: Arc<AtomicBool>,
+    aux_stop: Arc<AtomicBool>,
     joins: Vec<JoinHandle<()>>,
+}
+
+/// A failed optional-channel startup must stop only the workers it managed to
+/// start. A running channel also watches the session stop, so a video/input
+/// failure still tears down audio and clipboard workers before the handle is
+/// joined.
+struct AuxStop {
+    session: Arc<AtomicBool>,
+    local: Arc<AtomicBool>,
+}
+
+impl AuxStop {
+    fn new(session: Arc<AtomicBool>, local: Arc<AtomicBool>) -> Self {
+        Self { session, local }
+    }
+
+    fn is_set(&self) -> bool {
+        self.session.load(Ordering::Relaxed) || self.local.load(Ordering::Relaxed)
+    }
+}
+
+trait StopSignal {
+    fn is_set(&self) -> bool;
+}
+
+impl StopSignal for AtomicBool {
+    fn is_set(&self) -> bool {
+        self.load(Ordering::Relaxed)
+    }
+}
+
+impl StopSignal for Arc<AtomicBool> {
+    fn is_set(&self) -> bool {
+        self.load(Ordering::Relaxed)
+    }
+}
+
+impl StopSignal for AuxStop {
+    fn is_set(&self) -> bool {
+        AuxStop::is_set(self)
+    }
 }
 
 #[derive(Default)]
@@ -393,12 +435,12 @@ struct ClipboardSeedState {
 
 fn defer_or_apply_remote(
     state: &Mutex<ClipboardSeedState>,
-    stop: &AtomicBool,
+    stop: &impl StopSignal,
     text: &str,
     mut apply: impl FnMut(&str),
 ) {
     let mut state = lock(state);
-    if stop.load(Ordering::Relaxed) {
+    if stop.is_set() {
         state.pending_remote = None;
         return;
     }
@@ -414,11 +456,11 @@ fn defer_or_apply_remote(
 
 fn complete_clipboard_seed(
     state: &Mutex<ClipboardSeedState>,
-    stop: &AtomicBool,
+    stop: &impl StopSignal,
     mut apply: impl FnMut(&str),
 ) {
     let mut state = lock(state);
-    if stop.load(Ordering::Relaxed) {
+    if stop.is_set() {
         state.pending_remote = None;
         return;
     }
@@ -450,24 +492,97 @@ impl AuxChannel {
     /// detached; it owns no live session callback and exits when that call does.
     fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.slot.close();
-        let _ = self.socket.shutdown(Shutdown::Both);
-        let deadline = Instant::now() + AUX_SHUTDOWN_WAIT;
-        while self.joins.iter().any(|join| !join.is_finished()) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
+        let Self {
+            socket,
+            slot,
+            aux_stop,
+            mut joins,
+            ..
+        } = self;
+        shutdown_auxiliary(Some(&socket), &slot, &aux_stop, &mut joins);
+    }
+}
+
+/// Own auxiliary resources while startup is still fallible. Dropping this
+/// owner is the rollback path for every clone or thread-spawn failure after the
+/// first worker starts; a failed optional channel must not stop the main session.
+struct AuxStartup {
+    socket: Option<TcpStream>,
+    slot: Arc<Outbox>,
+    aux_stop: Arc<AtomicBool>,
+    joins: Vec<JoinHandle<()>>,
+    committed: bool,
+}
+
+impl AuxStartup {
+    fn new(socket: TcpStream, slot: Arc<Outbox>, aux_stop: Arc<AtomicBool>) -> Self {
+        Self {
+            socket: Some(socket),
+            slot,
+            aux_stop,
+            joins: Vec::new(),
+            committed: false,
         }
-        for join in self.joins {
-            if join.is_finished() {
-                let _ = join.join();
-            } else {
-                let name = join
-                    .thread()
-                    .name()
-                    .unwrap_or("native auxiliary")
-                    .to_owned();
-                report(&format!("{name} did not stop within 100ms; detached"));
-                drop(join);
-            }
+    }
+
+    fn into_channel(mut self, stop: Arc<AtomicBool>) -> AuxChannel {
+        self.committed = true;
+        let socket = self
+            .socket
+            .take()
+            .expect("auxiliary startup socket must exist before commit");
+        let joins = std::mem::take(&mut self.joins);
+        AuxChannel {
+            socket,
+            slot: Arc::clone(&self.slot),
+            stop,
+            aux_stop: Arc::clone(&self.aux_stop),
+            joins,
+        }
+    }
+}
+
+impl Drop for AuxStartup {
+    fn drop(&mut self) {
+        if !self.committed {
+            shutdown_auxiliary(
+                self.socket.as_ref(),
+                &self.slot,
+                &self.aux_stop,
+                &mut self.joins,
+            );
+        }
+    }
+}
+
+/// Signal local cancellation, wake the writer and reader, then join every
+/// cooperative auxiliary worker up to the existing teardown bound.
+fn shutdown_auxiliary(
+    socket: Option<&TcpStream>,
+    slot: &Outbox,
+    aux_stop: &AtomicBool,
+    joins: &mut Vec<JoinHandle<()>>,
+) {
+    aux_stop.store(true, Ordering::Relaxed);
+    slot.close();
+    if let Some(socket) = socket {
+        let _ = socket.shutdown(Shutdown::Both);
+    }
+    let deadline = Instant::now() + AUX_SHUTDOWN_WAIT;
+    while joins.iter().any(|join| !join.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for join in joins.drain(..) {
+        if join.is_finished() {
+            let _ = join.join();
+        } else {
+            let name = join
+                .thread()
+                .name()
+                .unwrap_or("native auxiliary")
+                .to_owned();
+            report(&format!("{name} did not stop within 100ms; detached"));
+            drop(join);
         }
     }
 }
@@ -735,6 +850,8 @@ pub fn spawn(
     })
 }
 
+type AuxTask = Box<dyn FnOnce() + Send + 'static>;
+
 /// Start the auxiliary channel's three threads: read, write, and poll.
 ///
 /// Three rather than two because the poll must keep running while the writer is
@@ -749,6 +866,32 @@ fn spawn_aux(
     policy: Policy,
     stop: Arc<AtomicBool>,
     audio: Option<AudioPlayout>,
+) -> std::io::Result<AuxChannel> {
+    let mut clone_socket = |socket: &TcpStream| socket.try_clone();
+    let mut spawn_thread = |name: &str, task: AuxTask| {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(task)
+    };
+    spawn_aux_with(
+        socket,
+        make_clipboard,
+        policy,
+        stop,
+        audio,
+        &mut clone_socket,
+        &mut spawn_thread,
+    )
+}
+
+fn spawn_aux_with(
+    socket: TcpStream,
+    make_clipboard: &mut dyn FnMut() -> Box<dyn TextClipboard>,
+    policy: Policy,
+    stop: Arc<AtomicBool>,
+    audio: Option<AudioPlayout>,
+    clone_socket: &mut dyn FnMut(&TcpStream) -> std::io::Result<TcpStream>,
+    spawn_thread: &mut dyn FnMut(&str, AuxTask) -> std::io::Result<JoinHandle<()>>,
 ) -> std::io::Result<AuxChannel> {
     // Nagle would add up to 40 ms to a small, bursty clipboard message.
     socket.set_nodelay(true)?;
@@ -781,7 +924,8 @@ fn spawn_aux(
     let clipboard_seed = Arc::new(Mutex::new(ClipboardSeedState::default()));
 
     let slot = Outbox::new();
-    let mut joins = Vec::new();
+    let aux_stop = Arc::new(AtomicBool::new(false));
+    let mut startup = AuxStartup::new(socket, Arc::clone(&slot), Arc::clone(&aux_stop));
 
     // Audio gets its own thread and a channel to reach it.
     //
@@ -805,174 +949,175 @@ fn spawn_aux(
         None => (None, None),
     };
     if let (Some(rx), Some(playout)) = (audio_rx, audio) {
-        let audio_stop = Arc::clone(&stop);
-        joins.push(
-            std::thread::Builder::new()
-                .name("native-audio".to_owned())
-                .spawn(move || {
-                    // A short window of what actually arrived, kept once and
-                    // then never again. It is what turns "frames arrived" into
-                    // "the right signal arrived": a frame counter cannot see a
-                    // channel swap, a resampling error or wrong endianness, and
-                    // those are the faults most likely to occur.
-                    let mut probe: Vec<f32> = Vec::new();
-                    let probe_target =
-                        playout.device.sample_rate as usize * playout.device.channels as usize / 4; // a quarter-second
-                    let mut probed = false;
+        let audio_stop = AuxStop::new(Arc::clone(&stop), Arc::clone(&aux_stop));
+        startup.joins.push(spawn_thread(
+            "native-audio",
+            Box::new(move || {
+                // A short window of what actually arrived, kept once and
+                // then never again. It is what turns "frames arrived" into
+                // "the right signal arrived": a frame counter cannot see a
+                // channel swap, a resampling error or wrong endianness, and
+                // those are the faults most likely to occur.
+                let mut probe: Vec<f32> = Vec::new();
+                let probe_target =
+                    playout.device.sample_rate as usize * playout.device.channels as usize / 4; // a quarter-second
+                let mut probed = false;
 
-                    // Usually ends when the reader drops its sender. Also heed
-                    // the session stop directly: a reader stuck in an OS
-                    // clipboard write can be detached, and must not retain this
-                    // worker and its playback resources with it.
-                    while !audio_stop.load(Ordering::Relaxed) {
-                        let frame = match rx.recv_timeout(Duration::from_millis(10)) {
-                            Ok(frame) => frame,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                        };
-                        AUDIO.note_frame();
-                        let samples = crate::audio::pcm16_le_to_f32(&frame.pcm);
-                        let matched = crate::audio::remap_channels(
-                            &samples,
-                            u16::from(frame.channels),
-                            playout.device.channels,
-                        );
-                        let ready = crate::audio::linear_resample(
-                            &matched,
-                            playout.device.channels as usize,
-                            frame.sample_rate,
-                            playout.device.sample_rate,
-                        );
-                        if !probed {
-                            probe.extend_from_slice(&ready);
-                            if probe.len() >= probe_target {
-                                AUDIO.note_probe(
-                                    &probe,
-                                    playout.device.sample_rate,
-                                    playout.device.channels,
-                                );
-                                probed = true;
-                                probe = Vec::new();
-                            }
+                // Usually ends when the reader drops its sender. Also heed
+                // the session stop directly: a reader stuck in an OS
+                // clipboard write can be detached, and must not retain this
+                // worker and its playback resources with it.
+                while !audio_stop.is_set() {
+                    let frame = match rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(frame) => frame,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    AUDIO.note_frame();
+                    let samples = crate::audio::pcm16_le_to_f32(&frame.pcm);
+                    let matched = crate::audio::remap_channels(
+                        &samples,
+                        u16::from(frame.channels),
+                        playout.device.channels,
+                    );
+                    let ready = crate::audio::linear_resample(
+                        &matched,
+                        playout.device.channels as usize,
+                        frame.sample_rate,
+                        playout.device.sample_rate,
+                    );
+                    if !probed {
+                        probe.extend_from_slice(&ready);
+                        if probe.len() >= probe_target {
+                            AUDIO.note_probe(
+                                &probe,
+                                playout.device.sample_rate,
+                                playout.device.channels,
+                            );
+                            probed = true;
+                            probe = Vec::new();
                         }
-                        playout.ring.push(&ready);
                     }
-                })?,
-        );
+                    playout.ring.push(&ready);
+                }
+            }),
+        )?);
     }
 
-    let rx_socket = socket.try_clone()?;
+    let rx_socket = clone_socket(
+        startup
+            .socket
+            .as_ref()
+            .expect("auxiliary startup socket must exist before commit"),
+    )?;
     let rx_bridge = Arc::clone(&bridge);
     let rx_os = Arc::clone(&apply_os);
     let rx_clipboard_seed = Arc::clone(&clipboard_seed);
-    let rx_stop = Arc::clone(&stop);
-    joins.push(
-        std::thread::Builder::new()
-            .name("native-aux-rx".to_owned())
-            .spawn(move || {
-                let mut stats = auxchan::ReaderStats::default();
-                let mut audio_continuity = CaptureContinuity::default();
-                let end = auxchan::pump_reader(
-                    rx_socket,
-                    &mut auxchan::ReaderSinks {
-                        accepts_clipboard: &mut || lock(&rx_bridge).accepts_incoming(),
-                        on_text: &mut |text| {
-                            defer_or_apply_remote(&rx_clipboard_seed, &rx_stop, text, |text| {
-                                apply_remote_clipboard(&rx_os, &rx_bridge, text);
-                            });
-                        },
-                        // **Handed off, never processed here.** Decode, channel
-                        // remap and resample are the expensive part, and doing them
-                        // on the reader would add their cost to the latency of every
-                        // clipboard message sharing this thread.
-                        //
-                        // `try_send`, never `send`. The queue is bounded, and
-                        // `SyncSender::send` BLOCKS when a bounded queue is full —
-                        // on this thread that would stall the reader, which is what
-                        // keeps the clipboard moving, so a stalled audio device
-                        // would wedge the clipboard. Dropping a frame is the right
-                        // trade: the alternative is wedging both directions to
-                        // preserve audio nobody can hear.
-                        on_audio: &mut |frame| {
-                            if audio_continuity.observe_frame(&frame) {
-                                AUDIO.note_capture_gap();
-                            }
-                            if !frame.pcm.is_empty()
-                                && let Some(tx) = audio_tx.as_ref()
-                            {
-                                enqueue_audio(tx, frame, &AUDIO);
-                            }
-                        },
-                        // Client -> host only; the client never receives it.
-                        on_audio_control: &mut |_| {},
+    let rx_stop = AuxStop::new(Arc::clone(&stop), Arc::clone(&aux_stop));
+    startup.joins.push(spawn_thread(
+        "native-aux-rx",
+        Box::new(move || {
+            let mut stats = auxchan::ReaderStats::default();
+            let mut audio_continuity = CaptureContinuity::default();
+            let end = auxchan::pump_reader(
+                rx_socket,
+                &mut auxchan::ReaderSinks {
+                    accepts_clipboard: &mut || lock(&rx_bridge).accepts_incoming(),
+                    on_text: &mut |text| {
+                        defer_or_apply_remote(&rx_clipboard_seed, &rx_stop, text, |text| {
+                            apply_remote_clipboard(&rx_os, &rx_bridge, text);
+                        });
                     },
-                    &mut stats,
-                );
-                if let auxchan::ReaderEnd::Io(reason) = end {
-                    report(&format!("clipboard channel closed: {reason}"));
-                }
-            })?,
-    );
+                    // **Handed off, never processed here.** Decode, channel
+                    // remap and resample are the expensive part, and doing them
+                    // on the reader would add their cost to the latency of every
+                    // clipboard message sharing this thread.
+                    //
+                    // `try_send`, never `send`. The queue is bounded, and
+                    // `SyncSender::send` BLOCKS when a bounded queue is full —
+                    // on this thread that would stall the reader, which is what
+                    // keeps the clipboard moving, so a stalled audio device
+                    // would wedge the clipboard. Dropping a frame is the right
+                    // trade: the alternative is wedging both directions to
+                    // preserve audio nobody can hear.
+                    on_audio: &mut |frame| {
+                        if audio_continuity.observe_frame(&frame) {
+                            AUDIO.note_capture_gap();
+                        }
+                        if !frame.pcm.is_empty()
+                            && let Some(tx) = audio_tx.as_ref()
+                        {
+                            enqueue_audio(tx, frame, &AUDIO);
+                        }
+                    },
+                    // Client -> host only; the client never receives it.
+                    on_audio_control: &mut |_| {},
+                },
+                &mut stats,
+            );
+            if let auxchan::ReaderEnd::Io(reason) = end {
+                report(&format!("clipboard channel closed: {reason}"));
+            }
+        }),
+    )?);
 
-    let tx_socket = socket.try_clone()?;
+    let tx_socket = clone_socket(
+        startup
+            .socket
+            .as_ref()
+            .expect("auxiliary startup socket must exist before commit"),
+    )?;
     let tx_slot = Arc::clone(&slot);
-    joins.push(
-        std::thread::Builder::new()
-            .name("native-aux-tx".to_owned())
-            .spawn(move || {
-                let writer = auxchan::pump_writer(&tx_socket, &tx_slot, &mut report);
-                if let auxchan::WriterEnd::Io(reason) = writer.end {
-                    report(&format!("clipboard channel write failed: {reason}"));
-                    let _ = tx_socket.shutdown(Shutdown::Both);
-                }
-            })?,
-    );
+    startup.joins.push(spawn_thread(
+        "native-aux-tx",
+        Box::new(move || {
+            let writer = auxchan::pump_writer(&tx_socket, &tx_slot, &mut report);
+            if let auxchan::WriterEnd::Io(reason) = writer.end {
+                report(&format!("clipboard channel write failed: {reason}"));
+                let _ = tx_socket.shutdown(Shutdown::Both);
+            }
+        }),
+    )?);
 
     let poll_slot = Arc::clone(&slot);
     let poll_bridge = Arc::clone(&bridge);
     let poll_os = Arc::clone(&poll_os);
     let poll_apply_os = Arc::clone(&apply_os);
     let poll_clipboard_seed = Arc::clone(&clipboard_seed);
-    let poll_stop = Arc::clone(&stop);
-    joins.push(
-        std::thread::Builder::new()
-            .name("native-clipboard-poll".to_owned())
-            .spawn(move || {
-                // An image or unreadable pasteboard both mean "no text we could
-                // have sent", which is exactly what an empty seed says.
-                let seed = lock(&poll_os).read_text().ok().flatten();
-                if poll_stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                lock(&poll_bridge).seed(seed.as_deref());
-                complete_clipboard_seed(&poll_clipboard_seed, &poll_stop, |text| {
-                    apply_remote_clipboard(&poll_apply_os, &poll_bridge, text);
-                });
-                while !poll_stop.load(Ordering::Relaxed) {
-                    {
-                        let mut os = lock(&poll_os);
-                        if let Some(text) = clip::poll_local(&mut **os, &poll_bridge, &mut report) {
-                            COUNTERS.note_sent();
-                            poll_slot.put_clipboard(text);
-                        }
-                    }
-                    let deadline = Instant::now() + CLIPBOARD_POLL_INTERVAL;
-                    while !poll_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-                        std::thread::sleep(
-                            Duration::from_millis(10)
-                                .min(deadline.saturating_duration_since(Instant::now())),
-                        );
+    let poll_stop = AuxStop::new(Arc::clone(&stop), Arc::clone(&aux_stop));
+    startup.joins.push(spawn_thread(
+        "native-clipboard-poll",
+        Box::new(move || {
+            // An image or unreadable pasteboard both mean "no text we could
+            // have sent", which is exactly what an empty seed says.
+            let seed = lock(&poll_os).read_text().ok().flatten();
+            if poll_stop.is_set() {
+                return;
+            }
+            lock(&poll_bridge).seed(seed.as_deref());
+            complete_clipboard_seed(&poll_clipboard_seed, &poll_stop, |text| {
+                apply_remote_clipboard(&poll_apply_os, &poll_bridge, text);
+            });
+            while !poll_stop.is_set() {
+                {
+                    let mut os = lock(&poll_os);
+                    if let Some(text) = clip::poll_local(&mut **os, &poll_bridge, &mut report) {
+                        COUNTERS.note_sent();
+                        poll_slot.put_clipboard(text);
                     }
                 }
-            })?,
-    );
+                let deadline = Instant::now() + CLIPBOARD_POLL_INTERVAL;
+                while !poll_stop.is_set() && Instant::now() < deadline {
+                    std::thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+            }
+        }),
+    )?);
 
-    Ok(AuxChannel {
-        socket,
-        slot,
-        stop,
-        joins,
-    })
+    Ok(startup.into_channel(stop))
 }
 
 /// A poisoned clipboard mutex is not worth ending a session over: the state it
@@ -3949,6 +4094,288 @@ mod tests {
     }
 
     use super::*;
+
+    fn assert_auxiliary_peer_closed(mut peer: TcpStream) {
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set auxiliary peer read timeout");
+        let mut byte = [0u8; 1];
+        match peer.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::UnexpectedEof
+                ) => {}
+            result => panic!("auxiliary socket remained open after rollback: {result:?}"),
+        }
+    }
+
+    #[test]
+    fn auxiliary_startup_rolls_back_after_each_socket_clone_failure() {
+        for failed_clone in 1..=2 {
+            let (socket, peer) = auxiliary_socket_pair();
+            let stop = Arc::new(AtomicBool::new(false));
+            let started = Arc::new(AtomicU64::new(0));
+            let finished = Arc::new(AtomicU64::new(0));
+            let mut clone_calls = 0;
+            let mut clone_socket = |socket: &TcpStream| {
+                clone_calls += 1;
+                if clone_calls == failed_clone {
+                    Err(std::io::Error::other(
+                        "injected auxiliary socket clone failure",
+                    ))
+                } else {
+                    socket.try_clone()
+                }
+            };
+            let started_by_thread = Arc::clone(&started);
+            let finished_by_thread = Arc::clone(&finished);
+            let mut spawn_thread = move |name: &str, task: AuxTask| {
+                let started = Arc::clone(&started_by_thread);
+                let finished = Arc::clone(&finished_by_thread);
+                std::thread::Builder::new()
+                    .name(name.to_owned())
+                    .spawn(move || {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        task();
+                        finished.fetch_add(1, Ordering::SeqCst);
+                    })
+            };
+
+            let result = spawn_aux_with(
+                socket,
+                &mut || Box::new(InertClipboard) as Box<dyn TextClipboard>,
+                Policy::default(),
+                Arc::clone(&stop),
+                None,
+                &mut clone_socket,
+                &mut spawn_thread,
+            );
+
+            assert!(
+                result.is_err(),
+                "clone failure must abort auxiliary startup"
+            );
+            assert_eq!(clone_calls, failed_clone);
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                (failed_clone - 1) as u64,
+                "only workers before the failed clone may have started"
+            );
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                finished.load(Ordering::SeqCst),
+                "every worker started before clone failure must terminate"
+            );
+            assert!(
+                !stop.load(Ordering::Relaxed),
+                "optional aux failure stopped session"
+            );
+            assert_auxiliary_peer_closed(peer);
+        }
+    }
+
+    #[test]
+    fn auxiliary_startup_audio_worker_rolls_back_after_first_socket_clone_failure() {
+        let (socket, peer) = auxiliary_socket_pair();
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicU64::new(0));
+        let stats = crate::audio::AudioStatsHandle::new();
+        let audio = Some(AudioPlayout {
+            ring: AudioRing::for_native_device(48_000, 2, stats),
+            device: AudioFormatSummary {
+                sample_rate: 48_000,
+                channels: 2,
+                bits_per_sample: 32,
+            },
+        });
+        let started_by_clone = Arc::clone(&started);
+        let mut clone_socket = move |_socket: &TcpStream| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while started_by_clone.load(Ordering::SeqCst) < 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "audio worker did not start before injected clone failure"
+                );
+                std::thread::yield_now();
+            }
+            Err(std::io::Error::other(
+                "injected auxiliary socket clone failure",
+            ))
+        };
+        let started_by_thread = Arc::clone(&started);
+        let finished_by_thread = Arc::clone(&finished);
+        let mut spawn_thread = move |name: &str, task: AuxTask| {
+            let started = Arc::clone(&started_by_thread);
+            let finished = Arc::clone(&finished_by_thread);
+            std::thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(move || {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    task();
+                    finished.fetch_add(1, Ordering::SeqCst);
+                })
+        };
+
+        let result = spawn_aux_with(
+            socket,
+            &mut || Box::new(InertClipboard) as Box<dyn TextClipboard>,
+            Policy::default(),
+            Arc::clone(&stop),
+            audio,
+            &mut clone_socket,
+            &mut spawn_thread,
+        );
+
+        assert!(
+            result.is_err(),
+            "clone failure must abort auxiliary startup"
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            finished.load(Ordering::SeqCst)
+        );
+        assert!(
+            !stop.load(Ordering::Relaxed),
+            "optional aux failure stopped session"
+        );
+
+        // The audio request is the only expected startup payload. Drain it before
+        // checking EOF; otherwise the request itself can masquerade as an open socket.
+        let mut peer = peer;
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set auxiliary peer read timeout");
+        let mut wire = Vec::new();
+        let mut chunk = [0u8; 128];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&chunk[..n]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::NotConnected
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("reading auxiliary startup payload: {error}"),
+            }
+        }
+        let mut reassembler = Reassembler::new(framing::DEFAULT_MAX_PAYLOAD);
+        reassembler.push(&wire);
+        let message = reassembler
+            .next_message()
+            .expect("decode audio request framing")
+            .expect("audio request must reach peer before rollback EOF");
+        assert_eq!(message.msg_type, rhydra::aux_proto::MSG_AUDIO_CONTROL);
+        assert!(matches!(
+            rhydra::aux_proto::decode_audio_control(&message.payload),
+            Ok(rhydra::aux_proto::AuxMessage::AudioControl { enable: true })
+        ));
+        assert!(
+            matches!(reassembler.next_message(), Ok(None)),
+            "rollback peer stream must contain only the audio request"
+        );
+    }
+
+    #[test]
+    fn auxiliary_startup_guard_closes_outbox_and_only_local_stop() {
+        let (socket, peer) = auxiliary_socket_pair();
+        let local_stop = Arc::new(AtomicBool::new(false));
+        let slot = Outbox::with_interval(Duration::from_millis(1));
+        {
+            let _startup = AuxStartup::new(socket, Arc::clone(&slot), Arc::clone(&local_stop));
+        }
+
+        assert!(local_stop.load(Ordering::Relaxed));
+        assert_eq!(slot.take(), rhydra::auxchan::Take::Closed);
+        drop(peer);
+    }
+
+    #[test]
+    fn auxiliary_startup_rolls_back_after_post_worker_spawn_failures() {
+        for (failed_name, workers_before_failure) in
+            [("native-aux-tx", 1u64), ("native-clipboard-poll", 2u64)]
+        {
+            let (socket, peer) = auxiliary_socket_pair();
+            let stop = Arc::new(AtomicBool::new(false));
+            let started = Arc::new(AtomicU64::new(0));
+            let finished = Arc::new(AtomicU64::new(0));
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut clone_socket = |socket: &TcpStream| socket.try_clone();
+            let started_by_spawn = Arc::clone(&started);
+            let started_by_thread = Arc::clone(&started);
+            let finished_by_thread = Arc::clone(&finished);
+            let calls_by_spawn = Arc::clone(&calls);
+            let mut spawn_thread = move |name: &str, task: AuxTask| {
+                calls_by_spawn.lock().unwrap().push(name.to_owned());
+                if name == failed_name {
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while started_by_spawn.load(Ordering::SeqCst) < workers_before_failure {
+                        assert!(
+                            Instant::now() < deadline,
+                            "workers before injected spawn failure did not start"
+                        );
+                        std::thread::yield_now();
+                    }
+                    return Err(std::io::Error::other(
+                        "injected auxiliary thread spawn failure",
+                    ));
+                }
+                let started = Arc::clone(&started_by_thread);
+                let finished = Arc::clone(&finished_by_thread);
+                std::thread::Builder::new()
+                    .name(name.to_owned())
+                    .spawn(move || {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        task();
+                        finished.fetch_add(1, Ordering::SeqCst);
+                    })
+            };
+
+            let result = spawn_aux_with(
+                socket,
+                &mut || Box::new(InertClipboard) as Box<dyn TextClipboard>,
+                Policy::default(),
+                Arc::clone(&stop),
+                None,
+                &mut clone_socket,
+                &mut spawn_thread,
+            );
+
+            assert!(
+                result.is_err(),
+                "spawn failure must abort auxiliary startup"
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                match failed_name {
+                    "native-aux-tx" => vec!["native-aux-rx", "native-aux-tx"],
+                    "native-clipboard-poll" =>
+                        vec!["native-aux-rx", "native-aux-tx", "native-clipboard-poll",],
+                    _ => unreachable!(),
+                }
+            );
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                finished.load(Ordering::SeqCst),
+                "every worker started before spawn failure must terminate"
+            );
+            assert_eq!(started.load(Ordering::SeqCst), workers_before_failure);
+            assert!(
+                !stop.load(Ordering::Relaxed),
+                "optional aux failure stopped session"
+            );
+            assert_auxiliary_peer_closed(peer);
+        }
+    }
 
     #[test]
     fn one_damaged_5k_block_inspects_only_that_block() {
