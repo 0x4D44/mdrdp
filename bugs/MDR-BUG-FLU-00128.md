@@ -31,7 +31,11 @@ In particular, the already-started writer waits on the empty outbox indefinitely
 
 ## Fix
 
-<unfixed — raised only>
+Integrated as `da33f3e`, version 0.1.243, on 2026-09-05. AuxStartup now owns resources before the first worker starts. Any later clone/spawn failure closes the outbox and socket, sets auxiliary-local cancellation and performs bounded joins. The main session stop flag remains clear on optional-channel failure. Running audio and clipboard workers watch both cancellation flags; normal shutdown retains its existing 100 ms bounded-detach policy.
+
+Four regressions cover socket-clone failures, post-worker spawn failures including the final clipboard poll spawn, audio-present rollback and direct guard cleanup. The lead disabled the guard's Drop cleanup: all four selected tests failed on their assertions (missing cancellation or workers not completed before return). After restoration and rebase onto current main, all 64 native-session tests passed, including the earlier ACK fix and blocked-clipboard shutdown tests. Formatting, warning-denying library/test clippy, both Windows type-checks and CLI help smoke passed. Existing unrelated Windows warnings remain. No live desktop, OS resource exhaustion or real clipboard was exercised.
+
+Commands and assertion evidence: [native review fix journal](<~/language/mdrdp/wrk_journals/2026.09.05 - JRN - native review fixes.md>). Fixed, awaiting independent verification; the fixing session does not close its own record.
 
 ## Notes
 
