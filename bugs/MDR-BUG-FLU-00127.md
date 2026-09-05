@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00127 — Native control replies bypass memory and end-to-end timeout bounds
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** native/control-client
 - **Raised:** 2026-09-04T22:00:27Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260905T061934Z-52de8fba
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00127-run-fix-20260905T061934Z-52de8fba
-- **Owner base:** aec6189071520688d1a15da18b7498cad1ea0c3f
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-09-05T06:19:34Z
-- **Owner until:** 2026-09-05T08:19:34Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-04T22:00:27Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-09-04T22:00:27Z, raised via `deltic bugs new`) -> Fixed (2026-09-05T06:38:24Z, deltic:auto role=fix run=fix-20260905T061934Z-52de8fba branch=task/bug-MDR-BUG-FLU-00127-run-fix-20260905T061934Z-52de8fba code=aff1e45 gate=manual)
 
 ## Observation
 
