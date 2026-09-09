@@ -133,7 +133,7 @@ impl Default for ClipboardSettings {
     fn default() -> Self {
         ClipboardSettings {
             direction: ClipboardDirection::Both,
-            max_image_bytes: 1_048_576,
+            max_image_bytes: 64 * 1024 * 1024,
             timeout_secs: 5,
         }
     }
@@ -295,7 +295,7 @@ mod tests {
         assert!(s.audio.playback);
         assert_eq!(s.audio.device, "default");
         assert_eq!(s.clipboard.direction, ClipboardDirection::Both);
-        assert_eq!(s.clipboard.max_image_bytes, 1_048_576);
+        assert_eq!(s.clipboard.max_image_bytes, 64 * 1024 * 1024);
         assert_eq!(s.clipboard.timeout_secs, 5);
         assert!(!s.diagnostics.overlay_on_connect);
         assert_eq!(s.diagnostics.stage_log, StageLogLevel::Stages);
@@ -336,6 +336,7 @@ stage_log = "stages"
 "#;
         let s: Settings = toml::from_str(text).expect("README schema parses");
         assert_eq!(s.defaults.username.as_deref(), Some("alice"));
+        assert_eq!(s.clipboard.max_image_bytes, 1_048_576);
         assert_eq!(s.diagnostics.metrics_dir, "~/mdrdp/runs");
     }
 
@@ -404,7 +405,11 @@ stage_log = "stages"
         let s: Settings =
             toml::from_str("[clipboard]\ntimeout_secs = 30\n").expect("partial parses");
         assert_eq!(s.clipboard.timeout_secs, 30);
-        assert_eq!(s.clipboard.max_image_bytes, 1_048_576, "sibling defaulted");
+        assert_eq!(
+            s.clipboard.max_image_bytes,
+            64 * 1024 * 1024,
+            "sibling defaulted"
+        );
         assert_eq!(s.defaults.port, 3389, "other tables defaulted");
     }
 }
