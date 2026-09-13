@@ -6,15 +6,15 @@
 - **Area:** native-video
 - **Raised:** 2026-08-20T11:26:57Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T081009Z-a6c23719
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00023-run-verify-20260913T081009Z-a6c23719
+- **Owner base:** bf895a2b2f7525b31b146f2a1a67da58dc22a0ae
+- **Owner fingerprint:** sha256:35ff653e49277e6032d036f3fc102d3547553d90b773343c4e07b04e3db81323
+- **Owner since:** 2026-09-13T08:10:09Z
+- **Owner until:** 2026-09-13T10:10:09Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
