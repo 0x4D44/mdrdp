@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00030 — Native session shows two cursors and the remote cursor trails by seconds
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/input
 - **Raised:** 2026-08-21T22:15:35Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T051530Z-ddb1b3a4
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00030-run-verify-20260913T051530Z-ddb1b3a4
-- **Owner base:** 42f92e14383e7b972a4c56d64c3b80fb58d8f622
-- **Owner fingerprint:** sha256:e1d03e77c3906f855dd6cf5f23d19d47c92ed8f1ad2c68571f6825a5fba88bc5
-- **Owner since:** 2026-09-13T05:15:30Z
-- **Owner until:** 2026-09-13T07:15:30Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-21T22:15:35Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-21T23:08:11Z, deltic:auto role=fix run=fix-20260821T225003Z-94169e2d branch=task/bug-MDR-BUG-FLU-00030-run-fix-20260821T225003Z-94169e2d code=40ae062 gate=manual)
+- **State history:** Open (2026-08-21T22:15:35Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-21T23:08:11Z, deltic:auto role=fix run=fix-20260821T225003Z-94169e2d branch=task/bug-MDR-BUG-FLU-00030-run-fix-20260821T225003Z-94169e2d code=40ae062 gate=manual) -> Closed (2026-09-13T05:26:31Z, independent verifier: cursor state reached the local platform path and wire framing round-tripped; the hidden-state mutant failed its assertion; model=codex@max)
 
 ## Observation
 
@@ -36,7 +36,16 @@ owns the cursor before hiding either copy.
 
 ## Fix
 
-<unfixed — raised only>
+Commit `40ae06287520ab71e53d1b88e2fd3b5395032bac` gives the IDD hardware cursor the
+remote ownership path and mirrors host cursor visibility to the native viewer. The
+post-fix native session suite passed 64/64, and the server cursor framing regression
+passed. The native test confirmed cursor messages reach the platform callback without
+painting the desktop.
+
+The independent red check changed the hidden cursor dispatch to `Default`. The selected
+test failed its own assertion with `[Default, Default]` instead of `[Hidden, Default]`.
+The original duplicate/trailing cursor observation was reviewed against the ownership
+path; this pass did not start a new Windows IDD session.
 
 ## Notes
 

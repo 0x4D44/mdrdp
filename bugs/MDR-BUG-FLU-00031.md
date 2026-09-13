@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00031 — Native keyboard feedback trails input by seconds
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/input
 - **Raised:** 2026-08-21T22:15:35Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T051543Z-06ee822b
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00031-run-verify-20260913T051543Z-06ee822b
-- **Owner base:** 5e3bc3a54dcb6f8cfb2df53c552de14d1b84917c
-- **Owner fingerprint:** sha256:a29673da8fbfecaae37de33703a1995c300fdcc60194355059643b85797ccf9d
-- **Owner since:** 2026-09-13T05:15:43Z
-- **Owner until:** 2026-09-13T07:15:43Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-21T22:15:35Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-21T23:23:59Z, deltic:auto role=fix run=fix-20260821T230833Z-43bbb955 branch=task/bug-MDR-BUG-FLU-00031-run-fix-20260821T230833Z-43bbb955 code=29b607b93e45786b645ffeda727bc545b15e86bb gate=manual)
+- **State history:** Open (2026-08-21T22:15:35Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-21T23:23:59Z, deltic:auto role=fix run=fix-20260821T230833Z-43bbb955 branch=task/bug-MDR-BUG-FLU-00031-run-fix-20260821T230833Z-43bbb955 code=29b607b93e45786b645ffeda727bc545b15e86bb gate=manual) -> Closed (2026-09-13T05:26:31Z, independent verifier: reliable keyboard input preceded the coalesced final mouse move; the newest-first mutant failed its ordering assertion; model=codex@max)
 
 ## Observation
 
@@ -35,7 +35,15 @@ repair must split those stages before changing the input protocol.
 
 ## Fix
 
-<unfixed — raised only>
+Commit `29b607b93e45786b645ffeda727bc545b15e86bb` separates physical mouse motion into
+a latest-value slot while retaining a reliable FIFO for keyboard, button, wheel, and
+scripted input. The post-fix native session suite passed 64/64 and the input suite
+passed 49/49, including the 10,000-move and key-order regressions.
+
+The independent red check made `next_native_input` consume the latest mouse move before
+the reliable queue. The selected test failed its ordering assertion with the mouse move
+before the key. The original several-second keyboard-latency observation was reviewed
+against this queue boundary; this pass did not start a new live host session.
 
 ## Notes
 

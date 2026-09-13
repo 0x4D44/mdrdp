@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00025 — 5K IDD publishes no frames because every full-surface GPU copy exceeds the fixed 2 ms proof deadline
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** idd/shared-pool
 - **Raised:** 2026-08-20T18:41:47Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T051432Z-6dc35d9b
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00025-run-verify-20260913T051432Z-6dc35d9b
-- **Owner base:** 39b032186fb333f41ddb0d2633deb330cac9a762
-- **Owner fingerprint:** sha256:9bd45f236f17b28354ce4c55ed4349aae7aa2f120c75734e89895477279db34c
-- **Owner since:** 2026-09-13T05:14:32Z
-- **Owner until:** 2026-09-13T07:14:32Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-20T18:41:47Z, raised via `deltic bugs new`) -> Fixed (2026-08-20T18:55:53Z, deltic:auto role=fix run=fix-20260820T184219Z-56b84acc branch=task/bug-MDR-BUG-FLU-00025-run-fix-20260820T184219Z-56b84acc code=8bd484e gate=manual)
+- **State history:** Open (2026-08-20T18:41:47Z, raised via `deltic bugs new`) -> Fixed (2026-08-20T18:55:53Z, deltic:auto role=fix run=fix-20260820T184219Z-56b84acc branch=task/bug-MDR-BUG-FLU-00025-run-fix-20260820T184219Z-56b84acc code=8bd484e gate=manual) -> Closed (2026-09-13T05:26:31Z, independent verifier: dynamic 5K deadline oracle passed and the fixed-floor mutant failed its named assertion; model=codex@max)
 
 ## Observation
 
@@ -27,6 +27,14 @@ Arthur connected to quench at 5120x2880 with mdrdp v0.1.109 and saw only tartan,
 
 ## Fix
 
-<unfixed — raised only>
+Commit `8bd484e021004848e391e85bcd9a7fba02aabe0d` derives the IDD copy-wait limit from
+surface pixels, clamps it between 2 ms and 16 ms, and starts the wait budget before GPU
+submission. A named runtime oracle extracted from the current `CopyWaitLimitUs` helper
+passed the 0, 1080p, 1440p, 5K, and cap cases. Reversing the root `MinimumUs` value from
+2000 to 1000 made the same oracle fail `CopyWaitLimitUs(0, 0) == 2000` with actual 1000.
+
+The post-fix server suite passed 409/409. The original 5120x2880 zero-frame observation
+and its measured D3D11 copy tail were reviewed against the current source; this macOS
+pass did not run the Windows IDD hardware or a new live Quench session.
 
 ## Notes
