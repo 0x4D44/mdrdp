@@ -6,15 +6,15 @@
 - **Area:** rhydra/agent
 - **Raised:** 2026-08-19T16:57:07Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T070455Z-5ee8576f
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00017-run-verify-20260913T070455Z-5ee8576f
+- **Owner base:** 91a596109bf3c2f780047878c44b03987eb4cbff
+- **Owner fingerprint:** sha256:411ee0c7134a9ed22449a20b28d95171be856c42df8c81c3f544117163f259b0
+- **Owner since:** 2026-09-13T07:04:55Z
+- **Owner until:** 2026-09-13T09:04:55Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
