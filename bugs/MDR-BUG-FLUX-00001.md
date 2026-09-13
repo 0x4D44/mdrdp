@@ -6,15 +6,15 @@
 - **Area:** audio
 - **Raised:** 2026-08-16T10:16:35Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T061845Z-b933a768
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00001-run-verify-20260913T061845Z-b933a768
+- **Owner base:** b793b179540d39e07769c14c451d711cb1d1748c
+- **Owner fingerprint:** sha256:e94e08463ff44634082c4f4ea22e899e1da5aab58b79e847155d78c71628f672
+- **Owner since:** 2026-09-13T06:18:45Z
+- **Owner until:** 2026-09-13T08:18:45Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
