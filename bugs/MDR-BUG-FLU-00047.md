@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00047 — AVC444 v1 drops chroma on unaligned surface widths
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** gfx/avc444
 - **Raised:** 2026-08-23T12:08:41Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T095003Z-f482c1cb
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00047-run-verify-20260913T095003Z-f482c1cb
-- **Owner base:** 4e06ab346de6f85ff69a14c857f3089b55bfe85a
-- **Owner fingerprint:** sha256:b6fe085778b2533c7afde57478c44b1652aae8521c037915e61b29a2de5616ca
-- **Owner since:** 2026-09-13T09:50:03Z
-- **Owner until:** 2026-09-13T11:50:03Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T12:08:41Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-23T12:14:10Z, deltic:auto role=fix run=fix-20260823T120917Z-08d8da0e branch=task/bug-MDR-BUG-FLU-00047-run-fix-20260823T120917Z-08d8da0e code=e9fd732 gate=manual)
+- **State history:** Open (2026-08-23T12:08:41Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-23T12:14:10Z, deltic:auto role=fix run=fix-20260823T120917Z-08d8da0e branch=task/bug-MDR-BUG-FLU-00047-run-fix-20260823T120917Z-08d8da0e code=e9fd732 gate=manual) -> Closed (2026-09-13T09:59:51Z, 0x4D44/Codex verify run=verify-20260913T095003Z-f482c1cb)
 
 ## Observation
 
@@ -27,6 +27,18 @@ The AVC444 client applies the AVC444v2 align32 width requirement to AVC444 v1 be
 
 ## Fix
 
-<unfixed — raised only>
+The AVC444 geometry gate now requires the surface width for AVC444 v1, whose chroma rows are interleaved at full width. It continues to require `align32(surface width)` for AVC444 v2, whose split chroma offsets depend on that padding.
 
 ## Notes
+
+## Verification
+
+Independent verification confirmed fix commit e9fd7321fa4acac1db8c8424f1f1833738c07cb. The shared geometry gate at vendor/ironrdp-egfx/src/client.rs:1386 selects the surface width for AVC444 v1 and the aligned width for v2; the combined and chroma-only paths use it at :1465 and :1559. The regression test at :3384 exercises an unaligned 60-pixel v1 surface and checks that chroma is retained.
+
+The lead v1 regression and v2 width-guard tests each passed 1/1. The independent verifier reproduced the v1 test at 1/1 and ran the vendored suites: EGFX 47/47, graphics 219/219, and PDU 372/372. No live Windows or GPU run was available on this macOS host.
+
+As a red root mutant, changing the AVC444 v1 arm at vendor/ironrdp-egfx/src/client.rs:1386 back to `align32` made `avc444_v1_accepts_a_frame_at_the_unaligned_surface_width` fail at :3417 with `left: 11`, `right: 25`. The independent verifier reproduced the same failure. The source was restored and the focused tests passed again.
+
+The claim warning naming MDR-BUG-FLU-00050 was resolved as non-overlap: that record changes Rhydra sender/stats behavior, while this one changes vendored AVC444 geometry; `scripts/check-windows.sh` is shared validation infrastructure only.
+
+The six repository gates passed: `cargo build --locked`; `cargo test --locked`; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh`; and `./scripts/check-windows.sh --locked`. The Windows gate exited 0 and emitted only the existing missing icon asset and unused `width`/`height` warnings in src/present.rs.
