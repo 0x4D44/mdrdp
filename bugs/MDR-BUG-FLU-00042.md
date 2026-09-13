@@ -6,15 +6,15 @@
 - **Area:** rhydra/clipboard
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T091158Z-e10300ab
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00042-run-verify-20260913T091158Z-e10300ab
+- **Owner base:** 17b713cf3d249120950a9211a7fe3b5f845fd3b0
+- **Owner fingerprint:** sha256:b7d1121e8f4d05464af4df07f08241f12a1e30e4d2586027e3186e9554bfc5c1
+- **Owner since:** 2026-09-13T09:11:58Z
+- **Owner until:** 2026-09-13T11:11:58Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
