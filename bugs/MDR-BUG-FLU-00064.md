@@ -6,15 +6,15 @@
 - **Area:** rhydra/rendering
 - **Raised:** 2026-08-23T19:42:47Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T112922Z-06f88a5f
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00064-run-verify-20260913T112922Z-06f88a5f
+- **Owner base:** 085f8f542730350ae1aaf08fc6f2ea831df4d708
+- **Owner fingerprint:** sha256:95729ae58b5973f7bf44e8bb71c90abfccde4a830eee702bb3f9d5dcb36a3926
+- **Owner since:** 2026-09-13T11:29:22Z
+- **Owner until:** 2026-09-13T13:29:22Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
