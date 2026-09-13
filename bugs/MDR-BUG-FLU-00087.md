@@ -6,15 +6,15 @@
 - **Area:** rdp/clipboard-policy
 - **Raised:** 2026-08-23T22:57:27Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T140308Z-ab5fc370
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00087-run-verify-20260913T140308Z-ab5fc370
+- **Owner base:** 6136b50ff78e50a75aa2a6415f43f0b807fdfc7e
+- **Owner fingerprint:** sha256:e6cde3c28812ca5ba1ea0f43f7e41ab3ffdae2321b50f45742e922a715e55029
+- **Owner since:** 2026-09-13T14:03:08Z
+- **Owner until:** 2026-09-13T16:03:08Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
