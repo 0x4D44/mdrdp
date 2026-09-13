@@ -6,15 +6,15 @@
 - **Area:** graphics/presentation-lifecycle
 - **Raised:** 2026-08-24T09:37:41Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T145238Z-e2e013ef
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00093-run-verify-20260913T145238Z-e2e013ef
+- **Owner base:** ca158ccf7b4ee3e5b635f87a99777cf67660fecf
+- **Owner fingerprint:** sha256:4b44cb460dd13b68649a6a9e91cc6533500891aca72994251e279fa7e30bea1f
+- **Owner since:** 2026-09-13T14:52:38Z
+- **Owner until:** 2026-09-13T16:52:38Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
