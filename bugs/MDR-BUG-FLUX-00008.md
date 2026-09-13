@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00008 — Reveal after Suppress Output paints black: the resumed AVC444 stream fails to decode in a burst
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** gfx
 - **Raised:** 2026-08-19T07:15:59Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T065042Z-fac484e7
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00008-run-verify-20260913T065042Z-fac484e7
-- **Owner base:** c5be6771f85373f4e319bbf45e5480b8e142b8ca
-- **Owner fingerprint:** sha256:9411fa08926265d895e15b9604b8494870e65ad73ce2a0646549cbc97945e818
-- **Owner since:** 2026-09-13T06:50:42Z
-- **Owner until:** 2026-09-13T08:50:42Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=1, indeterminate=0
-- **State history:** Open (2026-08-19T07:15:59Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-20T09:48:39Z, deltic:auto role=fix run=fix-20260820T094820Z-p79668-n341034000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T094820Z-p79668-n341034000-c1 code=dc30a1e gate=manual) -> Open (2026-08-20T10:10:59Z, independent verification failed by Codex: kiln 0.1.102 reproduced 533 decode errors and the new black flash) -> Fixed (2026-08-20T10:43:52Z, deltic:auto role=fix run=fix-20260820T101154Z-p9452-n781886000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T101154Z-p9452-n781886000-c1 code=3403a72 gate=manual)
+- **State history:** Open (2026-08-19T07:15:59Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-20T09:48:39Z, deltic:auto role=fix run=fix-20260820T094820Z-p79668-n341034000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T094820Z-p79668-n341034000-c1 code=dc30a1e gate=manual) -> Open (2026-08-20T10:10:59Z, independent verification failed by Codex: kiln 0.1.102 reproduced 533 decode errors and the new black flash) -> Fixed (2026-08-20T10:43:52Z, deltic:auto role=fix run=fix-20260820T101154Z-p9452-n781886000-c1 branch=task/bug-MDR-BUG-FLUX-00008-run-fix-20260820T101154Z-p9452-n781886000-c1 code=3403a72 gate=manual) -> Closed (2026-09-13T07:01:15Z, 0x4D44/Codex verify run=verify-20260913T065042Z-fac484e7)
 
 ## Observation
 
@@ -403,3 +403,11 @@ chains, including surface deletion and same-id reuse; deliberately collapsing th
 map made that test fail. A mapped zero-filled replacement retains the previous desktop
 through both different-id and same-id handoffs; the test first failed with transparent
 black, then passed with the presentation fallback.
+
+## Verification
+
+Independent verification confirmed fix commit `3403a723b62acba24c9e398ddaee6e8a777aac0b` and the root surface-decoder lifetime change in `vendor/ironrdp-egfx/src/client.rs`: H.264 decoder sessions persist per live surface and survive `ResetGraphics`, then retire on surface deletion or same-id replacement. The focused regressions `client::tests::reset_graphics_does_not_destroy_the_h264_decoder` and `client::tests::per_surface_decoders_survive_interleaved_updates_without_reset` passed after restoration, with 2 and 1 tests respectively.
+
+As a red root mutant, adding a reset of every `h264_decoders` entry to `handle_reset_graphics` made `client::tests::reset_graphics_does_not_destroy_the_h264_decoder` fail at `vendor/ironrdp-egfx/src/client.rs:2250`: `left: 1`, `right: 0`. The mutant was removed and the source diff is empty. The repository gates then passed: `cargo build --locked`; `cargo test --locked` with 908 library tests, 17 binary tests, 5 wire tests, and 3 malformed-ZGFX tests; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh` with 372 vendored tests; and `./scripts/check-windows.sh --locked`.
+
+No fresh Kiln live cycle was available during this verification, so no new live AVC444 claim is made. The controlled Kiln evidence recorded above remains the end-to-end observation.

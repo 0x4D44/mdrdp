@@ -1,25 +1,24 @@
 # MDR-BUG-FLUX-00012 — Native sessions publish no stats samples: latency, decode, present and frame_gap are all empty in the metrics report
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** native-transport
 - **Raised:** 2026-08-19T11:18:36Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T065052Z-de090978
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00012-run-verify-20260913T065052Z-de090978
-- **Owner base:** 917971504030db9db1333a303c4e38527280d3c5
-- **Owner fingerprint:** sha256:96fed46a025c40fd633eac784f48e8b832b944986d0fbc4c7f50d5be5deef0c1
-- **Owner since:** 2026-09-13T06:50:52Z
-- **Owner until:** 2026-09-13T08:50:52Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T11:18:36Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-24T08:32:47Z, deltic:auto role=fix run=fix-20260824T083231Z-1af22f05 branch=task/bug-MDR-BUG-FLUX-00012-run-fix-20260824T083231Z-1af22f05 code=58d238c82eb86a3240138ed71073232fc33e3d38 gate=manual)
+- **State history:** Open (2026-08-19T11:18:36Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-24T08:32:47Z, deltic:auto role=fix run=fix-20260824T083231Z-1af22f05 branch=task/bug-MDR-BUG-FLUX-00012-run-fix-20260824T083231Z-1af22f05 code=58d238c82eb86a3240138ed71073232fc33e3d38 gate=manual) -> Closed (2026-09-13T07:01:15Z, 0x4D44/Codex verify run=verify-20260913T065052Z-de090978)
 
 ## Observation
 
@@ -115,3 +114,10 @@ exactly: `frames 116  bytes in 1049864`.
 This closes the caveat the fix was committed with (unit tests only, no live
 host). Reported by Arthur against `mdrdp -S`.
 
+## Verification
+
+Independent verification confirmed fix commit `58d238c82eb86a3240138ed71073232fc33e3d38` and the root `NativeSink::record_paint`/`InputClock` path in `src/native/session.rs`. The focused regressions `native::session::tests::every_painted_frame_is_counted_not_just_the_keyframe`, `a_paint_closes_the_outstanding_input_round_trip_on_both_paths`, `only_the_first_unanswered_input_starts_the_round_trip_clock`, and `the_input_thread_stamps_the_clock_when_a_record_reaches_the_wire` each passed after restoration.
+
+As a red root mutant, removing `s.frames += 1` from `NativeSink::record_paint` made `every_painted_frame_is_counted_not_just_the_keyframe` fail at `src/native/session.rs:5562`: `left: 0`, `right: 3`. The line was restored and the source diff is empty. The repository gates then passed: `cargo build --locked`; `cargo test --locked` with 908 library tests, 17 binary tests, 5 wire tests, and 3 malformed-ZGFX tests; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh` with 372 vendored tests; and `./scripts/check-windows.sh --locked`.
+
+No fresh Windows Rhydra session was available during this verification, so no new live native claim is made. The controlled Quench before/after evidence recorded above remains the end-to-end observation.
