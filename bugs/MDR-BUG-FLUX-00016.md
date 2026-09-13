@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00016 — ironrdp-egfx test avc444_lc1_updates_luma_only_inside_its_rects fails on origin/main
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** gfx
 - **Raised:** 2026-08-19T16:10:47Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T070440Z-4069f992
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00016-run-verify-20260913T070440Z-4069f992
-- **Owner base:** ba442a420eda5616d108494456d6d59f32ea14de
-- **Owner fingerprint:** sha256:8e9b4e17ed737b064900d8a50cfffa5c79be453a23fb45123e743aadb9f4376c
-- **Owner since:** 2026-09-13T07:04:40Z
-- **Owner until:** 2026-09-13T09:04:40Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T16:10:47Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-19T23:05:42Z, deltic:auto role=fix run=fix-20260819T230526Z-p7070-n733698000-c1 branch=task/bug-MDR-BUG-FLUX-00016-run-fix-20260819T230526Z-p7070-n733698000-c1 code=8aae123 gate=manual)
+- **State history:** Open (2026-08-19T16:10:47Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-19T23:05:42Z, deltic:auto role=fix run=fix-20260819T230526Z-p7070-n733698000-c1 branch=task/bug-MDR-BUG-FLUX-00016-run-fix-20260819T230526Z-p7070-n733698000-c1 code=8aae123 gate=manual) -> Closed (2026-09-13T07:18:02Z, 0x4D44/Codex verify run=verify-20260913T070440Z-4069f992)
 
 ## Observation
 
@@ -92,3 +92,19 @@ passed. Closing that properly needs either upstreaming the vendored patches or a
 dependency-isolation approach that does not drag `libz-sys` into the Windows check.
 
 ## Notes
+
+## Verification
+
+Independent verification confirmed fix commit `8aae1233b8729fb043ee27fd7dd65bcafd99c9f3` is reachable from `origin/main`. The exact fix snapshot's `client::tests::avc444_lc1_updates_luma_only_inside_its_rects` passed. A root behavioral mutant removing the `if odd_position && seen { continue; }` preservation branch in `vendor/ironrdp-graphics/src/avc444.rs` made that regression fail at `vendor/ironrdp-egfx/src/client.rs:1778` with `left: 31`, `right: 86`. The mutant was restored, the same exact-snapshot regression passed again, and the snapshot worktree was clean. The current tree's renamed equivalent, `client::tests::avc444_lc1_applies_the_main_view_only_inside_its_rects`, also passed.
+
+The repository gates then passed: `cargo build --locked`; `cargo test --locked` with 908 library tests, 17 binary tests, 5 wire tests, and 3 malformed-ZGFX tests; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh` with 47 EGFX, 219 graphics, and 372 PDU tests; and `./scripts/check-windows.sh --locked`.
+
+No fresh live protocol cycle was available during this verification, so no new live claim is made. The original controlled vendored-test failure and related historical evidence remain the end-to-end observation.
+
+## Verification
+
+Independent verification confirmed fix commit `8aae1233b8729fb043ee27fd7dd65bcafd99c9f3` is reachable from `origin/main`. The exact fix snapshot's `client::tests::avc444_lc1_updates_luma_only_inside_its_rects` passed. A root behavioral mutant removing the `if odd_position && seen { continue; }` preservation branch in `vendor/ironrdp-graphics/src/avc444.rs` made that regression fail at `vendor/ironrdp-egfx/src/client.rs:1778` with `left: 31`, `right: 86`. The mutant was restored, the same exact-snapshot regression passed again, and the snapshot worktree was clean. The current tree's renamed equivalent, `client::tests::avc444_lc1_applies_the_main_view_only_inside_its_rects`, also passed.
+
+The repository gates then passed: `cargo build --locked`; `cargo test --locked` with 908 library tests, 17 binary tests, 5 wire tests, and 3 malformed-ZGFX tests; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh` with 47 EGFX, 219 graphics, and 372 PDU tests; and `./scripts/check-windows.sh --locked`.
+
+No fresh live protocol cycle was available during this verification, so no new live claim is made. The original controlled vendored-test failure and related historical evidence remain the end-to-end observation.

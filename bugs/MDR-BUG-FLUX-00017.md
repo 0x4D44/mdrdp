@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00017 — rhydra health ladder: a disconnected agent session reports as a missing IDD device, pointing the operator at the wrong remedy
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** rhydra/agent
 - **Raised:** 2026-08-19T16:57:07Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T070455Z-5ee8576f
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00017-run-verify-20260913T070455Z-5ee8576f
-- **Owner base:** 91a596109bf3c2f780047878c44b03987eb4cbff
-- **Owner fingerprint:** sha256:411ee0c7134a9ed22449a20b28d95171be856c42df8c81c3f544117163f259b0
-- **Owner since:** 2026-09-13T07:04:55Z
-- **Owner until:** 2026-09-13T09:04:55Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T16:57:07Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-25T00:09:07Z, deltic:auto role=fix run=fix-20260824T235840Z-9b6d5b75 branch=task/bug-MDR-BUG-FLUX-00017-run-fix-20260824T235840Z-9b6d5b75 code=4794a4e gate=manual)
+- **State history:** Open (2026-08-19T16:57:07Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-25T00:09:07Z, deltic:auto role=fix run=fix-20260824T235840Z-9b6d5b75 branch=task/bug-MDR-BUG-FLUX-00017-run-fix-20260824T235840Z-9b6d5b75 code=4794a4e gate=manual) -> Closed (2026-09-13T07:18:02Z, 0x4D44/Codex verify run=verify-20260913T070455Z-5ee8576f)
 
 ## Observation
 
@@ -104,3 +104,19 @@ when it is red.
 <unfixed — raised only>
 
 ## Notes
+
+## Verification
+
+Independent verification confirmed fix commit `4794a4e8c37f595f9069ce5170e975a57f0b369d`. The focused regression `agent::tests::a_device_hidden_by_a_disconnected_agent_session_is_unknown_not_absent` passed, and all 38 `agent::tests::` tests passed. As a red root mutant, changing the detached-session branch in `device_rung` from `RungState::Unknown` to `RungState::Fail` made the focused regression fail at `tools/latency-spike/server/src/agent.rs:1270` with `left: Fail`, `right: Unknown`. The branch was restored and the focused regression passed again.
+
+The repository gates then passed: `cargo build --locked`; `cargo test --locked` with 908 library tests, 17 binary tests, 5 wire tests, and 3 malformed-ZGFX tests; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh`; and `./scripts/check-windows.sh --locked`, which type-checked the Rhydra server code as well.
+
+No fresh Windows Quench session was available during this verification, so no new live claim is made. The original observed Quench session-topology evidence remains the end-to-end observation.
+
+## Verification
+
+Independent verification confirmed fix commit `4794a4e8c37f595f9069ce5170e975a57f0b369d`. The focused regression `agent::tests::a_device_hidden_by_a_disconnected_agent_session_is_unknown_not_absent` passed, and all 38 `agent::tests::` tests passed. As a red root mutant, changing the detached-session branch in `device_rung` from `RungState::Unknown` to `RungState::Fail` made the focused regression fail at `tools/latency-spike/server/src/agent.rs:1270` with `left: Fail`, `right: Unknown`. The branch was restored and the focused regression passed again.
+
+The repository gates then passed: `cargo build --locked`; `cargo test --locked` with 908 library tests, 17 binary tests, 5 wire tests, and 3 malformed-ZGFX tests; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh`; and `./scripts/check-windows.sh --locked`, which type-checked the Rhydra server code as well.
+
+No fresh Windows Quench session was available during this verification, so no new live claim is made. The original observed Quench session-topology evidence remains the end-to-end observation.
