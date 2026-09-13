@@ -42,6 +42,7 @@ use crate::surface::{
 };
 use crate::ui::font;
 use crate::window_policy::{DisplayFollow, DisplayVerdict, Geometry, ResizeVerdict, WindowPolicy};
+use tracing::trace;
 
 /// What the caller must decide before a window exists.
 #[derive(Debug, Clone)]
@@ -2340,6 +2341,12 @@ impl SessionApp {
                 return;
             }
         }
+        trace!(
+            generation = stamp.generation,
+            fresh_content_epoch = stamp.fresh_content_epoch,
+            acknowledge,
+            "presentation submitted"
+        );
         // Streak counts CONSECUTIVE failures: without this reset, 30 unrelated hiccups
         // across a long session would close a perfectly healthy window.
         self.present_failures = 0;

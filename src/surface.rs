@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use crate::stats::CacheStats;
 use ironrdp_graphics::clearcodec::MAX_DECODE_DIM;
+use tracing::trace;
 
 /// Bytes per pixel, everywhere in this module.
 pub const BPP: usize = 4;
@@ -742,14 +743,30 @@ impl SurfaceStore {
         self.presentation_not_before = None;
         self.generation = self.generation.wrapping_add(1);
         self.fresh_content_epoch = self.fresh_content_epoch.wrapping_add(1);
+        trace!(
+            generation = self.generation,
+            fresh_content_epoch = self.fresh_content_epoch,
+            kind = "immediate",
+            "presentation stamp advanced"
+        );
     }
 
     fn touch_presentation_deferred(&mut self, not_before: Instant) {
+        let settle_ms = not_before
+            .saturating_duration_since(Instant::now())
+            .as_millis();
         self.presentation_not_before = Some(
             self.presentation_not_before
                 .map_or(not_before, |current| current.max(not_before)),
         );
         self.generation = self.generation.wrapping_add(1);
+        trace!(
+            generation = self.generation,
+            fresh_content_epoch = self.fresh_content_epoch,
+            kind = "chroma_refinement",
+            settle_ms,
+            "presentation stamp advanced"
+        );
     }
 
     fn mark_frame_visible_dirty(&mut self) {

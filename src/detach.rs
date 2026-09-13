@@ -209,7 +209,12 @@ fn prune_old_logs(dir: &std::path::Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !(name.starts_with("mdrdp-") && name.ends_with(".log")) {
+        // The diagnostics pair is already size-bounded and may belong to a live
+        // session. Do not unlink it as a side effect of starting a detached run.
+        if !(name.starts_with("mdrdp-")
+            && name.ends_with(".log")
+            && !name.starts_with("mdrdp-diagnostics-"))
+        {
             continue;
         }
         let stale = entry

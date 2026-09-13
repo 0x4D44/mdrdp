@@ -22,6 +22,7 @@ pub mod h264;
 pub mod hevc;
 pub mod hostscripts;
 pub mod input;
+pub mod logging;
 pub mod metrics;
 pub mod native;
 pub mod presence;

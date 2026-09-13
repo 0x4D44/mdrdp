@@ -1350,7 +1350,9 @@ impl GraphicsPipelineClient {
         // avc444_decompress. NOTE: Encoding is a bitflags type whose
         // LUMA_AND_CHROMA value is 0, so dispatch MUST be by equality, never
         // `.contains()`.
-        #[derive(Clone, Copy)]
+        let stream1_rect_count = stream1_rects.len();
+        let stream2_rect_count = stream2_rects.len();
+        #[derive(Debug, Clone, Copy)]
         enum Passes {
             LumaAndChroma,
             LumaOnly,
@@ -1367,6 +1369,15 @@ impl GraphicsPipelineClient {
                 return;
             }
         };
+        trace!(
+            surface_id,
+            codec = ?codec_id,
+            lc = ?stream.encoding,
+            passes = ?passes,
+            stream1_rects = stream1_rect_count,
+            stream2_rects = stream2_rect_count,
+            "AVC444 update classified"
+        );
 
         // The chroma passes index the aux frame through the geometry the encoder
         // packed against, and the two axes fail differently under SPS cropping
@@ -1603,6 +1614,17 @@ impl GraphicsPipelineClient {
         let Some(buffer) = self.avc444_buffers.get(&surface_id) else {
             return;
         };
+        let emitted_rect_count = emit_rects.len();
+        trace!(
+            surface_id,
+            codec = ?codec_id,
+            lc = ?stream.encoding,
+            passes = ?passes,
+            emitted_rects = emitted_rect_count,
+            chroma_pass = matches!(passes, Passes::LumaAndChroma | Passes::ChromaOnly),
+            chroma_skipped = chroma_skipped.is_some(),
+            "AVC444 update ready for presentation"
+        );
         for rect in emit_rects {
             let mut data = core::mem::take(&mut self.rgba_scratch);
             buffer.to_rgba_into(&rect, &mut data);

@@ -217,12 +217,12 @@ fn write_session_metrics(
     mdrdp::metrics::write_report(std::path::Path::new(path), &report)
 }
 
-/// Install a global stderr tracing subscriber when `MDRDP_LOG` names a filter.
+/// Install the session metadata subscriber.
 ///
-/// Session-thread instrumentation (EGFX frame/ack traffic, DVC dispatch, clipboard
-/// warnings) is written against `tracing`, but a normal run installs no global
-/// subscriber, so all of it is invisible. Setting e.g. `MDRDP_LOG=ironrdp_egfx=trace`
-/// makes that stream observable without touching a default run.
+/// AVC444 frame/pass ordering is useful on every run while chasing presentation bugs,
+/// but the trace is too chatty for the terminal. Ordinary runs write it to a bounded
+/// pair of flip-flop files. `MDRDP_LOG` remains an explicit escape hatch: its filter is
+/// written to stderr, preserving the old controlled-capture workflow.
 ///
 /// Print the end-of-session diagnostics, and write the `--screenshot` frame.
 ///
@@ -400,23 +400,42 @@ fn report_session_epilogue(
 /// caller's shell must not silently turn a session into a diagnostic one. The connect
 /// sequence is unaffected either way — it runs under its own scoped subscriber, which
 /// also keeps credential-bearing connector events away from this one.
-fn install_diagnostics_subscriber(default_filter: Option<&str>) {
-    let filter = match std::env::var("MDRDP_LOG") {
-        Ok(filter) => filter,
-        // Settings ▸ Diagnostics ▸ Stage log = Verbose supplies a default filter;
-        // an explicit MDRDP_LOG always wins over it.
-        Err(_) => match default_filter {
-            Some(f) => f.to_owned(),
-            None => return,
-        },
-    };
+fn install_diagnostics_subscriber(default_filter: &str) {
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let explicit_filter = std::env::var("MDRDP_LOG").ok();
+    let filter = explicit_filter
+        .clone()
+        .unwrap_or_else(|| default_filter.to_owned());
+    let writer = match explicit_filter {
+        Some(_) => BoxMakeWriter::new(std::io::stderr),
+        None => match mdrdp::logging::open_default() {
+            Ok(log) => {
+                let paths = log.paths();
+                eprintln!(
+                    "diagnostics: {} and {} ({} MiB each)",
+                    paths[0].display(),
+                    paths[1].display(),
+                    mdrdp::logging::DEFAULT_MAX_BYTES / (1024 * 1024),
+                );
+                BoxMakeWriter::new(Mutex::new(log))
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: could not open default diagnostics logs ({error}); writing tracing to stderr"
+                );
+                BoxMakeWriter::new(std::io::stderr)
+            }
+        },
+    };
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(filter))
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
+                .with_writer(writer)
                 .with_ansi(false),
         )
         .init();
@@ -787,10 +806,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             settings_after_load_failure()
         }
     };
-    install_diagnostics_subscriber(
-        (settings.diagnostics.stage_log == mdrdp::settings::StageLogLevel::Verbose)
-            .then_some("ironrdp=debug,mdrdp=debug"),
-    );
+    install_diagnostics_subscriber(mdrdp::logging::DEFAULT_FILTER);
 
     if list_only {
         if favourites.is_empty() {

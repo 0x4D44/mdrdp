@@ -42,6 +42,7 @@ use ironrdp_egfx::pdu::{
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use serde::Serialize;
+use tracing::trace;
 
 use crate::stats::{SlotStatsHandle, UNKNOWN_CODEC};
 use crate::surface::{BPP, Rect, SurfaceError, SurfaceStore};
@@ -870,6 +871,17 @@ impl GraphicsPipelineHandler for GfxHandler {
         if !matches!(update.codec_id, Codec1Type::Avc444 | Codec1Type::Avc444v2) {
             self.note_codec(update.codec_id);
         }
+        trace!(
+            surface_id = update.surface_id,
+            codec = ?update.codec_id,
+            presentation = ?update.presentation,
+            left = update.destination_rectangle.left,
+            top = update.destination_rectangle.top,
+            right = update.destination_rectangle.right,
+            bottom = update.destination_rectangle.bottom,
+            data_len = update.data.len(),
+            "bitmap update received"
+        );
         // Cache attribution wants the painter's codec either way.
         self.note_surface_codec(update.surface_id, codec_name(update.codec_id));
         if update.data.is_empty() {

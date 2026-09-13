@@ -101,6 +101,20 @@ Cache effectiveness is reported two ways deliberately. Hit rate flatters a cache
 hits often on tiny regions; the share of *pixels* served from cache is the honest
 measure, and the two disagree exactly when the cache is not earning its keep.
 
+AVC444 presentation-order diagnostics are enabled by default. The metadata-only trace
+alternates between `mdrdp-diagnostics-a.log` and `mdrdp-diagnostics-b.log` under the
+client's config `logs` directory, with an 8 MiB cap per file. It records codec/pass,
+rectangles, presentation stamps, deadlines, and successful presents, never pixels or
+payloads. A plain `mdrdp Crucible` run is enough to collect it.
+
+For a one-off custom filter, set `MDRDP_LOG`; that preserves the explicit stderr capture
+path and does not use the default files:
+
+```
+MDRDP_LOG='ironrdp_egfx=trace,mdrdp::gfx=trace,mdrdp::surface=trace,mdrdp::window=trace' \
+  mdrdp Crucible --rdp --foreground --duration 30 2>avc-order.log
+```
+
 `--metrics-json` writes the same latency, graphics, cache, codec, channel, audio, CPU, and
 peak-memory evidence in a stable JSON schema. It never includes the host, username,
 credential, file paths, clipboard data, pixels, or audio payloads. The report is assembled
