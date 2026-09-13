@@ -6,15 +6,15 @@
 - **Area:** rhydra/input
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T084817Z-f8be8942
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00038-run-verify-20260913T084817Z-f8be8942
+- **Owner base:** c1959be401e7b88d3fe45c721948027c6014937e
+- **Owner fingerprint:** sha256:a2fc91ae8349cc04026b98fcea1d47f263003d934e145ffa80560a1cfd63a6cc
+- **Owner since:** 2026-09-13T08:48:17Z
+- **Owner until:** 2026-09-13T10:48:17Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
