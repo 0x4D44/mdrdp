@@ -6,15 +6,15 @@
 - **Area:** session/rdp presentation
 - **Raised:** 2026-08-24T16:59:47Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T054735Z-31b14edb
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00112-run-verify-20260913T054735Z-31b14edb
+- **Owner base:** 61e98e48d7dec611bb30c4f860150f7caae1eecb
+- **Owner fingerprint:** sha256:c889ce6d976407bf91d06279a66237bfdbe27416a2bd37df6349b30690d011d4
+- **Owner since:** 2026-09-13T05:47:35Z
+- **Owner until:** 2026-09-13T07:47:35Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
