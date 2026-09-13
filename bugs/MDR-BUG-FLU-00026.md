@@ -6,15 +6,15 @@
 - **Area:** deploy/driver
 - **Raised:** 2026-08-20T19:02:37Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T081245Z-458a2b4e
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00026-run-verify-20260913T081245Z-458a2b4e
+- **Owner base:** c1e328c43db1b33e262ba12b1b113756c9e2909f
+- **Owner fingerprint:** sha256:09a1cdc4fe2a7970aa0c861cfa3c2a4cd02abae5949ceb3b565669aacad8e442
+- **Owner since:** 2026-09-13T08:12:45Z
+- **Owner until:** 2026-09-13T10:12:45Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
