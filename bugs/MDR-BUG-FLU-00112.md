@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00112 — Fresh visible RDP session can show only incremental damage until the host forces a full repaint
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** session/rdp presentation
 - **Raised:** 2026-08-24T16:59:47Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T054735Z-31b14edb
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00112-run-verify-20260913T054735Z-31b14edb
-- **Owner base:** 61e98e48d7dec611bb30c4f860150f7caae1eecb
-- **Owner fingerprint:** sha256:c889ce6d976407bf91d06279a66237bfdbe27416a2bd37df6349b30690d011d4
-- **Owner since:** 2026-09-13T05:47:35Z
-- **Owner until:** 2026-09-13T07:47:35Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T16:59:47Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T17:05:26Z, deltic:auto role=fix run=fix-20260824T170017Z-aa80616e branch=task/bug-MDR-BUG-FLU-00112-run-fix-20260824T170017Z-aa80616e code=91e04d0 gate=manual)
+- **State history:** Open (2026-08-24T16:59:47Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T17:05:26Z, deltic:auto role=fix run=fix-20260824T170017Z-aa80616e branch=task/bug-MDR-BUG-FLU-00112-run-fix-20260824T170017Z-aa80616e code=91e04d0 gate=manual) -> Closed (2026-09-13T05:52:55Z, independent verifier: the selected first-refresh test passed, its startup-request mutant failed the named assertion, the session and Windows gates passed, model=codex@max)
 
 ## Observation
 
@@ -34,8 +34,13 @@ initializes a fresh visible window as not occluded and does not owe the applicat
 `Occluded(false)` transition, so the old code could wait forever for a visibility event
 before asking Windows for complete pixels.
 
-The focused regression checks that startup enqueues an enabled visibility request whose
-last PDU is the full-desktop refresh. It failed with “session startup must enqueue a
-visibility request” before the fix, then passed with all 71 session tests.
+The focused regression `a_fresh_visible_session_requests_a_complete_first_desktop`
+passed as one selected test. Replacing only `initial_visibility_request()`'s `Some(true)`
+with `None` made that selected test fail its own `session startup must enqueue a
+visibility request` assertion. The post-fix session filter passed 114 tests, and
+`scripts/check-windows.sh --locked` passed for both app and Rhydra host targets.
+
+The original Kiln observation was reviewed against the startup pump and refresh path,
+but this macOS pass did not start a new Windows RDP session.
 
 ## Notes

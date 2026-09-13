@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00114 — Partial AVC444 validity lets chroma repaint from zero or stale luma
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/avc444
 - **Raised:** 2026-08-24T17:22:02Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T054745Z-ec08590e
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00114-run-verify-20260913T054745Z-ec08590e
-- **Owner base:** cfabca213f3a5254d4e9f17005d5654418bfdb9b
-- **Owner fingerprint:** sha256:af686fa96275224a79a6be3efdd48439d0fa5df3b49551b3b279a36396de03d2
-- **Owner since:** 2026-09-13T05:47:45Z
-- **Owner until:** 2026-09-13T07:47:45Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T17:22:02Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T17:55:36Z, deltic:auto role=fix run=fix-20260824T172235Z-bb368359 branch=task/bug-MDR-BUG-FLU-00114-run-fix-20260824T172235Z-bb368359 code=ccff9a0 gate=manual)
+- **State history:** Open (2026-08-24T17:22:02Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T17:55:36Z, deltic:auto role=fix run=fix-20260824T172235Z-bb368359 branch=task/bug-MDR-BUG-FLU-00114-run-fix-20260824T172235Z-bb368359 code=ccff9a0 gate=manual) -> Closed (2026-09-13T05:52:55Z, independent verifier: the regional AVC444 suite and root invalidation mutant proved the fix, application, vendored, and Windows gates passed, model=codex@max)
 
 ## Observation
 
@@ -27,6 +27,18 @@ After a partial non-AVC mutation, GraphicsPipelineClient drops the whole surface
 
 ## Fix
 
-<unfixed — raised only>
+Commit `ccff9a0baea01d5383454dd1e4f196499ec84be2` keeps AVC444 validity regional
+through non-AVC mutations, records the regions actually painted, and refuses LC2
+promotion without a complete luma baseline. The `ironrdp-egfx` client filter passed
+all 37 tests, including the seven regional regressions added by the fix; the `mdrdp`
+graphics filter passed 65 tests. Replacing the regional `SolidFill` invalidation with
+whole-surface buffer removal made `partial_non_avc_mutation_preserves_a_disjoint_avc444_baseline`
+fail its own luma assertion (`left: 0, right: 114`). The source mutation was restored
+and the source diff is empty.
+
+The original partial-mutation observation was reviewed against the client, graphics,
+and surface-validity paths. The vendored suite passed 372 tests, and
+`scripts/check-windows.sh --locked` passed for both app and Rhydra host targets. This
+macOS pass did not start a new Windows RDP session.
 
 ## Notes
