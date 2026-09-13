@@ -6,15 +6,15 @@
 - **Area:** native-transport/h264
 - **Raised:** 2026-08-20T19:02:37Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T051503Z-bad3aa28
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00027-run-verify-20260913T051503Z-bad3aa28
+- **Owner base:** 154370746c612475688d6e434ccd77b68c64ce32
+- **Owner fingerprint:** sha256:3d7430518b7f4275c0f08ced67d4a4ae1143621f24dea31539b134ec9f94dda7
+- **Owner since:** 2026-09-13T05:15:03Z
+- **Owner until:** 2026-09-13T07:15:03Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
