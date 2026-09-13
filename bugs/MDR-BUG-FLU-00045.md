@@ -6,15 +6,15 @@
 - **Area:** rhydra/telemetry
 - **Raised:** 2026-08-22T19:40:41Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T093547Z-dbf682aa
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00045-run-verify-20260913T093547Z-dbf682aa
+- **Owner base:** beae2a547d911687ded9309fd6a19e622c5bcefa
+- **Owner fingerprint:** sha256:97695cacd767afc21b3d004c92d8918f6c377fe7efbacc3b623e50a9b1059038
+- **Owner since:** 2026-09-13T09:35:47Z
+- **Owner until:** 2026-09-13T11:35:47Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
