@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00065 — Default 20 Mbit/s budget makes the 5K native desktop visibly pixelated
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/rendering-quality
 - **Raised:** 2026-08-23T20:27:23Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T053204Z-da05f7d1
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00065-run-verify-20260913T053204Z-da05f7d1
-- **Owner base:** 96a2a629f480bd6ccb1580177563f214bd4271c8
-- **Owner fingerprint:** sha256:02f6bcba9188076fb485a4fa4c47c8ff95bb3edc302f41e6c4b906e8e65d5fdc
-- **Owner since:** 2026-09-13T05:32:04Z
-- **Owner until:** 2026-09-13T07:32:04Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T20:27:23Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T20:32:26Z, deltic:auto role=fix run=fix-20260823T202741Z-f2e5c4d1 branch=task/bug-MDR-BUG-FLU-00065-run-fix-20260823T202741Z-f2e5c4d1 code=5534fea gate=manual)
+- **State history:** Open (2026-08-23T20:27:23Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T20:32:26Z, deltic:auto role=fix run=fix-20260823T202741Z-f2e5c4d1 branch=task/bug-MDR-BUG-FLU-00065-run-fix-20260823T202741Z-f2e5c4d1 code=5534fea gate=manual) -> Closed (2026-09-13T05:45:26Z, independent verifier: 409 Rhydra tests, the selected 5K bitrate test, and the Windows cross-target gate passed; reverting the 80,000 kbit/s 5K policy failed its 80,000 assertion, model=codex@max)
 
 ## Observation
 
@@ -27,6 +27,14 @@ On the integrated v0.1.147 client and Rhydra v0.5.0 host, Quench negotiated the 
 
 ## Fix
 
-<unfixed — raised only>
+Commit `5534fea09b487a5871408c8d6a33b2b297e87e13` makes the supervised 5120x2880
+path pass 80,000 kbit/s before the two encoder tiles divide that budget. The selected
+`supervised_five_k_gets_four_times_the_1440p_bitrate` test passed with the current tree;
+replacing only the 5K policy value with 20,000 made that same test fail its own
+`left: 20000, right: 80000` assertion. The full server suite passed 409/409 and
+`scripts/check-windows.sh --locked` passed for both the app and Rhydra host targets.
+
+The original Quench pixelation observation was reviewed against the supervised launch
+path, but this macOS pass did not start a new Windows IDD or live Quench session.
 
 ## Notes
