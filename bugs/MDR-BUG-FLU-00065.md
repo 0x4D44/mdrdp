@@ -6,15 +6,15 @@
 - **Area:** rhydra/rendering-quality
 - **Raised:** 2026-08-23T20:27:23Z
 - **Discovery source:** Human
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T053204Z-da05f7d1
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00065-run-verify-20260913T053204Z-da05f7d1
+- **Owner base:** 96a2a629f480bd6ccb1580177563f214bd4271c8
+- **Owner fingerprint:** sha256:02f6bcba9188076fb485a4fa4c47c8ff95bb3edc302f41e6c4b906e8e65d5fdc
+- **Owner since:** 2026-09-13T05:32:04Z
+- **Owner until:** 2026-09-13T07:32:04Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
