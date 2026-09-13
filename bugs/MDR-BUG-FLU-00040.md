@@ -6,15 +6,15 @@
 - **Area:** rhydra/process-lifecycle
 - **Raised:** 2026-08-22T19:40:40Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T085841Z-c6293da0
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00040-run-verify-20260913T085841Z-c6293da0
+- **Owner base:** c185da23bac4767851e8db93e8c17af9e7a556b0
+- **Owner fingerprint:** sha256:9e36e15374f544f94f859c43711d938bf3d4628720ae75115ee0659251c8ef10
+- **Owner since:** 2026-09-13T08:58:41Z
+- **Owner until:** 2026-09-13T10:58:41Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
