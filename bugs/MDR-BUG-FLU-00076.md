@@ -6,15 +6,15 @@
 - **Area:** rdp/avc444-chroma
 - **Raised:** 2026-08-23T21:33:59Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T123048Z-81a3ee07
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00076-run-verify-20260913T123048Z-81a3ee07
+- **Owner base:** f7c4521b4d560c7969868e3227a2cb02d9b33031
+- **Owner fingerprint:** sha256:d1b4a5094d05d79832719815fae03bffd09ec4a1b5468bebcaf6e9a8eb0cbce2
+- **Owner since:** 2026-09-13T12:30:48Z
+- **Owner until:** 2026-09-13T14:30:48Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
