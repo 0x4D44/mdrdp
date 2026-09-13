@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00021 — mdrdp deploy signs the IDD driver catalogue without a timestamp, so the signature dies with the certificate
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** deploy/driver-signing
 - **Raised:** 2026-08-20T10:05:10Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T073837Z-d0b3941a
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00021-run-verify-20260913T073837Z-d0b3941a
-- **Owner base:** 494c5d623f713288424d4ce6c8df321b96bfe5e4
-- **Owner fingerprint:** sha256:ca99c34a288de3f98379021d403c8f3ebfbbc8ddf593039cfbf7fbc8399c9f82
-- **Owner since:** 2026-09-13T07:38:37Z
-- **Owner until:** 2026-09-13T09:38:37Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-20T10:05:10Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-25T05:51:59Z, deltic:auto role=fix run=fix-20260825T054543Z-b566a704 branch=task/bug-MDR-BUG-FLUX-00021-run-fix-20260825T054543Z-b566a704 code=10b1135 gate=manual)
+- **State history:** Open (2026-08-20T10:05:10Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-25T05:51:59Z, deltic:auto role=fix run=fix-20260825T054543Z-b566a704 branch=task/bug-MDR-BUG-FLUX-00021-run-fix-20260825T054543Z-b566a704 code=10b1135 gate=manual) -> Closed (2026-09-13T07:53:16Z, 0x4D44/Codex verify run=verify-20260913T073837Z-d0b3941a)
 
 ## Observation
 
@@ -50,3 +50,11 @@ Found while scoping a possible second (audio) driver; unrelated to that decision
 <unfixed — raised only>
 
 ## Notes
+
+## Verification
+
+Independent verification confirmed fix commit `10b1135fcf0e47ad798e13279770876600700f31` and the deployed signing command at `src/deploy.rs:1331`, which includes `/t http://timestamp.digicert.com`. The focused regression `deploy::tests::driver_catalogue_signature_is_timestamped` passed after restoration. As a red root mutant, removing only the timestamp argument made it fail at `src/deploy.rs:2713` with `the deployed catalogue signature must outlive its signing certificate`. The argument was restored and the focused regression passed again.
+
+The repository gates then passed: `cargo build --locked`; `cargo test --locked`; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh`; and `./scripts/check-windows.sh --locked`.
+
+Live Windows deployment validation was unavailable without the signing tools, driver artifacts, credentials, certificate-store changes, elevation, and installation side effects. No live deployment claim is made. The original deployment-path observation remains the end-to-end product observation.
