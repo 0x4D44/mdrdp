@@ -6,15 +6,15 @@
 - **Area:** native-transport
 - **Raised:** 2026-08-19T11:18:15Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T063123Z-04e08974
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00011-run-verify-20260913T063123Z-04e08974
+- **Owner base:** 8f0c6a39dd8a49b1321189f9371a5981fd1a53f4
+- **Owner fingerprint:** sha256:448d53a3f657f5dc7fc2cbf662290172ca4dcdd6ed48a6f9bce382b7c1f16276
+- **Owner since:** 2026-09-13T06:31:23Z
+- **Owner until:** 2026-09-13T08:31:23Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
