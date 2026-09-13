@@ -6,15 +6,15 @@
 - **Area:** rdp/clipboard-latency
 - **Raised:** 2026-08-23T20:34:25Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T121351Z-af272b56
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00075-run-verify-20260913T121351Z-af272b56
+- **Owner base:** 85fd2e05c7be502bc1228cad7b7a1ae7ef2c3b14
+- **Owner fingerprint:** sha256:277a73ccb31d1266386cea6a3dd0502c4be1c0e5ad17d0417151670ba1b8b884
+- **Owner since:** 2026-09-13T12:13:51Z
+- **Owner until:** 2026-09-13T14:13:51Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
