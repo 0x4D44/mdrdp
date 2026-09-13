@@ -6,15 +6,15 @@
 - **Area:** rdp/surface-handoff
 - **Raised:** 2026-08-23T20:34:25Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T120226Z-2965ae61
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00072-run-verify-20260913T120226Z-2965ae61
+- **Owner base:** 6b14f83253c02a217f3d4b55e5ef36528bfcc429
+- **Owner fingerprint:** sha256:8320b77d4f3c95b28240eb634ecdae0903914888fc9d7ce405299695b61701b6
+- **Owner since:** 2026-09-13T12:02:26Z
+- **Owner until:** 2026-09-13T14:02:26Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
