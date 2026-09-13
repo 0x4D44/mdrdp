@@ -6,15 +6,15 @@
 - **Area:** rhydra/secure-desktop
 - **Raised:** 2026-08-23T22:04:30Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260913T131945Z-3c508bc0
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00082-run-verify-20260913T131945Z-3c508bc0
+- **Owner base:** 064efd42a620b4877bab8c7fcb9e56f5edbc1517
+- **Owner fingerprint:** sha256:ad90ecc8b797cce17d426ee0fe85575633055cfb8ef5de3dd35b335248394da8
+- **Owner since:** 2026-09-13T13:19:45Z
+- **Owner until:** 2026-09-13T15:19:45Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
