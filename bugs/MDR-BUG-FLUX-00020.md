@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00020 — ironrdp-graphics and ironrdp-pdu tests never run: cargo refuses to test a path dep with dev-dependencies
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** testing
 - **Raised:** 2026-08-19T23:06:09Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T072225Z-a9374634
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00020-run-verify-20260913T072225Z-a9374634
-- **Owner base:** c1f2d9b16e93aaa6d63aa2c75be389bbf7f4ca23
-- **Owner fingerprint:** sha256:cc2a0ef367bc7df2a8fa3c8fbc15b23c5d450a0937791f629b84a536bf3154e6
-- **Owner since:** 2026-09-13T07:22:25Z
-- **Owner until:** 2026-09-13T09:22:25Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T23:06:09Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-24T19:32:28Z, deltic:auto role=fix run=fix-20260824T191841Z-ef9a618c branch=task/bug-MDR-BUG-FLUX-00020-run-fix-20260824T191841Z-ef9a618c code=0f6c16a0d933e1e2d126c2d8d79f97ea2a2a2ed5 gate=manual)
+- **State history:** Open (2026-08-19T23:06:09Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-24T19:32:28Z, deltic:auto role=fix run=fix-20260824T191841Z-ef9a618c branch=task/bug-MDR-BUG-FLUX-00020-run-fix-20260824T191841Z-ef9a618c code=0f6c16a0d933e1e2d126c2d8d79f97ea2a2a2ed5 gate=manual) -> Closed (2026-09-13T07:35:22Z, 0x4D44/Codex verify run=verify-20260913T072225Z-a9374634)
 
 ## Observation
 
@@ -69,3 +69,11 @@ Fix directions worth exploring instead:
 <unfixed — raised only>
 
 ## Notes
+
+## Verification
+
+Independent verification confirmed fix commit `0f6c16a0d933e1e2d126c2d8d79f97ea2a2a2ed5` and the separate locked manifest invocations in `scripts/test-vendored.sh`. The restored harness ran the vendored suites: 47 EGFX, 219 graphics, and 372 PDU tests passed. As a red root mutant, replacing the separate manifest invocation with `cargo test -p "$pkg"` made the harness fail with Cargo errors for both `ironrdp-graphics` and `ironrdp-pdu`, and exit 1. The invocation was restored; `bash -n scripts/test-vendored.sh` and the restored harness passed again.
+
+The repository gates then passed: `cargo build --locked`; `cargo test --locked`; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh`; and `./scripts/check-windows.sh --locked`.
+
+No live protocol validation was required or available; no new live claim is made. The original test-discovery failure remains the end-to-end observation.
