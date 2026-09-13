@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00009 — Exit diagnostic summary and --screenshot are skipped when the session is quit via Cmd+Q / Quit menu
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** diagnostics
 - **Raised:** 2026-08-19T07:16:05Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T063113Z-f55cb609
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00009-run-verify-20260913T063113Z-f55cb609
-- **Owner base:** 586d5a0c1821184868c360044720cf3049f77d58
-- **Owner fingerprint:** sha256:0f3c648d51734ec02dc14edf1544dee3af9726e0498051b6b1cf4c9ce4ba4b5c
-- **Owner since:** 2026-09-13T06:31:13Z
-- **Owner until:** 2026-09-13T08:31:13Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T07:16:05Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-19T15:15:13Z, deltic:auto role=fix run=fix-20260819T151441Z-p23386-n706098000-c1 branch=task/bug-MDR-BUG-FLUX-00009-run-fix-20260819T151441Z-p23386-n706098000-c1 code=b26b8e7 gate=manual)
+- **State history:** Open (2026-08-19T07:16:05Z, raised via `deltic bugs new` model=claude-opus-5@high) -> Fixed (2026-08-19T15:15:13Z, deltic:auto role=fix run=fix-20260819T151441Z-p23386-n706098000-c1 branch=task/bug-MDR-BUG-FLUX-00009-run-fix-20260819T151441Z-p23386-n706098000-c1 code=b26b8e7 gate=manual) -> Closed (2026-09-13T06:47:48Z, 0x4D44/Codex verify run=verify-20260913T063113Z-f55cb609)
 
 ## Observation
 
@@ -87,3 +87,9 @@ Not unit-tested: what broke was *where* the call lived in the winit lifecycle, w
 in-process test can observe. The red/green above is the evidence.
 
 ## Notes
+
+## Verification
+
+Independent verification confirmed fix commit `b26b8e7718934ae33170ba6416157ab8a5570d63` and the root lifecycle seam: `report_session_epilogue()` is called from the `on_exit` closure, while the post-`window.run()` call remains only as a guarded fallback. `MDRDP_GUI_TESTS=1 CARGO_TARGET_DIR="$TMPDIR/.../target" deltic timeout 120 cargo test --locked --test macos_menu_lifetime -- --nocapture </dev/null` passed and exercised the macOS `LoopExiting` hook; `cargo test --locked --bin mdrdp -- --nocapture </dev/null` passed all 17 binary tests. As a red root mutant, the hook's `report_session_epilogue(...)` call was removed while leaving the fallback; the source placement oracle then failed its assertion that the `on_exit` closure contains the call. The mutant still compiled with `cargo check --locked --bin mdrdp`.
+
+After restoration, the placement oracle passed, the GUI hook test passed, and the source diff was empty. The full repository gates also passed: `cargo build --locked`, `cargo test --locked` (908 library, 17 binary, 8 integration tests), `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `./scripts/test-vendored.sh` (372 vendored tests), and `./scripts/check-windows.sh --locked`. A fresh release run against `quench.lan.example` with `--rdp` could not reach the session window and produced no screenshot or diagnostic summary, so no new live Cmd+Q observation is claimed; the original controlled Quench red/green evidence above remains the end-to-end session evidence.

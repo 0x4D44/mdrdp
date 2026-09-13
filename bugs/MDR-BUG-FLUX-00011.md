@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00011 — rhydra native: a fresh viewer gets no frame until the desktop changes, so connecting to an idle desktop paints nothing
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** native-transport
 - **Raised:** 2026-08-19T11:18:15Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T063123Z-04e08974
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00011-run-verify-20260913T063123Z-04e08974
-- **Owner base:** 8f0c6a39dd8a49b1321189f9371a5981fd1a53f4
-- **Owner fingerprint:** sha256:448d53a3f657f5dc7fc2cbf662290172ca4dcdd6ed48a6f9bce382b7c1f16276
-- **Owner since:** 2026-09-13T06:31:23Z
-- **Owner until:** 2026-09-13T08:31:23Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T11:18:15Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-23T19:42:03Z, deltic:auto role=fix run=fix-20260823T193534Z-bc7d638d branch=task/bug-MDR-BUG-FLUX-00011-run-fix-20260823T193534Z-bc7d638d code=787740f gate=manual) -> Open (2026-08-24T16:50:34Z, reopened after human report reproduced the original static first-frame symptom on mdrdp 0.1.211 against Kiln) -> Fixed (2026-08-24T16:53:19Z, provisional recurrence attribution withdrawn after live presence proved Kiln used RDP/Avc444v2 rather than the native transport; original fix remains code=787740f)
+- **State history:** Open (2026-08-19T11:18:15Z, raised via `deltic bugs new` model=claude-fable-5@high) -> Fixed (2026-08-23T19:42:03Z, deltic:auto role=fix run=fix-20260823T193534Z-bc7d638d branch=task/bug-MDR-BUG-FLUX-00011-run-fix-20260823T193534Z-bc7d638d code=787740f gate=manual) -> Open (2026-08-24T16:50:34Z, reopened after human report reproduced the original static first-frame symptom on mdrdp 0.1.211 against Kiln) -> Fixed (2026-08-24T16:53:19Z, provisional recurrence attribution withdrawn after live presence proved Kiln used RDP/Avc444v2 rather than the native transport; original fix remains code=787740f) -> Closed (2026-09-13T06:47:48Z, 0x4D44/Codex verify run=verify-20260913T063123Z-04e08974)
 
 ## Observation
 
@@ -50,3 +50,9 @@ The superficially similar 0.1.211 Kiln report was provisionally attributed here,
 live session presence identified its transport as RDP with AVC444v2. It does not
 reproduce or refute this native-transport defect; the RDP repaint path is tracked
 separately.
+
+## Verification
+
+Independent verification confirmed fix commit `787740fdfa093249cc718a1490d08d61f5a4a0b2` and the root hunk in `tools/latency-spike/server/src/win/pipeline.rs`: idle `Timeout`/`PointerOnly` results can encode the retained desktop texture after a connect-edge keyframe request. The portable state regressions in `tools/latency-spike/server/src/bootstrap.rs` passed all 4 tests. As a red root mutant, `pending || keyframe_requested` was changed to `pending && keyframe_requested`; `bootstrap::tests::reconnect_arms_one_retained_frame_after_an_idle_poll` then failed at its retained-frame assertion. After restoring the condition, all 4 bootstrap tests passed again and the source diff was empty.
+
+The full repository gates also passed: `cargo build --locked`, `cargo test --locked` (908 library, 17 binary, 8 integration tests), `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `./scripts/test-vendored.sh` (372 vendored tests), and `./scripts/check-windows.sh --locked`. No fresh Windows Rhydra host session was available, so no new live static-desktop first-frame observation is claimed; the portable state tests cover connect, reconnect, source invalidation, admission, and recovery behavior.
