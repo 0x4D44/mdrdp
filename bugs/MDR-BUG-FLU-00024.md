@@ -1,6 +1,6 @@
 # MDR-BUG-FLU-00024 — Cold 5K mode switch outlives native display-status deadline, failing the first connection
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** native/probe
@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-20T17:42:01Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T18:57:46Z, deltic:auto role=fix run=fix-20260824T184631Z-eca420fc branch=task/bug-MDR-BUG-FLU-00024-run-fix-20260824T184631Z-eca420fc code=3180b7f gate=manual)
+- **State history:** Open (2026-08-20T17:42:01Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-24T18:57:46Z, deltic:auto role=fix run=fix-20260824T184631Z-eca420fc branch=task/bug-MDR-BUG-FLU-00024-run-fix-20260824T184631Z-eca420fc code=3180b7f gate=manual) -> Closed (2026-09-13T08:11:15Z, 0x4D44/Codex verify run=verify-20260913T081032Z-a26431ba)
 
 ## Observation
 
@@ -30,3 +30,11 @@ On quench with integrated mdrdp v0.1.109 and rhydra v0.5.0 freshly deployed, the
 <unfixed — raised only>
 
 ## Notes
+
+## Verification
+
+Independent verification confirmed fix commit `3180b7f4df8b40edf2de2d864d57328cc92e6f86`, including the cold display deadline in `src/native/probe.rs:79` and its selection for an unsettled first status at `src/native/probe.rs:305-309`. The focused regression `native::probe::tests::display_negotiation_gets_a_cold_transition_budget` passed after restoration. As a red root mutant, returning the ordinary deadline for an unsettled display made it fail at `src/native/probe.rs:824` because the left deadline was 8 seconds and the right deadline was 20 seconds. The cold selection was restored and the focused regression passed again.
+
+The repository gates then passed: `cargo build --locked`; `cargo test --locked`; `cargo fmt --all -- --check`; `cargo clippy --all-targets --locked -- -D warnings`; `./scripts/test-vendored.sh`; and `./scripts/check-windows.sh --locked`.
+
+No fresh Quench display-mode transition was attempted because it changes host display state and consumes the host's single session slot. No new live claim is made. The original cold 5K observation remains the end-to-end product observation.
