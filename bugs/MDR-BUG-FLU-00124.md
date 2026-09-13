@@ -1,25 +1,24 @@
 # MDR-BUG-FLU-00124 — AVC444 refinement debounce starves continuous-motion presentation
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/presentation
 - **Raised:** 2026-08-26T13:20:26Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260913T060713Z-319e4141
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00124-run-verify-20260913T060713Z-319e4141
-- **Owner base:** 4f5505c6220feb3184d1406a7373a30e4db6c716
-- **Owner fingerprint:** sha256:d16ba1378e1fd8791d6ea00fead40b7ee13343a86b2aca800782168e8f9e935b
-- **Owner since:** 2026-09-13T06:07:13Z
-- **Owner until:** 2026-09-13T08:07:13Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-26T13:20:26Z, raised via `deltic bugs new`) -> Fixed (2026-08-26T14:07:48Z, deltic:auto role=fix run=fix-20260826T132111Z-fdc36f77 branch=task/bug-MDR-BUG-FLU-00124-run-fix-20260826T132111Z-fdc36f77 code=4ba656c2588a654d2c5a250bbbe713029e476c3c gate=manual)
+- **State history:** Open (2026-08-26T13:20:26Z, raised via `deltic bugs new`) -> Fixed (2026-08-26T14:07:48Z, deltic:auto role=fix run=fix-20260826T132111Z-fdc36f77 branch=task/bug-MDR-BUG-FLU-00124-run-fix-20260826T132111Z-fdc36f77 code=4ba656c2588a654d2c5a250bbbe713029e476c3c gate=manual) -> Closed (2026-09-13T06:16:59Z, 0x4D44/Codex verify run=verify-20260913T060713Z-319e4141)
 
 ## Observation
 
@@ -27,6 +26,6 @@ Arthur reports that full-screen window dragging feels very sticky in mdrdp 0.1.2
 
 ## Fix
 
-<unfixed — raised only>
+Commit `4ba656c2588a654d2c5a250bbbe713029e476c3c` preserves fresh-content urgency with a presentation epoch and lets a new picture replace an older chroma-only deadline. The focused regressions `window::tests::a_coalesced_chroma_refinement_cannot_delay_unpresented_fresh_content` and `window::tests::fresh_content_bypasses_chroma_settling_but_keeps_large_canvas_cadence` passed; the worker's `chroma_refinement` filter passed 7 tests. As a behavioral red check, changing `SurfaceStore::presentation_not_before` to return the deadline unconditionally made `a_coalesced_chroma_refinement_cannot_delay_unpresented_fresh_content` fail its own assertion (`left: Err(Instant { ... })`, `right: Ok(Copied)`). The source was restored and its diff is empty. `cargo build --locked`, `cargo test --locked` (908 library, 17 binary, 8 integration tests), `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `./scripts/check-windows.sh --locked`, and `./scripts/test-vendored.sh` (372 vendored tests) all passed. No live RDP or GUI presentation test was available for this verification pass.
 
 ## Notes
