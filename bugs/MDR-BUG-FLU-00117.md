@@ -6,15 +6,15 @@
 - **Area:** native/clipboard-lifecycle
 - **Raised:** 2026-08-24T18:18:02Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260914T094940Z-5547a4d5
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00117-run-verify-20260914T094940Z-5547a4d5
+- **Owner base:** 707b54f257c7f617b73d6f47aef96b7e55b316f7
+- **Owner fingerprint:** sha256:5f55fb4a1fd757ec8c1c36efe24e8712710672511bdb1e20dc7db574105b6a86
+- **Owner since:** 2026-09-14T09:49:40Z
+- **Owner until:** 2026-09-14T11:49:40Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
