@@ -374,13 +374,14 @@ fn pending_presentation_deadline(
 }
 
 fn copy_presentation_when_due(
-    store: &SurfaceStore,
+    store: &mut SurfaceStore,
     snapshot: &mut PresentationSnapshot,
     presented: Option<PresentationStamp>,
     last_presented: Option<Instant>,
     now: Instant,
     fallback_dimensions: (u16, u16),
 ) -> Result<PresentationCopy, Instant> {
+    store.settle_avc444_deadline(now);
     let stamp = store.presentation_stamp();
     let (width, height) = store
         .presentation_dimensions()
@@ -2255,12 +2256,12 @@ impl SessionApp {
         // dimensions, and eventual snapshot coherent. A platform expose inside the
         // cadence window must not copy tens of MiB only to discard them afterward.
         let copy_result = {
-            let store = self
+            let mut store = self
                 .store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             copy_presentation_when_due(
-                &store,
+                &mut store,
                 &mut self.presentation,
                 self.presented,
                 self.last_presented_at,
@@ -2400,6 +2401,7 @@ impl SessionApp {
             generation = stamp.generation,
             fresh_content_epoch = stamp.fresh_content_epoch,
             acknowledge,
+            avc444_batch = ?self.presentation.avc444_batch,
             redraw_us = redraw_started.elapsed().as_micros(),
             "presentation submitted"
         );
@@ -2412,7 +2414,7 @@ impl SessionApp {
             self.store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .acknowledge_presentation(stamp);
+                .acknowledge_presentation(self.presentation.avc444_batch);
         }
         self.last_presented_at = Some(Instant::now());
         // Close the paint→present handoff measurement for this generation.
@@ -3205,7 +3207,7 @@ mod tests {
         let mut stale_stamp = store.presentation_stamp();
         stale_stamp.generation = stale_stamp.generation.wrapping_sub(1);
         let result = copy_presentation_when_due(
-            &store,
+            &mut store,
             &mut snapshot,
             Some(stale_stamp),
             Some(now),
@@ -3247,15 +3249,141 @@ mod tests {
         assert!(store.commit_frame(23));
 
         assert_eq!(
-            copy_presentation_when_due(&store, &mut snapshot, presented, None, now, (2, 1),),
+            copy_presentation_when_due(&mut store, &mut snapshot, presented, None, now, (2, 1),),
             Err(deadline)
         );
         assert_eq!(snapshot.pixels, [RED, RED].concat());
         assert_eq!(
-            copy_presentation_when_due(&store, &mut snapshot, presented, None, deadline, (2, 1),),
+            copy_presentation_when_due(
+                &mut store,
+                &mut snapshot,
+                presented,
+                None,
+                deadline,
+                (2, 1),
+            ),
             Ok(PresentationCopy::Copied)
         );
         assert_eq!(snapshot.pixels, [BLUE, BLUE].concat());
+    }
+
+    #[test]
+    fn submitted_snapshot_does_not_lose_the_next_active_frames_luma_wait() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        let region = Rect::new(0, 0, 2, 1);
+        store.solid_fill(1, &[region], RED).unwrap();
+        store.map_to_output(1);
+        let mut snapshot = PresentationSnapshot::default();
+        store.copy_presentation_state(&mut snapshot);
+        let displayed = Some(snapshot.stamp);
+        let start = Instant::now();
+
+        store.begin_frame(41);
+        store.note_avc444_regions(1, &[region], &[], start);
+        store
+            .blit_avc444_rgba(1, region, &[BLUE, BLUE].concat(), 2)
+            .unwrap();
+        store.finish_avc444_update(1);
+        assert!(store.commit_frame(41));
+        let due = start + Duration::from_millis(50);
+        assert_eq!(
+            copy_presentation_when_due(&mut store, &mut snapshot, displayed, None, due, (2, 1)),
+            Ok(PresentationCopy::Copied)
+        );
+        let submitted_stamp = snapshot.stamp;
+        let submitted_batch = snapshot.avc444_batch;
+        assert!(submitted_batch.is_some());
+
+        // The next decode starts while the captured snapshot is being rendered.
+        let next_luma = start + Duration::from_millis(51);
+        store.begin_frame(42);
+        store.note_avc444_regions(1, &[region], &[], next_luma);
+        store
+            .blit_avc444_rgba(1, region, &[GREEN, GREEN].concat(), 2)
+            .unwrap();
+        // A successful submission must not require the producer to become idle.
+        store.acknowledge_presentation(submitted_batch);
+        store.finish_avc444_update(1);
+        assert!(store.commit_frame(42));
+
+        let next_deadline = start + Duration::from_millis(101);
+        assert_eq!(store.presentation_not_before(None), Some(next_deadline));
+        assert_eq!(
+            copy_presentation_when_due(
+                &mut store,
+                &mut snapshot,
+                Some(submitted_stamp),
+                None,
+                start + Duration::from_millis(65),
+                (2, 1)
+            ),
+            Err(next_deadline),
+            "the previous successful draw cannot bypass the new frame's wait"
+        );
+        assert_eq!(snapshot.pixels, [BLUE, BLUE].concat());
+    }
+
+    #[test]
+    fn busy_submit_without_ack_retries_ready_snapshot_and_preserves_new_luma_wait() {
+        let mut store = SurfaceStore::new();
+        store.create(1, 2, 1);
+        let region = Rect::new(0, 0, 2, 1);
+        store.solid_fill(1, &[region], RED).unwrap();
+        store.map_to_output(1);
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let displayed = Some(snapshot.stamp);
+        let start = Instant::now();
+
+        // The first copy is submitted to a busy compositor, so it receives no acknowledgement.
+        store.begin_frame(51);
+        store.note_avc444_regions(1, &[region], &[region], start);
+        store
+            .blit_avc444_rgba(1, region, &[BLUE, BLUE].concat(), 2)
+            .unwrap();
+        store.finish_avc444_update(1);
+        assert!(store.commit_frame(51));
+        assert_eq!(
+            copy_presentation_when_due(&mut store, &mut snapshot, displayed, None, start, (2, 1)),
+            Ok(PresentationCopy::Copied)
+        );
+        let submitted_batch = snapshot.avc444_batch;
+        assert!(submitted_batch.is_some());
+
+        // New luma arrives before the retry. Its ledger is independent of the unacknowledged
+        // ready token, so the retry remains immediately due while the raw deadline is retained.
+        let next_luma = start + Duration::from_millis(1);
+        store.begin_frame(52);
+        store.note_avc444_regions(1, &[region], &[], next_luma);
+        store
+            .blit_avc444_rgba(1, region, &[GREEN, GREEN].concat(), 2)
+            .unwrap();
+        store.finish_avc444_update(1);
+        assert!(store.commit_frame(52));
+        let next_deadline = start + Duration::from_millis(51);
+        assert_eq!(store.presentation_not_before(None), None);
+
+        assert_eq!(
+            copy_presentation_when_due(
+                &mut store,
+                &mut snapshot,
+                displayed,
+                None,
+                start + Duration::from_millis(2),
+                (2, 1),
+            ),
+            Ok(PresentationCopy::Copied),
+            "ready token keeps a busy-submission retry due despite newer luma"
+        );
+        assert_eq!(snapshot.pixels, [GREEN, GREEN].concat());
+        assert_eq!(snapshot.avc444_batch, submitted_batch);
+
+        store.acknowledge_presentation(submitted_batch);
+        assert_eq!(store.presentation_not_before(None), Some(next_deadline));
     }
 
     #[test]
@@ -3296,7 +3424,14 @@ mod tests {
             "the damage wake must hold luma just like the snapshot-copy gate"
         );
         assert_eq!(
-            copy_presentation_when_due(&store, &mut snapshot, presented, None, chroma_at, (2, 1)),
+            copy_presentation_when_due(
+                &mut store,
+                &mut snapshot,
+                presented,
+                None,
+                chroma_at,
+                (2, 1)
+            ),
             Err(now + Duration::from_millis(50))
         );
         assert_eq!(snapshot.pixels, [RED, RED].concat());
@@ -3322,7 +3457,14 @@ mod tests {
         );
 
         assert_eq!(
-            copy_presentation_when_due(&store, &mut snapshot, presented, None, chroma_at, (2, 1)),
+            copy_presentation_when_due(
+                &mut store,
+                &mut snapshot,
+                presented,
+                None,
+                chroma_at,
+                (2, 1)
+            ),
             Ok(PresentationCopy::Copied),
             "complete chroma must release the pending luma immediately"
         );
@@ -3332,7 +3474,7 @@ mod tests {
             "the immediate present should still use the latest refined pixels"
         );
 
-        store.acknowledge_presentation(snapshot.stamp);
+        store.acknowledge_presentation(snapshot.avc444_batch);
         let presented = Some(snapshot.stamp);
         store.begin_frame(27);
         store.note_avc444_regions(1, &[], &[region], chroma_at);
@@ -3342,7 +3484,14 @@ mod tests {
         store.finish_avc444_update(1);
         assert!(store.commit_frame(27));
         assert_eq!(
-            copy_presentation_when_due(&store, &mut snapshot, presented, None, chroma_at, (2, 1)),
+            copy_presentation_when_due(
+                &mut store,
+                &mut snapshot,
+                presented,
+                None,
+                chroma_at,
+                (2, 1)
+            ),
             Ok(PresentationCopy::Copied),
             "chroma alone never starts a wait"
         );
@@ -3388,7 +3537,7 @@ mod tests {
 
         assert_eq!(
             copy_presentation_when_due(
-                &store,
+                &mut store,
                 &mut snapshot,
                 presented,
                 Some(now),
@@ -3463,7 +3612,7 @@ mod tests {
         assert_eq!(store.generation(), generation);
 
         let result = copy_presentation_when_due(
-            &store,
+            &mut store,
             &mut snapshot,
             Some(presented),
             None,

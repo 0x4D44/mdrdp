@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Ack the copied batch, not the latest decoder stamp (`surface.rs:acknowledge_presentation`).
+  Decode can advance during platform submission. A quiescence-dependent ack leaves waits
+  bypassed under continuous traffic. Keep ready tokens separate from newer pending coverage.
+
 - Wait on AVC444 luma, not chroma; bound the first deadline (`surface.rs:note_avc444_regions`).
   LC0 has independent luma/chroma regions; LC2 may refine an earlier graphics frame.
   Keep wire-order decoding, track spatial coverage, and release on completion or timeout.

@@ -2421,7 +2421,7 @@ mod tests {
                 pixels.copy_presentation_state(&mut snapshot),
                 crate::surface::PresentationCopy::Copied
             );
-            pixels.acknowledge_presentation(snapshot.stamp);
+            pixels.acknowledge_presentation(snapshot.avc444_batch);
         }
         assert_eq!(snapshot.pixels[..4], [100, 100, 100, 255]);
         let presented = snapshot.stamp;

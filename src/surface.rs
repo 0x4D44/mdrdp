@@ -728,12 +728,18 @@ pub struct SurfaceStore {
     /// Luma regions that have not yet received their matching AVC444 chroma coverage.
     /// These are clipped to the currently mapped source and kept disjoint.
     avc444_pending_luma: Vec<Rect>,
-    /// A ready/expired AVC444 batch has been observed but its current presentation has
-    /// not been acknowledged yet. This latch prevents a later luma update from rearming
-    /// the wait before the presenter has successfully displayed the current stamp.
-    avc444_waiting_for_ack: bool,
+    /// The AVC444 batch token whose ready presentation has not been acknowledged yet.
+    ///
+    /// This is separate from the pending luma ledger: a ready snapshot may be copied while
+    /// a newer luma batch is already being tracked, and its acknowledgement must reveal
+    /// that newer deadline rather than discard it.
+    avc444_ready: Option<u64>,
+    /// Monotone token source for ready AVC444 batches. Lifecycle resets clear `ready` but
+    /// never this sequence, so an old acknowledgement cannot match a later incarnation.
+    avc444_batch_seq: u64,
     /// An unframed AVC444 callback sequence is still copying its bitmap updates. The
-    /// presenter must not copy or acknowledge the in-progress sequence between callbacks.
+    /// presenter must not copy the in-progress sequence between callbacks; an already
+    /// copied snapshot may still be acknowledged while the producer continues decoding.
     avc444_update_active: bool,
     generation: u64,
     /// Retained for compatibility with presentation stamps. The AVC444 wait does not use
@@ -787,6 +793,9 @@ pub(crate) struct PresentationSnapshot {
     pub(crate) mapping: PresentationMapping,
     pub(crate) pixels: Vec<u8>,
     pub(crate) stamp: PresentationStamp,
+    /// AVC444 ready token carried by the pixels copied into this snapshot.
+    /// Pending and retained copies leave this field unchanged.
+    pub(crate) avc444_batch: Option<u64>,
 }
 
 impl SurfaceStore {
@@ -813,16 +822,18 @@ impl SurfaceStore {
         }
     }
 
-    /// Return the pending AVC444 luma deadline.
+    /// Return the effective AVC444 luma deadline.
     ///
-    /// `presented` remains in the signature for the window/presenter contract, but the
-    /// deadline is independent of the fresh-content epoch. AVC444 luma and chroma can
-    /// advance generations independently while one bounded wait is outstanding.
+    /// A ready token permits an early snapshot copy, while the raw pending deadline and
+    /// regions remain protected until that token is acknowledged.
     pub(crate) fn presentation_not_before(
         &self,
         _presented: Option<PresentationStamp>,
     ) -> Option<Instant> {
-        self.presentation_not_before
+        self.avc444_ready
+            .is_none()
+            .then_some(self.presentation_not_before)
+            .flatten()
     }
 
     pub(crate) fn release_presentation_delay(&mut self) {
@@ -833,7 +844,7 @@ impl SurfaceStore {
         self.generation = self.generation.wrapping_add(1);
         self.fresh_content_epoch = self.fresh_content_epoch.wrapping_add(1);
         let now = Instant::now();
-        let (kind, wait_us) = match self.presentation_not_before {
+        let (kind, wait_us) = match self.presentation_not_before(None) {
             Some(deadline) if deadline > now => (
                 "luma_wait",
                 u64::try_from(deadline.saturating_duration_since(now).as_micros())
@@ -846,6 +857,8 @@ impl SurfaceStore {
             fresh_content_epoch = self.fresh_content_epoch,
             kind,
             wait_us,
+            avc444_ready = ?self.avc444_ready,
+            avc444_pending_deadline = ?self.presentation_not_before,
             outstanding = self.avc444_pending_luma.len(),
             "presentation stamp advanced"
         );
@@ -854,52 +867,55 @@ impl SurfaceStore {
     fn avc444_policy_active(&self) -> bool {
         self.presentation_not_before.is_some()
             || !self.avc444_pending_luma.is_empty()
-            || self.avc444_waiting_for_ack
+            || self.avc444_ready.is_some()
     }
 
     fn clear_avc444_presentation_policy(&mut self, reason: &'static str) {
         let outstanding = self.avc444_pending_luma.len();
         let active = self.avc444_policy_active();
+        let ready = self.avc444_ready;
+        let pending_deadline = self.presentation_not_before;
         self.presentation_not_before = None;
         self.avc444_pending_luma.clear();
-        self.avc444_waiting_for_ack = false;
+        self.avc444_ready = None;
         if active {
-            trace!(reason, outstanding, "AVC444 presentation deadline released");
+            trace!(
+                reason,
+                ready = ?ready,
+                pending_deadline = ?pending_deadline,
+                outstanding,
+                "AVC444 presentation policy cleared"
+            );
         }
     }
 
-    fn release_avc444_presentation_policy(
-        &mut self,
-        reason: &'static str,
-        retain_expired_deadline: bool,
-    ) {
+    fn release_avc444_presentation_policy(&mut self, reason: &'static str) {
         let outstanding = self.avc444_pending_luma.len();
         let active = self.avc444_policy_active();
+        let previous_ready = self.avc444_ready;
+        let pending_deadline = self.presentation_not_before;
         self.avc444_pending_luma.clear();
-        self.avc444_waiting_for_ack = true;
-        if !retain_expired_deadline {
-            self.presentation_not_before = None;
-        }
+        self.presentation_not_before = None;
+        self.avc444_batch_seq = self.avc444_batch_seq.wrapping_add(1);
+        self.avc444_ready = Some(self.avc444_batch_seq);
         trace!(
             reason,
-            outstanding, active, "AVC444 presentation deadline released"
+            previous_ready = ?previous_ready,
+            ready = ?self.avc444_ready,
+            pending_deadline = ?pending_deadline,
+            outstanding,
+            active,
+            "AVC444 presentation batch ready"
         );
     }
 
-    fn mark_avc444_deadline_expired(&mut self, now: Instant) -> bool {
-        if self.avc444_waiting_for_ack {
-            return true;
-        }
+    pub(crate) fn settle_avc444_deadline(&mut self, now: Instant) {
         if self
             .presentation_not_before
             .is_some_and(|deadline| now >= deadline)
         {
-            // Retain the expired timestamp until the current stamp is acknowledged. The
-            // presenter can still observe that it is due, while later luma cannot rearm it.
-            self.release_avc444_presentation_policy("deadline_expired", true);
-            return true;
+            self.release_avc444_presentation_policy("deadline_expired");
         }
-        false
     }
 
     fn add_pending_luma(&mut self, regions: &[Rect]) -> bool {
@@ -996,14 +1012,12 @@ impl SurfaceStore {
             return;
         }
 
-        if self.mark_avc444_deadline_expired(now) {
-            return;
-        }
+        self.settle_avc444_deadline(now);
         if luma.len().saturating_add(chroma.len()) > MAX_AVC444_PENDING_REGIONS * 2 {
             // Keep every pixel callback alive, but abandon the metadata ledger before a
             // pathological PDU can make union/subtraction quadratic or fragment it past
             // its bounded representation.
-            self.release_avc444_presentation_policy("region_budget", false);
+            self.release_avc444_presentation_policy("region_budget");
             return;
         }
 
@@ -1011,7 +1025,7 @@ impl SurfaceStore {
             if !self.add_pending_luma(&luma) {
                 // The pixels still go through blit_avc444_rgba. Only the policy falls
                 // back to urgent presentation when its geometric ledger overflows.
-                self.release_avc444_presentation_policy("region_fragmentation", false);
+                self.release_avc444_presentation_policy("region_fragmentation");
                 return;
             }
             if self.presentation_not_before.is_none() && !self.avc444_pending_luma.is_empty() {
@@ -1030,11 +1044,11 @@ impl SurfaceStore {
 
         if !chroma.is_empty() && !self.avc444_pending_luma.is_empty() {
             if !self.subtract_pending_luma(&chroma) {
-                self.release_avc444_presentation_policy("region_fragmentation", false);
+                self.release_avc444_presentation_policy("region_fragmentation");
                 return;
             }
             if self.avc444_pending_luma.is_empty() {
-                self.release_avc444_presentation_policy("chroma_complete", false);
+                self.release_avc444_presentation_policy("chroma_complete");
             }
         }
     }
@@ -1051,29 +1065,29 @@ impl SurfaceStore {
         }
     }
 
-    /// A successful present of the current stamp permits the next AVC444 batch to arm a
-    /// deadline. Stale stamps and in-progress frame/update callbacks cannot clear policy.
-    pub(crate) fn acknowledge_presentation(&mut self, stamp: PresentationStamp) {
-        if self.avc444_update_active || !matches!(self.frame_state, FrameState::Idle) {
+    /// A successful present acknowledges only the ready token carried by that snapshot.
+    /// Decode may advance the store, or remain in an active callback/frame, before this
+    /// runs. Pending luma and its deadline belong to newer work and are never cleared here.
+    pub(crate) fn acknowledge_presentation(&mut self, batch: Option<u64>) {
+        let ready = self.avc444_ready;
+        if batch.is_some() && batch == ready {
+            self.avc444_ready = None;
             trace!(
-                reason = "active_update_or_frame",
+                batch = ?batch,
+                ready = ?self.avc444_ready,
+                pending_deadline = ?self.presentation_not_before,
+                outstanding = self.avc444_pending_luma.len(),
+                "AVC444 presentation batch acknowledged"
+            );
+        } else {
+            trace!(
+                batch = ?batch,
+                ready = ?ready,
+                pending_deadline = ?self.presentation_not_before,
                 outstanding = self.avc444_pending_luma.len(),
                 "AVC444 presentation acknowledgement ignored"
             );
-            return;
         }
-        if stamp != self.presentation_stamp() {
-            trace!(
-                reason = "stale_stamp",
-                outstanding = self.avc444_pending_luma.len(),
-                "AVC444 presentation acknowledgement ignored"
-            );
-            return;
-        }
-        // The presenter only calls this after it has successfully copied/submitted the
-        // current snapshot. That acknowledgement, rather than a second wall clock, is
-        // the authority that permits the next AVC444 batch to arm a wait.
-        self.clear_avc444_presentation_policy("presentation_acknowledged");
     }
 
     fn mark_frame_visible_dirty(&mut self) {
@@ -1208,8 +1222,8 @@ impl SurfaceStore {
     }
 
     fn release_non_avc_presentation_policy(&mut self) {
-        if self.avc444_policy_active() {
-            self.release_avc444_presentation_policy("non_avc_mutation", false);
+        if self.presentation_not_before.is_some() || !self.avc444_pending_luma.is_empty() {
+            self.release_avc444_presentation_policy("non_avc_mutation");
         }
     }
 
@@ -1501,6 +1515,7 @@ impl SurfaceStore {
             snapshot.pixel_height = 0;
             snapshot.mapping = PresentationMapping::default();
             snapshot.pixels.clear();
+            snapshot.avc444_batch = self.avc444_ready;
             return PresentationCopy::Empty;
         };
         snapshot.width = mapping.canvas_width;
@@ -1510,6 +1525,7 @@ impl SurfaceStore {
         snapshot.mapping = mapping;
         snapshot.pixels.resize(surface.pixels.len(), 0);
         snapshot.pixels.copy_from_slice(surface.pixels());
+        snapshot.avc444_batch = self.avc444_ready;
         PresentationCopy::Copied
     }
 
@@ -2460,6 +2476,21 @@ mod tests {
         );
         assert_eq!(snapshot.pixels, [RED, BLUE].concat());
         assert_eq!(snapshot.stamp, store.presentation_stamp());
+
+        // Transactional copy results must not overwrite a token from the last coherent copy.
+        snapshot.avc444_batch = Some(77);
+        store.begin_frame(8);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Pending
+        );
+        assert_eq!(snapshot.avc444_batch, Some(77));
+        store.abort_frame();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Retained
+        );
+        assert_eq!(snapshot.avc444_batch, Some(77));
     }
 
     #[test]
@@ -2587,18 +2618,18 @@ mod tests {
         assert_eq!(store.presentation_not_before(None), Some(deadline));
 
         // A later metadata callback observes expiry using the explicit test clock. The
-        // expired deadline remains visible until its current stamp is acknowledged.
+        // timer-only release publishes a ready token and clears the public deadline.
         note_and_finish(&mut store, &[], &[], deadline);
-        assert_eq!(store.presentation_not_before(None), Some(deadline));
-        assert!(store.avc444_waiting_for_ack);
+        assert_eq!(store.presentation_not_before(None), None);
+        assert!(store.avc444_ready.is_some());
+        assert!(store.avc444_pending_luma.is_empty());
     }
 
     #[test]
-    fn expiry_does_not_rearm_later_luma_until_matching_ack() {
+    fn expiry_tracks_later_luma_behind_the_ready_token_until_ack() {
         let mut store = mapped_policy_store(2, 1);
         let start = Instant::now();
         note_and_finish(&mut store, &[Rect::new(0, 0, 2, 1)], &[], start);
-        let deadline = start + std::time::Duration::from_millis(50);
 
         note_and_finish(
             &mut store,
@@ -2606,12 +2637,16 @@ mod tests {
             &[],
             start + std::time::Duration::from_millis(51),
         );
-        assert_eq!(store.presentation_not_before(None), Some(deadline));
-        assert!(store.avc444_waiting_for_ack);
-
-        store.acknowledge_presentation(store.presentation_stamp());
+        let ready = store.avc444_ready;
+        let next_deadline = start + std::time::Duration::from_millis(101);
+        assert!(ready.is_some());
         assert_eq!(store.presentation_not_before(None), None);
-        assert!(!store.avc444_waiting_for_ack);
+        assert_eq!(store.presentation_not_before, Some(next_deadline));
+        assert_eq!(store.avc444_pending_luma, vec![Rect::new(0, 0, 2, 1)]);
+
+        store.acknowledge_presentation(ready);
+        assert_eq!(store.presentation_not_before(None), Some(next_deadline));
+        assert_eq!(store.avc444_ready, None);
 
         note_and_finish(
             &mut store,
@@ -2621,12 +2656,13 @@ mod tests {
         );
         assert_eq!(
             store.presentation_not_before(None),
-            Some(start + std::time::Duration::from_millis(102))
+            Some(next_deadline),
+            "a later luma must not extend the pending deadline"
         );
     }
 
     #[test]
-    fn completion_does_not_rearm_until_the_current_stamp_is_acknowledged() {
+    fn completion_tracks_new_luma_behind_the_ready_token_until_snapshot_ack() {
         let mut store = mapped_policy_store(2, 1);
         let start = Instant::now();
         note_and_finish(
@@ -2636,9 +2672,16 @@ mod tests {
             start,
         );
         assert_eq!(store.presentation_not_before(None), None);
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let submitted = snapshot.avc444_batch;
+        assert!(submitted.is_some());
 
-        // This is a new AVC update before the completed one was presented. It must not
-        // arm a second wait, although its pixels still land normally.
+        // This is a new AVC update before the completed one was presented. Its deadline is
+        // tracked, but the ready token makes the submitted snapshot immediately eligible.
         note_and_finish(
             &mut store,
             &[Rect::new(0, 0, 2, 1)],
@@ -2646,9 +2689,16 @@ mod tests {
             start + std::time::Duration::from_millis(1),
         );
         assert_eq!(store.presentation_not_before(None), None);
+        assert_eq!(
+            store.presentation_not_before,
+            Some(start + std::time::Duration::from_millis(51))
+        );
 
-        let current = store.presentation_stamp();
-        store.acknowledge_presentation(current);
+        store.acknowledge_presentation(submitted);
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(start + std::time::Duration::from_millis(51))
+        );
         note_and_finish(
             &mut store,
             &[Rect::new(0, 0, 2, 1)],
@@ -2657,7 +2707,8 @@ mod tests {
         );
         assert_eq!(
             store.presentation_not_before(None),
-            Some(start + std::time::Duration::from_millis(52))
+            Some(start + std::time::Duration::from_millis(51)),
+            "existing pending luma keeps the original deadline"
         );
     }
 
@@ -2740,38 +2791,75 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_active_acknowledgements_cannot_clear_a_newer_wait() {
+    fn stale_completed_snapshot_ack_cannot_clear_a_newer_or_reset_wait() {
         let mut store = mapped_policy_store(2, 1);
         let start = Instant::now();
-        note_and_finish(&mut store, &[Rect::new(0, 0, 2, 1)], &[], start);
-        let stale = store.presentation_stamp();
-        store
-            .blit_avc444_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2)
-            .unwrap();
+        let region = Rect::new(0, 0, 2, 1);
+        note_and_finish(&mut store, &[region], &[region], start);
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let stale_batch = snapshot.avc444_batch;
+        assert!(stale_batch.is_some());
+
+        // A newer luma wait may be tracked while the completed snapshot is still ready.
+        note_and_finish(
+            &mut store,
+            &[region],
+            &[],
+            start + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(
+            store.presentation_not_before,
+            Some(start + std::time::Duration::from_millis(51))
+        );
+
+        // Expiry creates a distinct ready token. The old completed snapshot cannot clear it.
         note_and_finish(
             &mut store,
             &[],
-            &[Rect::new(0, 0, 1, 1)],
-            start + std::time::Duration::from_millis(1),
+            &[],
+            start + std::time::Duration::from_millis(51),
         );
-        let current = store.presentation_stamp();
-        assert_ne!(stale, current);
-        store.acknowledge_presentation(stale);
-        assert_eq!(
-            store.presentation_not_before(None),
-            Some(start + std::time::Duration::from_millis(50))
-        );
+        let newer_batch = store.avc444_ready;
+        assert!(newer_batch.is_some());
+        assert_ne!(stale_batch, newer_batch);
+        store.acknowledge_presentation(stale_batch);
+        assert_eq!(store.avc444_ready, newer_batch);
 
-        store.note_avc444_regions(1, &[], &[], start + std::time::Duration::from_millis(2));
-        store.acknowledge_presentation(current);
-        assert!(store.avc444_update_active);
-        assert_eq!(
-            store.presentation_not_before(None),
-            Some(start + std::time::Duration::from_millis(50))
+        store.acknowledge_presentation(newer_batch);
+        assert_eq!(store.avc444_ready, None);
+
+        // A reveal/reset clears the ready state but must not rewind token generation.
+        let seq_after_newer = store.avc444_batch_seq;
+        store.release_presentation_delay();
+        assert_eq!(store.avc444_batch_seq, seq_after_newer);
+        note_and_finish(
+            &mut store,
+            &[region],
+            &[],
+            start + std::time::Duration::from_millis(52),
         );
-        store.finish_avc444_update(1);
-        store.acknowledge_presentation(store.presentation_stamp());
-        assert_eq!(store.presentation_not_before(None), None);
+        let reset_deadline = start + std::time::Duration::from_millis(102);
+        assert_eq!(store.presentation_not_before, Some(reset_deadline));
+        store.acknowledge_presentation(stale_batch);
+        assert_eq!(store.presentation_not_before, Some(reset_deadline));
+
+        note_and_finish(
+            &mut store,
+            &[],
+            &[region],
+            start + std::time::Duration::from_millis(53),
+        );
+        let post_reset_batch = store.avc444_ready;
+        assert!(post_reset_batch.is_some());
+        assert_ne!(stale_batch, post_reset_batch);
+        store.acknowledge_presentation(stale_batch);
+        assert_eq!(store.avc444_ready, post_reset_batch);
+        store.acknowledge_presentation(post_reset_batch);
+        assert_eq!(store.avc444_ready, None);
     }
 
     #[test]
@@ -2783,7 +2871,7 @@ mod tests {
         let start = Instant::now();
         note_and_finish(&mut store, &regions, &[], start);
         assert_eq!(store.presentation_not_before(None), None);
-        assert!(store.avc444_waiting_for_ack);
+        assert!(store.avc444_ready.is_some());
 
         let blue = solid(514, 1, BLUE);
         store
@@ -2800,7 +2888,7 @@ mod tests {
         note_and_finish(&mut store, &regions, &[], start);
 
         assert_eq!(store.presentation_not_before(None), None);
-        assert!(store.avc444_waiting_for_ack);
+        assert!(store.avc444_ready.is_some());
 
         let blue = solid(2, 1, BLUE);
         store
@@ -2824,12 +2912,11 @@ mod tests {
         store
             .blit_avc444_rgba(1, Rect::new(0, 0, 1, 1), &solid(1, 1, BLUE), 1)
             .unwrap();
-        let current = store.presentation_stamp();
         assert_eq!(
             store.copy_presentation_state(&mut snapshot),
             PresentationCopy::Pending
         );
-        store.acknowledge_presentation(current);
+        store.acknowledge_presentation(None);
         assert_eq!(
             store.presentation_not_before(None),
             Some(start + std::time::Duration::from_millis(50))
@@ -2855,7 +2942,7 @@ mod tests {
             .blit_rgba(1, Rect::new(0, 0, 1, 1), &solid(1, 1, RED), 1)
             .unwrap();
         assert_eq!(store.presentation_not_before(None), None);
-        assert!(store.avc444_waiting_for_ack);
+        assert!(store.avc444_ready.is_some());
 
         note_and_finish(
             &mut store,
@@ -2864,7 +2951,12 @@ mod tests {
             start + std::time::Duration::from_millis(1),
         );
         assert_eq!(store.presentation_not_before(None), None);
-        store.acknowledge_presentation(store.presentation_stamp());
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        store.acknowledge_presentation(snapshot.avc444_batch);
         note_and_finish(
             &mut store,
             &[Rect::new(0, 0, 2, 1)],
@@ -2873,7 +2965,7 @@ mod tests {
         );
         assert_eq!(
             store.presentation_not_before(None),
-            Some(start + std::time::Duration::from_millis(52))
+            Some(start + std::time::Duration::from_millis(51))
         );
     }
 
@@ -2905,7 +2997,7 @@ mod tests {
         store.delete(1);
         assert_eq!(store.presentation_not_before(None), None);
         store.release_presentation_delay();
-        assert!(!store.avc444_waiting_for_ack);
+        assert_eq!(store.avc444_ready, None);
     }
 
     #[test]
