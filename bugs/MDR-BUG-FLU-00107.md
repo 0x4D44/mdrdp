@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00107 — Native transport failure leaves a frozen window open
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/session-lifecycle
 - **Raised:** 2026-08-24T12:24:24Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260914T085023Z-b94c304a
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00107-run-verify-20260914T085023Z-b94c304a
-- **Owner base:** ecf5414290b65589548afd6663257564949bfe77
-- **Owner fingerprint:** sha256:334f94f15195c94c7d1536df72f2b9b9becad35d49cf88776cbda63a9489f9e1
-- **Owner since:** 2026-09-14T08:50:23Z
-- **Owner until:** 2026-09-14T10:50:23Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T12:24:24Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T12:36:04Z, deltic:auto role=fix run=fix-20260824T122528Z-6553d1a4 branch=task/bug-MDR-BUG-FLU-00107-run-fix-20260824T122528Z-6553d1a4 code=3deb088 gate=manual)
+- **State history:** Open (2026-08-24T12:24:24Z, raised via `deltic bugs new`) -> Fixed (2026-08-24T12:36:04Z, deltic:auto role=fix run=fix-20260824T122528Z-6553d1a4 branch=task/bug-MDR-BUG-FLU-00107-run-fix-20260824T122528Z-6553d1a4 code=3deb088 gate=manual) -> Closed (2026-09-14T09:01:13Z, 0x4D44/Codex verify run=verify-20260914T085023Z-b94c304a)
 
 ## Observation
 
@@ -27,6 +27,23 @@ The native video and input worker failure paths set the stop flag and close peer
 
 ## Fix
 
-<unfixed — raised only>
+`6027aa3` makes the video and input workers close the native window waker on
+their first terminal transport failure, while preserving intentional shutdown
+and suppressing duplicate close notifications. The change is integrated in
+`3deb088`.
+
+## Verification
+
+The lead and independent verifiers ran the video EOF, input EOF, and malformed
+video framing regressions; all selected tests passed. The native-session family
+passed 64 tests for both verifiers.
+
+The independent verifier disabled the `close_window()` calls at
+`src/native/session.rs:1177` and `src/native/session.rs:1205`. All three focused
+tests then failed with `Err(Empty)` instead of the expected `Ok(())`. The lead
+made the same mutation and observed the same missing close signal. Restoring
+the calls made the lead EOF and malformed-framing checks pass again, and the
+independent verifier reran the focus and 64-test family successfully. The
+regressions use loopback sockets; no live RDP runtime was used.
 
 ## Notes
