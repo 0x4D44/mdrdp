@@ -30,6 +30,18 @@ Evidence fingerprint: `manual:v1:avc444-luma-and-chroma-presentations-still-alte
 
 ## Fix
 
-<unfixed — raised only>
+Integrated in `1f8674a`, version `0.1.247`: hold pending luma for at most 50 ms
+from the first update, releasing early on accepted chroma coverage. Preserve
+wire-order decoding and bracket unframed bitmap callbacks. Bound region tracking
+and prevent deadline rearming before a successful current-stamp presentation.
+
+Focused validation: 73 surface, 65 graphics and 69 window tests passed; all
+vendored suites passed. Regression mutations were restored after observed
+failures. Clippy (`--all-targets -D warnings`) and Windows cross-check passed.
+Existing Windows warnings and standalone vendored formatting drift remain.
+
+Design and full evidence are in the 2026.09.14 bounded AVC444 luma-wait HLD and
+journal. This is Fixed, not independently visually verified: a live affected
+terminal session still needs to confirm the reported flicker has improved.
 
 ## Notes
