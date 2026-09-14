@@ -1,0 +1,39 @@
+# MDR-BUG-FLU-00129 — Windowed RDP resolution stays reduced after a monitor returns
+
+- **State:** Open
+- **Priority:** Should
+- **Severity:** Medium
+- **Area:** window/resolution
+- **Raised:** 2026-09-14T06:44:19Z
+- **Discovery source:** Human
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
+- **Verify retry after:** -
+- **Held branch:** -
+- **Legacy fixed run:** -
+- **Attempts:** fix=0, doubt=0, indeterminate=0
+- **State history:** Open (2026-09-14T06:44:19Z, raised via `deltic bugs new`)
+
+## Observation
+
+With Dynamic resolution enabled, switching an external monitor off can cause an RDP
+session that was using a large resolution to renegotiate to the laptop's smaller
+resolution. When the monitor is turned back on, the RDP session may be on another
+macOS desktop/Space and does not renegotiate back to the larger resolution. Expected:
+a transient monitor power change must not permanently replace the chosen session or
+window resolution; when the original display/window geometry returns, mdrdp should
+renegotiate accordingly. Actual: the session can remain at the smaller resolution
+after the monitor returns.
+
+## Fix
+
+<unfixed — raised only>
+
+## Notes
