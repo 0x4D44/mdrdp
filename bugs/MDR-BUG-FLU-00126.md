@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00126 — Native ACK writer failure suppresses the window close notification
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** native/session-lifecycle
 - **Raised:** 2026-09-04T22:00:20Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260914T103327Z-fe5ba486
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00126-run-verify-20260914T103327Z-fe5ba486
-- **Owner base:** 838082d97f4ec1af2de3134dcbaf1d26793b64fe
-- **Owner fingerprint:** sha256:e5fabec34ececd68edf350e8da70b12689f0b9504658a14d664e1b0ad061b036
-- **Owner since:** 2026-09-14T10:33:27Z
-- **Owner until:** 2026-09-14T12:33:27Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-04T22:00:20Z, raised via `deltic bugs new`) -> Fixed (2026-09-05T06:19:18Z, deltic:auto role=fix run=fix-20260905T060401Z-97098776 branch=task/bug-MDR-BUG-FLU-00126-run-fix-20260905T060401Z-97098776 code=e6f5e55 gate=manual)
+- **State history:** Open (2026-09-04T22:00:20Z, raised via `deltic bugs new`) -> Fixed (2026-09-05T06:19:18Z, deltic:auto role=fix run=fix-20260905T060401Z-97098776 branch=task/bug-MDR-BUG-FLU-00126-run-fix-20260905T060401Z-97098776 code=e6f5e55 gate=manual) -> Closed (2026-09-14T10:43:29Z, 0x4D44/Codex verify run=verify-20260914T103327Z-fe5ba486)
 
 ## Observation
 
@@ -35,7 +35,19 @@ Integrated as `e6f5e55`, version 0.1.241, on 2026-09-05. ACK failure now atomica
 
 Regression evidence: restoring the old ACK behavior failed the expected `TransportFailed` assertion. Replacing the shared claim with unconditional success failed intentional-shutdown classification and observed three notifications instead of one. Mutations were restored; all 60 native-session tests passed. Windows type-check, formatting, library/test clippy, and CLI help smoke passed. The contention test passed 20 repeat runs. No live GUI disconnect was tested.
 
-Detailed evidence: [native review fix journal](~/language/mdrdp/wrk_journals/2026.09.05%20-%20JRN%20-%20native%20review%20fixes.md). Fixed, awaiting independent verification; this fixing session does not close its own record.
+Detailed evidence: [native review fix journal](~/language/mdrdp/wrk_journals/2026.09.05%20-%20JRN%20-%20native%20review%20fixes.md). Independent verification is recorded below.
+
+## Verification
+
+The independent verifier passed the ACK failure, intentional shutdown, and
+competing-failure tests, plus all 64 native-session tests.
+
+The independent verifier changed `if claim_terminal_failure(stop)` to
+`if false` at `src/native/session.rs:1158`. The ACK failure test failed at
+`src/native/session.rs:6179` because the transport failure was not reported.
+The lead made the same mutation and observed the same failure. Restoring the
+terminal claim made all three focused tests and the 64-test native-session
+family pass again. No live Windows or RDP runtime was used.
 
 ## Notes
 
