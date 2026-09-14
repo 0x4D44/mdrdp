@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00127 — Native control replies bypass memory and end-to-end timeout bounds
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** native/control-client
 - **Raised:** 2026-09-04T22:00:27Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260914T104949Z-51d4a75d
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00127-run-verify-20260914T104949Z-51d4a75d
-- **Owner base:** 6664701eaf0e485f3acdaebb46b90839b0ebdea2
-- **Owner fingerprint:** sha256:611e89737f2ed77aa19a5b329076008ae4fa7404183dfb8626b1277da93591b6
-- **Owner since:** 2026-09-14T10:49:49Z
-- **Owner until:** 2026-09-14T12:49:49Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-04T22:00:27Z, raised via `deltic bugs new`) -> Fixed (2026-09-05T06:38:24Z, deltic:auto role=fix run=fix-20260905T061934Z-52de8fba branch=task/bug-MDR-BUG-FLU-00127-run-fix-20260905T061934Z-52de8fba code=aff1e45 gate=manual)
+- **State history:** Open (2026-09-04T22:00:27Z, raised via `deltic bugs new`) -> Fixed (2026-09-05T06:38:24Z, deltic:auto role=fix run=fix-20260905T061934Z-52de8fba branch=task/bug-MDR-BUG-FLU-00127-run-fix-20260905T061934Z-52de8fba code=aff1e45 gate=manual) -> Closed (2026-09-14T11:06:16Z, 0x4D44/Codex verify run=verify-20260914T104949Z-51d4a75d)
 
 ## Observation
 
@@ -35,12 +35,18 @@ Integrated as `aff1e45`, version 0.1.242, on 2026-09-05. Status and command requ
 
 Six new regression tests cover both helpers' oversized and dripping replies, blocked partial writes, and expired budgets without byte transfer. Each failed on an assertion under a targeted mutation, then passed after restoration. The lead reran 43 selected control-related tests, 15 native-probe tests, the Windows guard for mdrdp and Rhydra host, formatting, and CLI help smoke successfully. Existing unrelated warnings remain.
 
-Live host compatibility is UNVERIFIED: Quench was unreachable over SSH and Temper refused SSH authentication. Neither attempt opened a desktop or changed credentials/configuration. Detailed mutation evidence and commands: [native review fix journal](~/language/mdrdp/wrk_journals/2026.09.05%20-%20JRN%20-%20native%20review%20fixes.md). Fixed, awaiting independent verification.
+Live host compatibility remains unverified: Quench was unreachable over SSH and Temper refused SSH authentication. Neither attempt opened a desktop or changed credentials/configuration. Detailed mutation evidence and commands: [native review fix journal](~/language/mdrdp/wrk_journals/2026.09.05%20-%20JRN%20-%20native%20review%20fixes.md).
+
+## Verification
+
+The independent verifier passed the four oversized and dripping-reply regressions and the 43-test `control` family. The lead passed the same six control regressions, including blocked partial writes and expired budgets, in the 41-test no-default-feature `control` family.
+
+Both verifiers disabled the reply-size guard at `tools/latency-spike/server/src/control.rs:653`. The independent run made both oversized-reply tests fail with `Err(Bad("not JSON: expected value ..."))`; the lead observed the same failure on the send-request case. This proves the tests reject the unbounded-reader regression before JSON parsing. Restoring the guard made the focused tests and each control family pass again, and both worktrees verified exact source restoration. No live RDP runtime was available.
 
 ## Notes
 
 Proposed fix (small/medium, approximately 2–4 hours): share a bounded control-reply reader, reject excess bytes before allocation grows, and derive connect/write/read timeouts from one absolute deadline. Preserve a clear timeout result at native call sites. Keep the reply ceiling large enough for legitimate status and clipboard-comparison replies.
 
-Future regression criteria: an unterminated oversized reply is rejected after at most limit + 1 bytes; a drip-fed reply cannot renew the total deadline; normal status/ack/error replies still decode; time spent connecting or writing reduces the remaining read budget. These checks were not executed in this review.
+Future regression criteria: an unterminated oversized reply is rejected after at most limit + 1 bytes; a drip-fed reply cannot renew the total deadline; normal status/ack/error replies still decode; time spent connecting or writing reduces the remaining read budget. The verification above exercises these criteria.
 
-Medium severity reflects the authenticated-host trust boundary: this is a faulty/compromised endpoint denial of service, not an unauthenticated Internet attack. Fixed MDR-BUG-FLU-00044 bounded incoming server requests, not these client reply readers. The reliability lens's timeout-overrun observation is consolidated here, not filed twice. No fix made.
+Medium severity reflects the authenticated-host trust boundary: this is a faulty/compromised endpoint denial of service, not an unauthenticated Internet attack. Fixed MDR-BUG-FLU-00044 bounded incoming server requests, not these client reply readers. The reliability lens's timeout-overrun observation is consolidated here, not filed twice.
