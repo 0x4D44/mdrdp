@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00117 — Native clipboard calls can block first paint and shutdown indefinitely
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** native/clipboard-lifecycle
 - **Raised:** 2026-08-24T18:18:02Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20260914T094940Z-5547a4d5
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00117-run-verify-20260914T094940Z-5547a4d5
-- **Owner base:** 707b54f257c7f617b73d6f47aef96b7e55b316f7
-- **Owner fingerprint:** sha256:5f55fb4a1fd757ec8c1c36efe24e8712710672511bdb1e20dc7db574105b6a86
-- **Owner since:** 2026-09-14T09:49:40Z
-- **Owner until:** 2026-09-14T11:49:40Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T18:18:02Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-24T18:36:56Z, deltic:auto role=fix run=fix-20260824T181823Z-ef1fd76d branch=task/bug-MDR-BUG-FLU-00117-run-fix-20260824T181823Z-ef1fd76d code=ac72260 gate=manual)
+- **State history:** Open (2026-08-24T18:18:02Z, raised via `deltic bugs new` model=gpt-5.6-sol@max) -> Fixed (2026-08-24T18:36:56Z, deltic:auto role=fix run=fix-20260824T181823Z-ef1fd76d branch=task/bug-MDR-BUG-FLU-00117-run-fix-20260824T181823Z-ef1fd76d code=ac72260 gate=manual) -> Closed (2026-09-14T10:07:30Z, 0x4D44/Codex verify run=verify-20260914T094940Z-5547a4d5)
 
 ## Observation
 
@@ -27,6 +27,25 @@ Native session startup seeds clipboard state by calling the synchronous OS clipb
 
 ## Fix
 
-<unfixed — raised only>
+`ac72260` moves the initial clipboard seed into the poll worker, preserves
+remote changes until seed completion, and bounds auxiliary teardown so a
+worker stuck in an uninterruptible OS clipboard call can be detached. The
+change is integrated in `ac72260`.
+
+## Verification
+
+The independent verifier ran four clipboard lifecycle tests and the
+native-session family; all passed, including 64 native-session tests.
+
+The independent verifier added a synchronous `read_text()` during auxiliary
+startup at `src/native/session.rs:919`. The focused startup test failed at
+`src/native/session.rs:3838` with `spawn_aux waited for the OS clipboard seed`.
+The lead made the same mutation and observed the failure at
+`src/native/session.rs:3837`. The lead also removed the shutdown deadline from
+`src/native/session.rs:572`; the bounded-shutdown test failed at
+`src/native/session.rs:3993` with `shutdown joined a blocked OS clipboard call`.
+Restoring both changes made the 48 clipboard-filtered tests, the auxiliary
+teardown test, and the 64-test native-session family pass again. No live RDP
+runtime was used.
 
 ## Notes
