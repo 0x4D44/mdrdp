@@ -6,15 +6,15 @@
 - **Area:** rdp/reactivation
 - **Raised:** 2026-08-24T10:49:26Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260914T064719Z-107ae7b7
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00096-run-verify-20260914T064719Z-107ae7b7
+- **Owner base:** 14a820b025f7a72d6a3e769c6ecc34e85630e33f
+- **Owner fingerprint:** sha256:fc96e113afef47f34bb10b8711bbbef6e334bdbc3bbd093a3e8926f52ab4eb1a
+- **Owner since:** 2026-09-14T06:47:19Z
+- **Owner until:** 2026-09-14T08:47:19Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
