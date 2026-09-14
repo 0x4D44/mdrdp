@@ -6,15 +6,15 @@
 - **Area:** native/recovery-ordering
 - **Raised:** 2026-08-24T17:56:16Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260914T093731Z-2ca5e05e
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00115-run-verify-20260914T093731Z-2ca5e05e
+- **Owner base:** ae056ad7c4bf7d2c6a8968f9779f2cd0186f0bf0
+- **Owner fingerprint:** sha256:6e02d254c6144c574b0760a4ed6a4ae8bb404c3bf450f5f5406cd8596073ffc3
+- **Owner since:** 2026-09-14T09:37:31Z
+- **Owner until:** 2026-09-14T11:37:31Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
