@@ -6,15 +6,15 @@
 - **Area:** native/input-latency
 - **Raised:** 2026-08-24T12:24:25Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260914T090513Z-67f921de
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00108-run-verify-20260914T090513Z-67f921de
+- **Owner base:** 52fa0e1ebc4f879be69b8bbe759532b30c336138
+- **Owner fingerprint:** sha256:e30a5fea6631a363dea53f9238b2e309bfbd6b3c5de4b75e1edd0a5e6c58a5a8
+- **Owner since:** 2026-09-14T09:05:13Z
+- **Owner until:** 2026-09-14T11:05:13Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
