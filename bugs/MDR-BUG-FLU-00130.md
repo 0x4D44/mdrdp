@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-14T21:13:36Z, deltic:auto role=fix run=fix-20260914T204351Z-8b2550a0 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0 code=1f8674a gate=manual) -> Open (2026-09-15, Codex, Arthur reports continued flicker on 0.1.247; successful submissions racing incoming frames leave the luma wait bypassed) -> Fixed (2026-09-14T23:53:12Z, deltic:auto role=fix run=fix-20260914T232621Z-8551b907 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T232621Z-8551b907 code=c3ac64e gate=manual)
+- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-14T21:13:36Z, deltic:auto role=fix run=fix-20260914T204351Z-8b2550a0 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0 code=1f8674a gate=manual) -> Open (2026-09-14T23:25:45Z, Codex, Arthur reports continued flicker on 0.1.247; successful submissions racing incoming frames leave the luma wait bypassed) -> Fixed (2026-09-14T23:53:12Z, deltic:auto role=fix run=fix-20260914T232621Z-8551b907 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T232621Z-8551b907 code=c3ac64e gate=manual)
 
 ## Observation
 
@@ -29,6 +29,27 @@ Evidence fingerprint: `manual:v1:avc444-luma-and-chroma-presentations-still-alte
 
 
 ## Fix
+
+### Snapshot acknowledgement correction — 0.1.248
+
+Integrated code `c3ac64e`, version landing `4c61c94`. Ready batch tokens are
+captured with snapshots and acknowledged independently of producer activity.
+Newer luma retains its own bounded pending coverage/deadline. Failed submissions
+remain retryable, timer-only expiry releases work, and lifecycle changes do not
+reuse an old acknowledgement token. This supersedes the current-stamp rule below.
+
+Validation: 73 surface, 71 window and 65 graphics tests passed independently;
+regressions were observed failing before the fix or under restored mutations.
+Clippy, formatting and both Windows type-checks passed, with existing Windows
+icon/unused-parameter warnings only. See the 2026.09.15 snapshot acknowledgement
+HLD and journal for the exact mutation evidence and limitations.
+
+The delay remains fixed at 50 ms, not adaptive. Ready retries may still include
+newer unrefined luma, and chroma arriving after the cap may still be drawn
+separately. No live visual improvement is claimed yet. Leave Fixed for an
+independent affected-session check; do not treat the policy tests as visual closure.
+
+### Earlier bounded wait — 0.1.247
 
 Integrated in `1f8674a`, version `0.1.247`: hold pending luma for at most 50 ms
 from the first update, releasing early on accepted chroma coverage. Preserve
@@ -45,6 +66,9 @@ journal. This is Fixed, not independently visually verified: a live affected
 terminal session still needs to confirm the reported flicker has improved.
 
 ## Notes
+
+The reopening date was normalized from the local calendar date to the UTC
+timestamp of its ledger commit (`1076555`), preserving transition order.
 
 2026-09-15: Arthur reports: "I'm running .247 and connected with it to temper.
 But I still see the chroma flickering." The local startup log confirms that
