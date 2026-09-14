@@ -6,15 +6,15 @@
 - **Area:** rdp/session-latency
 - **Raised:** 2026-08-24T11:29:10Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260914T071757Z-203bddf6
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00099-run-verify-20260914T071757Z-203bddf6
+- **Owner base:** 49cf2acedcaf3f593f35498595ba97b833c79489
+- **Owner fingerprint:** sha256:c499e7c6a2f369cf78d3391cfdeea347ec1eb5a990f0c278f018da1dfca88fda
+- **Owner since:** 2026-09-14T07:17:57Z
+- **Owner until:** 2026-09-14T09:17:57Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
