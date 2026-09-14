@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00130 — AVC444 luma and chroma presentations still alternate on coloured terminal content
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** Medium
 - **Area:** graphics/avc444
 - **Raised:** 2026-09-14T20:41:13Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260914T204351Z-8b2550a0
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0
-- **Owner base:** a3e6514a15eef8c55872cdbc108779ec7434743c
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-09-14T20:43:51Z
-- **Owner until:** 2026-09-14T22:43:51Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`)
+- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-14T21:13:36Z, deltic:auto role=fix run=fix-20260914T204351Z-8b2550a0 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0 code=1f8674a gate=manual)
 
 ## Observation
 
