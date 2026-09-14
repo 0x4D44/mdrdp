@@ -6,15 +6,15 @@
 - **Area:** graphics/AVC444
 - **Raised:** 2026-08-24T11:06:32Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260914T064734Z-aaf23e3b
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00097-run-verify-20260914T064734Z-aaf23e3b
+- **Owner base:** a962df101232d1bd5f8d75e2ed42ad09061b1ade
+- **Owner fingerprint:** sha256:9b2469215962444ae6fd46a6e5fdbe0781a487fc0e0fea0f6b8ad1d649d6b6f3
+- **Owner since:** 2026-09-14T06:47:34Z
+- **Owner until:** 2026-09-14T08:47:34Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
