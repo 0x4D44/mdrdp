@@ -189,6 +189,21 @@ impl WindowPolicy {
         self.phase = Phase::Idle;
     }
 
+    /// A monitor transition settled at this window geometry.
+    ///
+    /// The geometry came from the window manager, so it must not replace the user's
+    /// remembered intent. Treat it as a fresh display event instead, allowing a window
+    /// that was temporarily shrunk to be restored when the monitor can hold it again.
+    pub(crate) fn on_settled_display_change(
+        &mut self,
+        actual: Geometry,
+        now_ms: u64,
+        monitor: Option<Geometry>,
+    ) -> ResizeVerdict {
+        self.note_display_event(now_ms);
+        self.on_resize(actual, now_ms, monitor)
+    }
+
     /// The window was occluded or revealed — on macOS this is what a screen lock looks
     /// like, and it brackets the period during which geometry gets rearranged.
     ///
@@ -420,6 +435,26 @@ mod tests {
             p.on_resize(SMALL, 500_100, None),
             ResizeVerdict::Restore(BIG),
             "a new upheaval deserves another go"
+        );
+    }
+
+    #[test]
+    fn a_settled_display_change_preserves_prior_user_intent() {
+        let mut p = policy();
+        assert_eq!(
+            p.on_settled_display_change(SMALL, 1_000, Some(SMALL)),
+            ResizeVerdict::Ignore,
+            "a monitor too small for the requested geometry must not be fought"
+        );
+        assert_eq!(
+            p.desired(),
+            BIG,
+            "a monitor transition must not replace the user's larger geometry"
+        );
+        assert_eq!(
+            p.on_settled_display_change(SMALL, 4_000, Some(BIG)),
+            ResizeVerdict::Restore(BIG),
+            "a later monitor transition must get a chance to restore it"
         );
     }
 

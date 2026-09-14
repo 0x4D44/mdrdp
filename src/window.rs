@@ -1860,6 +1860,25 @@ impl SessionApp {
         });
     }
 
+    /// Remember and request a windowed resolution, retaining the current remote scale.
+    fn request_windowed_resolution_at(&mut self, geometry: Geometry) {
+        let width = geometry.width;
+        let height = geometry.height;
+        // The next fullscreen round trip should come back to what the user last chose,
+        // not to the connect-time size.
+        self.windowed_session = (
+            u16::try_from(width).unwrap_or(u16::MAX),
+            u16::try_from(height).unwrap_or(u16::MAX),
+        );
+        self.send_command(SessionCommand::Resize {
+            width,
+            height,
+            // Keep the scale the session already has: a mid-session scale change leaves
+            // non-DPI-aware remote apps DWM-stretched and blurry until relaunch.
+            scale_percent: None,
+        });
+    }
+
     fn send_command(&mut self, command: SessionCommand) {
         if let Some(commands) = &self.commands {
             // A dead session is closing the window anyway; nothing useful to do here.
@@ -1947,10 +1966,25 @@ impl SessionApp {
                 if self.fullscreen {
                     self.request_native_resolution(&window);
                 } else {
-                    // The dock transition's final geometry becomes the new windowed
-                    // intent, so a later reveal cannot restore the old display's size.
-                    self.policy = WindowPolicy::new(geometry);
-                    self.follow_current_window_size();
+                    // The dock transition's final geometry is the size the window manager
+                    // could provide now. Preserve the user's larger intent so a later
+                    // display return can restore it, while the remote follows this window
+                    // if the current monitor cannot hold it.
+                    let monitor_geometry = window
+                        .current_monitor()
+                        .map(|monitor| Geometry::new(monitor.size().width, monitor.size().height));
+                    match self.policy.on_settled_display_change(
+                        geometry,
+                        self.now_ms(),
+                        monitor_geometry,
+                    ) {
+                        ResizeVerdict::Restore(target) => {
+                            self.restore_window_geometry(&window, geometry, target);
+                        }
+                        ResizeVerdict::UserResize | ResizeVerdict::Ignore => {
+                            self.follow_current_window_size();
+                        }
+                    }
                 }
                 true
             }
@@ -1975,32 +2009,25 @@ impl SessionApp {
         });
     }
 
-    /// Consult the geometry policy about a size: ask it back if the system chose it,
-    /// arm the resolution-follow timer if the user did.
+    /// Request a policy restore or arm the resolution-follow timer if the user resized.
     ///
     /// Requesting is all we can do — every platform is free to ignore it, which is why the
     /// policy bounds its attempts rather than looping until the sizes agree.
-    fn hold_geometry(&mut self, event_loop: &ActiveEventLoop, actual: Geometry) {
+    fn hold_geometry(&mut self, event_loop: &ActiveEventLoop, actual: Geometry) -> ResizeVerdict {
         let Some(window) = self.window.clone() else {
-            return;
+            return ResizeVerdict::Ignore;
         };
         let monitor = window
             .current_monitor()
             .map(|m| Geometry::new(m.size().width, m.size().height));
         let now = self.now_ms();
-        match self.policy.on_resize(actual, now, monitor) {
+        let verdict = self.policy.on_resize(actual, now, monitor);
+        match verdict {
             ResizeVerdict::Restore(target) => {
                 // A restore in flight must never fire a follow: the size on screen is
                 // the very one we are arguing with.
                 self.resize_settle = None;
-                tracing::debug!(
-                    actual_w = actual.width,
-                    actual_h = actual.height,
-                    target_w = target.width,
-                    target_h = target.height,
-                    "restoring window geometry after a display change"
-                );
-                let _ = window.request_inner_size(PhysicalSize::new(target.width, target.height));
+                self.restore_window_geometry(&window, actual, target);
             }
             ResizeVerdict::UserResize => {
                 if self.config.dynamic_resolution && self.config.follow_window_resize {
@@ -2017,6 +2044,21 @@ impl SessionApp {
                 self.resize_settle = None;
             }
         }
+        verdict
+    }
+
+    fn restore_window_geometry(&mut self, window: &Window, actual: Geometry, target: Geometry) {
+        tracing::debug!(
+            actual_w = actual.width,
+            actual_h = actual.height,
+            target_w = target.width,
+            target_h = target.height,
+            "restoring window geometry after a display change"
+        );
+        if self.config.dynamic_resolution && self.config.follow_window_resize {
+            self.request_windowed_resolution_at(target);
+        }
+        let _ = window.request_inner_size(PhysicalSize::new(target.width, target.height));
     }
 
     /// Fire the debounced resolution follow, if its deadline has passed.
@@ -2040,31 +2082,19 @@ impl SessionApp {
     }
 
     fn follow_current_window_size(&mut self) {
-        let Some(window) = &self.window else {
+        let Some(window) = self.window.clone() else {
             return;
         };
         let size = window.inner_size();
         let Some((width, height)) = follow_request(
             size.width,
             size.height,
-            self.viewport.session_width,
-            self.viewport.session_height,
+            self.windowed_session.0,
+            self.windowed_session.1,
         ) else {
             return;
         };
-        // The next fullscreen round trip should come back to what the user last chose,
-        // not to the connect-time size.
-        self.windowed_session = (
-            u16::try_from(width).unwrap_or(u16::MAX),
-            u16::try_from(height).unwrap_or(u16::MAX),
-        );
-        self.send_command(SessionCommand::Resize {
-            width,
-            height,
-            // Keep the scale the session already has: a mid-session scale change leaves
-            // non-DPI-aware remote apps DWM-stretched and blurry until relaunch.
-            scale_percent: None,
-        });
+        self.request_windowed_resolution_at(Geometry::new(width, height));
     }
 
     /// A closed receiver means the session is gone, so there is nothing left to show.
@@ -2702,9 +2732,31 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .release_presentation_delay();
                     let display_change = self.observe_display();
-                    if !self.fullscreen && !display_change {
+                    if self.fullscreen {
+                        // A monitor can return while this window is on another Space.
+                        // In that case the monitor snapshot is unchanged, so no settled
+                        // display event will trigger a request. Re-sync the current monitor
+                        // once on reveal; the session pump drops an exact duplicate.
+                        if !display_change
+                            && self.config.dynamic_resolution
+                            && self.config.follow_window_resize
+                        {
+                            self.request_native_resolution(&window);
+                        }
+                    } else if !display_change {
                         let size = window.inner_size();
-                        self.hold_geometry(event_loop, Geometry::new(size.width, size.height));
+                        let verdict =
+                            self.hold_geometry(event_loop, Geometry::new(size.width, size.height));
+                        if !matches!(verdict, ResizeVerdict::Restore(_))
+                            && self.config.dynamic_resolution
+                            && self.config.follow_window_resize
+                        {
+                            // The remote may still be completing a resize requested just
+                            // before occlusion. Compare with the last requested size, not
+                            // the last painted viewport, so this reveal can issue the
+                            // compensating request.
+                            self.follow_current_window_size();
+                        }
                     }
                     window.request_redraw();
                 }
@@ -2985,6 +3037,10 @@ mod tests {
     fn a_settled_size_differing_from_the_session_is_requested_verbatim() {
         // Bounds and encoder ceilings belong to the session pump, not here.
         assert_eq!(follow_request(1800, 1124, 1920, 1080), Some((1800, 1124)));
+        // A request still completing on the server must not hide a later, larger
+        // follow-up. The caller supplies the last requested windowed size here rather
+        // than the last painted viewport, which can still have the old dimensions.
+        assert_eq!(follow_request(2560, 1440, 640, 480), Some((2560, 1440)));
     }
 
     #[test]
