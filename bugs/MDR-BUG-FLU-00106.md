@@ -6,15 +6,15 @@
 - **Area:** rdp/input-latency
 - **Raised:** 2026-08-24T12:24:24Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260914T085003Z-b940bd66
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00106-run-verify-20260914T085003Z-b940bd66
+- **Owner base:** 28141d7cfa41de4da1bfea39ecbea60f0ded9a9e
+- **Owner fingerprint:** sha256:124f571577efcb622e1f3ed26c314da5d1648e558b3e2bd493f55f13cbc01395
+- **Owner since:** 2026-09-14T08:50:03Z
+- **Owner until:** 2026-09-14T10:50:03Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
