@@ -6,13 +6,18 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Wait on AVC444 luma, not chroma; bound the first deadline (`surface.rs:note_avc444_regions`).
+  LC0 has independent luma/chroma regions; LC2 may refine an earlier graphics frame.
+  Keep wire-order decoding, track spatial coverage, and release on completion or timeout.
+  Frame-ID inequality is not evidence that chroma is stale. See the 2026.09.14 luma-wait HLD.
+
 - Fresh presentation state must replace stale deadlines; max-merging restores latency (`window.rs:request_damage_redraw`).
   A durable freshness stamp is insufficient if the event loop keeps the older LC2 wake.
   Recompute the latest state's full deadline, and carry platform retries separately from damage.
 
-- Debounce AVC444 LC2 quality refinement; never delay LC1 or preserve stale aux (`gfx.rs:on_bitmap_updated`).
-  MS-RDPEGFX permits LC2 in a later frame. Showing it immediately during motion flashes
-  4:4:4 between required 4:2:0 luma frames; a short settle deadline hides only that refinement.
+- LC2-only debounce was superseded by bounded luma waiting (`gfx.rs:on_avc444_regions`).
+  The earlier 100 ms chroma-only delay did not prevent Arthur's reported flicker and missed
+  chroma carried by LC0. The replacement waits briefly before publishing luma instead.
 
 - Drain inbound TLS while writes block; POLLOUT-only waits can deadlock both peers (`connect.rs:write_framed`).
   rustls drains queued output before reading. Authenticate and buffer inbound TLS without

@@ -24,6 +24,16 @@ use tracing::trace;
 /// Bytes per pixel, everywhere in this module.
 pub const BPP: usize = 4;
 
+/// Give an AVC444 luma update a short chance to receive its matching chroma update.
+///
+/// This is deliberately a bounded, first-update deadline. A stream of luma updates must
+/// not keep moving the goalposts indefinitely, or a busy desktop would never present.
+const AVC444_LUMA_PRESENTATION_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Keep the geometric ledger bounded. Falling back to immediate presentation preserves
+/// every decoded pixel when a pathological region set cannot be represented cheaply.
+const MAX_AVC444_PENDING_REGIONS: usize = 256;
+
 /// Exact pixel coverage for a surface incarnation.
 ///
 /// The bitset is allocated only after a partial write. A full-surface write uses the
@@ -595,6 +605,80 @@ struct PresentationFallback {
     mapping: PresentationMapping,
 }
 
+/// Return the part of `rect` not covered by `cover`.
+///
+/// Both rectangles use exclusive right/bottom edges. The result is at most four
+/// rectangles, and its members do not overlap. Keeping this operation geometric rather
+/// than pixel-based lets the AVC444 wait stay small even for large surfaces.
+fn subtract_rect(rect: Rect, cover: Rect) -> Vec<Rect> {
+    let left = rect.left.max(cover.left);
+    let top = rect.top.max(cover.top);
+    let right = rect.right.min(cover.right);
+    let bottom = rect.bottom.min(cover.bottom);
+    if left >= right || top >= bottom {
+        return vec![rect];
+    }
+
+    let mut remainder = Vec::with_capacity(4);
+    if rect.top < top {
+        remainder.push(Rect::new(rect.left, rect.top, rect.right, top));
+    }
+    if bottom < rect.bottom {
+        remainder.push(Rect::new(rect.left, bottom, rect.right, rect.bottom));
+    }
+    if rect.left < left {
+        remainder.push(Rect::new(rect.left, top, left, bottom));
+    }
+    if right < rect.right {
+        remainder.push(Rect::new(right, top, rect.right, bottom));
+    }
+    remainder
+}
+
+/// Merge two rectangles only when their union is itself a rectangle.
+///
+/// The pending ledger is kept non-overlapping by subtraction. Merging edge-adjacent
+/// pieces prevents harmless tile grids from consuming the fragmentation budget.
+fn merge_rects(a: Rect, b: Rect) -> Option<Rect> {
+    if a.top == b.top && a.bottom == b.bottom && a.left <= b.right && b.left <= a.right {
+        return Some(Rect::new(
+            a.left.min(b.left),
+            a.top,
+            a.right.max(b.right),
+            a.bottom,
+        ));
+    }
+    if a.left == b.left && a.right == b.right && a.top <= b.bottom && b.top <= a.bottom {
+        return Some(Rect::new(
+            a.left,
+            a.top.min(b.top),
+            a.right,
+            a.bottom.max(b.bottom),
+        ));
+    }
+    None
+}
+
+/// Coalesce the simple rectangular pieces produced by [`subtract_rect`].
+fn coalesce_rects(rects: &mut Vec<Rect>) {
+    loop {
+        let mut merged = false;
+        'search: for left in 0..rects.len() {
+            for right in left + 1..rects.len() {
+                if let Some(union) = merge_rects(rects[left], rects[right]) {
+                    rects[left] = union;
+                    rects.remove(right);
+                    merged = true;
+                    break 'search;
+                }
+            }
+        }
+        if !merged {
+            break;
+        }
+    }
+}
+
 /// Geometry needed to place one source surface inside the logical output canvas.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PresentationMapping {
@@ -639,14 +723,21 @@ pub struct SurfaceStore {
     /// Whether the active frame, or a dirty frame that was aborted, touched presentation
     /// state. Offscreen/cache-only work must not manufacture a redraw at EndFrame.
     frame_visible_dirty: bool,
-    /// A frame remains deferable only while every visible mutation is a chroma refinement.
-    /// Any fresh picture mutation clears this deadline before commit.
-    frame_presentation_not_before: Option<Instant>,
-    /// Earliest time the latest committed generation should be copied by the presenter.
+    /// Earliest time a pending AVC444 luma region may be copied by the presenter.
     presentation_not_before: Option<Instant>,
+    /// Luma regions that have not yet received their matching AVC444 chroma coverage.
+    /// These are clipped to the currently mapped source and kept disjoint.
+    avc444_pending_luma: Vec<Rect>,
+    /// A ready/expired AVC444 batch has been observed but its current presentation has
+    /// not been acknowledged yet. This latch prevents a later luma update from rearming
+    /// the wait before the presenter has successfully displayed the current stamp.
+    avc444_waiting_for_ack: bool,
+    /// An unframed AVC444 callback sequence is still copying its bitmap updates. The
+    /// presenter must not copy or acknowledge the in-progress sequence between callbacks.
+    avc444_update_active: bool,
     generation: u64,
-    /// Bumped only by an immediate visible commit. Deferred chroma refinements retain the
-    /// epoch so they cannot erase an unacknowledged fresh-picture transition.
+    /// Retained for compatibility with presentation stamps. The AVC444 wait does not use
+    /// this epoch as a freshness filter.
     fresh_content_epoch: u64,
     /// Cache effectiveness, counted where the cache is actually used. Counting it here
     /// rather than in the EGFX handler means it measures what reached the pixels, not
@@ -722,57 +813,272 @@ impl SurfaceStore {
         }
     }
 
-    /// Return the quality-only settle deadline only after this fresh-content epoch has
-    /// reached the platform. A later refinement cannot hide an unpresented picture.
+    /// Return the pending AVC444 luma deadline.
+    ///
+    /// `presented` remains in the signature for the window/presenter contract, but the
+    /// deadline is independent of the fresh-content epoch. AVC444 luma and chroma can
+    /// advance generations independently while one bounded wait is outstanding.
     pub(crate) fn presentation_not_before(
         &self,
-        presented: Option<PresentationStamp>,
+        _presented: Option<PresentationStamp>,
     ) -> Option<Instant> {
-        if presented.is_some_and(|stamp| stamp.fresh_content_epoch == self.fresh_content_epoch) {
-            self.presentation_not_before
-        } else {
-            None
-        }
+        self.presentation_not_before
     }
 
     pub(crate) fn release_presentation_delay(&mut self) {
-        self.presentation_not_before = None;
+        self.clear_avc444_presentation_policy("reveal");
     }
 
     fn touch_presentation(&mut self) {
-        self.presentation_not_before = None;
         self.generation = self.generation.wrapping_add(1);
         self.fresh_content_epoch = self.fresh_content_epoch.wrapping_add(1);
+        let now = Instant::now();
+        let (kind, wait_us) = match self.presentation_not_before {
+            Some(deadline) if deadline > now => (
+                "luma_wait",
+                u64::try_from(deadline.saturating_duration_since(now).as_micros())
+                    .unwrap_or(u64::MAX),
+            ),
+            _ => ("ready", 0),
+        };
         trace!(
             generation = self.generation,
             fresh_content_epoch = self.fresh_content_epoch,
-            kind = "immediate",
+            kind,
+            wait_us,
+            outstanding = self.avc444_pending_luma.len(),
             "presentation stamp advanced"
         );
     }
 
-    fn touch_presentation_deferred(&mut self, not_before: Instant) {
-        let settle_ms = not_before
-            .saturating_duration_since(Instant::now())
-            .as_millis();
-        self.presentation_not_before = Some(
-            self.presentation_not_before
-                .map_or(not_before, |current| current.max(not_before)),
-        );
-        self.generation = self.generation.wrapping_add(1);
+    fn avc444_policy_active(&self) -> bool {
+        self.presentation_not_before.is_some()
+            || !self.avc444_pending_luma.is_empty()
+            || self.avc444_waiting_for_ack
+    }
+
+    fn clear_avc444_presentation_policy(&mut self, reason: &'static str) {
+        let outstanding = self.avc444_pending_luma.len();
+        let active = self.avc444_policy_active();
+        self.presentation_not_before = None;
+        self.avc444_pending_luma.clear();
+        self.avc444_waiting_for_ack = false;
+        if active {
+            trace!(reason, outstanding, "AVC444 presentation deadline released");
+        }
+    }
+
+    fn release_avc444_presentation_policy(
+        &mut self,
+        reason: &'static str,
+        retain_expired_deadline: bool,
+    ) {
+        let outstanding = self.avc444_pending_luma.len();
+        let active = self.avc444_policy_active();
+        self.avc444_pending_luma.clear();
+        self.avc444_waiting_for_ack = true;
+        if !retain_expired_deadline {
+            self.presentation_not_before = None;
+        }
         trace!(
-            generation = self.generation,
-            fresh_content_epoch = self.fresh_content_epoch,
-            kind = "chroma_refinement",
-            settle_ms,
-            "presentation stamp advanced"
+            reason,
+            outstanding, active, "AVC444 presentation deadline released"
         );
+    }
+
+    fn mark_avc444_deadline_expired(&mut self, now: Instant) -> bool {
+        if self.avc444_waiting_for_ack {
+            return true;
+        }
+        if self
+            .presentation_not_before
+            .is_some_and(|deadline| now >= deadline)
+        {
+            // Retain the expired timestamp until the current stamp is acknowledged. The
+            // presenter can still observe that it is due, while later luma cannot rearm it.
+            self.release_avc444_presentation_policy("deadline_expired", true);
+            return true;
+        }
+        false
+    }
+
+    fn add_pending_luma(&mut self, regions: &[Rect]) -> bool {
+        let mut pending = self.avc444_pending_luma.clone();
+        for &region in regions {
+            let mut uncovered = vec![region];
+            for &existing in &pending {
+                let mut next = Vec::new();
+                for piece in uncovered {
+                    next.extend(subtract_rect(piece, existing));
+                    if next.len() > MAX_AVC444_PENDING_REGIONS {
+                        return false;
+                    }
+                }
+                uncovered = next;
+                if uncovered.is_empty() {
+                    break;
+                }
+            }
+            pending.extend(uncovered);
+            coalesce_rects(&mut pending);
+            if pending.len() > MAX_AVC444_PENDING_REGIONS {
+                return false;
+            }
+        }
+        self.avc444_pending_luma = pending;
+        true
+    }
+
+    fn subtract_pending_luma(&mut self, regions: &[Rect]) -> bool {
+        let mut pending = self.avc444_pending_luma.clone();
+        for &region in regions {
+            let mut remainder = Vec::new();
+            for existing in pending {
+                remainder.extend(subtract_rect(existing, region));
+                if remainder.len() > MAX_AVC444_PENDING_REGIONS {
+                    return false;
+                }
+            }
+            coalesce_rects(&mut remainder);
+            if remainder.len() > MAX_AVC444_PENDING_REGIONS {
+                return false;
+            }
+            pending = remainder;
+        }
+        self.avc444_pending_luma = pending;
+        true
+    }
+
+    fn mapped_source_bounds(&self, id: u16) -> Option<Rect> {
+        if self.output_mapping_stale {
+            return None;
+        }
+        let mapping = self.output?;
+        (mapping.surface_id == id
+            && self.surfaces.contains_key(&id)
+            && mapping.source_width > 0
+            && mapping.source_height > 0)
+            .then_some(Rect::new(0, 0, mapping.source_width, mapping.source_height))
+    }
+
+    fn clipped_mapped_regions(&self, id: u16, regions: &[Rect]) -> Vec<Rect> {
+        let Some(bounds) = self.mapped_source_bounds(id) else {
+            return Vec::new();
+        };
+        regions
+            .iter()
+            .filter_map(|region| region.clip_to(bounds.right, bounds.bottom))
+            .collect()
+    }
+
+    /// Record the luma and chroma regions of one AVC444 update before its bitmap callbacks.
+    ///
+    /// Luma is added before chroma is subtracted so LC0 (the combined form) can release its
+    /// own newly-added regions immediately. Offscreen surfaces and pixels outside the mapped
+    /// source do not participate in this presentation policy.
+    pub(crate) fn note_avc444_regions(
+        &mut self,
+        id: u16,
+        luma: &[Rect],
+        chroma: &[Rect],
+        now: Instant,
+    ) {
+        self.avc444_update_active = true;
+
+        let luma = self.clipped_mapped_regions(id, luma);
+        let chroma = self.clipped_mapped_regions(id, chroma);
+        if self.mapped_source_bounds(id).is_none() {
+            trace!(
+                surface_id = id,
+                outstanding = 0usize,
+                "AVC444 presentation regions ignored without mapped output"
+            );
+            return;
+        }
+
+        if self.mark_avc444_deadline_expired(now) {
+            return;
+        }
+        if luma.len().saturating_add(chroma.len()) > MAX_AVC444_PENDING_REGIONS * 2 {
+            // Keep every pixel callback alive, but abandon the metadata ledger before a
+            // pathological PDU can make union/subtraction quadratic or fragment it past
+            // its bounded representation.
+            self.release_avc444_presentation_policy("region_budget", false);
+            return;
+        }
+
+        if !luma.is_empty() {
+            if !self.add_pending_luma(&luma) {
+                // The pixels still go through blit_avc444_rgba. Only the policy falls
+                // back to urgent presentation when its geometric ledger overflows.
+                self.release_avc444_presentation_policy("region_fragmentation", false);
+                return;
+            }
+            if self.presentation_not_before.is_none() && !self.avc444_pending_luma.is_empty() {
+                let deadline = now
+                    .checked_add(AVC444_LUMA_PRESENTATION_DELAY)
+                    .unwrap_or(now);
+                self.presentation_not_before = Some(deadline);
+                trace!(
+                    surface_id = id,
+                    deadline_ms = AVC444_LUMA_PRESENTATION_DELAY.as_millis() as u64,
+                    outstanding = self.avc444_pending_luma.len(),
+                    "AVC444 luma presentation deadline started"
+                );
+            }
+        }
+
+        if !chroma.is_empty() && !self.avc444_pending_luma.is_empty() {
+            if !self.subtract_pending_luma(&chroma) {
+                self.release_avc444_presentation_policy("region_fragmentation", false);
+                return;
+            }
+            if self.avc444_pending_luma.is_empty() {
+                self.release_avc444_presentation_policy("chroma_complete", false);
+            }
+        }
+    }
+
+    /// Mark the end of the sequential bitmap callbacks for one unframed AVC444 update.
+    pub(crate) fn finish_avc444_update(&mut self, id: u16) {
+        if self.avc444_update_active {
+            self.avc444_update_active = false;
+            trace!(
+                surface_id = id,
+                outstanding = self.avc444_pending_luma.len(),
+                "AVC444 bitmap update complete"
+            );
+        }
+    }
+
+    /// A successful present of the current stamp permits the next AVC444 batch to arm a
+    /// deadline. Stale stamps and in-progress frame/update callbacks cannot clear policy.
+    pub(crate) fn acknowledge_presentation(&mut self, stamp: PresentationStamp) {
+        if self.avc444_update_active || !matches!(self.frame_state, FrameState::Idle) {
+            trace!(
+                reason = "active_update_or_frame",
+                outstanding = self.avc444_pending_luma.len(),
+                "AVC444 presentation acknowledgement ignored"
+            );
+            return;
+        }
+        if stamp != self.presentation_stamp() {
+            trace!(
+                reason = "stale_stamp",
+                outstanding = self.avc444_pending_luma.len(),
+                "AVC444 presentation acknowledgement ignored"
+            );
+            return;
+        }
+        // The presenter only calls this after it has successfully copied/submitted the
+        // current snapshot. That acknowledgement, rather than a second wall clock, is
+        // the authority that permits the next AVC444 batch to arm a wait.
+        self.clear_avc444_presentation_policy("presentation_acknowledged");
     }
 
     fn mark_frame_visible_dirty(&mut self) {
         if !matches!(self.frame_state, FrameState::Idle) {
             self.frame_visible_dirty = true;
-            self.frame_presentation_not_before = None;
         }
     }
 
@@ -785,7 +1091,6 @@ impl SurfaceStore {
         }
         if matches!(self.frame_state, FrameState::Idle) {
             self.frame_visible_dirty = false;
-            self.frame_presentation_not_before = None;
         }
         self.frame_state = FrameState::Active(frame_id);
     }
@@ -795,22 +1100,19 @@ impl SurfaceStore {
             return false;
         }
         let frame_visible_dirty = self.frame_visible_dirty;
-        let frame_presentation_not_before = self.frame_presentation_not_before;
         let had_fallback = self.presentation_fallback.is_some();
         let had_suppressed_presentation = self.presentation_suppressed;
         let output_complete = self.output_surface().is_some_and(Surface::is_complete);
         self.frame_state = FrameState::Idle;
         self.frame_visible_dirty = false;
-        self.frame_presentation_not_before = None;
         if output_complete {
             self.presentation_fallback = None;
             self.presentation_suppressed = false;
             if had_fallback || had_suppressed_presentation || frame_visible_dirty {
-                if let Some(not_before) = frame_presentation_not_before {
-                    self.touch_presentation_deferred(not_before);
-                } else {
-                    self.touch_presentation();
-                }
+                // A frame boundary publishes its pixels, but it must not cancel an
+                // outstanding AVC444 luma wait. That policy is released only by matching
+                // chroma, an explicit lifecycle event, or a successful presentation ack.
+                self.touch_presentation();
             }
         } else if self.output.is_none() {
             // A frame that terminally deletes the mapped surface publishes an empty
@@ -858,63 +1160,62 @@ impl SurfaceStore {
         }
     }
 
-    fn finish_surface_mutation(&mut self, id: u16) {
-        self.finish_surface_mutation_with_deadline(id, None);
-    }
-
-    fn finish_surface_mutation_with_deadline(&mut self, id: u16, not_before: Option<Instant>) {
+    fn finish_surface_mutation_core(&mut self, id: u16) -> bool {
         if !matches!(self.frame_state, FrameState::Idle) {
             let is_current_output = !self.output_mapping_stale
                 && self.output.is_some_and(|mapping| mapping.surface_id == id);
             let is_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
             if is_current_output && (self.presentation_fallback.is_none() || is_complete) {
-                self.frame_presentation_not_before = if self.frame_visible_dirty {
-                    match (self.frame_presentation_not_before, not_before) {
-                        (Some(current), Some(next)) => Some(current.max(next)),
-                        _ => None,
-                    }
-                } else {
-                    not_before
-                };
                 self.frame_visible_dirty = true;
+                return true;
             }
-            return;
+            return false;
         }
         let is_current_output = !self.output_mapping_stale
             && self.output.is_some_and(|mapping| mapping.surface_id == id);
         if !is_current_output {
-            return;
+            return false;
         }
         let is_complete = self.surfaces.get(&id).is_some_and(Surface::is_complete);
         if is_complete {
             self.presentation_fallback = None;
             if self.presentation_suppressed {
                 self.presentation_suppressed = false;
-                if let Some(not_before) = not_before {
-                    self.touch_presentation_deferred(not_before);
-                } else {
-                    self.touch_presentation();
-                }
-                return;
+                self.touch_presentation();
+                return true;
             }
         }
         if self.presentation_fallback.is_some() && !is_complete {
             // The fallback is still the visible surface, so do not wake the presenter for
             // a replacement write that cannot change what it will copy.
-            return;
+            return false;
         }
         if self.presentation_suppressed {
-            return;
+            return false;
         }
-        if let Some(not_before) = not_before {
-            self.touch_presentation_deferred(not_before);
-        } else {
-            self.touch_presentation();
+        self.touch_presentation();
+        true
+    }
+
+    fn finish_surface_mutation(&mut self, id: u16) {
+        if self.finish_surface_mutation_core(id) {
+            self.release_non_avc_presentation_policy();
+        }
+    }
+
+    fn finish_avc444_mutation(&mut self, id: u16) {
+        let _ = self.finish_surface_mutation_core(id);
+    }
+
+    fn release_non_avc_presentation_policy(&mut self) {
+        if self.avc444_policy_active() {
+            self.release_avc444_presentation_policy("non_avc_mutation", false);
         }
     }
 
     pub fn create(&mut self, id: u16, width: u16, height: u16) {
         if self.output.is_some_and(|mapping| mapping.surface_id == id) {
+            self.clear_avc444_presentation_policy("surface_recreated");
             self.mark_frame_visible_dirty();
             self.retain_painted_output();
             self.output_mapping_stale = true;
@@ -924,6 +1225,9 @@ impl SurfaceStore {
 
     pub fn delete(&mut self, id: u16) {
         let deleting_output = self.output.is_some_and(|mapping| mapping.surface_id == id);
+        if deleting_output {
+            self.clear_avc444_presentation_policy("surface_deleted");
+        }
         let idle_presentation_changed = deleting_output
             && matches!(self.frame_state, FrameState::Idle)
             && (self.presentation_fallback.is_some()
@@ -978,6 +1282,9 @@ impl SurfaceStore {
         }
         let changed = self.graphics_output_size != Some((width, height));
         self.graphics_output_size = Some((width, height));
+        // ResetGraphics is a new presentation lifecycle even when the dimensions happen
+        // to repeat. Any old AVC444 wait belongs to the destroyed/reset output state.
+        self.clear_avc444_presentation_policy("graphics_reset");
         if changed && self.output.is_some() {
             if matches!(self.frame_state, FrameState::Idle) {
                 if !self.presentation_suppressed
@@ -1055,6 +1362,7 @@ impl SurfaceStore {
         }
         let mapping_changed = self.output_mapping_stale || self.output != Some(mapping);
         if mapping_changed {
+            self.clear_avc444_presentation_policy("output_mapping_changed");
             self.mark_frame_visible_dirty();
             self.retain_painted_output();
         }
@@ -1179,7 +1487,7 @@ impl SurfaceStore {
         &self,
         snapshot: &mut PresentationSnapshot,
     ) -> PresentationCopy {
-        if matches!(self.frame_state, FrameState::Active(_)) {
+        if self.avc444_update_active || matches!(self.frame_state, FrameState::Active(_)) {
             return PresentationCopy::Pending;
         }
         if self.presentation_suppressed || matches!(self.frame_state, FrameState::Aborted) {
@@ -1223,16 +1531,16 @@ impl SurfaceStore {
         src: &[u8],
         src_stride_px: u16,
     ) -> Result<(), SurfaceError> {
-        self.blit_rgba_with_deadline(id, dest, src, src_stride_px, None)
+        self.blit_rgba_kind(id, dest, src, src_stride_px, false)
     }
 
-    fn blit_rgba_with_deadline(
+    fn blit_rgba_kind(
         &mut self,
         id: u16,
         dest: Rect,
         src: &[u8],
         src_stride_px: u16,
-        not_before: Option<Instant>,
+        avc444: bool,
     ) -> Result<(), SurfaceError> {
         let surface = self
             .surfaces
@@ -1245,21 +1553,28 @@ impl SurfaceStore {
         if written == 0 {
             return Ok(());
         }
-        self.finish_surface_mutation_with_deadline(id, not_before);
+        if avc444 {
+            self.finish_avc444_mutation(id);
+        } else {
+            self.finish_surface_mutation(id);
+        }
         Ok(())
     }
 
-    /// Blit an AVC444 chroma-only refinement without immediately presenting its transient
-    /// quality change. Fresh luma can supersede the deadline through the normal blit path.
-    pub(crate) fn blit_rgba_deferred(
+    /// Blit decoded AVC444 pixels while preserving the metadata-driven luma wait.
+    ///
+    /// AVC444 luma and chroma callbacks use the same ordinary clipping and accounting as
+    /// [`Self::blit_rgba`]. The only difference is that this codec-specific entry point
+    /// does not treat each bitmap callback as a non-AVC urgent mutation; the preceding
+    /// `note_avc444_regions` call owns that decision.
+    pub(crate) fn blit_avc444_rgba(
         &mut self,
         id: u16,
         dest: Rect,
         src: &[u8],
         src_stride_px: u16,
-        not_before: Instant,
     ) -> Result<(), SurfaceError> {
-        self.blit_rgba_with_deadline(id, dest, src, src_stride_px, Some(not_before))
+        self.blit_rgba_kind(id, dest, src, src_stride_px, true)
     }
 
     /// Blit a complete decoded rectangle while retiring coverage only for the exact
@@ -2189,97 +2504,408 @@ mod tests {
         assert_eq!(snapshot.pixels, solid(2, 1, BLUE));
     }
 
-    #[test]
-    fn a_chroma_refinement_commit_is_deferred_until_its_settle_deadline() {
+    fn mapped_policy_store(width: u16, height: u16) -> SurfaceStore {
         let mut store = SurfaceStore::new();
-        store.create(1, 2, 1);
-        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
-        store.map_to_output(1);
-        let presented = store.presentation_stamp();
-        let before = store.generation();
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-
-        store.begin_frame(8);
+        store.create(1, width, height);
         store
-            .blit_rgba_deferred(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2, deadline)
+            .solid_fill(1, &[Rect::new(0, 0, width, height)], RED)
             .unwrap();
-        assert!(store.commit_frame(8));
+        store.map_to_output(1);
+        store
+    }
 
-        assert_eq!(store.generation(), before + 1);
+    fn note_and_finish(store: &mut SurfaceStore, luma: &[Rect], chroma: &[Rect], now: Instant) {
+        store.note_avc444_regions(1, luma, chroma, now);
+        store.finish_avc444_update(1);
+    }
+
+    #[test]
+    fn luma_wait_starts_at_the_first_luma_and_chroma_releases_at_34ms() {
+        let mut store = mapped_policy_store(4, 1);
+        let start = Instant::now();
+        let luma = [Rect::new(0, 0, 4, 1)];
+        note_and_finish(&mut store, &luma, &[], start);
+        let deadline = start + std::time::Duration::from_millis(50);
+        assert_eq!(store.presentation_not_before(None), Some(deadline));
+
+        note_and_finish(
+            &mut store,
+            &[],
+            &[Rect::new(0, 0, 4, 1)],
+            start + std::time::Duration::from_millis(34),
+        );
         assert_eq!(
-            store.presentation_not_before(Some(presented)),
-            Some(deadline)
+            store.presentation_not_before(Some(PresentationStamp::default())),
+            None,
+            "full chroma coverage releases the luma wait early"
         );
     }
 
     #[test]
-    fn fresh_picture_content_cancels_a_pending_chroma_refinement_deadline() {
-        let mut store = SurfaceStore::new();
-        store.create(1, 2, 1);
-        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
-        store.map_to_output(1);
-        let presented = store.presentation_stamp();
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    fn luma_wait_is_immutable_and_does_not_extend_with_later_luma() {
+        let mut store = mapped_policy_store(8, 1);
+        let start = Instant::now();
+        note_and_finish(&mut store, &[Rect::new(0, 0, 2, 1)], &[], start);
+        let first_deadline = start + std::time::Duration::from_millis(50);
 
-        store.begin_frame(8);
-        store
-            .blit_rgba_deferred(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2, deadline)
-            .unwrap();
-        assert!(store.commit_frame(8));
-        assert_eq!(
-            store.presentation_not_before(Some(presented)),
-            Some(deadline)
+        note_and_finish(
+            &mut store,
+            &[Rect::new(4, 0, 6, 1)],
+            &[],
+            start + std::time::Duration::from_millis(10),
         );
-
-        store.begin_frame(9);
-        store
-            .blit_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, RED), 2)
-            .unwrap();
-        assert!(store.commit_frame(9));
-        assert_eq!(store.presentation_not_before(Some(presented)), None);
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(first_deadline),
+            "later luma must not extend the first pending deadline"
+        );
     }
 
     #[test]
-    fn revealing_a_surface_releases_its_chroma_refinement_delay() {
-        let mut store = SurfaceStore::new();
-        store.create(1, 2, 1);
-        store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
-        store.map_to_output(1);
-        let presented = store.presentation_stamp();
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    fn repeat_identical_mapping_does_not_rearm_luma_wait() {
+        let mut store = mapped_policy_store(2, 1);
+        let start = Instant::now();
+        note_and_finish(&mut store, &[Rect::new(0, 0, 2, 1)], &[], start);
+        let first_deadline = start + std::time::Duration::from_millis(50);
 
-        store.begin_frame(10);
-        store
-            .blit_rgba_deferred(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2, deadline)
-            .unwrap();
-        assert!(store.commit_frame(10));
-        let generation = store.generation();
+        assert!(store.map_to_output_geometry(1, 2, 1, 0, 0, 2, 1));
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[],
+            start + std::time::Duration::from_millis(10),
+        );
+        assert_eq!(store.presentation_not_before(None), Some(first_deadline));
+    }
 
+    #[test]
+    fn luma_wait_expires_after_50ms_without_chroma() {
+        let mut store = mapped_policy_store(2, 1);
+        let start = Instant::now();
+        note_and_finish(&mut store, &[Rect::new(0, 0, 2, 1)], &[], start);
+        let deadline = start + std::time::Duration::from_millis(50);
+        assert_eq!(store.presentation_not_before(None), Some(deadline));
+
+        // A later metadata callback observes expiry using the explicit test clock. The
+        // expired deadline remains visible until its current stamp is acknowledged.
+        note_and_finish(&mut store, &[], &[], deadline);
+        assert_eq!(store.presentation_not_before(None), Some(deadline));
+        assert!(store.avc444_waiting_for_ack);
+    }
+
+    #[test]
+    fn expiry_does_not_rearm_later_luma_until_matching_ack() {
+        let mut store = mapped_policy_store(2, 1);
+        let start = Instant::now();
+        note_and_finish(&mut store, &[Rect::new(0, 0, 2, 1)], &[], start);
+        let deadline = start + std::time::Duration::from_millis(50);
+
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[],
+            start + std::time::Duration::from_millis(51),
+        );
+        assert_eq!(store.presentation_not_before(None), Some(deadline));
+        assert!(store.avc444_waiting_for_ack);
+
+        store.acknowledge_presentation(store.presentation_stamp());
+        assert_eq!(store.presentation_not_before(None), None);
+        assert!(!store.avc444_waiting_for_ack);
+
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[],
+            start + std::time::Duration::from_millis(52),
+        );
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(start + std::time::Duration::from_millis(102))
+        );
+    }
+
+    #[test]
+    fn completion_does_not_rearm_until_the_current_stamp_is_acknowledged() {
+        let mut store = mapped_policy_store(2, 1);
+        let start = Instant::now();
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[Rect::new(0, 0, 2, 1)],
+            start,
+        );
+        assert_eq!(store.presentation_not_before(None), None);
+
+        // This is a new AVC update before the completed one was presented. It must not
+        // arm a second wait, although its pixels still land normally.
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[],
+            start + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(store.presentation_not_before(None), None);
+
+        let current = store.presentation_stamp();
+        store.acknowledge_presentation(current);
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[],
+            start + std::time::Duration::from_millis(2),
+        );
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(start + std::time::Duration::from_millis(52))
+        );
+    }
+
+    #[test]
+    fn partial_and_disjoint_chroma_regions_release_only_when_all_luma_is_covered() {
+        let mut store = mapped_policy_store(8, 2);
+        let start = Instant::now();
+        let luma = [Rect::new(0, 0, 2, 2), Rect::new(6, 0, 8, 2)];
+        note_and_finish(&mut store, &luma, &[], start);
+        let deadline = start + std::time::Duration::from_millis(50);
+
+        note_and_finish(
+            &mut store,
+            &[],
+            &[Rect::new(0, 0, 1, 2), Rect::new(6, 0, 8, 2)],
+            start + std::time::Duration::from_millis(10),
+        );
+        assert_eq!(store.presentation_not_before(None), Some(deadline));
+        assert_eq!(store.avc444_pending_luma, vec![Rect::new(1, 0, 2, 2)]);
+
+        note_and_finish(
+            &mut store,
+            &[],
+            &[Rect::new(1, 0, 2, 2)],
+            start + std::time::Duration::from_millis(20),
+        );
+        assert_eq!(store.presentation_not_before(None), None);
+    }
+
+    #[test]
+    fn lc0_adds_luma_before_subtracting_its_independent_chroma_list() {
+        let mut store = mapped_policy_store(4, 1);
+        let start = Instant::now();
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 4, 1)],
+            &[Rect::new(1, 0, 3, 1)],
+            start,
+        );
+        assert_eq!(
+            store.avc444_pending_luma,
+            vec![Rect::new(0, 0, 1, 1), Rect::new(3, 0, 4, 1)]
+        );
+        assert!(store.presentation_not_before(None).is_some());
+    }
+
+    #[test]
+    fn offscreen_and_out_of_mapped_source_regions_do_not_arm_the_wait() {
+        let mut store = mapped_policy_store(4, 4);
+        store.create(2, 4, 4);
+        assert!(store.map_to_output_geometry(1, 2, 2, 0, 0, 2, 2));
+        let start = Instant::now();
+        store.note_avc444_regions(2, &[Rect::new(0, 0, 4, 4)], &[], start);
+        store.finish_avc444_update(2);
+        assert_eq!(store.presentation_not_before(None), None);
+
+        note_and_finish(
+            &mut store,
+            &[Rect::new(1, 1, 8, 8)],
+            &[],
+            start + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(start + std::time::Duration::from_millis(51)),
+            "only the clipped 1..2 square is mapped and should arm the policy"
+        );
         store.release_presentation_delay();
 
-        assert_eq!(store.presentation_not_before(Some(presented)), None);
-        assert_eq!(store.generation(), generation);
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 4, 4)],
+            &[],
+            start + std::time::Duration::from_millis(2),
+        );
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(start + std::time::Duration::from_millis(52))
+        );
     }
 
     #[test]
-    fn fresh_content_in_the_same_frame_cancels_a_chroma_refinement_delay() {
-        let mut store = SurfaceStore::new();
+    fn stale_and_active_acknowledgements_cannot_clear_a_newer_wait() {
+        let mut store = mapped_policy_store(2, 1);
+        let start = Instant::now();
+        note_and_finish(&mut store, &[Rect::new(0, 0, 2, 1)], &[], start);
+        let stale = store.presentation_stamp();
+        store
+            .blit_avc444_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2)
+            .unwrap();
+        note_and_finish(
+            &mut store,
+            &[],
+            &[Rect::new(0, 0, 1, 1)],
+            start + std::time::Duration::from_millis(1),
+        );
+        let current = store.presentation_stamp();
+        assert_ne!(stale, current);
+        store.acknowledge_presentation(stale);
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(start + std::time::Duration::from_millis(50))
+        );
+
+        store.note_avc444_regions(1, &[], &[], start + std::time::Duration::from_millis(2));
+        store.acknowledge_presentation(current);
+        assert!(store.avc444_update_active);
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(start + std::time::Duration::from_millis(50))
+        );
+        store.finish_avc444_update(1);
+        store.acknowledge_presentation(store.presentation_stamp());
+        assert_eq!(store.presentation_not_before(None), None);
+    }
+
+    #[test]
+    fn fragmentation_overflow_releases_immediately_without_dropping_pixels() {
+        let mut store = mapped_policy_store(514, 1);
+        let regions: Vec<_> = (0..257)
+            .map(|x| Rect::new(x * 2, 0, x * 2 + 1, 1))
+            .collect();
+        let start = Instant::now();
+        note_and_finish(&mut store, &regions, &[], start);
+        assert_eq!(store.presentation_not_before(None), None);
+        assert!(store.avc444_waiting_for_ack);
+
+        let blue = solid(514, 1, BLUE);
+        store
+            .blit_avc444_rgba(1, Rect::new(0, 0, 514, 1), &blue, 514)
+            .unwrap();
+        assert_eq!(store.get(1).unwrap().pixels(), blue.as_slice());
+    }
+
+    #[test]
+    fn input_region_budget_releases_immediately_without_skipping_pixels() {
+        let mut store = mapped_policy_store(2, 1);
+        let regions = vec![Rect::new(0, 0, 2, 1); 513];
+        let start = Instant::now();
+        note_and_finish(&mut store, &regions, &[], start);
+
+        assert_eq!(store.presentation_not_before(None), None);
+        assert!(store.avc444_waiting_for_ack);
+
+        let blue = solid(2, 1, BLUE);
+        store
+            .blit_avc444_rgba(1, Rect::new(0, 0, 2, 1), &blue, 2)
+            .unwrap();
+        assert_eq!(store.get(1).unwrap().pixels(), blue.as_slice());
+    }
+
+    #[test]
+    fn unframed_avc_update_cannot_copy_or_ack_between_bitmap_callbacks() {
+        let mut store = mapped_policy_store(2, 1);
+        let start = Instant::now();
+        let mut snapshot = PresentationSnapshot::default();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+        let old = snapshot.pixels.clone();
+
+        store.note_avc444_regions(1, &[Rect::new(0, 0, 2, 1)], &[], start);
+        store
+            .blit_avc444_rgba(1, Rect::new(0, 0, 1, 1), &solid(1, 1, BLUE), 1)
+            .unwrap();
+        let current = store.presentation_stamp();
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Pending
+        );
+        store.acknowledge_presentation(current);
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(start + std::time::Duration::from_millis(50))
+        );
+        assert_eq!(snapshot.pixels, old);
+
+        store.finish_avc444_update(1);
+        assert_eq!(
+            store.copy_presentation_state(&mut snapshot),
+            PresentationCopy::Copied
+        );
+    }
+
+    #[test]
+    fn non_avc_visible_writes_release_a_pending_wait_but_initial_mapping_does_not_latch_one() {
+        let mut store = mapped_policy_store(2, 1);
+        assert_eq!(store.presentation_not_before(None), None);
+        let start = Instant::now();
+        note_and_finish(&mut store, &[Rect::new(0, 0, 2, 1)], &[], start);
+        assert!(store.presentation_not_before(None).is_some());
+
+        store
+            .blit_rgba(1, Rect::new(0, 0, 1, 1), &solid(1, 1, RED), 1)
+            .unwrap();
+        assert_eq!(store.presentation_not_before(None), None);
+        assert!(store.avc444_waiting_for_ack);
+
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[],
+            start + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(store.presentation_not_before(None), None);
+        store.acknowledge_presentation(store.presentation_stamp());
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[],
+            start + std::time::Duration::from_millis(2),
+        );
+        assert_eq!(
+            store.presentation_not_before(None),
+            Some(start + std::time::Duration::from_millis(52))
+        );
+    }
+
+    #[test]
+    fn lifecycle_changes_clear_the_old_avc444_policy() {
+        let start = Instant::now();
+        let mut store = mapped_policy_store(2, 1);
+        note_and_finish(&mut store, &[Rect::new(0, 0, 2, 1)], &[], start);
+        store.set_graphics_output_size(2, 1);
+        assert_eq!(store.presentation_not_before(None), None);
+
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[],
+            start + std::time::Duration::from_millis(1),
+        );
         store.create(1, 2, 1);
+        assert_eq!(store.presentation_not_before(None), None);
+
         store.solid_fill(1, &[Rect::new(0, 0, 2, 1)], RED).unwrap();
         store.map_to_output(1);
-        let presented = store.presentation_stamp();
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-
-        store.begin_frame(11);
-        store
-            .blit_rgba_deferred(1, Rect::new(0, 0, 2, 1), &solid(2, 1, BLUE), 2, deadline)
-            .unwrap();
-        store
-            .blit_rgba(1, Rect::new(0, 0, 2, 1), &solid(2, 1, RED), 2)
-            .unwrap();
-        assert!(store.commit_frame(11));
-
-        assert_eq!(store.presentation_not_before(Some(presented)), None);
+        note_and_finish(
+            &mut store,
+            &[Rect::new(0, 0, 2, 1)],
+            &[],
+            start + std::time::Duration::from_millis(2),
+        );
+        store.delete(1);
+        assert_eq!(store.presentation_not_before(None), None);
+        store.release_presentation_delay();
+        assert!(!store.avc444_waiting_for_ack);
     }
 
     #[test]

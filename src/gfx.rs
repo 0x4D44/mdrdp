@@ -28,12 +28,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ironrdp::pdu::geometry::ExclusiveRectangle;
-use ironrdp_egfx::client::{
-    BitmapUpdate, BitmapUpdatePresentation, GraphicsPipelineHandler, Surface as EgfxSurface,
-};
+use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface as EgfxSurface};
 use ironrdp_egfx::pdu::{
     CacheToSurfacePdu, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
     EvictCacheEntryPdu, GfxPdu, Point, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu,
@@ -59,10 +57,6 @@ pub fn rect_from_egfx(rect: &ExclusiveRectangle) -> Rect {
 
 /// Side of a progressive tile, in pixels. MS-RDPRFX fixes the tile grid at 64x64.
 pub const PROGRESSIVE_TILE: u16 = 64;
-
-/// Keep chroma-only AVC444 refinements off screen briefly. Continuous animation replaces
-/// them with fresh luma; a settled image still gains its full chroma detail after the pause.
-const CHROMA_REFINEMENT_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 /// Where a progressive tile lands on its surface.
 ///
@@ -863,6 +857,23 @@ impl GraphicsPipelineHandler for GfxHandler {
         });
     }
 
+    fn on_avc444_regions(
+        &mut self,
+        surface_id: u16,
+        luma: &[ExclusiveRectangle],
+        chroma: &[ExclusiveRectangle],
+    ) {
+        let luma: Vec<_> = luma.iter().map(rect_from_egfx).collect();
+        let chroma: Vec<_> = chroma.iter().map(rect_from_egfx).collect();
+        self.with_store(|store| {
+            store.note_avc444_regions(surface_id, &luma, &chroma, Instant::now());
+        });
+    }
+
+    fn on_avc444_update_complete(&mut self, surface_id: u16) {
+        self.with_store(|store| store.finish_avc444_update(surface_id));
+    }
+
     /// Bitmaps the upstream client decoded itself (uncompressed, and AVC420 if a decoder
     /// is ever configured). Already RGBA by that API's contract, so it is blitted as-is.
     fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
@@ -892,18 +903,12 @@ impl GraphicsPipelineHandler for GfxHandler {
             return;
         }
         let stride = dest.width();
-        let result = self.with_store(|store| match update.presentation {
-            BitmapUpdatePresentation::Immediate => {
+        let result = self.with_store(|store| {
+            if matches!(update.codec_id, Codec1Type::Avc444 | Codec1Type::Avc444v2) {
+                store.blit_avc444_rgba(update.surface_id, dest, &update.data, stride)
+            } else {
                 store.blit_rgba(update.surface_id, dest, &update.data, stride)
             }
-            BitmapUpdatePresentation::ChromaRefinement => store.blit_rgba_deferred(
-                update.surface_id,
-                dest,
-                &update.data,
-                stride,
-                Instant::now() + CHROMA_REFINEMENT_SETTLE_DELAY,
-            ),
-            _ => store.blit_rgba(update.surface_id, dest, &update.data, stride),
         });
         if result.is_ok() {
             // Painted bytes are attributed per rect for every codec on this path
@@ -2369,44 +2374,106 @@ mod tests {
     }
 
     #[test]
-    fn chroma_refinement_metadata_reaches_the_surface_presenter() {
+    fn decoded_avc444_coverage_holds_luma_and_releases_only_complete_chroma() {
         let store = store();
-        let mut handler = GfxHandler::new(Arc::clone(&store));
-        handler.on_surface_created(&egfx_surface(1, 2, 1));
-        handler.on_surface_mapped(1, 0, 0);
-        handler.on_solid_fill(&SolidFillPdu {
-            surface_id: 1,
-            fill_pixel: Color {
-                b: 0,
-                g: 0,
-                r: 255,
-                xa: 0,
-            },
-            rectangles: vec![rect(0, 0, 2, 1)],
-        });
-        let mut update = BitmapUpdate::new(
-            1,
-            rect(0, 0, 2, 1),
-            Codec1Type::Avc444,
-            vec![0, 0, 255, 255, 0, 0, 255, 255],
-            2,
-            1,
+        let handler = GfxHandler::new(Arc::clone(&store));
+        let mut client =
+            GraphicsPipelineClient::new(Box::new(handler), Some(Box::new(TaggedYuvDecoder)));
+        process_pdu(
+            &mut client,
+            GfxPdu::CreateSurface(ironrdp_egfx::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 32,
+                height: 16,
+                pixel_format: PixelFormat::XRgb,
+            }),
         );
-        update.presentation = BitmapUpdatePresentation::ChromaRefinement;
+        // Establish decoded baseline pixels before observing the presentation policy.
+        process_pdu(
+            &mut client,
+            GfxPdu::MapSurfaceToOutput(ironrdp_egfx::pdu::MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }),
+        );
+        let full = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 32,
+            bottom: 16,
+        };
+        let left = InclusiveRectangle { right: 16, ..full };
+        let right = InclusiveRectangle { left: 16, ..full };
+        process_pdu(
+            &mut client,
+            avc444_pdu(
+                Encoding::LUMA_AND_CHROMA,
+                vec![full.clone()],
+                &[100, 128, 128, 0],
+                Some((vec![full.clone()], &[0, 128, 128, 1])),
+            ),
+        );
+        let mut snapshot = crate::surface::PresentationSnapshot::default();
+        {
+            let mut pixels = store.lock().unwrap();
+            assert_eq!(
+                pixels.copy_presentation_state(&mut snapshot),
+                crate::surface::PresentationCopy::Copied
+            );
+            pixels.acknowledge_presentation(snapshot.stamp);
+        }
+        assert_eq!(snapshot.pixels[..4], [100, 100, 100, 255]);
+        let presented = snapshot.stamp;
 
-        let presented = store.lock().unwrap().presentation_stamp();
-
-        handler.on_frame_start(22);
-        handler.on_bitmap_updated(&update);
-        handler.on_frame_complete(22);
-
+        process_pdu(
+            &mut client,
+            avc444_pdu(Encoding::LUMA, vec![full], &[235, 128, 128, 0], None),
+        );
+        let deadline = store
+            .lock()
+            .unwrap()
+            .presentation_not_before(Some(presented));
         assert!(
+            deadline.is_some(),
+            "decoded luma must start a presentation wait"
+        );
+
+        // LC0's luma and chroma rectangles need not coincide. Its LEFT chroma
+        // completes only half the pending area; the RIGHT luma still needs chroma.
+        process_pdu(
+            &mut client,
+            avc444_pdu(
+                Encoding::LUMA_AND_CHROMA,
+                vec![right.clone()],
+                &[80, 128, 128, 0],
+                Some((vec![left], &[0, 128, 128, 1])),
+            ),
+        );
+        assert_eq!(
             store
                 .lock()
                 .unwrap()
-                .presentation_not_before(Some(presented))
-                .is_some()
+                .presentation_not_before(Some(presented)),
+            deadline
         );
+        process_pdu(
+            &mut client,
+            avc444_pdu(Encoding::CHROMA, vec![right], &[0, 128, 128, 1], None),
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .presentation_not_before(Some(presented)),
+            None
+        );
+        assert_eq!(
+            store.lock().unwrap().copy_presentation_state(&mut snapshot),
+            crate::surface::PresentationCopy::Copied
+        );
+        assert_eq!(snapshot.pixels[..4], [235, 235, 235, 255]);
+        assert_eq!(snapshot.pixels[16 * 4..17 * 4], [80, 80, 80, 255]);
     }
 
     /// Output mapping PDUs must display a surface; unsupported RAIL mappings must not

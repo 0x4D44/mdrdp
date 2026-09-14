@@ -2180,15 +2180,23 @@ impl SessionApp {
             (width, height),
             not_before,
         ) {
-            // This is the deadline for the latest coherent store stamp. Replace an older
-            // LC2 wake so fresh content can shorten 100 ms settling to the 33 ms canvas
-            // cadence; repeated refinements already carry their `max` in the store.
+            trace!(
+                generation = stamp.generation,
+                wait_us = deadline.saturating_duration_since(now).as_micros(),
+                "presentation wake scheduled"
+            );
+            // Replace the old wake: chroma completion can shorten the luma wait.
+            // Repeated luma does not extend the store's first-update deadline.
             self.redraw_deadline = Some(deadline);
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             return;
         }
         self.redraw_deadline = None;
         if let Some(window) = &self.window {
+            trace!(
+                generation = stamp.generation,
+                "presentation redraw requested"
+            );
             window.request_redraw();
         }
     }
@@ -2212,6 +2220,7 @@ impl SessionApp {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let redraw_started = Instant::now();
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -2233,6 +2242,10 @@ impl SessionApp {
             .as_ref()
             .is_some_and(|presenter| presenter.can_start_frame(width, height))
         {
+            trace!(
+                reason = "compositor_busy_before_copy",
+                "presentation deferred"
+            );
             let deadline = Instant::now() + PRESENT_BACKPRESSURE_RETRY;
             self.schedule_redraw_retry(event_loop, deadline);
             return;
@@ -2261,6 +2274,7 @@ impl SessionApp {
             // An active logical frame is not publishable yet. Rate-limit the state check
             // and do no conversion or platform rendering while it remains active.
             Ok(PresentationCopy::Pending) => {
+                trace!(reason = "graphics_update_active", "presentation deferred");
                 let deadline = Instant::now() + PRESENT_RETRY;
                 self.schedule_redraw_retry(event_loop, deadline);
                 return;
@@ -2275,6 +2289,13 @@ impl SessionApp {
                 false,
             ),
             Err(deadline) => {
+                trace!(
+                    reason = "luma_or_canvas_deadline",
+                    wait_us = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_micros(),
+                    "presentation deferred"
+                );
                 self.redraw_deadline = Some(deadline);
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                 return;
@@ -2362,6 +2383,10 @@ impl SessionApp {
         match buffer.present() {
             Ok(crate::present::PresentStatus::Presented) => {}
             Ok(crate::present::PresentStatus::Busy) => {
+                trace!(
+                    reason = "compositor_busy_at_submit",
+                    "presentation deferred"
+                );
                 let deadline = Instant::now() + PRESENT_BACKPRESSURE_RETRY;
                 self.schedule_redraw_retry(event_loop, deadline);
                 return;
@@ -2375,6 +2400,7 @@ impl SessionApp {
             generation = stamp.generation,
             fresh_content_epoch = stamp.fresh_content_epoch,
             acknowledge,
+            redraw_us = redraw_started.elapsed().as_micros(),
             "presentation submitted"
         );
         // Streak counts CONSECUTIVE failures: without this reset, 30 unrelated hiccups
@@ -2383,6 +2409,10 @@ impl SessionApp {
         self.redraw_retry = false;
         if acknowledge {
             self.presented = Some(stamp);
+            self.store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .acknowledge_presentation(stamp);
         }
         self.last_presented_at = Some(Instant::now());
         // Close the paint→present handoff measurement for this generation.
@@ -2690,6 +2720,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             // rearrange windows around these moments, so the policy uses them to read the
             // resizes that follow as the system's doing rather than the user's.
             WindowEvent::Occluded(occluded) => {
+                trace!(occluded, "presentation visibility changed");
                 // A drag cannot span an occlusion; whatever the timer was watching for
                 // is over, and the sizes that follow a reveal are the system's.
                 self.resize_settle = None;
@@ -2724,9 +2755,8 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 // the size may have been changed while the screen was off, and no further
                 // `Resized` is guaranteed to arrive to prompt us.
                 if !occluded && let Some(window) = self.window.clone() {
-                    // Nothing saw the hidden-window transition, so showing the latest
-                    // committed pixels cannot cause the 4:2:0-to-4:4:4 flicker that the
-                    // refinement delay prevents. Do not make a reveal wait on an old timer.
+                    // Reveal prioritises the latest committed desktop over waiting for
+                    // chroma. Do not make it wait on an old hidden-window timer.
                     self.store
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3192,7 +3222,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chroma_refinement_waits_for_settling_even_on_a_small_surface() {
+    fn luma_wait_retains_the_snapshot_and_expires_at_fifty_ms() {
         let mut store = SurfaceStore::new();
         store.create(1, 2, 1);
         store
@@ -3206,18 +3236,14 @@ mod tests {
         );
         let presented = Some(snapshot.stamp);
         let now = Instant::now();
-        let deadline = now + Duration::from_millis(100);
+        let deadline = now + Duration::from_millis(50);
 
         store.begin_frame(23);
+        store.note_avc444_regions(1, &[Rect::new(0, 0, 2, 1)], &[], now);
         store
-            .blit_rgba_deferred(
-                1,
-                Rect::new(0, 0, 2, 1),
-                &[BLUE, BLUE].concat(),
-                2,
-                deadline,
-            )
-            .expect("paint chroma refinement");
+            .blit_avc444_rgba(1, Rect::new(0, 0, 2, 1), &[BLUE, BLUE].concat(), 2)
+            .expect("paint luma");
+        store.finish_avc444_update(1);
         assert!(store.commit_frame(23));
 
         assert_eq!(
@@ -3233,7 +3259,7 @@ mod tests {
     }
 
     #[test]
-    fn a_coalesced_chroma_refinement_cannot_delay_unpresented_fresh_content() {
+    fn chroma_at_thirty_four_ms_releases_luma_without_another_settle_delay() {
         let mut store = SurfaceStore::new();
         store.create(1, 2, 1);
         store
@@ -3247,72 +3273,84 @@ mod tests {
         );
         let presented = Some(snapshot.stamp);
         let now = Instant::now();
-        let deadline = now + Duration::from_millis(100);
+        let region = Rect::new(0, 0, 2, 1);
 
         store.begin_frame(24);
+        store.note_avc444_regions(1, &[region], &[], now);
         store
-            .blit_rgba_strict(1, Rect::new(0, 0, 2, 1), &[BLUE, BLUE].concat())
+            .blit_avc444_rgba(1, region, &[BLUE, BLUE].concat(), 2)
             .expect("paint fresh luma content");
+        store.finish_avc444_update(1);
         assert!(store.commit_frame(24));
+        let chroma_at = now + Duration::from_millis(34);
+        assert_eq!(
+            damage_redraw_deadline(
+                presented,
+                store.presentation_stamp(),
+                None,
+                chroma_at,
+                (2, 1),
+                store.presentation_not_before(presented),
+            ),
+            Some(now + Duration::from_millis(50)),
+            "the damage wake must hold luma just like the snapshot-copy gate"
+        );
+        assert_eq!(
+            copy_presentation_when_due(&store, &mut snapshot, presented, None, chroma_at, (2, 1)),
+            Err(now + Duration::from_millis(50))
+        );
+        assert_eq!(snapshot.pixels, [RED, RED].concat());
 
         store.begin_frame(25);
+        store.note_avc444_regions(1, &[], &[region], chroma_at);
         store
-            .blit_rgba_deferred(
-                1,
-                Rect::new(0, 0, 2, 1),
-                &[GREEN, GREEN].concat(),
-                2,
-                deadline,
-            )
+            .blit_avc444_rgba(1, Rect::new(0, 0, 2, 1), &[GREEN, GREEN].concat(), 2)
             .expect("paint late chroma refinement");
+        store.finish_avc444_update(1);
         assert!(store.commit_frame(25));
-
-        let later_deadline = now + Duration::from_millis(200);
-        store.begin_frame(26);
-        store
-            .blit_rgba_deferred(
-                1,
-                Rect::new(0, 0, 2, 1),
-                &[WHITE, WHITE].concat(),
-                2,
-                later_deadline,
-            )
-            .expect("paint another late chroma refinement");
-        assert!(store.commit_frame(26));
+        assert_eq!(
+            damage_redraw_deadline(
+                presented,
+                store.presentation_stamp(),
+                None,
+                chroma_at,
+                (2, 1),
+                store.presentation_not_before(presented),
+            ),
+            None,
+            "complete chroma replaces the scheduled wake with an immediate redraw"
+        );
 
         assert_eq!(
-            copy_presentation_when_due(&store, &mut snapshot, presented, None, now, (2, 1),),
+            copy_presentation_when_due(&store, &mut snapshot, presented, None, chroma_at, (2, 1)),
             Ok(PresentationCopy::Copied),
-            "a later chroma refinement must not hide fresh content that was never presented"
+            "complete chroma must release the pending luma immediately"
         );
         assert_eq!(
             snapshot.pixels,
-            [WHITE, WHITE].concat(),
+            [GREEN, GREEN].concat(),
             "the immediate present should still use the latest refined pixels"
         );
 
+        store.acknowledge_presentation(snapshot.stamp);
         let presented = Some(snapshot.stamp);
-        let final_deadline = now + Duration::from_millis(300);
         store.begin_frame(27);
+        store.note_avc444_regions(1, &[], &[region], chroma_at);
         store
-            .blit_rgba_deferred(
-                1,
-                Rect::new(0, 0, 2, 1),
-                &[GREEN, GREEN].concat(),
-                2,
-                final_deadline,
-            )
+            .blit_avc444_rgba(1, Rect::new(0, 0, 2, 1), &[WHITE, WHITE].concat(), 2)
             .expect("paint refinement after successful presentation");
+        store.finish_avc444_update(1);
         assert!(store.commit_frame(27));
         assert_eq!(
-            copy_presentation_when_due(&store, &mut snapshot, presented, None, now, (2, 1),),
-            Err(final_deadline),
-            "quality-only work should settle again after the fresh epoch is presented"
+            copy_presentation_when_due(&store, &mut snapshot, presented, None, chroma_at, (2, 1)),
+            Ok(PresentationCopy::Copied),
+            "chroma alone never starts a wait"
         );
+        assert_eq!(snapshot.pixels, [WHITE, WHITE].concat());
     }
 
     #[test]
-    fn fresh_content_bypasses_chroma_settling_but_keeps_large_canvas_cadence() {
+    fn chroma_completion_keeps_large_canvas_cadence() {
         let mut store = SurfaceStore::new();
         assert!(store.set_graphics_output_size(5120, 2880));
         store.create(1, 2, 1);
@@ -3329,20 +3367,23 @@ mod tests {
         let now = Instant::now();
 
         store.begin_frame(28);
+        store.note_avc444_regions(1, &[Rect::new(0, 0, 2, 1)], &[], now);
         store
-            .blit_rgba_strict(1, Rect::new(0, 0, 2, 1), &[BLUE, BLUE].concat())
+            .blit_avc444_rgba(1, Rect::new(0, 0, 2, 1), &[BLUE, BLUE].concat(), 2)
             .expect("paint fresh picture");
+        store.finish_avc444_update(1);
         assert!(store.commit_frame(28));
         store.begin_frame(29);
+        store.note_avc444_regions(
+            1,
+            &[],
+            &[Rect::new(0, 0, 2, 1)],
+            now + Duration::from_millis(1),
+        );
         store
-            .blit_rgba_deferred(
-                1,
-                Rect::new(0, 0, 2, 1),
-                &[GREEN, GREEN].concat(),
-                2,
-                now + Duration::from_millis(100),
-            )
+            .blit_avc444_rgba(1, Rect::new(0, 0, 2, 1), &[GREEN, GREEN].concat(), 2)
             .expect("paint chroma refinement");
+        store.finish_avc444_update(1);
         assert!(store.commit_frame(29));
 
         assert_eq!(
@@ -3355,7 +3396,7 @@ mod tests {
                 (1920, 1080),
             ),
             Err(now + DAMAGE_PRESENT_INTERVAL),
-            "freshness removes only the 100 ms refinement term"
+            "chroma releases only the luma wait, not the canvas cadence"
         );
     }
 
