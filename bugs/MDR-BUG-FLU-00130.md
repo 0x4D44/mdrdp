@@ -1,6 +1,6 @@
 # MDR-BUG-FLU-00130 — AVC444 luma and chroma presentations still alternate on coloured terminal content
 
-- **State:** Fixed
+- **State:** Open
 - **Priority:** Must
 - **Severity:** Medium
 - **Area:** graphics/avc444
@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-14T21:13:36Z, deltic:auto role=fix run=fix-20260914T204351Z-8b2550a0 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0 code=1f8674a gate=manual)
+- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-14T21:13:36Z, deltic:auto role=fix run=fix-20260914T204351Z-8b2550a0 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0 code=1f8674a gate=manual) -> Open (2026-09-15, Codex, Arthur reports continued flicker on 0.1.247; successful submissions racing incoming frames leave the luma wait bypassed)
 
 ## Observation
 
@@ -45,3 +45,13 @@ journal. This is Fixed, not independently visually verified: a live affected
 terminal session still needs to confirm the reported flicker has improved.
 
 ## Notes
+
+2026-09-15: Arthur reports: "I'm running .247 and connected with it to temper.
+But I still see the chroma flickering." The local startup log confirms that
+version, host, 2560x1440 and IOSurface presentation. Metadata at 23:07:49 UTC
+shows a deadline release, successful submissions rejected by the policy as
+`active_update_or_frame`, then fresh luma published with `wait_us=0`.
+`SurfaceStore::acknowledge_presentation` requires the latest producer stamp and
+an idle decoder; the ready latch suppresses new region tracking until that
+condition holds. This establishes a wait-policy defect, not proof that it is
+the only source of visible flicker. Genuine 50 ms expiry also occurs.
