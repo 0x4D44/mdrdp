@@ -6,15 +6,15 @@
 - **Area:** rhydra/idd-deploy
 - **Raised:** 2026-08-25T06:54:28Z
 - **Discovery source:** Automation
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20260914T103304Z-9811bada
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00121-run-verify-20260914T103304Z-9811bada
+- **Owner base:** c172779da2c3a2e13ee9a331e88a0ab9c5eb7dfb
+- **Owner fingerprint:** sha256:fee3ed437a0a860e2051e4a678d663ec81c3c438191df52bc6bda9374aa69797
+- **Owner since:** 2026-09-14T10:33:04Z
+- **Owner until:** 2026-09-14T12:33:04Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
