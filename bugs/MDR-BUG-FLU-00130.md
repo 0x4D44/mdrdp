@@ -93,6 +93,9 @@ the learned delay with the old fixed 50 ms delay failed its late-chroma
 assertion, then restoration was clean.
 
 The 0.1.249 release binary attempted the original Temper observation but the
-connection timed out before session startup. No screenshot, metrics, or live
-visual evidence is claimed. The claim was released; this remains Fixed and
-indeterminate pending a reachable affected Temper session.
+connection timed out before session startup. A fresh DNS lookup resolves
+`temper.lan.example` to `192.0.2.254`; a bounded TCP probe to that current
+address also timed out, so the previously recorded `192.0.2.171` is stale.
+No screenshot, metrics, or live visual evidence is claimed. The claim was
+released; this remains Fixed and indeterminate pending a reachable affected
+Temper session.
