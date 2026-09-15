@@ -21,14 +21,11 @@ use crate::stats::CacheStats;
 use ironrdp_graphics::clearcodec::MAX_DECODE_DIM;
 use tracing::trace;
 
+mod avc444_wait;
+use avc444_wait::{ChromaWait, INITIAL_WAIT};
+
 /// Bytes per pixel, everywhere in this module.
 pub const BPP: usize = 4;
-
-/// Give an AVC444 luma update a short chance to receive its matching chroma update.
-///
-/// This is deliberately a bounded, first-update deadline. A stream of luma updates must
-/// not keep moving the goalposts indefinitely, or a busy desktop would never present.
-const AVC444_LUMA_PRESENTATION_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Keep the geometric ledger bounded. Falling back to immediate presentation preserves
 /// every decoded pixel when a pathological region set cannot be represented cheaply.
@@ -728,6 +725,9 @@ pub struct SurfaceStore {
     /// Luma regions that have not yet received their matching AVC444 chroma coverage.
     /// These are clipped to the currently mapped source and kept disjoint.
     avc444_pending_luma: Vec<Rect>,
+    /// Arrival observations outlive a presentation timeout, so slow chroma can train
+    /// the next batch. They never extend an already armed presentation deadline.
+    avc444_chroma_wait: ChromaWait,
     /// The AVC444 batch token whose ready presentation has not been acknowledged yet.
     ///
     /// This is separate from the pending luma ledger: a ready snapshot may be copied while
@@ -871,6 +871,7 @@ impl SurfaceStore {
     }
 
     fn clear_avc444_presentation_policy(&mut self, reason: &'static str) {
+        self.avc444_chroma_wait.invalidate(reason);
         let outstanding = self.avc444_pending_luma.len();
         let active = self.avc444_policy_active();
         let ready = self.avc444_ready;
@@ -1013,6 +1014,7 @@ impl SurfaceStore {
         }
 
         self.settle_avc444_deadline(now);
+        self.avc444_chroma_wait.observe(&luma, &chroma, now);
         if luma.len().saturating_add(chroma.len()) > MAX_AVC444_PENDING_REGIONS * 2 {
             // Keep every pixel callback alive, but abandon the metadata ledger before a
             // pathological PDU can make union/subtraction quadratic or fragment it past
@@ -1029,13 +1031,20 @@ impl SurfaceStore {
                 return;
             }
             if self.presentation_not_before.is_none() && !self.avc444_pending_luma.is_empty() {
-                let deadline = now
-                    .checked_add(AVC444_LUMA_PRESENTATION_DELAY)
-                    .unwrap_or(now);
+                let learned = self.avc444_chroma_wait.delay();
+                // Do not inflate the existing combined-update residual wait. Its
+                // independent chroma list is not proof a later pass will follow.
+                let delay = if chroma.is_empty() {
+                    learned
+                } else {
+                    learned.min(INITIAL_WAIT)
+                };
+                let deadline = now.checked_add(delay).unwrap_or(now);
                 self.presentation_not_before = Some(deadline);
                 trace!(
                     surface_id = id,
-                    deadline_ms = AVC444_LUMA_PRESENTATION_DELAY.as_millis() as u64,
+                    deadline_ms = delay.as_millis() as u64,
+                    learned_wait_us = learned.as_micros() as u64,
                     outstanding = self.avc444_pending_luma.len(),
                     "AVC444 luma presentation deadline started"
                 );
@@ -1222,6 +1231,7 @@ impl SurfaceStore {
     }
 
     fn release_non_avc_presentation_policy(&mut self) {
+        self.avc444_chroma_wait.invalidate("non_avc_mutation");
         if self.presentation_not_before.is_some() || !self.avc444_pending_luma.is_empty() {
             self.release_avc444_presentation_policy("non_avc_mutation");
         }
@@ -2548,6 +2558,79 @@ mod tests {
     fn note_and_finish(store: &mut SurfaceStore, luma: &[Rect], chroma: &[Rect], now: Instant) {
         store.note_avc444_regions(1, luma, chroma, now);
         store.finish_avc444_update(1);
+    }
+
+    #[test]
+    fn adaptive_learning_preserves_armed_deadlines_and_caps_combined_updates() {
+        let mut store = mapped_policy_store(4, 1);
+        let start = Instant::now();
+        let a = Rect::new(0, 0, 2, 1);
+        let b = Rect::new(2, 0, 4, 1);
+        let ms = std::time::Duration::from_millis;
+        note_and_finish(&mut store, &[a], &[], start);
+        store.settle_avc444_deadline(start + ms(50));
+        store.acknowledge_presentation(store.avc444_ready);
+        note_and_finish(&mut store, &[b], &[], start + ms(100));
+        note_and_finish(&mut store, &[], &[a], start + ms(120));
+        assert_eq!(store.avc444_chroma_wait.delay(), ms(128));
+        assert_eq!(store.presentation_not_before(None), Some(start + ms(150)));
+
+        store.release_presentation_delay();
+        // Partial combined coverage retains the old maximum 50 ms tax, even
+        // though a subsequent unpaired batch uses the learned 128 ms budget.
+        note_and_finish(&mut store, &[a], &[Rect::new(0, 0, 1, 1)], start + ms(200));
+        assert_eq!(store.presentation_not_before(None), Some(start + ms(250)));
+        store.release_presentation_delay();
+        note_and_finish(&mut store, &[a], &[], start + ms(300));
+        assert_eq!(store.presentation_not_before(None), Some(start + ms(428)));
+    }
+
+    #[test]
+    fn adaptive_probes_are_invalidated_by_reveal_and_non_avc_after_timeout() {
+        let ms = std::time::Duration::from_millis;
+        let a = Rect::new(0, 0, 2, 1);
+        for non_avc in [false, true] {
+            let mut store = mapped_policy_store(2, 1);
+            let t = Instant::now();
+            note_and_finish(&mut store, &[a], &[], t);
+            note_and_finish(&mut store, &[], &[a], t + ms(80));
+            store.acknowledge_presentation(store.avc444_ready);
+            note_and_finish(&mut store, &[a], &[], t + ms(100));
+            store.settle_avc444_deadline(t + ms(188));
+            store.acknowledge_presentation(store.avc444_ready);
+            if non_avc {
+                store.solid_fill(1, &[a], BLUE).unwrap();
+            } else {
+                store.release_presentation_delay();
+            }
+            note_and_finish(&mut store, &[], &[a], t + ms(300));
+            assert_eq!(
+                store.avc444_chroma_wait.delay(),
+                ms(88),
+                "stale 200 ms completion must not train, non_avc={non_avc}"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_wait_learns_chroma_arriving_after_timeout_and_ack() {
+        let mut store = mapped_policy_store(2, 1);
+        let start = Instant::now();
+        let region = Rect::new(0, 0, 2, 1);
+        let ms = std::time::Duration::from_millis;
+        note_and_finish(&mut store, &[region], &[], start);
+        store.settle_avc444_deadline(start + ms(50));
+        store.acknowledge_presentation(store.avc444_ready);
+        note_and_finish(&mut store, &[], &[region], start + ms(80));
+
+        let next = start + ms(100);
+        note_and_finish(&mut store, &[region], &[], next);
+        assert!(
+            store.presentation_not_before(None).unwrap() >= next + ms(80),
+            "late chroma must train the next wait even after the old batch was presented"
+        );
+        note_and_finish(&mut store, &[], &[region], next + ms(80));
+        assert_eq!(store.presentation_not_before(None), None);
     }
 
     #[test]
