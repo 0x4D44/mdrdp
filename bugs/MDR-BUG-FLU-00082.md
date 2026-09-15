@@ -18,7 +18,7 @@
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
-- **Attempts:** fix=0, doubt=0, indeterminate=1
+- **Attempts:** fix=0, doubt=0, indeterminate=2
 - **State history:** Open (2026-08-23T22:04:30Z, raised via `deltic bugs new`) -> Fixed (2026-08-23T22:11:32Z, deltic:auto role=fix run=fix-20260823T220531Z-aad19780 branch=task/bug-MDR-BUG-FLU-00082-run-fix-20260823T220531Z-aad19780 code=39a1844 gate=manual)
 
 ## Observation
@@ -58,5 +58,14 @@ unused `width`/`height` warnings in `src/present.rs`.
 The required locked-Winlogon Quench runtime could not be rerun from this macOS
 host. The Windows-only regression was not executable here, and no live service,
 SCM, viewer, frame, or encoded-output evidence is claimed. The verification claim
-was cleared by the release operation; this record remains Fixed with one
-indeterminate attempt pending a reachable Windows runtime check.
+was cleared by the release operation; this record remains Fixed with two
+indeterminate attempts pending a reachable Windows runtime check.
+
+2026-09-15: Independent run `verify-20260915T063905Z-e05676da` rechecked the
+desktop-handoff fix. The Rhydra reconciler, desktop-sync, and agent CLI suites
+passed 38/38, 6/6, and 4/4. Reversing both desktop-synchronisation root hunks
+left those portable tests green, so they cannot prove the locked-desktop
+symptom. Quench port 3389 timed out and port 22 reported the host down. No
+locked Winlogon, viewer, frame, or encoded-output evidence is claimed. The
+claim was released; this remains Fixed and indeterminate pending a reachable
+Windows runtime check.

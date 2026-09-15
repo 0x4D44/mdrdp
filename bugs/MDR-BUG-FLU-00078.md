@@ -18,7 +18,7 @@
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
-- **Attempts:** fix=0, doubt=0, indeterminate=1
+- **Attempts:** fix=0, doubt=0, indeterminate=2
 - **State history:** Open (2026-08-23T21:46:28Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T21:48:01Z, deltic:auto role=fix run=fix-20260823T214751Z-79cfb27f branch=task/bug-MDR-BUG-FLU-00078-run-fix-20260823T214751Z-79cfb27f code=bcfc91f gate=manual)
 
 ## Observation
@@ -55,4 +55,13 @@ not resolve from this host, and SSH to the recorded address `192.0.2.240` timed
 out. No SCM, LocalSystem token, `SetTokenInformation`, control listener, capture,
 audio, or input launch evidence is claimed. The verification claim was cleared
 by `1b7f11d291c47e6a539fa7c6245f7724a61dec93`; the record remains Fixed
-with one indeterminate attempt pending a reachable Quench runtime check.
+with two indeterminate attempts pending a reachable Quench runtime check.
+
+2026-09-15: Independent run `verify-20260915T063314Z-6a79e964` rechecked the
+integrated token-access fix. The `TOKEN_ALL_ACCESS` source oracle passed, and
+replacing it with the exact pre-fix token mask failed that oracle; restoration
+left the worktree clean. The Rhydra library suite passed 409/409. Quench was
+not reachable: port 3389 timed out and port 22 reported the host down. No
+service, worker, or console-session evidence is claimed. The claim was
+released; this remains Fixed and indeterminate pending the required Windows
+runtime check.
