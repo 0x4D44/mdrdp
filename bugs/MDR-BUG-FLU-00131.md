@@ -30,6 +30,20 @@ Evidence fingerprint: `manual:v1:fullscreen-resolution-restoration-is-discarded-
 
 ## Fix
 
-<unfixed — raised only>
+The resize duplicate check now uses the validated EGFX Graphics Output Buffer
+dimensions, falling back to the activation dimensions before the first graphics
+reset. It also requires agreement with the last successfully sent layout, so an
+A→B→A request sequence cannot lose its restore while B is still in flight.
+
+Three regressions cover restoration after an EGFX-only shrink, restoration while
+a contrary layout is in flight, and suppression of a true duplicate after a reset.
+The first test invokes the real graphics-reset handler. Replacing the decision with
+the original activation-size-only comparison made all three fail on their assertions;
+restoring the fix passed all three. The 99-test session family passed, as did the
+Windows checks for mdrdp and the Rhydra host, focused clippy, and formatting.
+
+Live restoration and physical monitor off/on remain unverified: Quench and Anvil
+were unreachable, and using Kiln would interrupt the active viewer. See
+`wrk_journals/2026.09.16 - JRN - fullscreen resolution restoration.md` for evidence.
 
 ## Notes
