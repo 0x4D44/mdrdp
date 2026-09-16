@@ -815,6 +815,13 @@ impl SurfaceStore {
         self.generation
     }
 
+    /// The dimensions of the EGFX Graphics Output Buffer, if ResetGraphics has reported
+    /// them. This is the remote desktop's actual output canvas; a mapped surface may be
+    /// smaller, larger, or temporarily absent while the graphics pipeline transitions.
+    pub(crate) fn graphics_output_size(&self) -> Option<(u16, u16)> {
+        self.graphics_output_size
+    }
+
     pub(crate) fn presentation_stamp(&self) -> PresentationStamp {
         PresentationStamp {
             generation: self.generation,

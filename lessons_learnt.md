@@ -6,6 +6,11 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- EGFX-only resize leaves activation dimensions stale; compare live output and last sent layout (`session.rs:service_resize`).
+  ResetGraphics can complete a resize without Deactivate All. Suppress a duplicate only
+  when its target matches the current output and no contrary layout was last sent;
+  otherwise a shrink followed by restoration can silently discard the restoration.
+
 - Learning only before timeout hides slow chroma (`surface.rs:note_avc444_regions`).
   Keep bounded timing probes after presentation timeout and acknowledgement. New overlapping
   luma invalidates the sample; a missing completion is not evidence of a shorter gap.

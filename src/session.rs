@@ -295,6 +295,10 @@ fn pump(
     let mut last_clipboard_poll = Instant::now();
     // A resize waiting for the Display Control channel to open, with when it was asked.
     let mut pending_resize: Option<(SessionCommand, Instant)> = None;
+    // The latest Display Control layout written to the wire. It remains separate from
+    // `pending_resize`: the server may not have acknowledged it with ResetGraphics yet,
+    // and a later compensating request must not be discarded against the old output.
+    let mut last_sent_resize: Option<ResizeTarget> = None;
     // The latest visibility change not yet told to the server.
     let mut pending_visibility = initial_visibility_request();
     // When input went out with no resulting paint seen yet. The gap between the two is
@@ -351,7 +355,13 @@ fn pump(
                 }
             }
         }
-        if let Err(e) = service_resize(established, &mut pending_resize, &mut turn_deadline) {
+        if let Err(e) = service_resize(
+            established,
+            store,
+            &mut pending_resize,
+            &mut last_sent_resize,
+            &mut turn_deadline,
+        ) {
             return SessionEnd::Failed(e);
         }
         if let Err(e) = service_visibility(established, &mut pending_visibility, &mut turn_deadline)
@@ -769,7 +779,9 @@ fn clamp_to_encodable(
 /// the old resolution is strictly better than no desktop.
 fn service_resize(
     established: &mut Established,
+    store: &Arc<Mutex<SurfaceStore>>,
     pending: &mut Option<(SessionCommand, Instant)>,
+    last_sent: &mut Option<ResizeTarget>,
     turn_deadline: &mut Option<Instant>,
 ) -> Result<(), ConnectError> {
     let Some((
@@ -791,16 +803,30 @@ fn service_resize(
     // reports whatever it likes; the wire has rules.
     let (width, height) =
         ironrdp::displaycontrol::pdu::MonitorLayoutEntry::adjust_display_size(width, height);
-
-    // A session that connected at this exact resolution and scale (the fullscreen-at-
-    // start path) has nothing to renegotiate; asking anyway costs a server round of
-    // Deactivate All / reactivation for zero change.
-    if resize_is_redundant(
+    let target = ResizeTarget {
         width,
         height,
         scale_percent,
+    };
+
+    // ResetGraphics is the authoritative acknowledgement of the EGFX output canvas. The
+    // activation size is only the fallback before EGFX has reported its first canvas, and
+    // is not updated by a graphics-only reset. This lock is taken only while a resize is
+    // pending, never on the quiet pump turns that dominate a session.
+    let graphics_output = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .graphics_output_size();
+
+    // A session that connected at this exact resolution and scale (the fullscreen-at-
+    // start path) has nothing to renegotiate; asking anyway costs a needless server
+    // resize round.
+    if resize_target_is_redundant(
+        target,
         established.desktop_size,
+        graphics_output,
         established.desktop_scale_percent,
+        *last_sent,
     ) {
         *pending = None;
         return Ok(());
@@ -848,12 +874,16 @@ fn service_resize(
                 );
             }
             eprintln!("resolution: requested {width}x{height} (scale {scale_percent:?})");
-            write_framed(
+            let result = write_framed(
                 &mut established.framed,
                 &frame,
                 write_deadline(turn_deadline),
             )
-            .map_err(ConnectError::Io)
+            .map_err(ConnectError::Io);
+            if result.is_ok() {
+                *last_sent = Some(target);
+            }
+            result
         }
         Some(Err(e)) => {
             // Losing one resize is not worth losing the desktop.
@@ -972,6 +1002,13 @@ fn initial_visibility_request() -> Option<bool> {
     Some(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResizeTarget {
+    width: u32,
+    height: u32,
+    scale_percent: Option<u32>,
+}
+
 /// Whether a resize request names the state the session is already in.
 ///
 /// Pure so it is testable without an [`Established`]. `scale` compares exactly:
@@ -989,13 +1026,38 @@ fn resize_is_redundant(
         && scale == current_scale
 }
 
+/// Decide whether a resize can be discarded using the activation and graphics state.
+///
+/// The graphics output is passed separately because a ResetGraphics PDU can change it
+/// without completing a Deactivation-Reactivation sequence. The session's activation
+/// size is retained as the fallback until EGFX reports its first output dimensions.
+fn resize_target_is_redundant(
+    target: ResizeTarget,
+    established: DesktopSize,
+    graphics_output: Option<(u16, u16)>,
+    current_scale: Option<u32>,
+    last_sent: Option<ResizeTarget>,
+) -> bool {
+    let observed = graphics_output
+        .map(|(width, height)| DesktopSize { width, height })
+        .unwrap_or(established);
+    resize_is_redundant(
+        target.width,
+        target.height,
+        target.scale_percent,
+        observed,
+        current_scale,
+    ) && last_sent.is_none_or(|sent| sent == target)
+}
+
 /// Run the [MS-RDPBCGR] Deactivation-Reactivation sequence after a Server Deactivate All.
 ///
-/// This is how a Display Control resolution change completes: the server deactivates,
+/// This is how legacy Display Control resolution changes complete: the server deactivates,
 /// capabilities are re-exchanged (carrying the new desktop size), and finalization runs
-/// again. The MCS channel IDs are invariant across it, so every joined channel — EGFX,
-/// clipboard, audio — survives; only the fast-path processor is rebuilt, because the
-/// share ID can change.
+/// again. Some servers instead expose a size change through EGFX ResetGraphics without
+/// this sequence. The MCS channel IDs are invariant across reactivation, so every joined
+/// channel — EGFX, clipboard, audio — survives; only the fast-path processor is rebuilt,
+/// because the share ID can change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReactivationOutcome {
     Complete,
@@ -1429,6 +1491,7 @@ mod tests {
     use crate::surface::SurfaceStore;
     use ironrdp::core::decode;
     use ironrdp::pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
+    use ironrdp_egfx::client::GraphicsPipelineHandler;
     use std::collections::VecDeque;
     use std::io::{self, Read, Write as _};
     use std::net::{TcpListener, TcpStream};
@@ -2230,6 +2293,79 @@ mod tests {
             Some(100),
             current,
             Some(100)
+        ));
+    }
+
+    #[test]
+    fn a_reset_graphics_size_forces_restore_even_when_activation_size_matches() {
+        let established = DesktopSize {
+            width: 2560,
+            height: 1440,
+        };
+        let restore = ResizeTarget {
+            width: 2560,
+            height: 1440,
+            scale_percent: Some(100),
+        };
+        let store = Arc::new(Mutex::new(SurfaceStore::new()));
+        let mut graphics = crate::gfx::GfxHandler::new(Arc::clone(&store));
+        graphics.on_reset_graphics(1920, 1080);
+        let graphics_output = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .graphics_output_size();
+        assert_eq!(graphics_output, Some((1920, 1080)));
+        assert!(
+            !resize_target_is_redundant(restore, established, graphics_output, Some(100), None,),
+            "a ResetGraphics shrink must not make the matching activation-size restore redundant"
+        );
+    }
+
+    #[test]
+    fn a_restore_is_not_dropped_while_a_contrary_resize_is_in_flight() {
+        let established = DesktopSize {
+            width: 2560,
+            height: 1440,
+        };
+        let restore = ResizeTarget {
+            width: 2560,
+            height: 1440,
+            scale_percent: Some(100),
+        };
+        let shrink = ResizeTarget {
+            width: 1920,
+            height: 1080,
+            scale_percent: Some(100),
+        };
+        assert!(
+            !resize_target_is_redundant(
+                restore,
+                established,
+                Some((2560, 1440)),
+                Some(100),
+                Some(shrink),
+            ),
+            "a restore must follow a contrary layout already written to the wire"
+        );
+    }
+
+    #[test]
+    fn a_graphics_reset_matching_the_target_makes_a_repeat_redundant() {
+        let established = DesktopSize {
+            width: 2560,
+            height: 1440,
+        };
+        let target = ResizeTarget {
+            width: 1920,
+            height: 1080,
+            scale_percent: Some(100),
+        };
+        assert!(resize_target_is_redundant(
+            target,
+            established,
+            Some((1920, 1080)),
+            Some(100),
+            None,
         ));
     }
 
