@@ -42,8 +42,13 @@ the original activation-size-only comparison made all three fail on their assert
 restoring the fix passed all three. The 99-test session family passed, as did the
 Windows checks for mdrdp and the Rhydra host, focused clippy, and formatting.
 
-Live restoration and physical monitor off/on remain unverified: Quench and Anvil
-were unreachable, and using Kiln would interrupt the active viewer. See
-`wrk_journals/2026.09.16 - JRN - fullscreen resolution restoration.md` for evidence.
+Live restoration passed on Kiln on 2026-09-16 after Arthur authorized the connection.
+A disposable probe against integrated v0.1.250 observed the server's ResetGraphics
+dimensions at 2560×1440 → 1920×1080 → 2560×1440, with 100% scale requested throughout.
+The production session emitted both resize requests without a full-reactivation
+message, then returned `session_end=graceful`. Windows subsequently reported the
+session disconnected. Physical monitor off/on remains unverified. This is additional
+fixer evidence, not independent closure. See
+`wrk_journals/2026.09.16 - JRN - fullscreen resolution restoration.md` for details.
 
 ## Notes
