@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00131 — Fullscreen resolution restoration is discarded after an EGFX-only resize
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** session/resolution
 - **Raised:** 2026-09-16T06:45:34Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20260916T064547Z-3e6476f9
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00131-run-fix-20260916T064547Z-3e6476f9
-- **Owner base:** 7063b819300417f2ca5f23fb74c5826dab345f3d
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-09-16T06:45:47Z
-- **Owner until:** 2026-09-16T08:45:47Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-16T06:45:34Z, raised via `deltic bugs new --land`)
+- **State history:** Open (2026-09-16T06:45:34Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-16T07:00:53Z, deltic:auto role=fix run=fix-20260916T064547Z-3e6476f9 branch=task/bug-MDR-BUG-FLU-00131-run-fix-20260916T064547Z-3e6476f9 code=27ce02a8f09ca9ec471cad07b0fc0c5e6f947bcc gate=manual)
 
 ## Observation
 
