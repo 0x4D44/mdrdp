@@ -251,11 +251,18 @@ pub fn spawn_writer(
         .unwrap_or_else(|e| eprintln!("warning: session presence not recorded ({e})"));
 }
 
-/// `2h13m`, `5m12s`, `42s`.
+/// `5d23h3m`, `2h13m`, `5m12s`, `42s`.
 fn fmt_duration(secs: u64) -> String {
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}h{m:02}m")
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60,
+    );
+    if d > 0 {
+        format!("{d}d{h}h{m}m")
+    } else if h > 0 {
+        format!("{h}h{m}m")
     } else if m > 0 {
         format!("{m}m{s:02}s")
     } else {
@@ -762,6 +769,7 @@ mod tests {
         assert_eq!(fmt_duration(42), "42s");
         assert_eq!(fmt_duration(5 * 60 + 12), "5m12s");
         assert_eq!(fmt_duration(2 * 3600 + 13 * 60), "2h13m");
+        assert_eq!(fmt_duration(5 * 86400 + 23 * 3600 + 3 * 60), "5d23h3m");
         assert_eq!(fmt_bytes(512), "512 B");
         assert_eq!(fmt_bytes(1_300), "1.3 KB");
         assert_eq!(fmt_bytes(3_400_000), "3.2 MB");
