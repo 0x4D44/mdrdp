@@ -94,7 +94,11 @@ impl Presenter {
     /// immediately after the check, so [`FrameBuf::present`] always checks again.
     pub fn can_start_frame(&self, width: NonZeroU32, height: NonZeroU32) -> bool {
         match self {
-            Self::Soft { .. } => true,
+            // The software surface never gates on size; only IOSurface ownership can.
+            Self::Soft { .. } => {
+                let _ = (width, height);
+                true
+            }
             #[cfg(target_os = "macos")]
             Self::Layer(layer) => layer.can_start_frame(width.get(), height.get()),
         }
