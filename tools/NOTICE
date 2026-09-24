@@ -74,4 +74,16 @@ Copyright Devolutions Inc. and contributors.
   surface-repro/s2s/src/surface.rs is a stale snapshot of mdrdp's own
       src/surface.rs, not third-party.
 
-Full licence texts: LICENSE-APACHE and LICENSE-MIT at the repository root.
+Microsoft Windows-driver-samples —
+https://github.com/microsoft/Windows-driver-samples — Microsoft Public License (MS-PL)
+Copyright (c) 2015 Microsoft.
+
+  latency-spike/idd/  (driver/, creator/)
+      Derived from IddSampleDriver at commit
+      717778a20ba4dd2440fe609f69153a1f8a64f597; the changes are listed in
+      latency-spike/idd/README.md. These files remain under MS-PL, not under
+      mdrdp's MIT OR Apache-2.0: MS-PL requires source distributions of them to
+      keep that licence. Its text is latency-spike/idd/LICENSE.upstream.
+
+Full licence texts: LICENSE-APACHE and LICENSE-MIT at the repository root, and
+latency-spike/idd/LICENSE.upstream for the MS-PL code above.

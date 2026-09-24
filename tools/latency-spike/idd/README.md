@@ -19,7 +19,8 @@ DebugView / WinDbg on the host.
 
 Derived from Microsoft's `IddSampleDriver`
 ([microsoft/Windows-driver-samples](https://github.com/microsoft/Windows-driver-samples),
-commit `717778a20ba4dd2440fe609f69153a1f8a64f597`), which is MIT-licensed. The upstream
+commit `717778a20ba4dd2440fe609f69153a1f8a64f597`), which is licensed under the Microsoft Public License (MS-PL), so these derived files
+stay under MS-PL rather than mdrdp's MIT OR Apache-2.0. The upstream
 licence is kept verbatim as `LICENSE.upstream`; Microsoft's copyright header is retained
 in every derived file. `driver/Driver.cpp` and `driver/Driver.h` stay deliberately close
 to the sample so they remain diffable against it.
