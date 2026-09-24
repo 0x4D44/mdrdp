@@ -520,7 +520,10 @@ mod tests {
         let mut s = spec();
         s.ssh_user = None;
         assert_eq!(bulk_ssh_args(&s).last().unwrap(), "quench.lan.example");
-        assert_eq!(interactive_ssh_args(&s).last().unwrap(), "quench.lan.example");
+        assert_eq!(
+            interactive_ssh_args(&s).last().unwrap(),
+            "quench.lan.example"
+        );
     }
 
     #[test]
