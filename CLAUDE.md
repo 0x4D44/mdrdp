@@ -176,9 +176,14 @@ real panel before claiming coverage of that class. **ICMP is blocked on both** (
 Firewall default), so `ping` fails on a perfectly healthy host — test reachability with a
 TCP connect to 3389 instead. Verified on quench 2026-08-17: ping 100% loss, tcp/3389 open.
 
+**Reach them by bare name** (`quench`, `temper`, `kiln`); the LAN resolves those. The repo
+is public, so older documents show placeholder names such as `quench.lan.example` and
+`192.0.2.x` addresses. Those were substituted when the history was published and do not
+resolve. Use the bare name instead.
+
 ### `quench` — our test box
 
-`quench.lan.example`, `192.0.2.240`. Use this one for protocol work, live measurement and
+Host `quench`. Use this one for protocol work, live measurement and
 day-to-day verification unless a task says otherwise.
 
 - **Log in as `ano`**, which has sudo on the box. The password lives in the macOS keychain
@@ -200,7 +205,7 @@ day-to-day verification unless a task says otherwise.
 
 ### `temper` — the second host, and the older evidence base
 
-`temper.lan.example`, `192.0.2.171`. Still live, and the target of every spike document
+Host `temper`. Still live, and the target of every spike document
 written before 2026-08-16. It is measurably laggier than quench under AVC (typing p50
 47.8 ms vs ~33 ms, p95 478 vs 87) and still runs the default ~30 fps frame cap, so the two
 are **not** interchangeable for a latency number — always say which host a figure came
