@@ -26,8 +26,14 @@
 //! worker operation function synchronously, keeping the deterministic unit tests fast and
 //! faithful to production behaviour.
 //!
-//! Text is preferred when present. Otherwise the bridge uses standard uncompressed `CF_DIB`
-//! bitmap data, with strict size checks around every decode and encode operation.
+//! Local content is read in the order file list, text, image (see [`choose_local_content`]).
+//! Files come first because Finder also places the file name as text and the file's icon as an
+//! image; neither may win over the file itself. A file list is announced as
+//! `FileGroupDescriptorW` for streamed transfer. When that list cannot be announced (a limit,
+//! a symlink, or a peer without file streaming), the bridge announces fallbacks instead: for a
+//! single `.png` file `CF_DIB` plus a registered `"PNG"` format with the file's bytes, and for
+//! any file list `CF_UNICODETEXT` with the file names. Images use standard uncompressed
+//! `CF_DIB` bitmap data, with strict size checks around every decode and encode operation.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -290,9 +296,16 @@ struct LocalFileSnapshot {
     entries: Vec<LocalFileEntry>,
 }
 
+/// One local clipboard generation ready to announce.
+///
+/// With `files` present the bridge announces the file list through IronRDP, which fixes that
+/// format list to `FileGroupDescriptorW` + `Preferred DropEffect`; `formats` is then only the
+/// fallback for a peer that cannot stream files. Without `files`, `formats` is the announce.
 struct LocalClipboardSnapshot {
     formats: Vec<ClipboardFormat>,
     files: Option<LocalFileSnapshot>,
+    /// Why a copied file list was dropped in favour of `formats`. Carries no paths or bytes.
+    file_error: Option<String>,
 }
 
 struct RemotePreparedEntry {
@@ -671,6 +684,7 @@ enum ClipboardWork {
     ReadFormats {
         id: u64,
         epoch: u64,
+        max_image_bytes: usize,
     },
     ReadLocalData {
         id: u64,
@@ -819,10 +833,14 @@ impl ClipboardWorkerState {
                 epoch,
                 changed: self.poll_local(observation_generation, allow_to_remote),
             },
-            ClipboardWork::ReadFormats { id, epoch } => ClipboardResult::Formats {
+            ClipboardWork::ReadFormats {
                 id,
                 epoch,
-                result: read_local_snapshot(&mut *self.os),
+                max_image_bytes,
+            } => ClipboardResult::Formats {
+                id,
+                epoch,
+                result: read_local_snapshot(&mut *self.os, max_image_bytes),
             },
             ClipboardWork::ReadLocalData {
                 id,
@@ -1319,7 +1337,8 @@ impl ClipboardExecutor {
 /// Abstracts OS clipboard access so the state machine can be tested without touching the
 /// real pasteboard.
 pub trait OsClipboard: Send {
-    /// Reads current clipboard content, preferring text when the platform exposes both.
+    /// Reads current clipboard content, preferring a file list, then text, then an image
+    /// (see [`choose_local_content`]).
     fn get_content(&mut self) -> Result<ClipboardContent, String>;
     /// Replaces the clipboard with text, RGBA image, or file-list content.
     fn set_content(&mut self, content: ClipboardContent) -> Result<(), String>;
@@ -1365,57 +1384,31 @@ impl Default for ArboardClipboard {
 impl OsClipboard for ArboardClipboard {
     fn get_content(&mut self) -> Result<ClipboardContent, String> {
         let clipboard = self.ensure()?;
-        match clipboard.get_text() {
-            Ok(text) => Ok(ClipboardContent::Text(text)),
-            Err(error) => {
-                // A non-text clipboard is expected when the user copied an image. Keep the
-                // handle alive and try arboard's native image conversion before giving up.
-                match clipboard.get_image() {
-                    Ok(image) => {
-                        let width = image.width;
-                        let height = image.height;
-                        let rgba = image.bytes.into_owned();
-                        if width == 0
-                            || height == 0
-                            || width > MAX_IMAGE_DIMENSION as usize
-                            || height > MAX_IMAGE_DIMENSION as usize
-                            || u64::try_from(width)
-                                .ok()
-                                .and_then(|w| {
-                                    u64::try_from(height).ok().and_then(|h| w.checked_mul(h))
-                                })
-                                .is_none_or(|pixels| pixels > MAX_IMAGE_PIXELS)
-                            || rgba.len()
-                                != width
-                                    .checked_mul(height)
-                                    .and_then(|pixels| pixels.checked_mul(4))
-                                    .unwrap_or(usize::MAX)
-                        {
-                            self.inner = None;
-                            return Err("clipboard image exceeds safe size limits".to_string());
-                        }
-                        Ok(ClipboardContent::Image {
-                            width,
-                            height,
-                            rgba,
-                        })
-                    }
-                    Err(image_error) => match clipboard.get().file_list() {
-                        Ok(paths) if !paths.is_empty() => Ok(ClipboardContent::Files(paths)),
-                        Ok(_) => {
-                            self.inner = None;
-                            Err(format!("{error}; image read failed: {image_error}"))
-                        }
-                        Err(file_error) => {
-                            self.inner = None;
-                            Err(format!(
-                                "{error}; image read failed: {image_error}; file list read failed: {file_error}"
-                            ))
-                        }
-                    },
+        let result = choose_local_content(
+            clipboard,
+            |clipboard| match clipboard.get().file_list() {
+                Ok(paths) => Ok(Some(paths)),
+                Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            },
+            |clipboard| match clipboard.get_text() {
+                Ok(text) => Ok(Some(text)),
+                Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            },
+            |clipboard| match clipboard.get_image() {
+                Ok(image) => {
+                    image_content(image.width, image.height, image.bytes.into_owned()).map(Some)
                 }
-            }
+                Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            },
+        );
+        if result.is_err() {
+            // Nothing usable was read. Drop the handle so a poisoned one is recreated next time.
+            self.inner = None;
         }
+        result
     }
 
     fn set_content(&mut self, content: ClipboardContent) -> Result<(), String> {
@@ -1468,6 +1461,55 @@ impl OsClipboard for ArboardClipboard {
             }
         }
     }
+}
+
+/// Picks which local representation to share: a non-empty file list, then text, then an image.
+///
+/// Finder puts a copied file on the pasteboard three ways: its URL, its name as plain text, and
+/// its icon as TIFF. Files must therefore win over both text (or the name is pasted) and image
+/// (or the icon is pasted). Text stays ahead of image because office apps and browsers put a
+/// rendered picture beside copied text, and the text is what the user means; the text-only
+/// auxiliary channel (`native::clipboard::TextOnly`) also relies on text winning.
+///
+/// Each reader returns `Ok(None)` when its representation is absent; an `Err` is remembered
+/// and the next reader is tried. Readers run lazily, in order.
+fn choose_local_content<T: ?Sized>(
+    source: &mut T,
+    read_files: impl FnOnce(&mut T) -> Result<Option<Vec<PathBuf>>, String>,
+    read_text: impl FnOnce(&mut T) -> Result<Option<String>, String>,
+    read_image: impl FnOnce(&mut T) -> Result<Option<ClipboardContent>, String>,
+) -> Result<ClipboardContent, String> {
+    let mut failures = Vec::new();
+    match read_files(source) {
+        Ok(Some(paths)) if !paths.is_empty() => return Ok(ClipboardContent::Files(paths)),
+        Ok(_) => {}
+        Err(error) => failures.push(format!("file list read failed: {error}")),
+    }
+    match read_text(source) {
+        Ok(Some(text)) => return Ok(ClipboardContent::Text(text)),
+        Ok(None) => {}
+        Err(error) => failures.push(format!("text read failed: {error}")),
+    }
+    match read_image(source) {
+        Ok(Some(content)) => return Ok(content),
+        Ok(None) => {}
+        Err(error) => failures.push(format!("image read failed: {error}")),
+    }
+    if failures.is_empty() {
+        Err("clipboard holds no file list, text, or image".to_string())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Wraps an OS-provided RGBA image after the same size checks every decode path applies.
+fn image_content(width: usize, height: usize, rgba: Vec<u8>) -> Result<ClipboardContent, String> {
+    validate_image_dimensions(width, height, rgba.len())?;
+    Ok(ClipboardContent::Image {
+        width,
+        height,
+        rgba,
+    })
 }
 
 /// Abstracts the monotonic clock used for paste-request timeouts, so tests can advance time
@@ -2158,7 +2200,15 @@ impl ClipboardBridge {
                 }
                 self.pending_format_read = None;
                 match result {
-                    Ok(snapshot) => self.complete_advertise(snapshot, cliprdr, out),
+                    Ok(snapshot) => {
+                        if let Some(error) = &snapshot.file_error {
+                            // The file list was dropped but other formats remain. Still tell
+                            // the user when a limit was the reason.
+                            self.note_file_limit_error(error);
+                            warn!(%error, "copied files cannot be announced as a file list; offering fallback formats");
+                        }
+                        self.complete_advertise(snapshot, cliprdr, out);
+                    }
                     Err(error) => {
                         self.note_file_limit_error(&error);
                         warn!(%error, "failed to read OS clipboard for format-list advertise");
@@ -2286,6 +2336,7 @@ impl ClipboardBridge {
         let outcome = self.submit_work(ClipboardWork::ReadFormats {
             id,
             epoch: self.epoch,
+            max_image_bytes: self.max_image_bytes,
         });
         match outcome {
             SubmitOutcome::Full(_) => {
@@ -2311,19 +2362,19 @@ impl ClipboardBridge {
         // clipboard. Cancel before any new FormatList can reach the wire so a stale worker result
         // cannot publish old files after this local generation wins.
         self.cancel_remote_transfer();
-        if let Some(files) = snapshot.files {
-            self.local_file_snapshot = Some(files.clone());
-            self.pending_file_copy = Some(files.clone());
-            if self.capabilities_negotiated
+        let files = snapshot.files.filter(|_| {
+            let streaming_refused = self.capabilities_negotiated
                 && !self
                     .negotiated_capabilities
-                    .contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED)
-            {
-                warn!("remote does not support clipboard file transfer");
-                self.pending_file_copy = None;
-                self.advertise_state = AdvertiseState::Idle;
-                return;
+                    .contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED);
+            if streaming_refused {
+                warn!("remote does not support clipboard file transfer; offering fallback formats");
             }
+            !streaming_refused
+        });
+        if let Some(files) = files {
+            self.local_file_snapshot = Some(files.clone());
+            self.pending_file_copy = Some(files.clone());
             match cliprdr.initiate_file_copy(
                 files
                     .entries
@@ -3199,25 +3250,179 @@ impl Drop for ClipboardBridge {
     }
 }
 
-fn read_local_snapshot(os: &mut dyn OsClipboard) -> Result<LocalClipboardSnapshot, String> {
+fn read_local_snapshot(
+    os: &mut dyn OsClipboard,
+    max_image_bytes: usize,
+) -> Result<LocalClipboardSnapshot, String> {
     let content = os.get_content()?;
     match content {
         ClipboardContent::Text(_) => Ok(LocalClipboardSnapshot {
             formats: text_formats(),
             files: None,
+            file_error: None,
         }),
         ClipboardContent::Image { .. } => Ok(LocalClipboardSnapshot {
             formats: image_formats(),
             files: None,
+            file_error: None,
         }),
-        ClipboardContent::Files(paths) => Ok(LocalClipboardSnapshot {
-            formats: vec![
-                ClipboardFormat::new(ClipboardFormatId::new(0xC0FE))
-                    .with_name(ClipboardFormatName::new_static(FORMAT_NAME_FILE_LIST)),
-            ],
-            files: Some(build_local_file_snapshot(&paths)?),
-        }),
+        ClipboardContent::Files(paths) => {
+            let formats = file_fallback_formats(&paths, max_image_bytes);
+            match build_local_file_snapshot(&paths) {
+                Ok(files) => Ok(LocalClipboardSnapshot {
+                    formats,
+                    files: Some(files),
+                    file_error: None,
+                }),
+                // Nothing else to offer: keep the plain failure (and its limit toast).
+                Err(error) if formats.is_empty() => Err(error),
+                Err(error) => Ok(LocalClipboardSnapshot {
+                    formats,
+                    files: None,
+                    file_error: Some(error),
+                }),
+            }
+        }
     }
+}
+
+/// Registered format carrying a copied `.png` file's bytes. Windows applications match the
+/// name `"PNG"`; the id only has to be unique in our own list (the file list uses 0xC0FE and
+/// IronRDP's `Preferred DropEffect` 0xC0FD).
+const PNG_FORMAT_ID: ClipboardFormatId = ClipboardFormatId(0xC0FF);
+const PNG_FORMAT_NAME: &str = "PNG";
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+
+fn png_format() -> ClipboardFormat {
+    ClipboardFormat::new(PNG_FORMAT_ID).with_name(ClipboardFormatName::new_static(PNG_FORMAT_NAME))
+}
+
+/// Formats offered for a copied file list when it cannot travel as `FileGroupDescriptorW`.
+/// Only file-system metadata and the PNG header are read here; pixels are decoded on request.
+fn file_fallback_formats(paths: &[PathBuf], max_image_bytes: usize) -> Vec<ClipboardFormat> {
+    let mut formats = Vec::new();
+    if single_png_file(paths, max_image_bytes).is_some() {
+        formats.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
+        formats.push(png_format());
+    }
+    if file_names_text(paths).is_some() {
+        formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
+    }
+    formats
+}
+
+/// The copied files' base names, one per line, so text targets keep receiving the names.
+fn file_names_text(paths: &[PathBuf]) -> Option<String> {
+    let names: Vec<_> = paths
+        .iter()
+        .filter_map(|path| path.file_name())
+        .map(|name| name.to_string_lossy())
+        .collect();
+    (!names.is_empty()).then(|| names.join("\n"))
+}
+
+/// Returns the path when the list is exactly one regular (non-symlink) `.png` file whose header
+/// is a PNG within the image limits, and whose bytes and decoded DIB both fit `max_bytes`.
+fn single_png_file(paths: &[PathBuf], max_bytes: usize) -> Option<&Path> {
+    let [path] = paths else {
+        return None;
+    };
+    let is_png_name = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !is_png_name {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes as u64 {
+        return None;
+    }
+    // Signature, then the IHDR chunk: length (13), type, width, height.
+    let mut header = [0u8; 24];
+    File::open(path).ok()?.read_exact(&mut header).ok()?;
+    if header[..8] != PNG_SIGNATURE || &header[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(header[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(header[20..24].try_into().ok()?);
+    let (width, height) = (usize::try_from(width).ok()?, usize::try_from(height).ok()?);
+    let rgba_len = width.checked_mul(height)?.checked_mul(4)?;
+    validate_image_dimensions(width, height, rgba_len).ok()?;
+    // Leave room for the 124-byte BITMAPV5HEADER `encode_dib` writes.
+    if rgba_len.checked_add(124)? > max_bytes {
+        return None;
+    }
+    Some(path)
+}
+
+/// Reads a PNG file's bytes, refusing anything larger than `max_bytes`.
+fn read_png_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let file =
+        File::open(path).map_err(|_| "clipboard PNG file could not be opened".to_string())?;
+    let mut data = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| "clipboard PNG file could not be read".to_string())?;
+    if data.len() > max_bytes {
+        return Err("clipboard PNG file exceeds the size limit".to_string());
+    }
+    if !data.starts_with(&PNG_SIGNATURE) {
+        return Err("clipboard PNG file has no PNG signature".to_string());
+    }
+    Ok(data)
+}
+
+/// Decodes a PNG file to top-down RGBA8. Palette, grey, and 16-bit inputs are normalised by
+/// the decoder, and the result is held to the same limits as every other clipboard image.
+fn decode_png_file(path: &Path, max_bytes: usize) -> Result<(usize, usize, Vec<u8>), String> {
+    let data = read_png_file(path, max_bytes)?;
+    let mut decoder =
+        png::Decoder::new_with_limits(std::io::Cursor::new(data), png::Limits { bytes: max_bytes });
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|_| "clipboard PNG header is invalid".to_string())?;
+    let (width, height) = {
+        let info = reader.info();
+        (info.width as usize, info.height as usize)
+    };
+    let rgba_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "clipboard image dimensions overflow".to_string())?;
+    validate_image_dimensions(width, height, rgba_len)?;
+    let buffer_len = reader
+        .output_buffer_size()
+        .filter(|len| *len <= max_bytes)
+        .ok_or_else(|| "clipboard PNG exceeds the size limit".to_string())?;
+    let mut buffer = vec![0u8; buffer_len];
+    let frame = reader
+        .next_frame(&mut buffer)
+        .map_err(|_| "clipboard PNG data is invalid".to_string())?;
+    if frame.bit_depth != png::BitDepth::Eight {
+        return Err("clipboard PNG bit depth is unsupported".to_string());
+    }
+    buffer.truncate(frame.buffer_size());
+    let rgba = match frame.color_type {
+        png::ColorType::Rgba => buffer,
+        png::ColorType::Rgb => buffer
+            .chunks_exact(3)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => buffer
+            .chunks_exact(2)
+            .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
+            .collect(),
+        png::ColorType::Grayscale => buffer
+            .iter()
+            .flat_map(|&grey| [grey, grey, grey, 255])
+            .collect(),
+        png::ColorType::Indexed => {
+            return Err("clipboard PNG palette was not expanded".to_string());
+        }
+    };
+    validate_image_dimensions(width, height, rgba.len())?;
+    Ok((width, height, rgba))
 }
 
 fn build_local_file_snapshot(paths: &[PathBuf]) -> Result<LocalFileSnapshot, String> {
@@ -3486,6 +3691,15 @@ fn read_local_data(
                 }
             }
         }
+        Ok(ClipboardContent::Files(paths)) => {
+            match read_file_fallback_data(&paths, format, max_image_bytes) {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(%error, ?format, "failed to serve copied files as a fallback format; sending error response");
+                    OwnedFormatDataResponse::new_error()
+                }
+            }
+        }
         Ok(_) => {
             debug!(?format, "remote requested an unsupported clipboard format");
             OwnedFormatDataResponse::new_error()
@@ -3495,6 +3709,30 @@ fn read_local_data(
             OwnedFormatDataResponse::new_error()
         }
     }
+}
+
+/// Serves one of [`file_fallback_formats`] for the file list currently on the clipboard.
+/// Error strings name the failure only, never a path or content.
+fn read_file_fallback_data(
+    paths: &[PathBuf],
+    format: ClipboardFormatId,
+    max_image_bytes: usize,
+) -> Result<OwnedFormatDataResponse, String> {
+    if format == ClipboardFormatId::CF_UNICODETEXT {
+        let names = file_names_text(paths)
+            .ok_or_else(|| "copied files have no names to offer as text".to_string())?;
+        return Ok(OwnedFormatDataResponse::new_unicode_string(&names));
+    }
+    if format != ClipboardFormatId::CF_DIB && format != PNG_FORMAT_ID {
+        return Err("format is not offered for copied files".to_string());
+    }
+    let path = single_png_file(paths, max_image_bytes)
+        .ok_or_else(|| "copied files are no longer a single PNG within limits".to_string())?;
+    if format == PNG_FORMAT_ID {
+        return read_png_file(path, max_image_bytes).map(OwnedFormatDataResponse::new_data);
+    }
+    let (width, height, rgba) = decode_png_file(path, max_image_bytes)?;
+    encode_dib(width, height, &rgba, max_image_bytes).map(OwnedFormatDataResponse::new_data)
 }
 
 fn apply_remote_data(
@@ -5841,5 +6079,263 @@ mod tests {
         assert!(!backend.temporary_directory().is_empty());
         let debug = format!("{backend:?}");
         assert!(!debug.contains(backend.temporary_directory()));
+    }
+
+    /// Runs [`choose_local_content`] over fixed reader results, recording which readers ran.
+    fn choose_from(
+        files: Option<Vec<PathBuf>>,
+        image: Option<(usize, usize, Vec<u8>)>,
+        text: Option<&str>,
+    ) -> (Result<ClipboardContent, String>, Vec<&'static str>) {
+        let mut calls = Vec::new();
+        let result = choose_local_content(
+            &mut calls,
+            |calls| {
+                calls.push("files");
+                Ok(files)
+            },
+            |calls| {
+                calls.push("text");
+                Ok(text.map(str::to_string))
+            },
+            |calls| {
+                calls.push("image");
+                image
+                    .map(|(width, height, rgba)| image_content(width, height, rgba))
+                    .transpose()
+            },
+        );
+        (result, calls)
+    }
+
+    #[test]
+    fn local_content_prefers_files_then_text_then_image() {
+        // Finder's shape: the file URL, its name as text, and its icon as an image.
+        let finder_file = PathBuf::from("photo.png");
+        let (content, calls) = choose_from(
+            Some(vec![finder_file.clone()]),
+            Some(test_image()),
+            Some("photo.png"),
+        );
+        assert_eq!(content, Ok(ClipboardContent::Files(vec![finder_file])));
+        assert_eq!(calls, vec!["files"], "no later reader runs once files win");
+
+        let (width, height, rgba) = test_image();
+        let (content, _) = choose_from(Some(Vec::new()), Some(test_image()), None);
+        assert_eq!(
+            content,
+            Ok(ClipboardContent::Image {
+                width,
+                height,
+                rgba
+            })
+        );
+
+        let (content, calls) = choose_from(None, None, Some("hello"));
+        assert_eq!(content, Ok(ClipboardContent::Text("hello".to_string())));
+        assert_eq!(calls, vec!["files", "text"]);
+
+        // Office apps and browsers put a rendered picture beside copied text.
+        let (content, _) = choose_from(None, Some(test_image()), Some("cells"));
+        assert_eq!(content, Ok(ClipboardContent::Text("cells".to_string())));
+
+        let (content, _) = choose_from(None, None, None);
+        assert!(
+            content.is_err(),
+            "an empty clipboard is still a read failure"
+        );
+    }
+
+    /// A 3x2 RGBA image whose every channel of every pixel differs, so a row flip, a column
+    /// flip, or an R/B swap all change the decoded bytes.
+    fn distinct_rgba_3x2() -> (usize, usize, Vec<u8>) {
+        let rgba = (0u8..24).map(|value| value * 10 + 5).collect();
+        (3, 2, rgba)
+    }
+
+    fn write_png(path: &Path, width: usize, height: usize, rgba: &[u8]) {
+        let file = File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(file, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(rgba).unwrap();
+    }
+
+    fn snapshot_format_ids(snapshot: &LocalClipboardSnapshot) -> Vec<ClipboardFormatId> {
+        snapshot.formats.iter().map(ClipboardFormat::id).collect()
+    }
+
+    #[test]
+    fn a_copied_png_file_offers_its_picture_and_name_after_the_file_list() {
+        let root = test_path("png-snapshot");
+        fs::create_dir_all(&root).unwrap();
+        let picture = root.join("Photo.PNG");
+        let (width, height, rgba) = distinct_rgba_3x2();
+        write_png(&picture, width, height, &rgba);
+        let note = root.join("note.txt");
+        fs::write(&note, b"not a picture").unwrap();
+
+        let (state, mut os) = fake_clipboard();
+        state.lock().unwrap().files = Some(vec![picture]);
+        let snapshot = read_local_snapshot(&mut *os, MAX_IMAGE_BYTES).unwrap();
+        assert!(snapshot.files.is_some(), "the file list is still announced");
+        assert!(snapshot.file_error.is_none());
+        assert_eq!(
+            snapshot_format_ids(&snapshot),
+            vec![
+                ClipboardFormatId::CF_DIB,
+                PNG_FORMAT_ID,
+                ClipboardFormatId::CF_UNICODETEXT
+            ]
+        );
+        assert_eq!(
+            snapshot.formats[1].name().map(|name| name.value()),
+            Some(PNG_FORMAT_NAME)
+        );
+
+        state.lock().unwrap().files = Some(vec![note]);
+        let snapshot = read_local_snapshot(&mut *os, MAX_IMAGE_BYTES).unwrap();
+        assert!(snapshot.files.is_some());
+        assert_eq!(
+            snapshot_format_ids(&snapshot),
+            vec![ClipboardFormatId::CF_UNICODETEXT]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_copied_png_file_serves_exact_pixels_bytes_and_name() {
+        let root = test_path("png-serve");
+        fs::create_dir_all(&root).unwrap();
+        let picture = root.join("photo.png");
+        let (width, height, rgba) = distinct_rgba_3x2();
+        write_png(&picture, width, height, &rgba);
+        let (state, mut os) = fake_clipboard();
+        state.lock().unwrap().files = Some(vec![picture.clone()]);
+
+        let dib = read_local_data(&mut *os, ClipboardFormatId::CF_DIB, MAX_IMAGE_BYTES);
+        assert!(!dib.is_error());
+        assert_eq!(
+            decode_dib(dib.data(), MAX_IMAGE_BYTES).unwrap(),
+            (width, height, rgba)
+        );
+
+        let png_bytes = read_local_data(&mut *os, PNG_FORMAT_ID, MAX_IMAGE_BYTES);
+        assert!(!png_bytes.is_error());
+        assert_eq!(png_bytes.data(), fs::read(&picture).unwrap().as_slice());
+
+        let name = read_local_data(&mut *os, ClipboardFormatId::CF_UNICODETEXT, MAX_IMAGE_BYTES);
+        assert!(!name.is_error());
+        assert_eq!(decode_utf16le_text(name.data()), "photo.png");
+
+        // A tighter policy ceiling refuses the picture rather than exceeding it.
+        let capped = read_local_data(&mut *os, ClipboardFormatId::CF_DIB, 64);
+        assert!(capped.is_error());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn announced_formats(msgs: Vec<CliprdrSvcMessages<Client>>) -> Vec<ClipboardFormat> {
+        let mut svc_messages: Vec<SvcMessage> = Vec::new();
+        for group in msgs {
+            svc_messages.extend(Vec::<SvcMessage>::from(group));
+        }
+        assert_eq!(svc_messages.len(), 1, "expected exactly one wire PDU");
+        let bytes = svc_messages[0]
+            .encode_unframed_pdu()
+            .expect("encode wire PDU");
+        let mut cursor = ReadCursor::new(&bytes);
+        match ClipboardPdu::decode(&mut cursor).expect("decode wire PDU") {
+            ClipboardPdu::FormatList(list) => list
+                .get_formats(true)
+                .expect("decode advertised format list"),
+            other => panic!("unexpected pdu variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_png_file_is_offered_as_a_picture_when_the_peer_cannot_stream_files() {
+        let root = test_path("png-no-streaming");
+        fs::create_dir_all(&root).unwrap();
+        let picture = root.join("photo.png");
+        let (width, height, rgba) = distinct_rgba_3x2();
+        write_png(&picture, width, height, &rgba);
+
+        let (state, os) = fake_clipboard();
+        state.lock().unwrap().files = Some(vec![picture.clone()]);
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        backend_mut(&mut cliprdr)
+            .on_process_negotiated_capabilities(ClipboardGeneralCapabilityFlags::empty());
+        bridge.pump(&mut cliprdr);
+        backend_mut(&mut cliprdr).on_request_format_list();
+        let formats = announced_formats(bridge.pump(&mut cliprdr));
+        let ids: Vec<_> = formats.iter().map(ClipboardFormat::id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ClipboardFormatId::CF_DIB,
+                PNG_FORMAT_ID,
+                ClipboardFormatId::CF_UNICODETEXT
+            ]
+        );
+        assert_eq!(
+            formats[1].name().map(|name| name.value()),
+            Some(PNG_FORMAT_NAME)
+        );
+
+        // The peer asks by the id we announced; the bridge serves the file's bytes.
+        backend_mut(&mut cliprdr).on_format_data_request(FormatDataRequest {
+            format: PNG_FORMAT_ID,
+        });
+        match only_pdu(bridge.pump(&mut cliprdr)) {
+            ClipboardPdu::FormatDataResponse(response) => {
+                assert!(!response.is_error());
+                assert_eq!(response.data(), fs::read(&picture).unwrap().as_slice());
+            }
+            other => panic!("unexpected pdu variant: {other:?}"),
+        }
+        drop(cliprdr);
+        drop(bridge);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_oversized_file_list_falls_back_to_its_name_and_still_warns() {
+        let root = test_path("oversized-fallback");
+        fs::create_dir_all(&root).unwrap();
+        let oversized = root.join("oversized.bin");
+        File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_FILE_TOTAL_BYTES + 1)
+            .unwrap();
+
+        let (state, os) = fake_clipboard();
+        state.lock().unwrap().files = Some(vec![oversized]);
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        backend_mut(&mut cliprdr).on_request_format_list();
+        assert_eq!(
+            only_format_ids(bridge.pump(&mut cliprdr)),
+            vec![ClipboardFormatId::CF_UNICODETEXT]
+        );
+        assert!(
+            bridge.take_file_limit_notification(),
+            "the user still learns the files were too large"
+        );
+
+        backend_mut(&mut cliprdr).on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        match only_pdu(bridge.pump(&mut cliprdr)) {
+            ClipboardPdu::FormatDataResponse(response) => {
+                assert_eq!(decode_utf16le_text(response.data()), "oversized.bin");
+            }
+            other => panic!("unexpected pdu variant: {other:?}"),
+        }
+        drop(cliprdr);
+        drop(bridge);
+        let _ = fs::remove_dir_all(root);
     }
 }
