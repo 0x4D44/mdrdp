@@ -111,6 +111,8 @@ harness = false
 # the disease (measured 2026-08-19, MDR-BUG-FLUX-00016).
 
 [patch.crates-io]
+# See vendor/README.md — a file copy can announce extra formats beside the file list.
+ironrdp-cliprdr = { path = "vendor/ironrdp-cliprdr" }
 # See vendor/README.md — one flag, without which EGFX never opens.
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 # ResetGraphics resizes the output buffer; it does not destroy offscreen surfaces.

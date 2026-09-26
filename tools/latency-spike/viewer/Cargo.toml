@@ -43,6 +43,7 @@ debug = 1
 # exactly the confound the spike exists to avoid. So the table is repeated verbatim
 # with the paths rebased.
 [patch.crates-io]
+ironrdp-cliprdr = { path = "../../../vendor/ironrdp-cliprdr" }
 ironrdp-connector = { path = "../../../vendor/ironrdp-connector" }
 ironrdp-egfx = { path = "../../../vendor/ironrdp-egfx" }
 ironrdp-graphics = { path = "../../../vendor/ironrdp-graphics" }
