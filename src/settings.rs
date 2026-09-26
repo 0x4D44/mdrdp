@@ -117,6 +117,8 @@ pub struct KeyboardSettings {
 #[serde(default)]
 pub struct AudioSettings {
     pub playback: bool,
+    /// Offer the default local input device after the RDP host sends OPEN.
+    pub microphone: bool,
     pub device: String,
 }
 
@@ -124,6 +126,7 @@ impl Default for AudioSettings {
     fn default() -> Self {
         AudioSettings {
             playback: true,
+            microphone: false,
             device: "default".to_owned(),
         }
     }
@@ -303,6 +306,7 @@ mod tests {
         assert!(s.graphics.integer_fullscreen_fit);
         assert!(!s.keyboard.mac_keyboard_mode);
         assert!(s.audio.playback);
+        assert!(!s.audio.microphone);
         assert_eq!(s.audio.device, "default");
         assert_eq!(s.clipboard.direction, ClipboardDirection::Both);
         assert_eq!(s.clipboard.max_image_bytes, 64 * 1024 * 1024);
@@ -336,6 +340,7 @@ mac_keyboard_mode = false
 [audio]
 playback = true
 device = "default"
+microphone = false
 
 [clipboard]
 direction = "both"
@@ -351,6 +356,18 @@ stage_log = "stages"
         assert_eq!(s.defaults.username.as_deref(), Some("alice"));
         assert_eq!(s.clipboard.max_image_bytes, 1_048_576);
         assert_eq!(s.diagnostics.metrics_dir, "~/mdrdp/runs");
+    }
+
+    #[test]
+    fn microphone_preference_round_trips_and_defaults_off() {
+        let configured: Settings =
+            toml::from_str("[audio]\nplayback = true\ndevice = \"default\"\nmicrophone = true\n")
+                .expect("settings parse");
+        let saved = toml::to_string(&configured).expect("settings serialize");
+        assert!(saved.contains("microphone = true"));
+
+        let defaults = toml::to_string(&Settings::default()).expect("defaults serialize");
+        assert!(defaults.contains("microphone = false"));
     }
 
     #[test]
@@ -370,6 +387,7 @@ stage_log = "stages"
         s.graphics.integer_fullscreen_fit = false;
         s.keyboard.mac_keyboard_mode = true;
         s.audio.playback = false;
+        s.audio.microphone = true;
         s.audio.device = "USB Audio".to_owned();
         s.clipboard.direction = ClipboardDirection::ToRemote;
         s.clipboard.max_image_bytes = 2_097_152;

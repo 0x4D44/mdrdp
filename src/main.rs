@@ -1189,6 +1189,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Register AUDIO_INPUT only when the opt-in is on and this session uses ordinary
+    // RDP. The worker does not open the input device until the host sends OPEN.
+    let (microphone_listener, microphone_service) = if !is_native && settings.audio.microphone {
+        match mdrdp::microphone::create(session_bell.clone()) {
+            Ok((listener, service)) => {
+                eprintln!("microphone: offered to the host; capture waits for its OPEN request");
+                (Some(listener), Some(service))
+            }
+            Err(error) => {
+                eprintln!("microphone: could not start capture worker: {error}");
+                (None, None)
+            }
+        }
+    } else {
+        if is_native && settings.audio.microphone {
+            eprintln!("microphone: available on RDP sessions, not the native transport");
+        }
+        (None, None)
+    };
+
     // The clipboard bridge stays out here (the session loop drives it); the backend
     // goes into the RDP connection below.
     let (clipboard_backend, clipboard_bridge) = match clipboard {
@@ -1323,6 +1343,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 rdpsnd,
                 // Lets the fullscreen toggle renegotiate the session resolution.
                 display_control: true,
+                microphone: microphone_listener,
             },
         ) {
             Ok(e) => Connected::Rdp(Box::new(e)),
@@ -1773,6 +1794,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 clipboard: clipboard_enabled.then_some(clipboard_bridge).flatten(),
                 stats: session_stats.clone(),
                 gfx: Some(gfx_stats.clone()),
+                microphone: microphone_service,
             },
             session_bell,
             session_wake_rx,

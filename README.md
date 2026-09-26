@@ -125,20 +125,21 @@ leave a plausible-looking partial report.
 
 - Connect over NLA/CredSSP with trust-on-first-use certificate pinning
 - EGFX graphics — ClearCodec and RFX Progressive, keyboard, mouse and scroll
-- Favourites launcher with a graphical New connection form and secure password storage
+- Opt-in Mac keyboard mode for layout-resolved text and IME commits (live layout check pending)
+- Favourites launcher with graphical add, edit, and remove flows and secure password storage
 - Borderless fullscreen and automatic remote resolution adjustment after docking,
   undocking, or moving between displays (with Dynamic resolution enabled)
 - Clipboard Unicode text, empty content, and bounded CF_DIB images in both directions,
   with explicit timeouts so one failed transfer cannot wedge later transfers
 - Clipboard file and folder copy in both directions, with a 512 MiB total transfer limit
 - Audio playback (PCM 16-bit, 44.1/48kHz, mono or stereo)
+- Opt-in microphone redirection over `AUDIO_INPUT` (live capture check pending)
 - Window geometry restored after a monitor sleeps or the screen locks
 - Graceful disconnect — abandoning the socket leaves a live session on the host
 
 ## What does not work yet
 
-- No drive redirection, multi-monitor, RemoteApp/RAIL, smart-card, or microphone.
-- Saved connections can be added in the launcher, but there is no edit/remove UI yet.
+- No drive redirection, multi-monitor, RemoteApp/RAIL, or smart-card redirection.
 
 ## Honest status
 

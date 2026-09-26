@@ -19,6 +19,7 @@ use crate::connect::{
 };
 use crate::disconnect::{self, ServerFarewell};
 use crate::input::{InputEvent, LatestMouseMove, encode_fastpath_input, to_fastpath};
+use crate::microphone::{MicrophoneDvc, MicrophonePump};
 use crate::stats::{CacheStats, StatsHandle};
 use crate::surface::SurfaceStore;
 use crate::wake::{self, Doorbell, DoorbellReceiver};
@@ -43,6 +44,8 @@ const READ_SLICE: Duration = Duration::from_millis(5);
 /// Fast-path's event count is one byte. Limiting one pump turn to one valid PDU also
 /// prevents a producer that stays ahead of the wire from starving inbound processing.
 const FASTPATH_INPUT_BATCH_MAX: usize = 255;
+/// Limit audio work per turn so capture cannot keep input and inbound PDUs waiting.
+const MICROPHONE_BATCH_MAX: usize = 2;
 
 /// How long the idle sleep lasts when neither the socket nor the doorbell fires.
 ///
@@ -76,6 +79,8 @@ pub struct SessionServices {
     /// EGFX handler, which is moved into the connector and unreachable afterwards, so
     /// nothing was ever copying them across and the overlay silently reported zero.
     pub gfx: Option<crate::gfx::GfxStatsHandle>,
+    /// None unless the user enabled microphone capture for this RDP session.
+    pub microphone: Option<MicrophonePump>,
 }
 
 /// A request the window can make of the running session.
@@ -245,6 +250,10 @@ fn run(
         &wake_rx,
     );
 
+    if let Some(microphone) = &services.microphone {
+        microphone.shutdown();
+    }
+
     // No later window event may keep replacing the physical position after the session
     // has stopped draining it. This mirrors the native input thread's close-before-exit.
     latest_mouse_move.close();
@@ -345,6 +354,14 @@ fn pump(
             Err(e) => return SessionEnd::Failed(e),
         };
 
+        // Capture output follows user input in priority and is capped per turn. If a
+        // backlog remains, the zero-duration wait below gives it another bounded turn.
+        let microphone_batch_full =
+            match service_microphone(established, services, &mut turn_deadline) {
+                Ok(batch_full) => batch_full,
+                Err(e) => return SessionEnd::Failed(e),
+            };
+
         // --- outbound: session commands ---------------------------------------
         // Only the newest of each kind matters: a user who toggled fullscreen twice
         // while the channel was still opening wants where they ended up, not the
@@ -414,7 +431,9 @@ fn pump(
             let ready = match wake::wait_readable(
                 &established.socket,
                 wake_rx,
-                readiness_wait_after_work(input_batch_full || clipboard_batch_full),
+                readiness_wait_after_work(
+                    input_batch_full || clipboard_batch_full || microphone_batch_full,
+                ),
             ) {
                 Ok(ready) => ready,
                 Err(e) => return SessionEnd::Failed(ConnectError::Io(e)),
@@ -634,6 +653,67 @@ fn service_clipboard(
         });
     }
     Ok(batch_full)
+}
+
+/// Send a small number of capture batches each turn, after user input and before the
+/// inbound wait. A bounded batch keeps microphone traffic from delaying desktop work.
+fn service_microphone(
+    established: &mut Established,
+    services: &SessionServices,
+    turn_deadline: &mut Option<Instant>,
+) -> Result<bool, ConnectError> {
+    let Some(microphone) = services.microphone.as_ref() else {
+        return Ok(false);
+    };
+    let mut open_timeout = None;
+    let active = established
+        .stage
+        .get_dvc::<MicrophoneDvc>()
+        .and_then(|dvc| {
+            let channel_id = dvc.channel_id()?;
+            let processor = dvc.channel_processor_downcast_ref::<MicrophoneDvc>()?;
+            open_timeout = processor.expire_open_reply(Instant::now());
+            Some((channel_id, processor.generation()))
+        });
+
+    let mut processed = 0;
+    if let Some(message) = open_timeout {
+        processed += 1;
+        if active == Some((message.channel_id, message.generation)) {
+            write_microphone_message(established, message, turn_deadline)?;
+        }
+    }
+    while processed < MICROPHONE_BATCH_MAX {
+        let Some(message) = microphone.try_recv() else {
+            break;
+        };
+        processed += 1;
+        if active != Some((message.channel_id, message.generation)) {
+            continue;
+        }
+
+        write_microphone_message(established, message, turn_deadline)?;
+    }
+    Ok(processed == MICROPHONE_BATCH_MAX)
+}
+
+fn write_microphone_message(
+    established: &mut Established,
+    message: crate::microphone::MicOutbound,
+    turn_deadline: &mut Option<Instant>,
+) -> Result<(), ConnectError> {
+    let svc_messages = crate::microphone::encode_dvc_messages(message.channel_id, message.pdus)
+        .map_err(|e| ConnectError::Protocol(describe(&e)))?;
+    let frame = established
+        .stage
+        .encode_dvc_messages(svc_messages)
+        .map_err(|e| ConnectError::Protocol(describe(&e)))?;
+    write_framed(
+        &mut established.framed,
+        &frame,
+        write_deadline(turn_deadline),
+    )
+    .map_err(ConnectError::Io)
 }
 
 /// Nudge the window only when something actually changed.

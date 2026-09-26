@@ -24,6 +24,7 @@ pub mod hostscripts;
 pub mod input;
 pub mod logging;
 pub mod metrics;
+pub mod microphone;
 pub mod native;
 pub mod presence;
 pub mod present;

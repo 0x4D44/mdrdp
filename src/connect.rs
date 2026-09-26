@@ -11,6 +11,7 @@
 use crate::audio::DynamicRdpsndListener;
 use crate::creds::Secret;
 use crate::egfx::{EgfxObservations, EgfxProbe};
+use crate::microphone::MicrophoneListener;
 use crate::stagelog::{StageEvent, StageLog};
 use crate::trust::{Fingerprint, KnownHosts, TofuVerifier, TrustOutcome};
 use ironrdp::connector::{ClientConnector, Config, Credentials, DesktopSize};
@@ -611,6 +612,8 @@ pub struct Channels {
     /// server for a new resolution mid-session. Off by default so the probe paths keep
     /// measuring the channel set they always measured.
     pub display_control: bool,
+    /// Offer microphone capture over the AUDIO_INPUT dynamic channel.
+    pub microphone: Option<MicrophoneListener>,
 }
 
 /// Two handlers backed by the same playback ring, one per RDPSND transport.
@@ -661,6 +664,7 @@ pub fn establish(
         cliprdr,
         rdpsnd,
         display_control,
+        microphone,
     } = channels;
     // Read before `rdpsnd` is moved into the channel set below.
     //
@@ -767,6 +771,11 @@ pub fn establish(
         drdynvc.attach_dynamic_channel(ironrdp::displaycontrol::client::DisplayControlClient::new(
             |_caps| Ok(Vec::new()),
         ));
+        has_dynamic_channel = true;
+    }
+
+    if let Some(listener) = microphone {
+        drdynvc.attach_listener(listener);
         has_dynamic_channel = true;
     }
 

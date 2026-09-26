@@ -533,6 +533,12 @@ impl SettingsModal {
 
     fn audio_pane(&mut self, ui: &mut Ui) {
         toggle_row(ui, &mut self.working.audio.playback, "Playback", None);
+        toggle_row(
+            ui,
+            &mut self.working.audio.microphone,
+            "Microphone",
+            Some("When enabled, the remote host can request local microphone audio"),
+        );
         row(ui, "Output device", INPUT_H, |ui| {
             segmented(
                 ui,
@@ -1183,6 +1189,7 @@ mod tests {
         s.graphics.dynamic_resolution = false;
         s.keyboard.mac_keyboard_mode = true;
         s.audio.playback = false;
+        s.audio.microphone = true;
         s.audio.device = "USB Audio".to_owned();
         s.clipboard.direction = ClipboardDirection::ToRemote;
         s.clipboard.max_image_bytes = 2 * 1024 * 1024;
@@ -1210,6 +1217,7 @@ mod tests {
         m.working.graphics = target.graphics.clone();
         m.working.keyboard = target.keyboard.clone();
         m.working.audio.playback = target.audio.playback;
+        m.working.audio.microphone = target.audio.microphone;
         m.working.clipboard.direction = target.clipboard.direction;
         m.working.diagnostics.overlay_on_connect = target.diagnostics.overlay_on_connect;
         m.working.diagnostics.stage_log = target.diagnostics.stage_log;
