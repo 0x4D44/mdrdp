@@ -1420,7 +1420,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_fullscreen(fullscreen)
         .with_overlay_on_start(settings.diagnostics.overlay_on_connect)
         .with_dynamic_resolution(settings.graphics.dynamic_resolution)
-        .with_integer_fullscreen_fit(settings.graphics.integer_fullscreen_fit);
+        .with_integer_fullscreen_fit(settings.graphics.integer_fullscreen_fit)
+        .with_mac_keyboard_mode(
+            matches!(&connected, Connected::Rdp(_)) && settings.keyboard.mac_keyboard_mode,
+        );
     if explicit_size {
         // Flags always win: --size names the session resolution, fullscreen or not.
         window_config = window_config.keeping_stated_resolution();

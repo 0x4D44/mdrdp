@@ -23,7 +23,7 @@ use ironrdp::pdu::input::mouse_x::PointerXFlags;
 use ironrdp::pdu::input::{MousePdu, MouseXPdu};
 use std::sync::Mutex;
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
 /// One wheel notch, in the units MS-RDPBCGR 2.2.8.1.1.3.1.1.3 counts.
 pub const WHEEL_UNITS_PER_NOTCH: i32 = 120;
@@ -96,6 +96,10 @@ pub enum ScrollAxis {
 pub enum InputEvent {
     Key {
         scancode: Scancode,
+        down: bool,
+    },
+    Unicode {
+        unit: u16,
         down: bool,
     },
     MouseMove {
@@ -390,6 +394,114 @@ pub fn from_key_event(event: &KeyEvent) -> Option<InputEvent> {
     })
 }
 
+/// Translate a key event for a session with Mac keyboard mode enabled.
+///
+/// The existing [`from_key_event`] function deliberately stays positional and is used
+/// by the default path. This companion returns a small vector because one physical key
+/// can produce several UTF-16 units, and an IME commit can be consumed by a caller in
+/// the same way as an ordinary key event. The ledger owns the representation selected
+/// by the press so a later release cannot accidentally change from Unicode to a
+/// scancode when modifiers have changed in the meantime.
+pub fn from_mac_key_event(
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    ime_composing: bool,
+    synthetic: bool,
+    ledger: &mut KeyLedger,
+) -> Vec<InputEvent> {
+    let PhysicalKey::Code(code) = event.physical_key else {
+        return Vec::new();
+    };
+    #[cfg(target_os = "macos")]
+    let scancode = if code == KeyCode::Backquote {
+        macos_backquote_scancode(event)
+    } else {
+        let Some(scancode) = scancode_for(code) else {
+            return Vec::new();
+        };
+        scancode
+    };
+    #[cfg(not(target_os = "macos"))]
+    let Some(scancode) = scancode_for(code) else {
+        return Vec::new();
+    };
+
+    mac_key_events_for_text(
+        scancode,
+        event.text.as_deref(),
+        event.state == ElementState::Pressed,
+        modifiers,
+        ime_composing,
+        synthetic,
+        ledger,
+    )
+}
+
+/// Translate a physical key with its layout-resolved text in Mac keyboard mode.
+///
+/// This lower-level form keeps the Mac mode decision testable without manufacturing a
+/// platform-private winit [`KeyEvent`]. Printable text uses Unicode when no shortcut
+/// modifier is held and an IME composition does not own the text. Control characters
+/// such as Enter and Tab therefore remain scancodes even when winit supplies them
+/// through `KeyEvent::text`.
+pub fn mac_key_events_for_text(
+    scancode: Scancode,
+    text: Option<&str>,
+    down: bool,
+    modifiers: ModifiersState,
+    ime_composing: bool,
+    synthetic: bool,
+    ledger: &mut KeyLedger,
+) -> Vec<InputEvent> {
+    if down {
+        if synthetic {
+            return Vec::new();
+        }
+
+        let representation = ledger.held.get(&scancode).cloned().unwrap_or_else(|| {
+            if !ime_composing
+                && !modifiers.control_key()
+                && !modifiers.super_key()
+                && !modifiers.alt_key()
+                && let Some(units) = printable_utf16_units(text)
+            {
+                HeldKey::Unicode(units)
+            } else {
+                HeldKey::Scancode
+            }
+        });
+        ledger.held.insert(scancode, representation.clone());
+        return representation.press_events(scancode);
+    }
+
+    let Some(representation) = ledger.held.remove(&scancode) else {
+        return Vec::new();
+    };
+    representation.release_events(scancode)
+}
+
+/// Turn committed text into balanced Unicode events. IME commits are already complete
+/// text, so there is no physical key release to wait for; each UTF-16 unit gets its own
+/// press/release pair.
+pub fn unicode_commit_events(text: &str) -> Vec<InputEvent> {
+    text.encode_utf16()
+        .flat_map(|unit| {
+            [
+                InputEvent::Unicode { unit, down: true },
+                InputEvent::Unicode { unit, down: false },
+            ]
+        })
+        .collect()
+}
+
+fn printable_utf16_units(text: Option<&str>) -> Option<Vec<u16>> {
+    let text = text?;
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return None;
+    }
+    Some(text.encode_utf16().collect())
+}
+
 /// Recover the ISO 102nd key that winit's macOS backend loses.
 ///
 /// winit 0.30 maps both macOS corner keycodes — `kVK_ISO_Section` (0x0A) and
@@ -509,7 +621,42 @@ pub fn from_cursor_moved<M: PointerMap + ?Sized>(x: f64, y: f64, map: &M) -> Opt
 /// "is the key actually held" answers both without caring which platform sent what.
 #[derive(Debug, Default)]
 pub struct KeyLedger {
-    held: std::collections::HashSet<Scancode>,
+    held: std::collections::HashMap<Scancode, HeldKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeldKey {
+    Scancode,
+    Unicode(Vec<u16>),
+}
+
+impl HeldKey {
+    fn press_events(&self, scancode: Scancode) -> Vec<InputEvent> {
+        match self {
+            HeldKey::Scancode => vec![InputEvent::Key {
+                scancode,
+                down: true,
+            }],
+            HeldKey::Unicode(units) => units
+                .iter()
+                .copied()
+                .map(|unit| InputEvent::Unicode { unit, down: true })
+                .collect(),
+        }
+    }
+
+    fn release_events(self, scancode: Scancode) -> Vec<InputEvent> {
+        match self {
+            HeldKey::Scancode => vec![InputEvent::Key {
+                scancode,
+                down: false,
+            }],
+            HeldKey::Unicode(units) => units
+                .into_iter()
+                .map(|unit| InputEvent::Unicode { unit, down: false })
+                .collect(),
+        }
+    }
 }
 
 impl KeyLedger {
@@ -529,10 +676,10 @@ impl KeyLedger {
             if synthetic {
                 return false;
             }
-            self.held.insert(scancode);
+            self.held.insert(scancode, HeldKey::Scancode);
             true
         } else {
-            self.held.remove(&scancode)
+            self.held.remove(&scancode).is_some()
         }
     }
 
@@ -540,10 +687,7 @@ impl KeyLedger {
     pub fn release_all(&mut self) -> Vec<InputEvent> {
         self.held
             .drain()
-            .map(|scancode| InputEvent::Key {
-                scancode,
-                down: false,
-            })
+            .flat_map(|(scancode, representation)| representation.release_events(scancode))
             .collect()
     }
 }
@@ -695,6 +839,14 @@ pub fn to_fastpath(event: InputEvent) -> FastPathInputEvent {
                 flags |= KeyboardFlags::EXTENDED;
             }
             FastPathInputEvent::KeyboardEvent(flags, scancode.code)
+        }
+        InputEvent::Unicode { unit, down } => {
+            let flags = if down {
+                KeyboardFlags::empty()
+            } else {
+                KeyboardFlags::RELEASE
+            };
+            FastPathInputEvent::UnicodeKeyboardEvent(flags, unit)
         }
         InputEvent::MouseMove { x, y } => FastPathInputEvent::MouseEvent(MousePdu {
             flags: PointerFlags::MOVE,
@@ -1187,6 +1339,208 @@ mod tests {
         assert_eq!(
             up,
             FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 0x1E)
+        );
+    }
+
+    #[test]
+    fn mac_keyboard_mode_emits_unicode_and_pairs_the_release_with_the_press() {
+        let mut keys = KeyLedger::new();
+        let down = mac_key_events_for_text(
+            Scancode::plain(0x1e),
+            Some("é"),
+            true,
+            winit::keyboard::ModifiersState::empty(),
+            false,
+            false,
+            &mut keys,
+        );
+        assert_eq!(
+            down,
+            vec![InputEvent::Unicode {
+                unit: 'é' as u16,
+                down: true
+            }]
+        );
+
+        let up = mac_key_events_for_text(
+            Scancode::plain(0x1e),
+            None,
+            false,
+            winit::keyboard::ModifiersState::empty(),
+            false,
+            false,
+            &mut keys,
+        );
+        assert_eq!(
+            up,
+            vec![InputEvent::Unicode {
+                unit: 'é' as u16,
+                down: false
+            }]
+        );
+    }
+
+    #[test]
+    fn mac_keyboard_mode_keeps_shortcuts_and_non_printing_keys_as_scancodes() {
+        let mut keys = KeyLedger::new();
+        let mut command = winit::keyboard::ModifiersState::empty();
+        command.insert(winit::keyboard::ModifiersState::from_bits_retain(
+            0b100 << 9,
+        ));
+        assert_eq!(
+            mac_key_events_for_text(
+                Scancode::plain(0x2e),
+                Some("c"),
+                true,
+                command,
+                false,
+                false,
+                &mut keys,
+            ),
+            vec![InputEvent::Key {
+                scancode: Scancode::plain(0x2e),
+                down: true,
+            }]
+        );
+
+        let mut keys = KeyLedger::new();
+        assert_eq!(
+            mac_key_events_for_text(
+                Scancode::plain(0x1c),
+                Some("\r"),
+                true,
+                winit::keyboard::ModifiersState::empty(),
+                false,
+                false,
+                &mut keys,
+            ),
+            vec![InputEvent::Key {
+                scancode: Scancode::plain(0x1c),
+                down: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn ime_commit_emits_one_balanced_unicode_pair_per_utf16_unit() {
+        assert_eq!(
+            unicode_commit_events("A😀"),
+            vec![
+                InputEvent::Unicode {
+                    unit: 'A' as u16,
+                    down: true,
+                },
+                InputEvent::Unicode {
+                    unit: 'A' as u16,
+                    down: false,
+                },
+                InputEvent::Unicode {
+                    unit: 0xD83D,
+                    down: true,
+                },
+                InputEvent::Unicode {
+                    unit: 0xD83D,
+                    down: false,
+                },
+                InputEvent::Unicode {
+                    unit: 0xDE00,
+                    down: true,
+                },
+                InputEvent::Unicode {
+                    unit: 0xDE00,
+                    down: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_active_ime_composition_suppresses_key_text_until_the_commit() {
+        let mut keys = KeyLedger::new();
+        assert_eq!(
+            mac_key_events_for_text(
+                Scancode::plain(0x12),
+                Some("e"),
+                true,
+                winit::keyboard::ModifiersState::empty(),
+                true,
+                false,
+                &mut keys,
+            ),
+            vec![InputEvent::Key {
+                scancode: Scancode::plain(0x12),
+                down: true,
+            }]
+        );
+        assert_eq!(
+            unicode_commit_events("é"),
+            vec![
+                InputEvent::Unicode {
+                    unit: 'é' as u16,
+                    down: true
+                },
+                InputEvent::Unicode {
+                    unit: 'é' as u16,
+                    down: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn focus_cleanup_releases_every_utf16_unit_from_a_unicode_key() {
+        let mut keys = KeyLedger::new();
+        assert_eq!(
+            mac_key_events_for_text(
+                Scancode::plain(0x1e),
+                Some("😀"),
+                true,
+                winit::keyboard::ModifiersState::empty(),
+                false,
+                false,
+                &mut keys,
+            ),
+            vec![
+                InputEvent::Unicode {
+                    unit: 0xD83D,
+                    down: true,
+                },
+                InputEvent::Unicode {
+                    unit: 0xDE00,
+                    down: true,
+                },
+            ]
+        );
+        assert_eq!(
+            keys.release_all(),
+            vec![
+                InputEvent::Unicode {
+                    unit: 0xD83D,
+                    down: false,
+                },
+                InputEvent::Unicode {
+                    unit: 0xDE00,
+                    down: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unicode_events_use_ironrdp_fast_path_unicode_input() {
+        assert_eq!(
+            round_trip(InputEvent::Unicode {
+                unit: 0x20AC,
+                down: true,
+            }),
+            FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::empty(), 0x20AC)
+        );
+        assert_eq!(
+            round_trip(InputEvent::Unicode {
+                unit: 0x20AC,
+                down: false,
+            }),
+            FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::RELEASE, 0x20AC)
         );
     }
 

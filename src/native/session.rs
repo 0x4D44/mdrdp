@@ -1692,6 +1692,13 @@ fn wire_records(event: &InputEvent, seq: &mut u32) -> Vec<Record> {
                 }
             }]
         }
+        InputEvent::Unicode { .. } => {
+            // Unicode events are deliberately confined to ordinary RDP windows. A
+            // native Rhydra peer only has the positional scan-record wire shape, so
+            // reject accidental cross-transport leakage instead of silently dropping
+            // a character or inventing a scancode.
+            panic!("Unicode input is unsupported by the native transport")
+        }
         InputEvent::MouseMove { x, y } => vec![Record::MouseMove { x, y, seq: next() }],
         InputEvent::MouseButton { button, down, x, y } => vec![
             Record::MouseMove { x, y, seq: next() },

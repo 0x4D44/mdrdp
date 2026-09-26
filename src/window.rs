@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::event::{Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CustomCursor, Fullscreen, Window, WindowAttributes, WindowId};
@@ -69,6 +69,9 @@ pub struct WindowConfig {
     /// division of native resolution (5K → 2560x1440 at 2x) instead of the fractional
     /// best fit (Settings ▸ Graphics). See [`crate::session::fullscreen_request`].
     pub integer_fullscreen_fit: bool,
+    /// Resolve printable keys through the local Mac layout and send Unicode fast-path
+    /// events. Navigation, editing and shortcut chords remain scancodes.
+    pub mac_keyboard_mode: bool,
     /// After a *user* resize of a windowed window settles, ask the session to match the
     /// new size, so the desktop renders 1:1 instead of scaling. Off when an explicit
     /// `--size` was given — a stated resolution is pinned, and dragging the window then
@@ -90,6 +93,7 @@ impl WindowConfig {
             overlay_on_start: false,
             dynamic_resolution: true,
             integer_fullscreen_fit: true,
+            mac_keyboard_mode: false,
             follow_window_resize: true,
             dock_label: None,
         }
@@ -117,6 +121,12 @@ impl WindowConfig {
     /// monitor past the H.264 encoder ceiling.
     pub fn with_integer_fullscreen_fit(mut self, on: bool) -> Self {
         self.integer_fullscreen_fit = on;
+        self
+    }
+
+    /// Enable the opt-in Mac-faithful printable-key path for this RDP window.
+    pub fn with_mac_keyboard_mode(mut self, on: bool) -> Self {
+        self.mac_keyboard_mode = on;
         self
     }
 
@@ -1341,6 +1351,9 @@ struct SessionApp {
     /// server never keeps a modifier the OS stole the release of. See
     /// [`input::KeyLedger`].
     keys: input::KeyLedger,
+    /// Whether winit currently owns a composing IME preedit. While true, printable
+    /// key text belongs to the later `Ime::Commit` event and must not be emitted twice.
+    ime_composing: bool,
     /// The coherent store state last copied and successfully put on screen.
     presented: Option<PresentationStamp>,
     failure: Option<WindowError>,
@@ -1467,6 +1480,7 @@ impl SessionApp {
             cursor: None,
             wheel: input::WheelAccumulator::new(),
             keys: input::KeyLedger::new(),
+            ime_composing: false,
             presented: None,
             failure: None,
             policy,
@@ -2461,7 +2475,7 @@ fn queue_input_event(
                 // older pending move so it cannot land after them.
                 moves.clear();
             }
-            InputEvent::Key { .. } => {}
+            InputEvent::Key { .. } | InputEvent::Unicode { .. } => {}
         }
     }
     input.send(event).is_ok()
@@ -2494,6 +2508,10 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                 return;
             }
         };
+        // IME is opt-in for an RDP window. It is what makes macOS deliver composed
+        // characters through `Ime::Commit`; the default positional path keeps winit's
+        // IME-disabled behavior byte-for-byte unchanged.
+        window.set_ime_allowed(self.config.mac_keyboard_mode);
 
         let presenter = match crate::present::Presenter::new(window.clone()) {
             Ok(p) => p,
@@ -2834,14 +2852,52 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
                     }
                     return;
                 }
-                // The ledger drops the synthetic presses the platform replays across a
-                // focus change (forwarding them double-presses keys) but keeps synthetic
-                // releases of keys we hold, and never sends a release the server has no
-                // press for.
-                if let Some(InputEvent::Key { scancode, down }) = input::from_key_event(&event)
+                if self.config.mac_keyboard_mode {
+                    // The Mac path remembers whether each physical key became a
+                    // Unicode or scancode event, so its release remains paired even if
+                    // the modifier state changed after the press.
+                    for translated in input::from_mac_key_event(
+                        &event,
+                        self.modifiers,
+                        self.ime_composing,
+                        is_synthetic,
+                        &mut self.keys,
+                    ) {
+                        self.send(event_loop, translated);
+                    }
+                } else if let Some(InputEvent::Key { scancode, down }) =
+                    input::from_key_event(&event)
                     && self.keys.on_key(scancode, down, is_synthetic)
                 {
+                    // The default path deliberately stays the existing positional
+                    // translation used by Windows App parity.
                     self.send(event_loop, InputEvent::Key { scancode, down });
+                }
+            }
+
+            WindowEvent::Ime(ime) => {
+                if !self.config.mac_keyboard_mode {
+                    return;
+                }
+                match ime {
+                    Ime::Enabled => {}
+                    Ime::Preedit(text, _) => {
+                        self.ime_composing = !text.is_empty();
+                    }
+                    Ime::Commit(text) => {
+                        // winit's IME contract suppresses KeyboardInput while marked
+                        // text is active. On macOS, `interpretKeyEvents` queues the
+                        // empty Preedit and this Commit before it marks the following
+                        // key as IME-owned, so this is the single owner of committed
+                        // characters; ordinary KeyEvent::text handles the ground state.
+                        self.ime_composing = false;
+                        for committed in input::unicode_commit_events(&text) {
+                            self.send(event_loop, committed);
+                        }
+                    }
+                    Ime::Disabled => {
+                        self.ime_composing = false;
+                    }
                 }
             }
 
@@ -2852,9 +2908,19 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             // forwarded down, exactly as mstsc does on deactivate.
             WindowEvent::Focused(focused) => {
                 if !focused {
+                    self.ime_composing = false;
+                    if self.config.mac_keyboard_mode
+                        && let Some(window) = &self.window
+                    {
+                        window.set_ime_allowed(false);
+                    }
                     for release in self.keys.release_all() {
                         self.send(event_loop, release);
                     }
+                } else if self.config.mac_keyboard_mode
+                    && let Some(window) = &self.window
+                {
+                    window.set_ime_allowed(true);
                 }
             }
 
@@ -3658,6 +3724,16 @@ mod tests {
         assert!(
             attributes.decorations,
             "existing windowed behavior stays unchanged"
+        );
+    }
+
+    #[test]
+    fn mac_keyboard_mode_is_opt_in_on_the_session_window_config() {
+        assert!(!WindowConfig::new("default", 1280, 800).mac_keyboard_mode);
+        assert!(
+            WindowConfig::new("mac", 1280, 800)
+                .with_mac_keyboard_mode(true)
+                .mac_keyboard_mode
         );
     }
 

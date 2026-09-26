@@ -1,6 +1,6 @@
 //! The Settings modal — screen 3 of the 2026-08-16 UI handoff.
 //!
-//! A 720×580 modal over the connections list, six panes down a 186px sidebar. Every
+//! A 720×580 modal over the connections list, seven panes down a 186px sidebar. Every
 //! visual value is the handoff README's ("3. Settings (modal over the list)" plus the
 //! shared-chrome specs), read through [`crate::ui::theme`] tokens.
 //!
@@ -59,11 +59,12 @@ pub enum SettingsOutcome {
     Saved(Settings),
 }
 
-/// The six sidebar panes, in sidebar order.
+/// The seven sidebar panes, in sidebar order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Defaults,
     Graphics,
+    Keyboard,
     Audio,
     Clipboard,
     Diagnostics,
@@ -71,9 +72,10 @@ pub enum Pane {
 }
 
 impl Pane {
-    pub const ALL: [Pane; 6] = [
+    pub const ALL: [Pane; 7] = [
         Pane::Defaults,
         Pane::Graphics,
+        Pane::Keyboard,
         Pane::Audio,
         Pane::Clipboard,
         Pane::Diagnostics,
@@ -84,6 +86,7 @@ impl Pane {
         match self {
             Pane::Defaults => "Defaults",
             Pane::Graphics => "Graphics",
+            Pane::Keyboard => "Keyboard",
             Pane::Audio => "Audio",
             Pane::Clipboard => "Clipboard",
             Pane::Diagnostics => "Diagnostics",
@@ -290,6 +293,7 @@ impl SettingsModal {
             .show(&mut pane_ui, |ui| match self.pane {
                 Pane::Defaults => self.defaults_pane(ui),
                 Pane::Graphics => self.graphics_pane(ui),
+                Pane::Keyboard => self.keyboard_pane(ui),
                 Pane::Audio => self.audio_pane(ui),
                 Pane::Clipboard => self.clipboard_pane(ui),
                 Pane::Diagnostics => self.diagnostics_pane(ui),
@@ -508,6 +512,22 @@ impl SettingsModal {
                 "Fullscreen past the H.264 ceiling uses half resolution at an exact \
                  2x instead of a fractional stretch",
             ),
+        );
+    }
+
+    fn keyboard_pane(&mut self, ui: &mut Ui) {
+        toggle_row(
+            ui,
+            &mut self.working.keyboard.mac_keyboard_mode,
+            "Mac keyboard mode",
+            Some(
+                "Printable keys use the Mac layout; shortcuts, navigation and editing keys \
+                 keep their positional behavior.",
+            ),
+        );
+        note(
+            ui,
+            "Changes apply to new sessions. The default keeps positional scancodes.",
         );
     }
 
@@ -1161,6 +1181,7 @@ mod tests {
         s.graphics.rfx_progressive = false;
         s.graphics.allow_uncompressed = true;
         s.graphics.dynamic_resolution = false;
+        s.keyboard.mac_keyboard_mode = true;
         s.audio.playback = false;
         s.audio.device = "USB Audio".to_owned();
         s.clipboard.direction = ClipboardDirection::ToRemote;
@@ -1187,6 +1208,7 @@ mod tests {
         m.working.defaults.keep_launcher_open = target.defaults.keep_launcher_open;
         m.working.defaults.reconnect_last = target.defaults.reconnect_last;
         m.working.graphics = target.graphics.clone();
+        m.working.keyboard = target.keyboard.clone();
         m.working.audio.playback = target.audio.playback;
         m.working.clipboard.direction = target.clipboard.direction;
         m.working.diagnostics.overlay_on_connect = target.diagnostics.overlay_on_connect;

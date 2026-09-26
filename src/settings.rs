@@ -1,4 +1,4 @@
-//! Application settings — the `settings.toml` behind Settings' six panes.
+//! Application settings — the `settings.toml` behind Settings' seven panes.
 //!
 //! A sibling of `favourites.toml`, written through the same atomic temp-and-rename
 //! dance, and deliberately a *separate* file so a settings write can never rewrite the
@@ -105,6 +105,14 @@ impl Default for GraphicsSettings {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardSettings {
+    /// Resolve printable keycaps through the local Mac layout and send Unicode input.
+    /// Shortcuts, navigation and editing keys remain positional scancodes.
+    pub mac_keyboard_mode: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
@@ -164,6 +172,7 @@ impl Default for DiagnosticsSettings {
 pub struct Settings {
     pub defaults: DefaultsSettings,
     pub graphics: GraphicsSettings,
+    pub keyboard: KeyboardSettings,
     pub audio: AudioSettings,
     pub clipboard: ClipboardSettings,
     pub diagnostics: DiagnosticsSettings,
@@ -292,6 +301,7 @@ mod tests {
         assert!(!s.graphics.allow_uncompressed);
         assert!(s.graphics.dynamic_resolution);
         assert!(s.graphics.integer_fullscreen_fit);
+        assert!(!s.keyboard.mac_keyboard_mode);
         assert!(s.audio.playback);
         assert_eq!(s.audio.device, "default");
         assert_eq!(s.clipboard.direction, ClipboardDirection::Both);
@@ -319,6 +329,9 @@ clear_codec = true
 rfx_progressive = true
 allow_uncompressed = false
 dynamic_resolution = true
+
+[keyboard]
+mac_keyboard_mode = false
 
 [audio]
 playback = true
@@ -355,6 +368,7 @@ stage_log = "stages"
         s.graphics.clear_codec = false;
         s.graphics.allow_uncompressed = true;
         s.graphics.integer_fullscreen_fit = false;
+        s.keyboard.mac_keyboard_mode = true;
         s.audio.playback = false;
         s.audio.device = "USB Audio".to_owned();
         s.clipboard.direction = ClipboardDirection::ToRemote;
