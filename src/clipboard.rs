@@ -29,11 +29,13 @@
 //! Local content is read in the order file list, text, image (see [`choose_local_content`]).
 //! Files come first because Finder also places the file name as text and the file's icon as an
 //! image; neither may win over the file itself. A file list is announced as
-//! `FileGroupDescriptorW` for streamed transfer. When that list cannot be announced (a limit,
-//! a symlink, or a peer without file streaming), the bridge announces fallbacks instead: for a
-//! single `.png` file `CF_DIB` plus a registered `"PNG"` format with the file's bytes, and for
-//! any file list `CF_UNICODETEXT` with the file names. Images use standard uncompressed
-//! `CF_DIB` bitmap data, with strict size checks around every decode and encode operation.
+//! `FileGroupDescriptorW` for streamed transfer, followed in the same format list by extra
+//! representations: for a single `.png` file `CF_DIB` plus a registered `"PNG"` format with the
+//! file's bytes, and for any file list `CF_UNICODETEXT` with the file names. So a copied picture
+//! pastes as a file in Explorer and as a picture in Paint. When the list itself cannot be
+//! announced (a limit, a symlink, or a peer without file streaming), those extra formats are
+//! announced alone. Images use standard uncompressed `CF_DIB` bitmap data, with strict size
+//! checks around every decode and encode operation.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -296,11 +298,26 @@ struct LocalFileSnapshot {
     entries: Vec<LocalFileEntry>,
 }
 
+impl LocalFileSnapshot {
+    fn descriptors(&self) -> Vec<FileDescriptor> {
+        self.entries
+            .iter()
+            .map(|entry| entry.descriptor.clone())
+            .collect()
+    }
+}
+
+/// A file list waiting for IronRDP to reach `Ready`, with the formats announced beside it.
+struct PendingFileCopy {
+    files: LocalFileSnapshot,
+    extra_formats: Vec<ClipboardFormat>,
+}
+
 /// One local clipboard generation ready to announce.
 ///
-/// With `files` present the bridge announces the file list through IronRDP, which fixes that
-/// format list to `FileGroupDescriptorW` + `Preferred DropEffect`; `formats` is then only the
-/// fallback for a peer that cannot stream files. Without `files`, `formats` is the announce.
+/// With `files` present the bridge announces `FileGroupDescriptorW` + `Preferred DropEffect`
+/// followed by `formats` (the vendored IronRDP's `initiate_file_copy_with_formats`); a peer that
+/// cannot stream files gets `formats` alone. Without `files`, `formats` is the announce.
 struct LocalClipboardSnapshot {
     formats: Vec<ClipboardFormat>,
     files: Option<LocalFileSnapshot>,
@@ -1737,7 +1754,7 @@ pub struct ClipboardBridge {
     capabilities_negotiated: bool,
     local_file_snapshot: Option<LocalFileSnapshot>,
     locked_local_files: HashMap<u32, LocalFileSnapshot>,
-    pending_file_copy: Option<LocalFileSnapshot>,
+    pending_file_copy: Option<PendingFileCopy>,
     remote_transfer: Option<RemoteTransfer>,
     pending_remote_prepare: Option<(u64, u64)>,
     pending_remote_publish: Option<(u64, u64)>,
@@ -2374,14 +2391,14 @@ impl ClipboardBridge {
         });
         if let Some(files) = files {
             self.local_file_snapshot = Some(files.clone());
-            self.pending_file_copy = Some(files.clone());
-            match cliprdr.initiate_file_copy(
-                files
-                    .entries
-                    .iter()
-                    .map(|entry| entry.descriptor.clone())
-                    .collect(),
-            ) {
+            let descriptors = files.descriptors();
+            self.pending_file_copy = Some(PendingFileCopy {
+                files,
+                extra_formats: snapshot.formats.clone(),
+            });
+            // The fallback formats travel beside the file list, so one copy pastes as a file
+            // in Explorer and as a picture or names elsewhere.
+            match cliprdr.initiate_file_copy_with_formats(descriptors, &snapshot.formats) {
                 Ok(messages) => {
                     out.push(messages);
                     self.pending_file_copy = None;
@@ -2439,13 +2456,10 @@ impl ClipboardBridge {
                 resend_requested: false,
                 ..
             } if ok => {
-                if let Some(files) = self.pending_file_copy.take() {
-                    match cliprdr.initiate_file_copy(
-                        files
-                            .entries
-                            .iter()
-                            .map(|entry| entry.descriptor.clone())
-                            .collect(),
+                if let Some(pending) = self.pending_file_copy.take() {
+                    match cliprdr.initiate_file_copy_with_formats(
+                        pending.files.descriptors(),
+                        &pending.extra_formats,
                     ) {
                         Ok(messages) => out.push(messages),
                         Err(error) => {
@@ -3297,7 +3311,8 @@ fn png_format() -> ClipboardFormat {
     ClipboardFormat::new(PNG_FORMAT_ID).with_name(ClipboardFormatName::new_static(PNG_FORMAT_NAME))
 }
 
-/// Formats offered for a copied file list when it cannot travel as `FileGroupDescriptorW`.
+/// Formats offered for a copied file list: beside `FileGroupDescriptorW`, or alone when the
+/// list cannot be announced.
 /// Only file-system metadata and the PNG header are read here; pixels are decoded on request.
 fn file_fallback_formats(paths: &[PathBuf], max_image_bytes: usize) -> Vec<ClipboardFormat> {
     let mut formats = Vec::new();
@@ -6251,6 +6266,116 @@ mod tests {
                 .expect("decode advertised format list"),
             other => panic!("unexpected pdu variant: {other:?}"),
         }
+    }
+
+    /// Feeds one wire-encoded FormatDataRequest through IronRDP, as the server would send it.
+    fn peer_requests(cliprdr: &mut CliprdrClient, format: ClipboardFormatId) -> Vec<SvcMessage> {
+        let bytes =
+            ironrdp_svc::pdu::encode_vec(&ClipboardPdu::FormatDataRequest(FormatDataRequest {
+                format,
+            }))
+            .expect("encode FormatDataRequest");
+        SvcProcessor::process(cliprdr, &bytes).expect("process FormatDataRequest")
+    }
+
+    #[test]
+    fn a_png_file_is_announced_as_a_file_and_a_picture_when_the_peer_streams_files() {
+        let root = test_path("png-with-streaming");
+        fs::create_dir_all(&root).unwrap();
+        let picture = root.join("photo.png");
+        let (width, height, rgba) = distinct_rgba_3x2();
+        write_png(&picture, width, height, &rgba);
+
+        let (state, os) = fake_clipboard();
+        state.lock().unwrap().files = Some(vec![picture.clone()]);
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        backend_mut(&mut cliprdr).on_process_negotiated_capabilities(
+            ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED,
+        );
+        bridge.pump(&mut cliprdr);
+        backend_mut(&mut cliprdr).on_request_format_list();
+        let formats = announced_formats(bridge.pump(&mut cliprdr));
+        let announced: Vec<_> = formats
+            .iter()
+            .map(|format| (format.id(), format.name().map(|name| name.value())))
+            .collect();
+        assert_eq!(
+            announced,
+            vec![
+                (ClipboardFormatId::new(0xC0FE), Some(FORMAT_NAME_FILE_LIST)),
+                (ClipboardFormatId::new(0xC0FD), Some("Preferred DropEffect")),
+                (ClipboardFormatId::CF_DIB, None),
+                (PNG_FORMAT_ID, Some(PNG_FORMAT_NAME)),
+                (ClipboardFormatId::CF_UNICODETEXT, None),
+            ]
+        );
+
+        // IronRDP hands a CF_DIB request to the bridge, which serves the file's pixels.
+        assert!(peer_requests(&mut cliprdr, ClipboardFormatId::CF_DIB).is_empty());
+        match only_pdu(bridge.pump(&mut cliprdr)) {
+            ClipboardPdu::FormatDataResponse(response) => {
+                assert!(!response.is_error());
+                assert_eq!(
+                    decode_dib(response.data(), MAX_IMAGE_BYTES).unwrap(),
+                    (width, height, rgba)
+                );
+            }
+            other => panic!("unexpected pdu variant: {other:?}"),
+        }
+
+        // The file list stays live beside the picture: IronRDP still answers it inline.
+        let replies = peer_requests(&mut cliprdr, ClipboardFormatId::new(0xC0FE));
+        assert_eq!(replies.len(), 1, "the file list is answered inline");
+        let bytes = replies[0].encode_unframed_pdu().expect("encode wire PDU");
+        let mut cursor = ReadCursor::new(&bytes);
+        match ClipboardPdu::decode(&mut cursor).expect("decode wire PDU") {
+            ClipboardPdu::FormatDataResponse(response) => {
+                let list = response.to_file_list().expect("file list");
+                assert_eq!(list.files.len(), 1);
+                assert_eq!(list.files[0].name, "photo.png");
+            }
+            other => panic!("unexpected pdu variant: {other:?}"),
+        }
+        drop(cliprdr);
+        drop(bridge);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_png_file_copied_before_the_channel_is_ready_keeps_its_picture_formats() {
+        let root = test_path("png-deferred");
+        fs::create_dir_all(&root).unwrap();
+        let picture = root.join("photo.png");
+        let (width, height, rgba) = distinct_rgba_3x2();
+        write_png(&picture, width, height, &rgba);
+
+        let (state, os) = fake_clipboard();
+        state.lock().unwrap().files = Some(vec![picture]);
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        // Still initializing: IronRDP refuses the file list, so the bridge sends the empty
+        // bootstrap and defers the list until the server acknowledges it.
+        let mut cliprdr = CliprdrClient::new(Box::new(backend));
+        backend_mut(&mut cliprdr).on_request_format_list();
+        assert!(contains_format_list(bridge.pump(&mut cliprdr)));
+
+        let ack =
+            ironrdp_svc::pdu::encode_vec(&ClipboardPdu::FormatListResponse(FormatListResponse::Ok))
+                .expect("encode FormatListResponse::Ok");
+        SvcProcessor::process(&mut cliprdr, &ack).expect("process FormatListResponse::Ok");
+        assert_eq!(
+            only_format_ids(bridge.pump(&mut cliprdr)),
+            vec![
+                ClipboardFormatId::new(0xC0FE),
+                ClipboardFormatId::new(0xC0FD),
+                ClipboardFormatId::CF_DIB,
+                PNG_FORMAT_ID,
+                ClipboardFormatId::CF_UNICODETEXT,
+            ]
+        );
+        drop(cliprdr);
+        drop(bridge);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

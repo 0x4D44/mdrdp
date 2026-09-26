@@ -45,7 +45,6 @@ __test = ["dep:visibility"]
 [lib]
 name = "ironrdp_cliprdr"
 path = "src/lib.rs"
-test = false
 doctest = false
 
 [dependencies.bitflags]

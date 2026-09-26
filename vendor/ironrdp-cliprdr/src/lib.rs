@@ -1458,6 +1458,24 @@ impl<R: Role> Cliprdr<R> {
     ///
     /// [2.2.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeclip/9c01c966-e09b-438d-9391-ce31f3caddc3
     pub fn initiate_file_copy(&mut self, files: Vec<FileDescriptor>) -> PduResult<CliprdrSvcMessages<R>> {
+        self.initiate_file_copy_with_formats(files, &[])
+    }
+
+    /// Same as [`Self::initiate_file_copy`], but the FormatList also carries `extra_formats`
+    /// after the `FileGroupDescriptorW` and `Preferred DropEffect` entries, so one copy can be
+    /// pasted as files or as another representation (for example a picture).
+    ///
+    /// The file list and drop effect are still answered inline. A FormatDataRequest for any
+    /// extra format is forwarded to the backend like any other, and the stored file list stays
+    /// in place for FileContentsRequests. An extra whose id collides with one of the two file
+    /// formats is dropped.
+    ///
+    /// mdrdp vendoring patch; see `vendor/README.md`.
+    pub fn initiate_file_copy_with_formats(
+        &mut self,
+        files: Vec<FileDescriptor>,
+        extra_formats: &[ClipboardFormat],
+    ) -> PduResult<CliprdrSvcMessages<R>> {
         self.require_ready("initiate_file_copy")?;
 
         if !self
@@ -1565,10 +1583,17 @@ impl<R: Role> Cliprdr<R> {
         // its shell file-copy machinery (with the native progress dialog)
         // on paste — without it, Explorer falls back to a plain synchronous
         // IStream read with no progress UI.
-        let formats = vec![
+        let mut formats = vec![
             ClipboardFormat::new(format_id).with_name(ClipboardFormatName::FILE_LIST),
             ClipboardFormat::new(drop_effect_id).with_name(ClipboardFormatName::PREFERRED_DROP_EFFECT),
         ];
+        for extra in extra_formats {
+            if extra.id() == format_id || extra.id() == drop_effect_id {
+                debug!(format_id = ?extra.id(), "Dropping extra format that collides with a file-copy format");
+            } else {
+                formats.push(extra.clone());
+            }
+        }
 
         // Track the format IDs we're using for the file list and drop effect
         // so handle_format_data_request can recognize and answer them inline.
@@ -2042,5 +2067,185 @@ impl<R: Role> Cliprdr<R> {
 
     pub fn __test_remote_file_list_format_id(&self) -> Option<ClipboardFormatId> {
         self.remote_file_list_format_id
+    }
+}
+
+/// mdrdp vendoring patch: tests for [`Cliprdr::initiate_file_copy_with_formats`].
+#[cfg(test)]
+mod tests {
+    use ironrdp_core::encode_vec;
+
+    use super::*;
+    use crate::pdu::FormatDataResponse;
+
+    const FILE_LIST_ID: u32 = 0xC0FE;
+    const DROP_EFFECT_ID: u32 = 0xC0FD;
+    const PNG_ID: u32 = 0xC0FF;
+
+    #[derive(Debug, Default)]
+    struct RecordingBackend {
+        format_data_requests: Vec<u32>,
+    }
+
+    ironrdp_core::impl_as_any!(RecordingBackend);
+
+    impl CliprdrBackend for RecordingBackend {
+        fn temporary_directory(&self) -> &str {
+            ".cliprdr"
+        }
+
+        fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+            ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+        }
+
+        fn on_ready(&mut self) {}
+
+        fn on_request_format_list(&mut self) {}
+
+        fn on_process_negotiated_capabilities(&mut self, _capabilities: ClipboardGeneralCapabilityFlags) {}
+
+        fn on_remote_copy(&mut self, _available_formats: &[ClipboardFormat]) {}
+
+        fn on_format_data_request(&mut self, request: FormatDataRequest) {
+            self.format_data_requests.push(request.format.value());
+        }
+
+        fn on_format_data_response(&mut self, _response: FormatDataResponse<'_>) {}
+
+        fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+
+        fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+
+        fn on_lock(&mut self, _data_id: LockDataId) {}
+
+        fn on_unlock(&mut self, _data_id: LockDataId) {}
+    }
+
+    fn ready_client() -> CliprdrClient {
+        let mut cliprdr = CliprdrClient::new(Box::new(RecordingBackend::default()));
+        cliprdr.state = CliprdrState::Ready;
+        cliprdr
+    }
+
+    fn one_file() -> Vec<FileDescriptor> {
+        vec![FileDescriptor::new("picture.png")]
+    }
+
+    fn picture_formats() -> Vec<ClipboardFormat> {
+        vec![
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+            ClipboardFormat::new(ClipboardFormatId::new(PNG_ID)).with_name(ClipboardFormatName::new_static("PNG")),
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+        ]
+    }
+
+    fn with_pdu<T>(message: &SvcMessage, inspect: impl FnOnce(ClipboardPdu<'_>) -> T) -> T {
+        let bytes = message.encode_unframed_pdu().expect("encode");
+        inspect(decode::<ClipboardPdu<'_>>(&bytes).expect("decode"))
+    }
+
+    /// The (id, name) pairs of the single FormatList among `messages`.
+    fn announced(cliprdr: &CliprdrClient, messages: CliprdrSvcMessages<Client>) -> Vec<(u32, Option<String>)> {
+        let lists: Vec<_> = Vec::<SvcMessage>::from(messages)
+            .iter()
+            .filter_map(|message| {
+                with_pdu(message, |pdu| match pdu {
+                    ClipboardPdu::FormatList(list) => Some(
+                        list.get_formats(cliprdr.are_long_format_names_enabled())
+                            .expect("formats")
+                            .iter()
+                            .map(|format| (format.id().value(), format.name().map(|name| name.value().to_owned())))
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(lists.len(), 1, "exactly one FormatList");
+        lists.into_iter().next().expect("one list")
+    }
+
+    fn ids(list: Vec<(u32, Option<String>)>) -> Vec<u32> {
+        list.into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn request(cliprdr: &mut CliprdrClient, format: u32) -> Vec<SvcMessage> {
+        let pdu = ClipboardPdu::FormatDataRequest(FormatDataRequest {
+            format: ClipboardFormatId::new(format),
+        });
+        cliprdr.process(&encode_vec(&pdu).expect("encode request")).expect("process")
+    }
+
+    fn forwarded(cliprdr: &CliprdrClient) -> Vec<u32> {
+        cliprdr
+            .downcast_backend::<RecordingBackend>()
+            .expect("backend")
+            .format_data_requests
+            .clone()
+    }
+
+    #[test]
+    fn extra_formats_follow_the_two_file_formats_in_order() {
+        let mut cliprdr = ready_client();
+        let messages = cliprdr
+            .initiate_file_copy_with_formats(one_file(), &picture_formats())
+            .expect("file copy");
+        assert_eq!(
+            announced(&cliprdr, messages),
+            vec![
+                (FILE_LIST_ID, Some("FileGroupDescriptorW".to_owned())),
+                (DROP_EFFECT_ID, Some("Preferred DropEffect".to_owned())),
+                (ClipboardFormatId::CF_DIB.value(), None),
+                (PNG_ID, Some("PNG".to_owned())),
+                (ClipboardFormatId::CF_UNICODETEXT.value(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_extra_format_colliding_with_a_file_format_is_dropped() {
+        let mut cliprdr = ready_client();
+        let extras = [
+            ClipboardFormat::new(ClipboardFormatId::new(FILE_LIST_ID)).with_name(ClipboardFormatName::new_static("X")),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+            ClipboardFormat::new(ClipboardFormatId::new(DROP_EFFECT_ID)),
+        ];
+        let messages = cliprdr
+            .initiate_file_copy_with_formats(one_file(), &extras)
+            .expect("file copy");
+        assert_eq!(
+            ids(announced(&cliprdr, messages)),
+            vec![FILE_LIST_ID, DROP_EFFECT_ID, ClipboardFormatId::CF_DIB.value()]
+        );
+    }
+
+    #[test]
+    fn plain_file_copy_still_announces_only_the_two_file_formats() {
+        let mut cliprdr = ready_client();
+        let messages = cliprdr.initiate_file_copy(one_file()).expect("file copy");
+        assert_eq!(ids(announced(&cliprdr, messages)), vec![FILE_LIST_ID, DROP_EFFECT_ID]);
+    }
+
+    #[test]
+    fn extra_format_requests_reach_the_backend_while_the_file_list_is_answered_inline() {
+        let mut cliprdr = ready_client();
+        cliprdr
+            .initiate_file_copy_with_formats(one_file(), &picture_formats())
+            .expect("file copy");
+
+        let dib = ClipboardFormatId::CF_DIB.value();
+        assert!(request(&mut cliprdr, dib).is_empty(), "CF_DIB is left to the backend");
+        assert!(request(&mut cliprdr, PNG_ID).is_empty(), "PNG is left to the backend");
+        assert_eq!(forwarded(&cliprdr), vec![dib, PNG_ID]);
+
+        let replies = request(&mut cliprdr, FILE_LIST_ID);
+        assert_eq!(replies.len(), 1);
+        let files = with_pdu(&replies[0], |pdu| match pdu {
+            ClipboardPdu::FormatDataResponse(response) => response.to_file_list().expect("file list"),
+            other => panic!("expected a FormatDataResponse, got {other:?}"),
+        });
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.files[0].name, "picture.png");
+        assert_eq!(forwarded(&cliprdr), vec![dib, PNG_ID], "the file list never reaches the backend");
     }
 }

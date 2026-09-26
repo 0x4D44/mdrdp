@@ -27,6 +27,31 @@ re-breaking the fix before being trusted.
 
 Remove when a released `ironrdp-session` answers bandwidth measure requests.
 
+## `ironrdp-cliprdr` 0.7.0 — a file copy can announce extra formats
+
+The published `Cliprdr::initiate_file_copy` hard-codes its FormatList to
+`FileGroupDescriptorW` (0xC0FE) + `Preferred DropEffect` (0xC0FD). The only way to announce
+anything else is `initiate_copy`, which clears the stored file list, after which IronRDP
+refuses the peer's file-list and file-contents requests. So a copy was either files or
+something else, never both.
+
+A PNG copied in macOS Finder must be both: Explorer pastes it as a file, while Paint and
+Claude Code read `CF_DIB`. The vendored crate adds
+`Cliprdr::initiate_file_copy_with_formats(files, extra_formats)`. It appends the extras
+after the two file formats, drops (and logs at debug) an extra whose id collides with either,
+and otherwise behaves exactly like `initiate_file_copy`, which now delegates to it with no
+extras. IronRDP still answers the file list and drop effect inline; a FormatDataRequest for
+an extra id goes to the backend like any other, which mdrdp's `src/clipboard.rs` already
+serves (`CF_DIB`, the registered `"PNG"` format, `CF_UNICODETEXT`).
+
+The published `Cargo.toml` sets `test = false` on the lib; the vendored copy drops it so
+`scripts/test-vendored.sh` runs the new tests in `src/lib.rs` (`mod tests`: extra order, the
+collision filter, extra requests forwarded while the file list is answered inline, and the
+unchanged two-format list for `initiate_file_copy`). Each was made to fail by breaking the
+patch before being trusted.
+
+Remove when a released `ironrdp-cliprdr` lets a file copy announce extra formats.
+
 ## `ironrdp-rdpsnd` 0.9.0 — stable negotiated format order
 
 Published IronRDP intersects the server and client format sets through a randomly seeded
