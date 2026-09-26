@@ -132,7 +132,7 @@ const MAX_FILE_CHUNK_BYTES: u32 = 1024 * 1024;
 const MAX_STALE_FILE_STREAM_IDS: usize = 1000;
 const FILE_TRANSFER_TIMEOUT_MS: u64 = 60_000;
 const STAGING_MIN_AGE: Duration = Duration::from_secs(60 * 60);
-const STAGING_LOCK_ATTEMPTS: usize = 32;
+const STAGING_LOCK_WAIT: Duration = Duration::from_millis(250);
 const STAGING_PARENT_NAME: &str = "mdrdp-clipboard";
 const STAGING_ROOT_PREFIX: &str = "session-";
 
@@ -398,7 +398,8 @@ impl StagingLayout {
 
     fn acquire_lock(&self) -> Option<StagingLock> {
         let lock_path = self.parent.join(".lock");
-        for _ in 0..STAGING_LOCK_ATTEMPTS {
+        let deadline = std::time::Instant::now() + STAGING_LOCK_WAIT;
+        loop {
             let file = match OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -412,12 +413,14 @@ impl StagingLayout {
             match file.try_lock() {
                 Ok(()) => return Some(StagingLock { file }),
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    thread::yield_now();
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(_) => return None,
             }
         }
-        None
     }
 
     fn create_remote_stage(
@@ -5480,6 +5483,24 @@ mod tests {
             std::process::id(),
             NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn staging_lock_waits_for_a_brief_concurrent_publication() {
+        let staging = StagingLayout::new_in(test_path("lock-wait"));
+        let first = staging.acquire_lock().expect("first lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(first);
+        });
+        let second = staging.acquire_lock();
+        release.join().unwrap();
+        assert!(
+            second.is_some(),
+            "a brief lock overlap must not drop a transfer"
+        );
+        drop(second);
+        let _ = fs::remove_dir_all(staging.parent);
     }
 
     #[test]
