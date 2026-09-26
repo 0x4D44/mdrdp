@@ -130,6 +130,7 @@ leave a plausible-looking partial report.
   undocking, or moving between displays (with Dynamic resolution enabled)
 - Clipboard Unicode text, empty content, and bounded CF_DIB images in both directions,
   with explicit timeouts so one failed transfer cannot wedge later transfers
+- Clipboard file and folder copy in both directions, with a 512 MiB total transfer limit
 - Audio playback (PCM 16-bit, 44.1/48kHz, mono or stereo)
 - Window geometry restored after a monitor sleeps or the screen locks
 - Graceful disconnect — abandoning the socket leaves a live session on the host
@@ -144,7 +145,8 @@ leave a plausible-looking partial report.
 Verified against real Windows hosts: NLA/TLS connect, ClearCodec/RFX Progressive and
 uncompressed graphics, the bitmap cache, fixed-resolution windows, graceful disconnect,
 desktop input, two-way clipboard transfer, real audio playback, and
-CLIPRDR/RDPSND/RDPDR/DRDYNVC channel joins. A
+CLIPRDR/RDPSND/RDPDR/DRDYNVC channel joins. File and folder clipboard copy has
+passed focused tests but has not yet been checked against a live Windows host. A
 35-second optimized Quench run at 1920x1080
 ended gracefully with zero decode, undecoded-region, surface, cache-miss, or unhandled-PDU
 errors. All 1,021 bitmap-cache lookups hit. The redacted report measured 0.57% average CPU

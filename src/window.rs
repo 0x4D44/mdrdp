@@ -185,6 +185,8 @@ pub enum SessionEvent {
     Close,
     /// A native (muda) menu item was activated, by id.
     Menu(String),
+    /// Show a short-lived user-visible notice over the desktop.
+    Toast(Toast),
 }
 
 /// The session process's diagnostics windows, by purpose.
@@ -463,6 +465,11 @@ impl Waker {
     /// Mirror a remote pointer change. `false` means the window is gone.
     pub fn cursor(&self, update: CursorUpdate) -> bool {
         self.proxy.send_event(SessionEvent::Cursor(update)).is_ok()
+    }
+
+    /// Show a short-lived user-visible notice. `false` means the window is gone.
+    pub fn toast(&self, toast: Toast) -> bool {
+        self.proxy.send_event(SessionEvent::Toast(toast)).is_ok()
     }
 }
 
@@ -2584,6 +2591,21 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
             SessionEvent::Cursor(update) => self.apply_remote_cursor(event_loop, update),
             SessionEvent::Close => event_loop.exit(),
             SessionEvent::Menu(id) => self.handle_menu(event_loop, &id),
+            SessionEvent::Toast(toast) => {
+                // Coalesce repeated reports for the same condition while its card is already
+                // visible. The producer signal is bounded, and a peer retry must not turn it
+                // into an unbounded stack of identical cards.
+                if !self
+                    .toasts
+                    .iter()
+                    .any(|(existing, _)| existing.title == toast.title)
+                {
+                    self.toasts.push((toast, Instant::now()));
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 

@@ -35,6 +35,7 @@ impl<T: OsClipboard> TextClipboard for TextOnly<T> {
         match self.0.get_content()? {
             ClipboardContent::Text(text) => Ok(Some(text)),
             ClipboardContent::Image { .. } => Ok(None),
+            ClipboardContent::Files(_) => Ok(None),
         }
     }
 

@@ -30,19 +30,24 @@
 //! bitmap data, with strict size checks around every decode and encode operation.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::wake::Doorbell;
 use ironrdp_cliprdr::backend::CliprdrBackend;
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
-    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
-    OwnedFormatDataResponse,
+    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardFormatName,
+    ClipboardGeneralCapabilityFlags, FORMAT_NAME_FILE_LIST, FileContentsFlags, FileContentsRequest,
+    FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
+    OwnedFileContentsResponse, OwnedFormatDataResponse,
 };
 use ironrdp_cliprdr::{Cliprdr, CliprdrSvcMessages, Role};
 use ironrdp_svc::pdu::IntoOwned as _;
@@ -116,13 +121,39 @@ const WORKER_COMMAND_QUEUE_DEPTH: usize = 1;
 const WORKER_RESULT_QUEUE_DEPTH: usize = 1;
 const WORKER_SHUTDOWN_WAIT: Duration = Duration::from_millis(100);
 
+/// File transfer limits are deliberately conservative. The protocol carries attacker
+/// controlled counts, names, sizes, offsets, and stream IDs, so every one is checked before
+/// it can allocate, create, or write anything.
+const MAX_FILE_COUNT: usize = 256;
+const MAX_FILE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_FILE_CHUNK_BYTES: u32 = 1024 * 1024;
+// IronRDP bounds unanswered file requests at 1000. Keep every canceled stream ID until its
+// response or timeout arrives, so a late response can never collide with a newer transfer.
+const MAX_STALE_FILE_STREAM_IDS: usize = 1000;
+const FILE_TRANSFER_TIMEOUT_MS: u64 = 60_000;
+const STAGING_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+const STAGING_LOCK_ATTEMPTS: usize = 32;
+const STAGING_PARENT_NAME: &str = "mdrdp-clipboard";
+const STAGING_ROOT_PREFIX: &str = "session-";
+
+/// The session presents this class of failures to the user. Other malformed input stays in
+/// diagnostics because it does not tell the user what action to take and must not become a
+/// toast flood from an untrusted peer.
+fn is_file_limit_error(error: &str) -> bool {
+    error.contains("file count exceeds")
+        || error.contains("files exceed the total size limit")
+        || error.contains("file size exceeds the safety limit")
+        || error.contains("file sizes overflow")
+}
+
+static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Raw clipboard events forwarded from [`ClipboardBackend`] to [`ClipboardBridge`].
 ///
 /// Each variant mirrors a [`CliprdrBackend`] callback (or, for [`Self::AdvertiseRequested`],
 /// a local-clipboard-change detected by [`ClipboardBridge::poll_local_change`]). The bridge
 /// interprets these with full access to the clipboard state machine and the live
 /// [`Cliprdr`] instance; the backend that produces them does no interpretation at all.
-#[derive(Debug)]
 pub enum ClipboardAction {
     /// We should (re-)advertise our current clipboard formats to the remote.
     AdvertiseRequested,
@@ -136,6 +167,84 @@ pub enum ClipboardAction {
     LocalDataRequested(ClipboardFormatId),
     /// The remote sent us clipboard content (or an explicit error) for a paste we requested.
     RemoteDataReceived(OwnedFormatDataResponse),
+    /// The remote sent us a parsed FileGroupDescriptorW list for an eager download.
+    RemoteFileList {
+        files: Vec<FileDescriptor>,
+        clip_data_id: Option<u32>,
+    },
+    /// The remote wants bytes from one of our advertised local files.
+    LocalFileContentsRequested(FileContentsRequest),
+    /// The remote sent bytes for one of our eager file downloads.
+    RemoteFileContentsReceived(OwnedFileContentsResponse),
+    /// The server and client completed capability negotiation.
+    NegotiatedCapabilities(ClipboardGeneralCapabilityFlags),
+    /// Incoming lock callbacks protect a local file-list snapshot.
+    Lock(LockDataId),
+    Unlock(LockDataId),
+    /// IronRDP's outgoing lock lifecycle protects an eager remote download.
+    OutgoingLocksExpired(Vec<LockDataId>),
+    OutgoingLocksCleared(Vec<LockDataId>),
+}
+
+impl fmt::Debug for ClipboardAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AdvertiseRequested => formatter.write_str("AdvertiseRequested"),
+            Self::ProtocolFormatListRequested => formatter.write_str("ProtocolFormatListRequested"),
+            Self::FormatListAcked(ok) => {
+                formatter.debug_tuple("FormatListAcked").field(ok).finish()
+            }
+            Self::RemoteCopy(formats) => formatter
+                .debug_struct("RemoteCopy")
+                .field("format_count", &formats.len())
+                .finish(),
+            Self::LocalDataRequested(format) => formatter
+                .debug_tuple("LocalDataRequested")
+                .field(format)
+                .finish(),
+            Self::RemoteDataReceived(response) => formatter
+                .debug_struct("RemoteDataReceived")
+                .field("is_error", &response.is_error())
+                .field("data_len", &response.data().len())
+                .finish(),
+            Self::RemoteFileList {
+                files,
+                clip_data_id,
+            } => formatter
+                .debug_struct("RemoteFileList")
+                .field("file_count", &files.len())
+                .field("clip_data_id", clip_data_id)
+                .finish(),
+            Self::LocalFileContentsRequested(request) => formatter
+                .debug_struct("LocalFileContentsRequested")
+                .field("stream_id", &request.stream_id)
+                .field("index", &request.index)
+                .field("flags", &request.flags)
+                .field("position", &request.position)
+                .field("requested_size", &request.requested_size)
+                .finish(),
+            Self::RemoteFileContentsReceived(response) => formatter
+                .debug_struct("RemoteFileContentsReceived")
+                .field("stream_id", &response.stream_id())
+                .field("is_error", &response.is_error())
+                .field("data_len", &response.data().len())
+                .finish(),
+            Self::NegotiatedCapabilities(capabilities) => formatter
+                .debug_tuple("NegotiatedCapabilities")
+                .field(capabilities)
+                .finish(),
+            Self::Lock(id) => formatter.debug_tuple("Lock").field(id).finish(),
+            Self::Unlock(id) => formatter.debug_tuple("Unlock").field(id).finish(),
+            Self::OutgoingLocksExpired(ids) => formatter
+                .debug_struct("OutgoingLocksExpired")
+                .field("count", &ids.len())
+                .finish(),
+            Self::OutgoingLocksCleared(ids) => formatter
+                .debug_struct("OutgoingLocksCleared")
+                .field("count", &ids.len())
+                .finish(),
+        }
+    }
 }
 
 /// Content visible through the OS clipboard. The image bytes are RGBA, row-major, top-down.
@@ -147,6 +256,400 @@ pub enum ClipboardContent {
         height: usize,
         rgba: Vec<u8>,
     },
+    Files(Vec<PathBuf>),
+}
+
+/// Stable metadata captured while a local clipboard generation is current. The path is opened
+/// only when the peer asks for a bounded SIZE/RANGE response, and the identity is checked again
+/// immediately before bytes leave the process.
+#[derive(Clone, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    is_dir: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+}
+
+#[derive(Clone)]
+struct LocalFileEntry {
+    path: PathBuf,
+    descriptor: FileDescriptor,
+    identity: FileIdentity,
+    is_dir: bool,
+}
+
+#[derive(Clone)]
+struct LocalFileSnapshot {
+    entries: Vec<LocalFileEntry>,
+}
+
+struct LocalClipboardSnapshot {
+    formats: Vec<ClipboardFormat>,
+    files: Option<LocalFileSnapshot>,
+}
+
+struct RemotePreparedEntry {
+    index: usize,
+    is_dir: bool,
+    declared_size: Option<u64>,
+}
+
+struct RemoteStageEntry {
+    path: PathBuf,
+    is_dir: bool,
+    declared_size: Option<u64>,
+    size: Option<u64>,
+    received: u64,
+}
+
+struct RemoteStage {
+    root: PathBuf,
+    entries: Vec<RemoteStageEntry>,
+}
+
+/// Per-process private staging layout. Each process gets its own root; cleanup takes an
+/// atomic lock in the shared parent and checks the current OS clipboard while holding it, so
+/// one live session cannot remove another session's still-published paths.
+#[derive(Clone)]
+struct StagingLayout {
+    parent: PathBuf,
+    root: PathBuf,
+    temporary_directory: String,
+}
+
+struct StagingLock {
+    file: File,
+}
+
+impl Drop for StagingLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[cfg(windows)]
+fn path_references_stage(reference: &Path, stage: &Path) -> bool {
+    let mut reference_components = reference.components();
+    stage.components().all(|stage_component| {
+        reference_components
+            .next()
+            .is_some_and(|reference_component| {
+                reference_component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&stage_component.as_os_str().to_string_lossy())
+            })
+    })
+}
+
+#[cfg(not(windows))]
+fn path_references_stage(reference: &Path, stage: &Path) -> bool {
+    reference.starts_with(stage)
+}
+
+impl StagingLayout {
+    fn new() -> Self {
+        Self::new_in(std::env::temp_dir().join(STAGING_PARENT_NAME))
+    }
+
+    fn new_in(parent: PathBuf) -> Self {
+        fs::create_dir_all(&parent).expect("create clipboard staging parent");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&parent, fs::Permissions::from_mode(0o700));
+        }
+        let id = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+        let mut id = id;
+        let root = loop {
+            let candidate =
+                parent.join(format!("{STAGING_ROOT_PREFIX}{}-{id}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    id = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => panic!("create clipboard staging root: {error}"),
+            }
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+        }
+        let temporary_directory = root.to_string_lossy().into_owned();
+        Self {
+            parent,
+            root,
+            temporary_directory,
+        }
+    }
+
+    fn temporary_directory(&self) -> &str {
+        &self.temporary_directory
+    }
+
+    fn acquire_lock(&self) -> Option<StagingLock> {
+        let lock_path = self.parent.join(".lock");
+        for _ in 0..STAGING_LOCK_ATTEMPTS {
+            let file = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                Ok(file) => file,
+                Err(_) => return None,
+            };
+            match file.try_lock() {
+                Ok(()) => return Some(StagingLock { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    thread::yield_now();
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    fn create_remote_stage(
+        &self,
+        transfer_id: u64,
+        files: &[FileDescriptor],
+    ) -> Result<RemoteStage, String> {
+        let root = self.root.join(format!("transfer-{transfer_id}"));
+        if root.exists() {
+            return Err("remote clipboard staging transfer already exists".to_string());
+        }
+        fs::create_dir(&root)
+            .map_err(|_| "remote clipboard staging directory could not be created".to_string())?;
+        let mut entries = Vec::new();
+        let mut seen = HashMap::<String, bool>::new();
+        let mut total_known = 0u64;
+
+        if files.is_empty() || files.len() > MAX_FILE_COUNT {
+            let _ = fs::remove_dir_all(&root);
+            return Err("remote clipboard file count exceeds the safety limit".to_string());
+        }
+
+        for (index, descriptor) in files.iter().enumerate() {
+            let components = match remote_path_components(descriptor) {
+                Ok(components) => components,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&root);
+                    return Err(error);
+                }
+            };
+            let key = components
+                .iter()
+                .map(|component| component.to_lowercase())
+                .collect::<Vec<_>>()
+                .join("/");
+            let is_dir = descriptor
+                .attributes
+                .is_some_and(|attributes| attributes.contains(ClipboardFileAttributes::DIRECTORY));
+            if seen.insert(key.clone(), is_dir).is_some() {
+                let _ = fs::remove_dir_all(&root);
+                return Err("remote clipboard file paths collide".to_string());
+            }
+            let mut prefix = Vec::new();
+            for component in components.iter().take(components.len().saturating_sub(1)) {
+                prefix.push(component.to_lowercase());
+                if seen.get(&prefix.join("/")).is_some_and(|is_dir| !*is_dir) {
+                    let _ = fs::remove_dir_all(&root);
+                    return Err("remote clipboard file paths contain a file parent".to_string());
+                }
+            }
+
+            let declared_size = descriptor.file_size;
+            if is_dir {
+                if declared_size.is_some_and(|size| size != 0) {
+                    let _ = fs::remove_dir_all(&root);
+                    return Err("remote clipboard directory has a non-zero size".to_string());
+                }
+            } else if let Some(size) = declared_size {
+                total_known = match total_known.checked_add(size) {
+                    Some(total) => total,
+                    None => {
+                        let _ = fs::remove_dir_all(&root);
+                        return Err("remote clipboard file sizes overflow".to_string());
+                    }
+                };
+                if MAX_FILE_TOTAL_BYTES < total_known {
+                    let _ = fs::remove_dir_all(&root);
+                    return Err("remote clipboard files exceed the total size limit".to_string());
+                }
+            }
+            let path = components
+                .iter()
+                .fold(root.clone(), |path, component| path.join(component));
+            if !path.starts_with(&root) {
+                let _ = fs::remove_dir_all(&root);
+                return Err("remote clipboard path escaped staging".to_string());
+            }
+            entries.push(RemoteStageEntry {
+                path,
+                is_dir,
+                declared_size,
+                size: if is_dir { Some(0) } else { declared_size },
+                received: 0,
+            });
+            debug_assert_eq!(index, entries.len() - 1);
+        }
+
+        // Create every directory first, including implicit parents, then create empty files.
+        // No file is exposed to the OS clipboard until all ranges have completed.
+        for entry in entries.iter().filter(|entry| entry.is_dir) {
+            if fs::create_dir_all(&entry.path).is_err() {
+                let _ = fs::remove_dir_all(&root);
+                return Err("remote clipboard directory staging failed".to_string());
+            }
+        }
+        for entry in entries.iter().filter(|entry| !entry.is_dir) {
+            if let Some(parent) = entry.path.parent()
+                && fs::create_dir_all(parent).is_err()
+            {
+                let _ = fs::remove_dir_all(&root);
+                return Err("remote clipboard file parent staging failed".to_string());
+            }
+            if OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&entry.path)
+                .is_err()
+            {
+                let _ = fs::remove_dir_all(&root);
+                return Err("remote clipboard file staging failed".to_string());
+            }
+        }
+
+        Ok(RemoteStage { root, entries })
+    }
+
+    fn cleanup_abandoned(&self, os: &mut dyn OsClipboard) {
+        self.cleanup_abandoned_at(os, SystemTime::now());
+    }
+
+    fn cleanup_abandoned_at(&self, os: &mut dyn OsClipboard, now: SystemTime) {
+        let Some(lock) = self.acquire_lock() else {
+            return;
+        };
+        let referenced = match os.get_file_list() {
+            Ok(referenced) => referenced,
+            Err(_) => {
+                drop(lock);
+                return;
+            }
+        };
+        if let Ok(entries) = fs::read_dir(&self.parent) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path == self.root
+                    || !path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(STAGING_ROOT_PREFIX))
+                {
+                    continue;
+                }
+                let Ok(metadata) = fs::metadata(&path) else {
+                    continue;
+                };
+                let age = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok());
+                if age.is_none_or(|age| age < STAGING_MIN_AGE) {
+                    continue;
+                }
+                if referenced
+                    .iter()
+                    .any(|reference| path_references_stage(reference, &path))
+                {
+                    continue;
+                }
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+        drop(lock);
+    }
+}
+
+fn remote_path_components(descriptor: &FileDescriptor) -> Result<Vec<String>, String> {
+    let mut components = Vec::new();
+    if let Some(relative_path) = &descriptor.relative_path {
+        if relative_path.starts_with('/')
+            || relative_path.starts_with('\\')
+            || relative_path.contains(':')
+            || relative_path.contains('\0')
+        {
+            return Err("remote clipboard path is absolute or malformed".to_string());
+        }
+        for component in relative_path.split(['/', '\\']) {
+            if component.is_empty() {
+                return Err("remote clipboard path is absolute or malformed".to_string());
+            }
+            validate_file_component(component)?;
+            components.push(component.to_string());
+        }
+    }
+    validate_file_component(&descriptor.name)?;
+    components.push(descriptor.name.clone());
+    let wire_len = components
+        .iter()
+        .map(|component| wire_component_len(component))
+        .sum::<usize>()
+        .saturating_add(components.len().saturating_sub(1));
+    if wire_len > 259 {
+        return Err("remote clipboard file path is too long".to_string());
+    }
+    Ok(components)
+}
+
+fn wire_component_len(component: &str) -> usize {
+    // FileDescriptor names are UTF-16 on the wire. `str::chars().count()` undercounts
+    // supplementary-plane characters, allowing a path to exceed the 260-code-unit field.
+    component.encode_utf16().count()
+}
+
+fn validate_file_component(component: &str) -> Result<(), String> {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.ends_with([' ', '.'])
+        || component.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '"' | '<' | '>' | '|' | '?' | '*'
+                )
+        })
+        || wire_component_len(component) > 255
+    {
+        return Err("remote clipboard file name is invalid".to_string());
+    }
+    let stem = component
+        .trim_end_matches([' ', '.'])
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
+    {
+        return Err("remote clipboard file name is reserved".to_string());
+    }
+    Ok(())
 }
 
 /// One operation sent to the serialized clipboard worker.
@@ -155,7 +658,6 @@ pub enum ClipboardContent {
 /// policy state with the worker. `Stop` is the only command without a result; its completion is
 /// reported through the worker's private done channel so shutdown cannot be blocked by a full
 /// result queue.
-#[derive(Debug)]
 enum ClipboardWork {
     PollLocal {
         id: u64,
@@ -172,6 +674,36 @@ enum ClipboardWork {
         epoch: u64,
         format: ClipboardFormatId,
         max_image_bytes: usize,
+    },
+    ReadLocalFile {
+        id: u64,
+        epoch: u64,
+        request: FileContentsRequest,
+        entry: LocalFileEntry,
+    },
+    PrepareRemoteFiles {
+        id: u64,
+        epoch: u64,
+        transfer_id: u64,
+        files: Vec<FileDescriptor>,
+    },
+    StoreRemoteChunk {
+        id: u64,
+        epoch: u64,
+        transfer_id: u64,
+        index: usize,
+        offset: u64,
+        expected_size: u64,
+        data: Vec<u8>,
+    },
+    PublishRemoteFiles {
+        id: u64,
+        epoch: u64,
+        transfer_id: u64,
+        sizes: Vec<(usize, u64)>,
+    },
+    AbortRemoteFiles {
+        transfer_id: u64,
     },
     ApplyRemote {
         id: u64,
@@ -190,7 +722,6 @@ enum ClipboardWork {
 /// A result from [`ClipboardWork`]. IDs and epochs are checked by the bridge before any result
 /// changes protocol state. Local poll results carry only the change bit: the bridge requests a
 /// fresh format read when it is ready to advertise, so a stale poll cannot advertise stale data.
-#[derive(Debug)]
 enum ClipboardResult {
     LocalPoll {
         id: u64,
@@ -200,13 +731,40 @@ enum ClipboardResult {
     Formats {
         id: u64,
         epoch: u64,
-        result: Result<Vec<ClipboardFormat>, String>,
+        result: Result<LocalClipboardSnapshot, String>,
     },
     LocalData {
         id: u64,
         epoch: u64,
         response: OwnedFormatDataResponse,
     },
+    LocalFileData {
+        id: u64,
+        epoch: u64,
+        response: OwnedFileContentsResponse,
+    },
+    RemoteFilesPrepared {
+        id: u64,
+        epoch: u64,
+        transfer_id: u64,
+        result: Result<Vec<RemotePreparedEntry>, String>,
+    },
+    RemoteChunkStored {
+        id: u64,
+        epoch: u64,
+        transfer_id: u64,
+        index: usize,
+        offset: u64,
+        len: usize,
+        result: Result<(), String>,
+    },
+    RemoteFilesPublished {
+        id: u64,
+        epoch: u64,
+        transfer_id: u64,
+        result: Result<(), String>,
+    },
+    RemoteFilesAborted,
     RemoteApplied {
         id: u64,
         epoch: u64,
@@ -222,15 +780,27 @@ struct ClipboardWorkerState {
     last_seen_fingerprint: Option<[u8; 32]>,
     observation_generation: u64,
     active_epoch: Arc<AtomicU64>,
+    active_transfer: Arc<AtomicU64>,
+    staging: StagingLayout,
+    remote_stages: HashMap<u64, RemoteStage>,
 }
 
 impl ClipboardWorkerState {
-    fn new(os: Box<dyn OsClipboard>, active_epoch: Arc<AtomicU64>) -> Self {
+    fn new(
+        mut os: Box<dyn OsClipboard>,
+        active_epoch: Arc<AtomicU64>,
+        active_transfer: Arc<AtomicU64>,
+        staging: StagingLayout,
+    ) -> Self {
+        staging.cleanup_abandoned(&mut *os);
         Self {
             os,
             last_seen_fingerprint: None,
             observation_generation: 1,
             active_epoch,
+            active_transfer,
+            staging,
+            remote_stages: HashMap::new(),
         }
     }
 
@@ -249,7 +819,7 @@ impl ClipboardWorkerState {
             ClipboardWork::ReadFormats { id, epoch } => ClipboardResult::Formats {
                 id,
                 epoch,
-                result: read_local_formats(&mut *self.os),
+                result: read_local_snapshot(&mut *self.os),
             },
             ClipboardWork::ReadLocalData {
                 id,
@@ -261,6 +831,80 @@ impl ClipboardWorkerState {
                 epoch,
                 response: read_local_data(&mut *self.os, format, max_image_bytes),
             },
+            ClipboardWork::ReadLocalFile {
+                id,
+                epoch,
+                request,
+                entry,
+            } => ClipboardResult::LocalFileData {
+                id,
+                epoch,
+                response: read_local_file(&request, &entry),
+            },
+            ClipboardWork::PrepareRemoteFiles {
+                id,
+                epoch,
+                transfer_id,
+                files,
+            } => {
+                let result = self.prepare_remote_files(transfer_id, files);
+                let prepared = match result {
+                    Ok(stage) => Ok(stage
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| RemotePreparedEntry {
+                            index,
+                            is_dir: entry.is_dir,
+                            declared_size: entry.declared_size,
+                        })
+                        .collect()),
+                    Err(error) => Err(error),
+                };
+                ClipboardResult::RemoteFilesPrepared {
+                    id,
+                    epoch,
+                    transfer_id,
+                    result: prepared,
+                }
+            }
+            ClipboardWork::StoreRemoteChunk {
+                id,
+                epoch,
+                transfer_id,
+                index,
+                offset,
+                expected_size,
+                data,
+            } => {
+                let len = data.len();
+                let result =
+                    self.store_remote_chunk(transfer_id, index, offset, expected_size, &data);
+                ClipboardResult::RemoteChunkStored {
+                    id,
+                    epoch,
+                    transfer_id,
+                    index,
+                    offset,
+                    len,
+                    result,
+                }
+            }
+            ClipboardWork::PublishRemoteFiles {
+                id,
+                epoch,
+                transfer_id,
+                sizes,
+            } => ClipboardResult::RemoteFilesPublished {
+                id,
+                epoch,
+                transfer_id,
+                result: self.publish_remote_files(transfer_id, &sizes),
+            },
+            ClipboardWork::AbortRemoteFiles { transfer_id } => {
+                let _ = self.abort_remote_files(transfer_id);
+                ClipboardResult::RemoteFilesAborted
+            }
             ClipboardWork::ApplyRemote {
                 id,
                 epoch,
@@ -290,6 +934,202 @@ impl ClipboardWorkerState {
             ClipboardWork::Stop { .. } => {
                 unreachable!("stop is consumed by the worker loop")
             }
+        }
+    }
+
+    fn prepare_remote_files(
+        &mut self,
+        transfer_id: u64,
+        files: Vec<FileDescriptor>,
+    ) -> Result<&RemoteStage, String> {
+        if self.active_transfer.load(Ordering::Acquire) != transfer_id {
+            return Err("remote clipboard file transfer was cancelled".to_string());
+        }
+        // The bridge permits only one active remote transfer. A cancellation can race with a
+        // queued prepare, so remove any older private stages before retaining the new one.
+        let stale_ids: Vec<u64> = self
+            .remote_stages
+            .keys()
+            .copied()
+            .filter(|id| *id != transfer_id)
+            .collect();
+        for stale_id in stale_ids {
+            if let Some(stage) = self.remote_stages.remove(&stale_id) {
+                self.remove_stage(&stage);
+            }
+        }
+        let stage = self.staging.create_remote_stage(transfer_id, &files)?;
+        if self.active_transfer.load(Ordering::Acquire) != transfer_id {
+            self.remove_stage(&stage);
+            return Err("remote clipboard file transfer was cancelled".to_string());
+        }
+        self.remote_stages.insert(transfer_id, stage);
+        self.remote_stages
+            .get(&transfer_id)
+            .ok_or_else(|| "remote clipboard staging was not retained".to_string())
+    }
+
+    fn store_remote_chunk(
+        &mut self,
+        transfer_id: u64,
+        index: usize,
+        offset: u64,
+        expected_size: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        if self.active_transfer.load(Ordering::Acquire) != transfer_id {
+            return Err("remote clipboard file transfer was cancelled".to_string());
+        }
+        if data.is_empty() || data.len() > MAX_FILE_CHUNK_BYTES as usize {
+            return Err("remote clipboard file chunk has an invalid size".to_string());
+        }
+        if expected_size > MAX_FILE_TOTAL_BYTES {
+            return Err("remote clipboard file size exceeds the safety limit".to_string());
+        }
+        let stage = self
+            .remote_stages
+            .get_mut(&transfer_id)
+            .ok_or_else(|| "remote clipboard file transfer is no longer active".to_string())?;
+        let entry = stage
+            .entries
+            .get_mut(index)
+            .ok_or_else(|| "remote clipboard file index is invalid".to_string())?;
+        if entry.is_dir || entry.received != offset {
+            return Err("remote clipboard file chunk correlation failed".to_string());
+        }
+        if entry.size.is_none() {
+            entry.size = Some(expected_size);
+        }
+        if entry.size != Some(expected_size) {
+            return Err("remote clipboard file chunk correlation failed".to_string());
+        }
+        let end = offset
+            .checked_add(
+                u64::try_from(data.len()).map_err(|_| "file chunk is too large".to_string())?,
+            )
+            .ok_or_else(|| "remote clipboard file range overflowed".to_string())?;
+        if expected_size < end {
+            return Err("remote clipboard file chunk exceeds the advertised size".to_string());
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&entry.path)
+            .map_err(|_| "remote clipboard staged file could not be opened".to_string())?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| "remote clipboard staged file seek failed".to_string())?;
+        file.write_all(data)
+            .map_err(|_| "remote clipboard staged file write failed".to_string())?;
+        entry.received = end;
+        Ok(())
+    }
+
+    fn publish_remote_files(
+        &mut self,
+        transfer_id: u64,
+        sizes: &[(usize, u64)],
+    ) -> Result<(), String> {
+        let stage = self
+            .remote_stages
+            .remove(&transfer_id)
+            .ok_or_else(|| "remote clipboard file transfer is no longer active".to_string())?;
+        let mut stage = stage;
+        if self.active_transfer.load(Ordering::Acquire) != transfer_id {
+            self.remove_stage(&stage);
+            return Err("remote clipboard file transfer was cancelled".to_string());
+        }
+        let mut seen_sizes = HashSet::new();
+        let mut total_size = 0u64;
+        for &(index, size) in sizes {
+            if !seen_sizes.insert(index) {
+                self.remove_stage(&stage);
+                return Err("remote clipboard file size was duplicated".to_string());
+            }
+            if size > MAX_FILE_TOTAL_BYTES {
+                self.remove_stage(&stage);
+                return Err("remote clipboard file size exceeds the safety limit".to_string());
+            }
+            let Some(entry) = stage.entries.get_mut(index) else {
+                self.remove_stage(&stage);
+                return Err("remote clipboard file size index is invalid".to_string());
+            };
+            if entry.is_dir || entry.declared_size.is_some_and(|declared| declared != size) {
+                self.remove_stage(&stage);
+                return Err("remote clipboard file size correlation failed".to_string());
+            }
+            total_size = match total_size.checked_add(size) {
+                Some(total) if total <= MAX_FILE_TOTAL_BYTES => total,
+                _ => {
+                    self.remove_stage(&stage);
+                    return Err("remote clipboard files exceed the total size limit".to_string());
+                }
+            };
+            entry.size = Some(size);
+        }
+        if stage
+            .entries
+            .iter()
+            .any(|entry| !entry.is_dir && entry.size != Some(entry.received))
+        {
+            self.remove_stage(&stage);
+            return Err("remote clipboard file transfer is incomplete".to_string());
+        }
+        let mut top_level = Vec::new();
+        let mut seen_top_level = HashSet::new();
+        for entry in &stage.entries {
+            let Ok(relative) = entry.path.strip_prefix(&stage.root) else {
+                self.remove_stage(&stage);
+                return Err("remote clipboard staging path escaped its root".to_string());
+            };
+            let Some(first) = relative.components().next() else {
+                self.remove_stage(&stage);
+                return Err("remote clipboard staging path is empty".to_string());
+            };
+            let top = stage.root.join(first.as_os_str());
+            if seen_top_level.insert(top.clone()) {
+                top_level.push(top);
+            }
+        }
+        if top_level.is_empty() {
+            self.remove_stage(&stage);
+            return Err("remote clipboard file transfer has no top-level paths".to_string());
+        }
+        let Some(lock) = self.staging.acquire_lock() else {
+            self.remove_stage(&stage);
+            return Err("clipboard staging is busy".to_string());
+        };
+        if self.active_transfer.load(Ordering::Acquire) != transfer_id {
+            self.remove_stage(&stage);
+            drop(lock);
+            return Err("remote clipboard file transfer was cancelled".to_string());
+        }
+        if let Err(error) = self.os.set_file_list(&top_level) {
+            self.remove_stage(&stage);
+            drop(lock);
+            return Err(error);
+        }
+        self.last_seen_fingerprint = Some(content_fingerprint(&ClipboardContent::Files(top_level)));
+        drop(lock);
+        Ok(())
+    }
+
+    fn abort_remote_files(&mut self, transfer_id: u64) -> Result<(), String> {
+        if let Some(stage) = self.remote_stages.remove(&transfer_id) {
+            self.remove_stage(&stage);
+        }
+        Ok(())
+    }
+
+    fn remove_stage(&self, stage: &RemoteStage) {
+        // `stage.root` is generated by StagingLayout and never comes from the peer. Keep the
+        // check here as a second guard before recursive cleanup of a transfer directory.
+        if stage.root.starts_with(&self.staging.root)
+            && stage.root != self.staging.root
+            && stage
+                .root
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("transfer-"))
+        {
+            let _ = fs::remove_dir_all(&stage.root);
         }
     }
 
@@ -328,11 +1168,19 @@ struct ClipboardWorkerHandle {
     join: Option<JoinHandle<()>>,
 }
 
+enum WorkerSubmitOutcome {
+    Queued,
+    Full(Box<ClipboardWork>),
+    Disconnected,
+}
+
 impl ClipboardWorkerHandle {
     fn spawn(
         os: Box<dyn OsClipboard>,
         bell: Option<Doorbell>,
         active_epoch: Arc<AtomicU64>,
+        active_transfer: Arc<AtomicU64>,
+        staging: StagingLayout,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::sync_channel(WORKER_COMMAND_QUEUE_DEPTH);
         let (result_tx, result_rx) = mpsc::sync_channel(WORKER_RESULT_QUEUE_DEPTH);
@@ -341,7 +1189,8 @@ impl ClipboardWorkerHandle {
         let join = thread::Builder::new()
             .name("mdrdp-clipboard".to_string())
             .spawn(move || {
-                let mut state = ClipboardWorkerState::new(os, active_epoch);
+                let mut state =
+                    ClipboardWorkerState::new(os, active_epoch, active_transfer, staging);
                 while let Ok(work) = command_rx.recv() {
                     if let ClipboardWork::Stop { id, epoch } = work {
                         let _ = (id, epoch);
@@ -370,11 +1219,15 @@ impl ClipboardWorkerHandle {
         }
     }
 
-    fn try_submit(&self, work: ClipboardWork) -> Result<(), TrySendError<ClipboardWork>> {
+    fn try_submit(&self, work: ClipboardWork) -> WorkerSubmitOutcome {
         let Some(command_tx) = &self.command_tx else {
-            return Err(TrySendError::Disconnected(work));
+            return WorkerSubmitOutcome::Disconnected;
         };
-        command_tx.try_send(work)
+        match command_tx.try_send(work) {
+            Ok(()) => WorkerSubmitOutcome::Queued,
+            Err(TrySendError::Full(work)) => WorkerSubmitOutcome::Full(Box::new(work)),
+            Err(TrySendError::Disconnected(_)) => WorkerSubmitOutcome::Disconnected,
+        }
     }
 
     fn try_result(&self) -> Option<ClipboardResult> {
@@ -390,12 +1243,12 @@ impl ClipboardWorkerHandle {
         let mut stop = ClipboardWork::Stop { id, epoch };
         loop {
             match self.try_submit(stop) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => break,
-                Err(TrySendError::Full(work)) => {
+                WorkerSubmitOutcome::Queued | WorkerSubmitOutcome::Disconnected => break,
+                WorkerSubmitOutcome::Full(work) => {
                     if std::time::Instant::now() >= deadline {
                         break;
                     }
-                    stop = work;
+                    stop = *work;
                     thread::yield_now();
                 }
             }
@@ -439,9 +1292,9 @@ impl ClipboardExecutor {
         match self {
             ClipboardExecutor::Inline(state) => SubmitOutcome::Completed(state.execute(work)),
             ClipboardExecutor::Worker(worker) => match worker.try_submit(work) {
-                Ok(()) => SubmitOutcome::Queued,
-                Err(TrySendError::Full(work)) => SubmitOutcome::Full(work),
-                Err(TrySendError::Disconnected(_)) => SubmitOutcome::Disconnected,
+                WorkerSubmitOutcome::Queued => SubmitOutcome::Queued,
+                WorkerSubmitOutcome::Full(work) => SubmitOutcome::Full(*work),
+                WorkerSubmitOutcome::Disconnected => SubmitOutcome::Disconnected,
             },
         }
     }
@@ -465,8 +1318,16 @@ impl ClipboardExecutor {
 pub trait OsClipboard: Send {
     /// Reads current clipboard content, preferring text when the platform exposes both.
     fn get_content(&mut self) -> Result<ClipboardContent, String>;
-    /// Replaces the clipboard with text or RGBA image content.
+    /// Replaces the clipboard with text, RGBA image, or file-list content.
     fn set_content(&mut self, content: ClipboardContent) -> Result<(), String>;
+    /// Reads the native file-list representation when the platform provides one.
+    fn get_file_list(&mut self) -> Result<Vec<PathBuf>, String> {
+        Err("clipboard file lists are unavailable".to_string())
+    }
+    /// Replaces the clipboard with a native file-list representation.
+    fn set_file_list(&mut self, _paths: &[PathBuf]) -> Result<(), String> {
+        Err("clipboard file lists are unavailable".to_string())
+    }
 }
 
 /// Real [`OsClipboard`] backed by `arboard`.
@@ -536,16 +1397,28 @@ impl OsClipboard for ArboardClipboard {
                             rgba,
                         })
                     }
-                    Err(image_error) => {
-                        self.inner = None;
-                        Err(format!("{error}; image read failed: {image_error}"))
-                    }
+                    Err(image_error) => match clipboard.get().file_list() {
+                        Ok(paths) if !paths.is_empty() => Ok(ClipboardContent::Files(paths)),
+                        Ok(_) => {
+                            self.inner = None;
+                            Err(format!("{error}; image read failed: {image_error}"))
+                        }
+                        Err(file_error) => {
+                            self.inner = None;
+                            Err(format!(
+                                "{error}; image read failed: {image_error}; file list read failed: {file_error}"
+                            ))
+                        }
+                    },
                 }
             }
         }
     }
 
     fn set_content(&mut self, content: ClipboardContent) -> Result<(), String> {
+        if let ClipboardContent::Files(paths) = content {
+            return self.set_file_list(&paths);
+        }
         let clipboard = self.ensure()?;
         let result = match content {
             ClipboardContent::Text(text) => clipboard.set_text(text),
@@ -558,7 +1431,32 @@ impl OsClipboard for ArboardClipboard {
                 height,
                 bytes: Cow::Owned(rgba),
             }),
+            ClipboardContent::Files(_) => unreachable!("file lists returned above"),
         };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.inner = None;
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn get_file_list(&mut self) -> Result<Vec<PathBuf>, String> {
+        let clipboard = self.ensure()?;
+        match clipboard.get().file_list() {
+            Ok(paths) => Ok(paths),
+            Err(arboard::Error::ContentNotAvailable) => Ok(Vec::new()),
+            Err(error) => {
+                self.inner = None;
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn set_file_list(&mut self, paths: &[PathBuf]) -> Result<(), String> {
+        let clipboard = self.ensure()?;
+        let result = clipboard.set().file_list(paths);
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -616,11 +1514,60 @@ enum AdvertiseState {
     Confirmed,
 }
 
+struct RemoteTransferEntry {
+    index: usize,
+    is_dir: bool,
+    declared_size: Option<u64>,
+    size: Option<u64>,
+    received: u64,
+}
+
+#[derive(Clone, Copy)]
+enum RemoteRequestKind {
+    Size,
+    Range,
+}
+
+#[derive(Clone, Copy)]
+struct RemotePendingRequest {
+    stream_id: u32,
+    index: usize,
+    offset: u64,
+    requested_size: u32,
+    kind: RemoteRequestKind,
+    operation_id: Option<u64>,
+}
+
+struct StoredRemoteChunk {
+    id: u64,
+    epoch: u64,
+    transfer_id: u64,
+    index: usize,
+    offset: u64,
+    len: usize,
+    result: Result<(), String>,
+}
+
+struct RemoteTransfer {
+    id: u64,
+    epoch: u64,
+    clip_data_id: Option<u32>,
+    entries: Vec<RemoteTransferEntry>,
+    pending: Option<RemotePendingRequest>,
+    started_at_ms: u64,
+}
+
 /// Implements [`CliprdrBackend`]. Deliberately thin: every callback forwards the raw event
 /// over the channel and returns immediately, doing no I/O and holding no state of its own.
-#[derive(Debug)]
 pub struct ClipboardBackend {
     tx: mpsc::Sender<ClipboardAction>,
+    temporary_directory: String,
+}
+
+impl fmt::Debug for ClipboardBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClipboardBackend")
+    }
 }
 
 impl AsAny for ClipboardBackend {
@@ -643,12 +1590,13 @@ impl ClipboardBackend {
 
 impl CliprdrBackend for ClipboardBackend {
     fn temporary_directory(&self) -> &str {
-        // File transfer is out of scope; we never advertise FileGroupDescriptorW.
-        ""
+        &self.temporary_directory
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        ClipboardGeneralCapabilityFlags::empty()
+        ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
+            | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED
     }
 
     fn on_ready(&mut self) {
@@ -665,8 +1613,9 @@ impl CliprdrBackend for ClipboardBackend {
 
     fn on_process_negotiated_capabilities(
         &mut self,
-        _capabilities: ClipboardGeneralCapabilityFlags,
+        capabilities: ClipboardGeneralCapabilityFlags,
     ) {
+        self.send(ClipboardAction::NegotiatedCapabilities(capabilities));
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -681,16 +1630,50 @@ impl CliprdrBackend for ClipboardBackend {
         self.send(ClipboardAction::RemoteDataReceived(response.into_owned()));
     }
 
-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {
-        // File transfer is out of scope. Safe no-op: we never advertise a file list, so a
-        // spec-compliant remote will not send this.
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        self.send(ClipboardAction::LocalFileContentsRequested(request));
     }
 
-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+        self.send(ClipboardAction::RemoteFileContentsReceived(
+            response.into_owned(),
+        ));
+    }
 
-    fn on_lock(&mut self, _data_id: LockDataId) {}
+    fn on_lock(&mut self, data_id: LockDataId) {
+        self.send(ClipboardAction::Lock(data_id));
+    }
 
-    fn on_unlock(&mut self, _data_id: LockDataId) {}
+    fn on_unlock(&mut self, data_id: LockDataId) {
+        self.send(ClipboardAction::Unlock(data_id));
+    }
+
+    fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
+        let files = if files.len() <= MAX_FILE_COUNT {
+            files.to_vec()
+        } else {
+            // IronRDP has already decoded the PDU, but avoid copying an oversized descriptor
+            // list into the bridge. The empty marker is rejected by stage creation and tears
+            // down the pending transfer without allocating another attacker-sized vector.
+            warn!(
+                file_count = files.len(),
+                "remote clipboard file list exceeds the safety limit"
+            );
+            Vec::new()
+        };
+        self.send(ClipboardAction::RemoteFileList {
+            files,
+            clip_data_id,
+        });
+    }
+
+    fn on_outgoing_locks_expired(&mut self, ids: &[LockDataId]) {
+        self.send(ClipboardAction::OutgoingLocksExpired(ids.to_vec()));
+    }
+
+    fn on_outgoing_locks_cleared(&mut self, ids: &[LockDataId]) {
+        self.send(ClipboardAction::OutgoingLocksCleared(ids.to_vec()));
+    }
 }
 
 /// The session-side half of the clipboard bridge: owns protocol state and the channel receiver.
@@ -705,6 +1688,19 @@ pub struct ClipboardBridge {
     ready_results: VecDeque<ClipboardResult>,
     clock: Arc<dyn ClipboardClock>,
     remote_formats: Vec<ClipboardFormat>,
+    negotiated_capabilities: ClipboardGeneralCapabilityFlags,
+    capabilities_negotiated: bool,
+    local_file_snapshot: Option<LocalFileSnapshot>,
+    locked_local_files: HashMap<u32, LocalFileSnapshot>,
+    pending_file_copy: Option<LocalFileSnapshot>,
+    remote_transfer: Option<RemoteTransfer>,
+    pending_remote_prepare: Option<(u64, u64)>,
+    pending_remote_publish: Option<(u64, u64)>,
+    deferred_remote_file_work: Option<ClipboardWork>,
+    stale_file_stream_ids: HashSet<u32>,
+    next_transfer_id: u64,
+    next_file_stream_id: u32,
+    active_transfer: Arc<AtomicU64>,
     paste_state: PasteState,
     advertise_state: AdvertiseState,
     /// Local polling starts before CLIPRDR's Monitor Ready handshake can complete. Sending
@@ -724,10 +1720,15 @@ pub struct ClipboardBridge {
     pending_poll_id: Option<u64>,
     pending_format_read: Option<u64>,
     pending_local_data: VecDeque<u64>,
+    pending_local_file_data: VecDeque<u64>,
     pending_paste_id: Option<u64>,
     deferred_format_read: bool,
     deferred_remote_apply: Option<ClipboardWork>,
     worker_active: bool,
+    /// Coalesced notification consumed by the session thread and shown through the window's
+    /// existing toast path. Keep only a bit: one oversized transfer must not build a queue while
+    /// the peer retries it.
+    file_limit_notification_pending: bool,
 }
 
 /// Creates a matched [`ClipboardBackend`]/[`ClipboardBridge`] pair using a serialized worker and
@@ -760,10 +1761,20 @@ fn clipboard_channel_worker(
     bell: Option<Doorbell>,
 ) -> (ClipboardBackend, ClipboardBridge) {
     let active_epoch = Arc::new(AtomicU64::new(1));
+    let active_transfer = Arc::new(AtomicU64::new(0));
+    let staging = StagingLayout::new();
     clipboard_channel_with_executor(
-        ClipboardExecutor::Worker(ClipboardWorkerHandle::spawn(os, bell, active_epoch.clone())),
+        ClipboardExecutor::Worker(ClipboardWorkerHandle::spawn(
+            os,
+            bell,
+            active_epoch.clone(),
+            active_transfer.clone(),
+            staging.clone(),
+        )),
         clock,
         active_epoch,
+        active_transfer,
+        staging,
     )
 }
 
@@ -772,10 +1783,19 @@ fn clipboard_channel_inline(
     clock: Arc<dyn ClipboardClock>,
 ) -> (ClipboardBackend, ClipboardBridge) {
     let active_epoch = Arc::new(AtomicU64::new(1));
+    let active_transfer = Arc::new(AtomicU64::new(0));
+    let staging = StagingLayout::new();
     clipboard_channel_with_executor(
-        ClipboardExecutor::Inline(ClipboardWorkerState::new(os, active_epoch.clone())),
+        ClipboardExecutor::Inline(ClipboardWorkerState::new(
+            os,
+            active_epoch.clone(),
+            active_transfer.clone(),
+            staging.clone(),
+        )),
         clock,
         active_epoch,
+        active_transfer,
+        staging,
     )
 }
 
@@ -783,9 +1803,14 @@ fn clipboard_channel_with_executor(
     executor: ClipboardExecutor,
     clock: Arc<dyn ClipboardClock>,
     active_epoch: Arc<AtomicU64>,
+    active_transfer: Arc<AtomicU64>,
+    staging: StagingLayout,
 ) -> (ClipboardBackend, ClipboardBridge) {
     let (tx, rx) = mpsc::channel();
-    let backend = ClipboardBackend { tx };
+    let backend = ClipboardBackend {
+        tx,
+        temporary_directory: staging.temporary_directory().to_string(),
+    };
     let bridge = ClipboardBridge {
         rx,
         local_pending: VecDeque::new(),
@@ -793,6 +1818,19 @@ fn clipboard_channel_with_executor(
         ready_results: VecDeque::new(),
         clock,
         remote_formats: Vec::new(),
+        negotiated_capabilities: ClipboardGeneralCapabilityFlags::empty(),
+        capabilities_negotiated: false,
+        local_file_snapshot: None,
+        locked_local_files: HashMap::new(),
+        pending_file_copy: None,
+        remote_transfer: None,
+        pending_remote_prepare: None,
+        pending_remote_publish: None,
+        deferred_remote_file_work: None,
+        stale_file_stream_ids: HashSet::new(),
+        next_transfer_id: 0,
+        next_file_stream_id: 0,
+        active_transfer,
         paste_state: PasteState::Idle,
         advertise_state: AdvertiseState::Idle,
         initial_format_list_requested: false,
@@ -807,10 +1845,12 @@ fn clipboard_channel_with_executor(
         pending_poll_id: None,
         pending_format_read: None,
         pending_local_data: VecDeque::new(),
+        pending_local_file_data: VecDeque::new(),
         pending_paste_id: None,
         deferred_format_read: false,
         deferred_remote_apply: None,
         worker_active: true,
+        file_limit_notification_pending: false,
     };
     (backend, bridge)
 }
@@ -826,6 +1866,20 @@ impl ClipboardBridge {
             .unwrap_or(MAX_IMAGE_BYTES);
         self.paste_timeout_ms = policy.paste_timeout_ms;
         self
+    }
+
+    /// Take one pending user-visible notification for an oversized file transfer.
+    ///
+    /// The session owns the UI, so the bridge reports only this bounded signal and never
+    /// carries file names, paths, or bytes across the window boundary.
+    pub(crate) fn take_file_limit_notification(&mut self) -> bool {
+        std::mem::take(&mut self.file_limit_notification_pending)
+    }
+
+    fn note_file_limit_error(&mut self, error: &str) {
+        if is_file_limit_error(error) {
+            self.file_limit_notification_pending = true;
+        }
     }
 
     /// Formats most recently offered by the remote's clipboard (from the last
@@ -854,6 +1908,7 @@ impl ClipboardBridge {
         self.check_timeouts();
         // Reliable deferred work gets first claim on a newly freed worker slot. Each is tried
         // once per session turn, so a blocked pasteboard cannot turn retry into a busy loop.
+        self.retry_deferred_remote_file_work();
         self.retry_deferred_remote_apply();
         self.retry_deferred_format_read();
 
@@ -915,9 +1970,16 @@ impl ClipboardBridge {
         self.pending_format_read = None;
         self.pending_poll_id = None;
         self.pending_local_data.clear();
+        self.pending_local_file_data.clear();
         self.pending_paste_id = None;
         self.deferred_format_read = false;
         self.deferred_remote_apply = None;
+        self.deferred_remote_file_work = None;
+        self.file_limit_notification_pending = false;
+        self.cancel_remote_transfer();
+        self.local_file_snapshot = None;
+        self.locked_local_files.clear();
+        self.pending_file_copy = None;
         self.paste_state = PasteState::Idle;
         self.advertise_state = AdvertiseState::Idle;
         self.initial_format_list_requested = false;
@@ -939,6 +2001,13 @@ impl ClipboardBridge {
                 );
                 self.paste_state = PasteState::Idle;
                 self.pending_paste_id = None;
+            }
+        }
+        if let Some(transfer) = self.remote_transfer.as_ref() {
+            let elapsed = self.clock.now_ms().saturating_sub(transfer.started_at_ms);
+            if elapsed >= FILE_TRANSFER_TIMEOUT_MS {
+                warn!(elapsed_ms = elapsed, "clipboard file transfer timed out");
+                self.cancel_remote_transfer();
             }
         }
     }
@@ -1025,7 +2094,7 @@ impl ClipboardBridge {
                 self.initial_format_list_requested = true;
                 self.advertise();
             }
-            ClipboardAction::FormatListAcked(ok) => self.handle_format_list_acked(ok),
+            ClipboardAction::FormatListAcked(ok) => self.handle_format_list_acked(ok, cliprdr, out),
             ClipboardAction::RemoteCopy(formats) => self.handle_remote_copy(formats, cliprdr, out),
             ClipboardAction::LocalDataRequested(format) => {
                 self.handle_local_data_requested(format, cliprdr, out)
@@ -1033,6 +2102,26 @@ impl ClipboardBridge {
             ClipboardAction::RemoteDataReceived(response) => {
                 self.handle_remote_data_received(response)
             }
+            ClipboardAction::RemoteFileList {
+                files,
+                clip_data_id,
+            } => self.handle_remote_file_list(files, clip_data_id),
+            ClipboardAction::LocalFileContentsRequested(request) => {
+                self.handle_local_file_contents_requested(request, cliprdr, out)
+            }
+            ClipboardAction::RemoteFileContentsReceived(response) => {
+                self.handle_remote_file_contents_received(response, cliprdr, out)
+            }
+            ClipboardAction::NegotiatedCapabilities(capabilities) => {
+                self.negotiated_capabilities = capabilities;
+                self.capabilities_negotiated = true;
+            }
+            ClipboardAction::Lock(data_id) => self.handle_lock(data_id),
+            ClipboardAction::Unlock(data_id) => {
+                self.locked_local_files.remove(&data_id.0);
+            }
+            ClipboardAction::OutgoingLocksExpired(ids) => self.handle_outgoing_locks_expired(&ids),
+            ClipboardAction::OutgoingLocksCleared(ids) => self.handle_outgoing_locks_cleared(&ids),
         }
     }
 
@@ -1066,9 +2155,18 @@ impl ClipboardBridge {
                 }
                 self.pending_format_read = None;
                 match result {
-                    Ok(formats) => self.complete_advertise(formats, cliprdr, out),
+                    Ok(snapshot) => self.complete_advertise(snapshot, cliprdr, out),
                     Err(error) => {
+                        self.note_file_limit_error(&error);
                         warn!(%error, "failed to read OS clipboard for format-list advertise");
+                        // Do not leave an older file snapshot available after a failed read:
+                        // serving it would expose bytes from a clipboard generation the user no
+                        // longer owns. Clear IronRDP's delayed file list when the channel is ready.
+                        self.local_file_snapshot = None;
+                        self.pending_file_copy = None;
+                        if let Ok(messages) = cliprdr.initiate_copy(&[]) {
+                            out.push(messages);
+                        }
                         self.advertise_state = AdvertiseState::Idle;
                     }
                 }
@@ -1089,6 +2187,62 @@ impl ClipboardBridge {
                     Err(error) => warn!(%error, "failed to encode clipboard format-data response"),
                 }
             }
+            ClipboardResult::LocalFileData {
+                id,
+                epoch,
+                response,
+            } => {
+                if epoch != self.epoch
+                    || !self
+                        .pending_local_file_data
+                        .iter()
+                        .any(|pending| *pending == id)
+                {
+                    return;
+                }
+                self.pending_local_file_data
+                    .retain(|pending| *pending != id);
+                match cliprdr.submit_file_contents(response) {
+                    Ok(messages) => out.push(messages),
+                    Err(error) => {
+                        warn!(%error, "failed to encode clipboard file-contents response")
+                    }
+                }
+            }
+            ClipboardResult::RemoteFilesPrepared {
+                id,
+                epoch,
+                transfer_id,
+                result,
+            } => self.handle_remote_files_prepared(id, epoch, transfer_id, result, cliprdr, out),
+            ClipboardResult::RemoteChunkStored {
+                id,
+                epoch,
+                transfer_id,
+                index,
+                offset,
+                len,
+                result,
+            } => self.handle_remote_chunk_stored(
+                StoredRemoteChunk {
+                    id,
+                    epoch,
+                    transfer_id,
+                    index,
+                    offset,
+                    len,
+                    result,
+                },
+                cliprdr,
+                out,
+            ),
+            ClipboardResult::RemoteFilesPublished {
+                id,
+                epoch,
+                transfer_id,
+                result,
+            } => self.handle_remote_files_published(id, epoch, transfer_id, result),
+            ClipboardResult::RemoteFilesAborted => {}
             ClipboardResult::RemoteApplied { id, epoch, result } => {
                 if epoch != self.epoch {
                     return;
@@ -1146,20 +2300,71 @@ impl ClipboardBridge {
 
     fn complete_advertise<R: Role>(
         &mut self,
-        formats: Vec<ClipboardFormat>,
+        snapshot: LocalClipboardSnapshot,
         cliprdr: &mut Cliprdr<R>,
         out: &mut Vec<CliprdrSvcMessages<R>>,
     ) {
-        match cliprdr.initiate_copy(&formats) {
-            Ok(messages) => out.push(messages),
-            Err(error) => {
-                warn!(%error, "failed to encode clipboard format-list advertise; giving up for now");
+        // Taking local clipboard ownership supersedes an eager download of the previous remote
+        // clipboard. Cancel before any new FormatList can reach the wire so a stale worker result
+        // cannot publish old files after this local generation wins.
+        self.cancel_remote_transfer();
+        if let Some(files) = snapshot.files {
+            self.local_file_snapshot = Some(files.clone());
+            self.pending_file_copy = Some(files.clone());
+            if self.capabilities_negotiated
+                && !self
+                    .negotiated_capabilities
+                    .contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED)
+            {
+                warn!("remote does not support clipboard file transfer");
+                self.pending_file_copy = None;
                 self.advertise_state = AdvertiseState::Idle;
+                return;
+            }
+            match cliprdr.initiate_file_copy(
+                files
+                    .entries
+                    .iter()
+                    .map(|entry| entry.descriptor.clone())
+                    .collect(),
+            ) {
+                Ok(messages) => {
+                    out.push(messages);
+                    self.pending_file_copy = None;
+                }
+                Err(file_error) => {
+                    // The first local copy can arrive while IronRDP is still in its
+                    // Initialization state. The empty bootstrap carries capabilities and
+                    // temporary-directory PDUs; the descriptor list is sent after its ack.
+                    match cliprdr.initiate_copy(&[]) {
+                        Ok(messages) => out.push(messages),
+                        Err(error) => {
+                            warn!(%file_error, %error, "failed to advertise clipboard file list");
+                            self.pending_file_copy = None;
+                            self.advertise_state = AdvertiseState::Idle;
+                        }
+                    }
+                }
+            }
+        } else {
+            self.local_file_snapshot = None;
+            self.pending_file_copy = None;
+            match cliprdr.initiate_copy(&snapshot.formats) {
+                Ok(messages) => out.push(messages),
+                Err(error) => {
+                    warn!(%error, "failed to encode clipboard format-list advertise; giving up for now");
+                    self.advertise_state = AdvertiseState::Idle;
+                }
             }
         }
     }
 
-    fn handle_format_list_acked(&mut self, ok: bool) {
+    fn handle_format_list_acked<R: Role>(
+        &mut self,
+        ok: bool,
+        cliprdr: &mut Cliprdr<R>,
+        out: &mut Vec<CliprdrSvcMessages<R>>,
+    ) {
         // An acknowledgement is itself proof that the protocol requested and received an
         // initial list. This keeps synthetic ready-client tests faithful too.
         self.initial_format_list_requested = true;
@@ -1180,7 +2385,27 @@ impl ClipboardBridge {
                 resend_requested: false,
                 ..
             } if ok => {
-                self.advertise_state = AdvertiseState::Confirmed;
+                if let Some(files) = self.pending_file_copy.take() {
+                    match cliprdr.initiate_file_copy(
+                        files
+                            .entries
+                            .iter()
+                            .map(|entry| entry.descriptor.clone())
+                            .collect(),
+                    ) {
+                        Ok(messages) => out.push(messages),
+                        Err(error) => {
+                            warn!(%error, "failed to send pending clipboard file list");
+                            self.local_file_snapshot = None;
+                            if let Ok(messages) = cliprdr.initiate_copy(&[]) {
+                                out.push(messages);
+                            }
+                            self.advertise_state = AdvertiseState::Idle;
+                        }
+                    }
+                } else {
+                    self.advertise_state = AdvertiseState::Confirmed;
+                }
             }
             AdvertiseState::Pending {
                 attempt,
@@ -1223,9 +2448,23 @@ impl ClipboardBridge {
         out: &mut Vec<CliprdrSvcMessages<R>>,
     ) {
         self.worker_active = true;
+        // A new remote FormatList supersedes any eager file download from the previous
+        // clipboard. Cancel before requesting the new delayed file list so an old staged
+        // transfer cannot publish after the clipboard generation changes.
+        self.cancel_remote_transfer();
         self.remote_formats = formats;
 
-        let Some(format) = best_content_format(&self.remote_formats) else {
+        if !self.allow_from_remote {
+            self.paste_state = PasteState::Idle;
+            self.pending_paste_id = None;
+            return;
+        }
+
+        let allow_remote_files = !self.capabilities_negotiated
+            || self
+                .negotiated_capabilities
+                .contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED);
+        let Some(format) = best_content_format(&self.remote_formats, allow_remote_files) else {
             debug!("remote copy offered no supported clipboard format");
             self.paste_state = PasteState::Idle;
             self.pending_paste_id = None;
@@ -1245,6 +2484,586 @@ impl ClipboardBridge {
                 self.paste_state = PasteState::Idle;
                 self.pending_paste_id = None;
             }
+        }
+    }
+
+    fn next_transfer_id(&mut self) -> u64 {
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
+        self.next_transfer_id
+    }
+
+    fn next_file_stream_id(&mut self) -> u32 {
+        for _ in 0..=MAX_STALE_FILE_STREAM_IDS {
+            self.next_file_stream_id = self.next_file_stream_id.wrapping_add(1).max(1);
+            if !self
+                .stale_file_stream_ids
+                .contains(&self.next_file_stream_id)
+            {
+                return self.next_file_stream_id;
+            }
+        }
+        // At most one stream is active and the stale set is bounded, so this is unreachable
+        // unless the stream-id bookkeeping invariant is broken.
+        unreachable!("no clipboard file stream id is available")
+    }
+
+    fn remember_stale_file_stream(&mut self, stream_id: u32) {
+        if self.stale_file_stream_ids.len() < MAX_STALE_FILE_STREAM_IDS {
+            self.stale_file_stream_ids.insert(stream_id);
+        }
+    }
+
+    fn retry_deferred_remote_file_work(&mut self) {
+        let Some(work) = self.deferred_remote_file_work.take() else {
+            return;
+        };
+        match self.submit_work(work) {
+            SubmitOutcome::Full(work) => self.deferred_remote_file_work = Some(work),
+            SubmitOutcome::Disconnected => {
+                warn!("clipboard worker disconnected during file transfer")
+            }
+            SubmitOutcome::Completed(_) | SubmitOutcome::Queued => {}
+        }
+    }
+
+    fn submit_remote_file_work(&mut self, work: ClipboardWork) {
+        match self.submit_work(work) {
+            SubmitOutcome::Full(work) => {
+                if self.deferred_remote_file_work.replace(work).is_some() {
+                    warn!("clipboard file transfer work was superseded")
+                }
+            }
+            SubmitOutcome::Disconnected => {
+                warn!("clipboard worker disconnected during file transfer")
+            }
+            SubmitOutcome::Completed(_) | SubmitOutcome::Queued => {}
+        }
+    }
+
+    fn handle_remote_file_list(&mut self, files: Vec<FileDescriptor>, clip_data_id: Option<u32>) {
+        let requested_format = match self.paste_state {
+            PasteState::Requested { format, .. } => format,
+            PasteState::Idle => return,
+        };
+        if !self.is_file_list_format(requested_format)
+            || !self.allow_from_remote
+            || (self.capabilities_negotiated
+                && !self
+                    .negotiated_capabilities
+                    .contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED))
+        {
+            return;
+        }
+        if files.is_empty() {
+            self.note_file_limit_error("remote clipboard file count exceeds the safety limit");
+            warn!("remote clipboard file list is empty or oversized");
+            self.paste_state = PasteState::Idle;
+            self.pending_paste_id = None;
+            self.cancel_remote_transfer();
+            return;
+        }
+        self.paste_state = PasteState::Idle;
+        self.pending_paste_id = None;
+        self.cancel_remote_transfer();
+
+        let transfer_id = self.next_transfer_id();
+        self.active_transfer.store(transfer_id, Ordering::Release);
+        let operation_id = self.next_operation_id();
+        self.remote_transfer = Some(RemoteTransfer {
+            id: transfer_id,
+            epoch: self.epoch,
+            clip_data_id,
+            entries: Vec::new(),
+            pending: None,
+            started_at_ms: self.clock.now_ms(),
+        });
+        self.pending_remote_prepare = Some((operation_id, transfer_id));
+        self.submit_remote_file_work(ClipboardWork::PrepareRemoteFiles {
+            id: operation_id,
+            epoch: self.epoch,
+            transfer_id,
+            files,
+        });
+    }
+
+    fn is_file_list_format(&self, format: ClipboardFormatId) -> bool {
+        self.remote_formats.iter().any(|available| {
+            available.id() == format
+                && available
+                    .name()
+                    .is_some_and(|name| name.value() == FORMAT_NAME_FILE_LIST)
+        })
+    }
+
+    fn handle_remote_files_prepared<R: Role>(
+        &mut self,
+        id: u64,
+        epoch: u64,
+        transfer_id: u64,
+        result: Result<Vec<RemotePreparedEntry>, String>,
+        cliprdr: &mut Cliprdr<R>,
+        out: &mut Vec<CliprdrSvcMessages<R>>,
+    ) {
+        if epoch != self.epoch || self.pending_remote_prepare != Some((id, transfer_id)) {
+            return;
+        }
+        self.pending_remote_prepare = None;
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.note_file_limit_error(&error);
+                warn!(operation_id = id, "remote clipboard file list was rejected");
+                self.cancel_remote_transfer();
+                return;
+            }
+        };
+        if prepared.is_empty() || prepared.len() > MAX_FILE_COUNT {
+            self.note_file_limit_error("remote clipboard file count exceeds the safety limit");
+            warn!("remote clipboard file list had an invalid count");
+            self.cancel_remote_transfer();
+            return;
+        }
+        let Some(transfer) = self.remote_transfer.as_mut() else {
+            return;
+        };
+        if transfer.id != transfer_id {
+            return;
+        }
+        let mut total_known = 0u64;
+        let mut entries = Vec::with_capacity(prepared.len());
+        for (expected_index, item) in prepared.into_iter().enumerate() {
+            if item.index != expected_index
+                || (item.is_dir && item.declared_size.is_some_and(|size| size != 0))
+            {
+                warn!("remote clipboard file list correlation failed");
+                self.cancel_remote_transfer();
+                return;
+            }
+            if !item.is_dir
+                && let Some(size) = item.declared_size
+            {
+                total_known = match total_known.checked_add(size) {
+                    Some(total) if total <= MAX_FILE_TOTAL_BYTES => total,
+                    _ => {
+                        self.note_file_limit_error(
+                            "remote clipboard files exceed the total size limit",
+                        );
+                        warn!("remote clipboard files exceed the total size limit");
+                        self.cancel_remote_transfer();
+                        return;
+                    }
+                };
+            }
+            entries.push(RemoteTransferEntry {
+                index: expected_index,
+                is_dir: item.is_dir,
+                declared_size: item.declared_size,
+                size: item.declared_size.or_else(|| item.is_dir.then_some(0)),
+                received: 0,
+            });
+        }
+        transfer.entries = entries;
+        self.request_next_remote_file(cliprdr, out);
+    }
+
+    fn request_next_remote_file<R: Role>(
+        &mut self,
+        cliprdr: &mut Cliprdr<R>,
+        out: &mut Vec<CliprdrSvcMessages<R>>,
+    ) {
+        let Some(snapshot) = self.remote_transfer.as_ref() else {
+            return;
+        };
+        if snapshot.pending.is_some() {
+            return;
+        }
+        let transfer_id = snapshot.id;
+        let epoch = snapshot.epoch;
+        let clip_data_id = snapshot.clip_data_id;
+        let next = snapshot
+            .entries
+            .iter()
+            .find(|entry| !entry.is_dir && entry.size.is_none())
+            .map(|entry| entry.index);
+        let range = snapshot
+            .entries
+            .iter()
+            .find(|entry| !entry.is_dir && entry.size.is_some_and(|size| entry.received < size));
+
+        let (index, flags, offset, requested_size, kind) = if let Some(index) = next {
+            (
+                index,
+                FileContentsFlags::SIZE,
+                0,
+                8,
+                RemoteRequestKind::Size,
+            )
+        } else if let Some(entry) = range {
+            let size = entry.size.expect("range entry has size");
+            let remaining = size.saturating_sub(entry.received);
+            let requested = remaining.min(u64::from(MAX_FILE_CHUNK_BYTES)) as u32;
+            if requested == 0 {
+                return;
+            }
+            (
+                entry.index,
+                FileContentsFlags::RANGE,
+                entry.received,
+                requested,
+                RemoteRequestKind::Range,
+            )
+        } else {
+            let sizes = snapshot
+                .entries
+                .iter()
+                .filter(|entry| !entry.is_dir)
+                .filter_map(|entry| entry.size.map(|size| (entry.index, size)))
+                .collect();
+            let operation_id = self.next_operation_id();
+            self.pending_remote_publish = Some((operation_id, transfer_id));
+            self.submit_remote_file_work(ClipboardWork::PublishRemoteFiles {
+                id: operation_id,
+                epoch,
+                transfer_id,
+                sizes,
+            });
+            return;
+        };
+
+        let stream_id = self.next_file_stream_id();
+        let request = FileContentsRequest {
+            stream_id,
+            index: i32::try_from(index).unwrap_or(i32::MAX),
+            flags,
+            position: offset,
+            requested_size,
+            data_id: clip_data_id,
+        };
+        match cliprdr.request_file_contents(request) {
+            Ok(messages) => {
+                out.push(messages);
+                if let Some(transfer) = self.remote_transfer.as_mut() {
+                    transfer.pending = Some(RemotePendingRequest {
+                        stream_id,
+                        index,
+                        offset,
+                        requested_size,
+                        kind,
+                        operation_id: None,
+                    });
+                }
+            }
+            Err(error) => {
+                warn!(%error, "failed to request remote clipboard file contents");
+                self.cancel_remote_transfer();
+            }
+        }
+    }
+
+    fn handle_remote_file_contents_received<R: Role>(
+        &mut self,
+        response: OwnedFileContentsResponse,
+        cliprdr: &mut Cliprdr<R>,
+        out: &mut Vec<CliprdrSvcMessages<R>>,
+    ) {
+        let stream_id = response.stream_id();
+        if self.stale_file_stream_ids.remove(&stream_id) {
+            // A response for a canceled transfer may still be in flight in CLIPRDR. It must not
+            // consume or cancel a newer transfer's pending request.
+            return;
+        }
+        let Some(transfer) = self.remote_transfer.as_ref() else {
+            self.cancel_remote_transfer();
+            return;
+        };
+        let Some(pending) = transfer.pending else {
+            self.cancel_remote_transfer();
+            return;
+        };
+        if stream_id != pending.stream_id || response.is_error() {
+            warn!("remote clipboard file contents response correlation failed");
+            self.cancel_remote_transfer();
+            return;
+        }
+        let transfer_id = transfer.id;
+        let pending = self
+            .remote_transfer
+            .as_mut()
+            .and_then(|transfer| transfer.pending.take())
+            .expect("pending file response was checked above");
+        match pending.kind {
+            RemoteRequestKind::Size => {
+                let Some(data) = response.data().get(..8) else {
+                    self.cancel_remote_transfer();
+                    return;
+                };
+                if response.data().len() != 8 {
+                    self.cancel_remote_transfer();
+                    return;
+                }
+                let size = u64::from_le_bytes(data.try_into().expect("size length checked"));
+                if size > MAX_FILE_TOTAL_BYTES {
+                    self.note_file_limit_error(
+                        "remote clipboard file size exceeds the safety limit",
+                    );
+                    self.cancel_remote_transfer();
+                    return;
+                }
+                let Some(entry) = self
+                    .remote_transfer
+                    .as_ref()
+                    .and_then(|transfer| transfer.entries.get(pending.index))
+                else {
+                    self.cancel_remote_transfer();
+                    return;
+                };
+                if entry.is_dir || entry.declared_size.is_some_and(|declared| declared != size) {
+                    self.cancel_remote_transfer();
+                    return;
+                }
+                let total_known = self
+                    .remote_transfer
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|transfer| transfer.entries.iter())
+                    .filter(|entry| !entry.is_dir)
+                    .filter_map(|entry| entry.size)
+                    .fold(0u64, |total, value| total.saturating_add(value));
+                if total_known.saturating_add(size) > MAX_FILE_TOTAL_BYTES {
+                    self.note_file_limit_error(
+                        "remote clipboard files exceed the total size limit",
+                    );
+                    self.cancel_remote_transfer();
+                    return;
+                }
+                if let Some(transfer) = self.remote_transfer.as_mut()
+                    && let Some(entry) = transfer.entries.get_mut(pending.index)
+                {
+                    entry.size = Some(size);
+                }
+                self.request_next_remote_file(cliprdr, out);
+            }
+            RemoteRequestKind::Range => {
+                if response.data().len() != pending.requested_size as usize {
+                    self.cancel_remote_transfer();
+                    return;
+                }
+                let Some((size, received)) = self
+                    .remote_transfer
+                    .as_ref()
+                    .and_then(|transfer| transfer.entries.get(pending.index))
+                    .and_then(|entry| entry.size.map(|size| (size, entry.received)))
+                else {
+                    self.cancel_remote_transfer();
+                    return;
+                };
+                let Some(end) = pending
+                    .offset
+                    .checked_add(u64::from(pending.requested_size))
+                else {
+                    self.cancel_remote_transfer();
+                    return;
+                };
+                if received != pending.offset || end > size {
+                    self.cancel_remote_transfer();
+                    return;
+                }
+                let operation_id = self.next_operation_id();
+                let data = response.data().to_vec();
+                self.submit_remote_file_work(ClipboardWork::StoreRemoteChunk {
+                    id: operation_id,
+                    epoch: self.epoch,
+                    transfer_id,
+                    index: pending.index,
+                    offset: pending.offset,
+                    expected_size: size,
+                    data,
+                });
+                if let Some(transfer) = self.remote_transfer.as_mut()
+                    && let Some(current) = transfer.pending.as_mut()
+                {
+                    *current = RemotePendingRequest {
+                        operation_id: Some(operation_id),
+                        ..pending
+                    };
+                }
+            }
+        }
+    }
+
+    fn handle_remote_chunk_stored<R: Role>(
+        &mut self,
+        stored: StoredRemoteChunk,
+        cliprdr: &mut Cliprdr<R>,
+        out: &mut Vec<CliprdrSvcMessages<R>>,
+    ) {
+        let StoredRemoteChunk {
+            id,
+            epoch,
+            transfer_id,
+            index,
+            offset,
+            len,
+            result,
+        } = stored;
+        if epoch != self.epoch {
+            return;
+        }
+        let Some(transfer) = self.remote_transfer.as_mut() else {
+            return;
+        };
+        if transfer.id != transfer_id {
+            return;
+        }
+        let Some(pending) = transfer.pending.as_ref() else {
+            return;
+        };
+        if pending.operation_id != Some(id)
+            || pending.index != index
+            || pending.offset != offset
+            || pending.requested_size as usize != len
+        {
+            return;
+        }
+        if let Err(error) = &result {
+            self.note_file_limit_error(error);
+            self.cancel_remote_transfer();
+            return;
+        }
+        let Some(entry) = transfer.entries.get_mut(index) else {
+            self.cancel_remote_transfer();
+            return;
+        };
+        entry.received = match entry.received.checked_add(len as u64) {
+            Some(received) => received,
+            None => {
+                self.cancel_remote_transfer();
+                return;
+            }
+        };
+        transfer.pending = None;
+        self.request_next_remote_file(cliprdr, out);
+    }
+
+    fn handle_remote_files_published(
+        &mut self,
+        id: u64,
+        epoch: u64,
+        transfer_id: u64,
+        result: Result<(), String>,
+    ) {
+        if epoch != self.epoch || self.pending_remote_publish != Some((id, transfer_id)) {
+            return;
+        }
+        self.pending_remote_publish = None;
+        if let Err(error) = &result {
+            self.note_file_limit_error(error);
+            warn!(
+                operation_id = id,
+                "remote clipboard files were not published"
+            );
+        }
+        self.active_transfer.store(0, Ordering::Release);
+        self.remote_transfer = None;
+    }
+
+    fn cancel_remote_transfer(&mut self) {
+        let transfer_id = self.remote_transfer.take().map(|transfer| {
+            if let Some(pending) = transfer.pending {
+                self.remember_stale_file_stream(pending.stream_id);
+            }
+            transfer.id
+        });
+        self.active_transfer.store(0, Ordering::Release);
+        self.pending_remote_prepare = None;
+        self.pending_remote_publish = None;
+        if let Some(transfer_id) = transfer_id {
+            let work = ClipboardWork::AbortRemoteFiles { transfer_id };
+            self.deferred_remote_file_work = None;
+            self.submit_remote_file_work(work);
+        }
+    }
+
+    fn handle_lock(&mut self, data_id: LockDataId) {
+        if let Some(snapshot) = &self.local_file_snapshot {
+            self.locked_local_files.insert(data_id.0, snapshot.clone());
+        }
+    }
+
+    fn handle_local_file_contents_requested<R: Role>(
+        &mut self,
+        request: FileContentsRequest,
+        cliprdr: &mut Cliprdr<R>,
+        out: &mut Vec<CliprdrSvcMessages<R>>,
+    ) {
+        if !self.allow_to_remote {
+            self.submit_file_error(cliprdr, out, request.stream_id);
+            return;
+        }
+        let snapshot = match request.data_id {
+            Some(data_id) => self.locked_local_files.get(&data_id),
+            None => self.local_file_snapshot.as_ref(),
+        };
+        let Some(snapshot) = snapshot else {
+            self.submit_file_error(cliprdr, out, request.stream_id);
+            return;
+        };
+        let Ok(index) = usize::try_from(request.index) else {
+            self.submit_file_error(cliprdr, out, request.stream_id);
+            return;
+        };
+        let Some(entry) = snapshot.entries.get(index).cloned() else {
+            self.submit_file_error(cliprdr, out, request.stream_id);
+            return;
+        };
+        let id = self.next_operation_id();
+        self.pending_local_file_data.push_back(id);
+        let outcome = self.submit_work(ClipboardWork::ReadLocalFile {
+            id,
+            epoch: self.epoch,
+            request: request.clone(),
+            entry,
+        });
+        if matches!(
+            outcome,
+            SubmitOutcome::Full(_) | SubmitOutcome::Disconnected
+        ) {
+            self.pending_local_file_data
+                .retain(|pending| *pending != id);
+            self.submit_file_error(cliprdr, out, request.stream_id);
+        }
+    }
+
+    fn submit_file_error<R: Role>(
+        &mut self,
+        cliprdr: &mut Cliprdr<R>,
+        out: &mut Vec<CliprdrSvcMessages<R>>,
+        stream_id: u32,
+    ) {
+        match cliprdr.submit_file_contents(OwnedFileContentsResponse::new_error(stream_id)) {
+            Ok(messages) => out.push(messages),
+            Err(error) => warn!(%error, "failed to encode clipboard file-contents error"),
+        }
+    }
+
+    fn handle_outgoing_locks_expired(&mut self, ids: &[LockDataId]) {
+        if self.remote_transfer.as_ref().is_some_and(|transfer| {
+            transfer
+                .clip_data_id
+                .is_some_and(|id| ids.iter().any(|lock| lock.0 == id))
+        }) {
+            // IronRDP keeps expired locks alive while requests are in flight. Continue the
+            // current transfer; the cleared callback below is the point where the lock is gone.
+        }
+    }
+
+    fn handle_outgoing_locks_cleared(&mut self, ids: &[LockDataId]) {
+        if self.remote_transfer.as_ref().is_some_and(|transfer| {
+            transfer
+                .clip_data_id
+                .is_some_and(|id| ids.iter().any(|lock| lock.0 == id))
+        }) {
+            self.cancel_remote_transfer();
         }
     }
 
@@ -1368,6 +3187,7 @@ impl ClipboardBridge {
 
 impl Drop for ClipboardBridge {
     fn drop(&mut self) {
+        self.cancel_remote_transfer();
         self.worker_active = false;
         self.epoch = self.epoch.wrapping_add(1).max(1);
         self.active_epoch.store(self.epoch, Ordering::Release);
@@ -1376,11 +3196,266 @@ impl Drop for ClipboardBridge {
     }
 }
 
-fn read_local_formats(os: &mut dyn OsClipboard) -> Result<Vec<ClipboardFormat>, String> {
-    match os.get_content()? {
-        ClipboardContent::Text(_) => Ok(text_formats()),
-        ClipboardContent::Image { .. } => Ok(image_formats()),
+fn read_local_snapshot(os: &mut dyn OsClipboard) -> Result<LocalClipboardSnapshot, String> {
+    let content = os.get_content()?;
+    match content {
+        ClipboardContent::Text(_) => Ok(LocalClipboardSnapshot {
+            formats: text_formats(),
+            files: None,
+        }),
+        ClipboardContent::Image { .. } => Ok(LocalClipboardSnapshot {
+            formats: image_formats(),
+            files: None,
+        }),
+        ClipboardContent::Files(paths) => Ok(LocalClipboardSnapshot {
+            formats: vec![
+                ClipboardFormat::new(ClipboardFormatId::new(0xC0FE))
+                    .with_name(ClipboardFormatName::new_static(FORMAT_NAME_FILE_LIST)),
+            ],
+            files: Some(build_local_file_snapshot(&paths)?),
+        }),
     }
+}
+
+fn build_local_file_snapshot(paths: &[PathBuf]) -> Result<LocalFileSnapshot, String> {
+    if paths.is_empty() || paths.len() > MAX_FILE_COUNT {
+        return Err("clipboard file count exceeds the safety limit".to_string());
+    }
+    let mut builder = LocalSnapshotBuilder {
+        entries: Vec::new(),
+        seen: HashSet::new(),
+        total_size: 0,
+    };
+    for path in paths {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| "clipboard file metadata could not be read".to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err("clipboard symlinks are not supported".to_string());
+        }
+        let canonical = fs::canonicalize(path)
+            .map_err(|_| "clipboard file path could not be resolved".to_string())?;
+        append_local_file_entry(&mut builder, &canonical, None)?;
+    }
+    Ok(LocalFileSnapshot {
+        entries: builder.entries,
+    })
+}
+
+struct LocalSnapshotBuilder {
+    entries: Vec<LocalFileEntry>,
+    seen: HashSet<String>,
+    total_size: u64,
+}
+
+fn append_local_file_entry(
+    builder: &mut LocalSnapshotBuilder,
+    path: &PathBuf,
+    relative_path: Option<String>,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "clipboard file metadata could not be read".to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("clipboard symlinks are not supported".to_string());
+    }
+    let canonical = fs::canonicalize(path)
+        .map_err(|_| "clipboard file path could not be resolved".to_string())?;
+    let metadata = fs::symlink_metadata(&canonical)
+        .map_err(|_| "clipboard file metadata could not be read".to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("clipboard symlinks are not supported".to_string());
+    }
+    let name = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "clipboard file name is not valid UTF-8".to_string())?;
+    validate_file_component(name)?;
+    let key = relative_path
+        .as_ref()
+        .map(|parent| format!("{parent}\\{name}"))
+        .unwrap_or_else(|| name.to_string())
+        .to_lowercase();
+    if !builder.seen.insert(key) {
+        return Err("clipboard file paths collide".to_string());
+    }
+    let wire_len = relative_path
+        .as_ref()
+        .map_or(0, |parent| wire_component_len(parent) + 1)
+        + wire_component_len(name);
+    if wire_len > 259 {
+        return Err("clipboard file path is too long".to_string());
+    }
+    let is_dir = metadata.is_dir();
+    let len = if is_dir { 0 } else { metadata.len() };
+    builder.total_size = builder
+        .total_size
+        .checked_add(len)
+        .ok_or_else(|| "clipboard file sizes overflow".to_string())?;
+    if builder.total_size > MAX_FILE_TOTAL_BYTES {
+        return Err("clipboard files exceed the total size limit".to_string());
+    }
+    if builder.entries.len() >= MAX_FILE_COUNT {
+        return Err("clipboard file count exceeds the safety limit".to_string());
+    }
+    let attributes = if is_dir {
+        ClipboardFileAttributes::DIRECTORY
+    } else {
+        ClipboardFileAttributes::NORMAL
+    };
+    let mut descriptor = FileDescriptor::new(name).with_attributes(attributes);
+    if let Some(parent) = &relative_path {
+        descriptor = descriptor.with_relative_path(parent.clone());
+    }
+    if !is_dir {
+        descriptor = descriptor.with_file_size(len);
+    }
+    if let Some(last_write_time) = filetime_from_system_time(metadata.modified().ok()) {
+        descriptor = descriptor.with_last_write_time(last_write_time);
+    }
+    builder.entries.push(LocalFileEntry {
+        path: canonical.clone(),
+        descriptor,
+        identity: file_identity(&metadata),
+        is_dir,
+    });
+
+    if is_dir {
+        // Keep traversal bounded before sorting: a local directory can contain far more
+        // entries than the wire limit, and collecting the whole iterator first would let a
+        // large directory consume unbounded memory before we reject it.
+        let mut children = fs::read_dir(&canonical)
+            .map_err(|_| "clipboard directory could not be read".to_string())?
+            .take(MAX_FILE_COUNT.saturating_add(1))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "clipboard directory could not be read".to_string())?;
+        if children.len() > MAX_FILE_COUNT {
+            return Err("clipboard file count exceeds the safety limit".to_string());
+        }
+        children.sort_by_key(|child| child.file_name());
+        for child in children {
+            let child_name = child.file_name();
+            let child_name = child_name
+                .to_str()
+                .ok_or_else(|| "clipboard file name is not valid UTF-8".to_string())?;
+            let child_relative_path = Some(match &relative_path {
+                Some(parent) => format!("{parent}\\{name}"),
+                None => name.to_string(),
+            });
+            let child_path = canonical.join(child_name);
+            append_local_file_entry(builder, &child_path, child_relative_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        is_dir: metadata.is_dir(),
+        #[cfg(unix)]
+        device: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.dev()
+        },
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ino()
+        },
+        #[cfg(windows)]
+        creation_time: {
+            use std::os::windows::fs::MetadataExt;
+            metadata.creation_time()
+        },
+        #[cfg(windows)]
+        last_write_time: {
+            use std::os::windows::fs::MetadataExt;
+            metadata.last_write_time()
+        },
+    }
+}
+
+fn filetime_from_system_time(time: Option<SystemTime>) -> Option<u64> {
+    const WINDOWS_EPOCH_OFFSET_SECONDS: u64 = 11_644_473_600;
+    let duration = time?.duration_since(UNIX_EPOCH).ok()?;
+    let seconds = duration
+        .as_secs()
+        .checked_add(WINDOWS_EPOCH_OFFSET_SECONDS)?;
+    seconds
+        .checked_mul(10_000_000)?
+        .checked_add(u64::from(duration.subsec_nanos() / 100))
+}
+
+fn read_local_file(
+    request: &FileContentsRequest,
+    entry: &LocalFileEntry,
+) -> OwnedFileContentsResponse {
+    let error = || OwnedFileContentsResponse::new_error(request.stream_id);
+    if request.index < 0 || request.flags.validate().is_err() {
+        return error();
+    }
+    let identity = match fs::symlink_metadata(&entry.path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => file_identity(&metadata),
+        _ => return error(),
+    };
+    if identity != entry.identity {
+        return error();
+    }
+    if request.flags == FileContentsFlags::SIZE {
+        if request.position != 0 || request.requested_size != 8 {
+            return error();
+        }
+        let size = if entry.is_dir { 0 } else { entry.identity.len };
+        return OwnedFileContentsResponse::new_size_response(request.stream_id, size);
+    }
+    if request.flags != FileContentsFlags::RANGE
+        || entry.is_dir
+        || request.requested_size == 0
+        || request.requested_size > MAX_FILE_CHUNK_BYTES
+    {
+        return error();
+    }
+    let end = match request
+        .position
+        .checked_add(u64::from(request.requested_size))
+    {
+        Some(end) if end <= entry.identity.len => end,
+        _ => return error(),
+    };
+    let mut file = match File::open(&entry.path) {
+        Ok(file) => file,
+        Err(_) => return error(),
+    };
+    if file.seek(SeekFrom::Start(request.position)).is_err() {
+        return error();
+    }
+    let opened_identity = match file.metadata() {
+        Ok(metadata) if !metadata.file_type().is_symlink() => file_identity(&metadata),
+        _ => return error(),
+    };
+    if opened_identity != entry.identity {
+        return error();
+    }
+    let mut data = vec![0u8; request.requested_size as usize];
+    if file.read_exact(&mut data).is_err() {
+        return error();
+    }
+    let after_handle = match file.metadata() {
+        Ok(metadata) if !metadata.file_type().is_symlink() => file_identity(&metadata),
+        _ => return error(),
+    };
+    let after = match fs::symlink_metadata(&entry.path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => file_identity(&metadata),
+        _ => return error(),
+    };
+    if opened_identity != after_handle
+        || after_handle != entry.identity
+        || after != entry.identity
+        || end > after_handle.len
+    {
+        return error();
+    }
+    OwnedFileContentsResponse::new_data_response(request.stream_id, data)
 }
 
 fn read_local_data(
@@ -1473,8 +3548,26 @@ fn image_formats() -> Vec<ClipboardFormat> {
     vec![ClipboardFormat::new(ClipboardFormatId::CF_DIB)]
 }
 
-fn best_content_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
-    if formats
+fn best_content_format(
+    formats: &[ClipboardFormat],
+    allow_file_list: bool,
+) -> Option<ClipboardFormatId> {
+    if allow_file_list
+        && formats.iter().any(|format| {
+            format
+                .name()
+                .is_some_and(|name| name.value() == FORMAT_NAME_FILE_LIST)
+        })
+    {
+        formats
+            .iter()
+            .find(|format| {
+                format
+                    .name()
+                    .is_some_and(|name| name.value() == FORMAT_NAME_FILE_LIST)
+            })
+            .map(ClipboardFormat::id)
+    } else if formats
         .iter()
         .any(|format| format.id() == ClipboardFormatId::CF_UNICODETEXT)
     {
@@ -1518,22 +3611,53 @@ fn best_content_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId>
 /// `repeated_polls_of_unchanged_huge_payload_cost_a_constant_capped_amount_each_time`, and
 /// `a_tail_only_change_past_the_prefix_cap_with_unchanged_length_is_not_detected`.
 fn content_fingerprint(content: &ClipboardContent) -> [u8; 32] {
-    let (tag, bytes, width, height) = match content {
-        ClipboardContent::Text(text) => (b"text".as_slice(), text.as_bytes(), 0, 0),
+    let mut hasher = Sha256::new();
+    let prefix_len = match content {
+        ClipboardContent::Text(text) => {
+            hasher.update(b"text");
+            hasher.update((0u64).to_le_bytes());
+            hasher.update((0u64).to_le_bytes());
+            let bytes = text.as_bytes();
+            let prefix_len = bytes.len().min(HASH_PREFIX_CAP_BYTES);
+            hasher.update(&bytes[..prefix_len]);
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            prefix_len
+        }
         ClipboardContent::Image {
             width,
             height,
             rgba,
-        } => (b"image".as_slice(), rgba.as_slice(), *width, *height),
+        } => {
+            hasher.update(b"image");
+            hasher.update((*width as u64).to_le_bytes());
+            hasher.update((*height as u64).to_le_bytes());
+            let prefix_len = rgba.len().min(HASH_PREFIX_CAP_BYTES);
+            hasher.update(&rgba[..prefix_len]);
+            hasher.update((rgba.len() as u64).to_le_bytes());
+            prefix_len
+        }
+        ClipboardContent::Files(paths) => {
+            hasher.update(b"files");
+            hasher.update((paths.len() as u64).to_le_bytes());
+            let mut hashed = 0usize;
+            for path in paths {
+                let bytes = path.to_string_lossy();
+                let bytes = bytes.as_bytes();
+                let remaining = HASH_PREFIX_CAP_BYTES.saturating_sub(hashed);
+                let take = bytes.len().min(remaining);
+                hasher.update(&bytes[..take]);
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hashed += take;
+                if hashed == HASH_PREFIX_CAP_BYTES {
+                    break;
+                }
+            }
+            hashed
+        }
     };
-    let prefix_len = bytes.len().min(HASH_PREFIX_CAP_BYTES);
 
-    let mut hasher = Sha256::new();
-    hasher.update(tag);
-    hasher.update((width as u64).to_le_bytes());
-    hasher.update((height as u64).to_le_bytes());
-    hasher.update(&bytes[..prefix_len]);
-    hasher.update((bytes.len() as u64).to_le_bytes());
+    #[cfg(not(test))]
+    let _ = prefix_len;
 
     #[cfg(test)]
     tests::HASHED_BYTES.with(|cell| cell.set(cell.get() + prefix_len));
@@ -1840,6 +3964,8 @@ fn put_i32(data: &mut [u8], offset: usize, value: i32) {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Condvar;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1873,6 +3999,7 @@ mod tests {
     struct FakeClipboardState {
         text: Option<String>,
         image: Option<(usize, usize, Vec<u8>)>,
+        files: Option<Vec<PathBuf>>,
         fail_next_get: bool,
         fail_next_set: bool,
         /// How many times the clipboard content was read — the observable proxy for
@@ -1898,6 +4025,8 @@ mod tests {
                     height,
                     rgba,
                 })
+            } else if let Some(files) = state.files.clone() {
+                Ok(ClipboardContent::Files(files))
             } else {
                 // An empty text clipboard is still a valid clipboard value and must be
                 // advertised, rather than treated as an inaccessible pasteboard.
@@ -1915,6 +4044,7 @@ mod tests {
                 ClipboardContent::Text(text) => {
                     state.text = Some(text);
                     state.image = None;
+                    state.files = None;
                 }
                 ClipboardContent::Image {
                     width,
@@ -1923,8 +4053,26 @@ mod tests {
                 } => {
                     state.text = None;
                     state.image = Some((width, height, rgba));
+                    state.files = None;
+                }
+                ClipboardContent::Files(files) => {
+                    state.text = None;
+                    state.image = None;
+                    state.files = Some(files);
                 }
             }
+            Ok(())
+        }
+
+        fn get_file_list(&mut self) -> Result<Vec<PathBuf>, String> {
+            Ok(self.0.lock().unwrap().files.clone().unwrap_or_default())
+        }
+
+        fn set_file_list(&mut self, paths: &[PathBuf]) -> Result<(), String> {
+            let mut state = self.0.lock().unwrap();
+            state.text = None;
+            state.image = None;
+            state.files = Some(paths.to_vec());
             Ok(())
         }
     }
@@ -3323,5 +5471,354 @@ mod tests {
         let lone_high_surrogate: u16 = 0xD800;
         let bytes = lone_high_surrogate.to_le_bytes();
         assert_eq!(decode_utf16le_text(&bytes), "\u{FFFD}");
+    }
+
+    fn test_path(label: &str) -> PathBuf {
+        static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "mdrdp-clipboard-test-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn local_file_snapshot_reads_bounded_ranges_and_rejects_replacement() {
+        let root = test_path("local");
+        fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("payload.bin");
+        let folder_path = root.join("folder");
+        fs::create_dir(&folder_path).unwrap();
+        let child_path = folder_path.join("child.txt");
+        fs::write(&child_path, b"child").unwrap();
+        fs::write(&file_path, b"abcdef").unwrap();
+
+        let snapshot =
+            build_local_file_snapshot(&[file_path.clone(), folder_path.clone()]).unwrap();
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(snapshot.entries[0].descriptor.file_size, Some(6));
+        assert!(
+            !snapshot.entries[0]
+                .descriptor
+                .attributes
+                .unwrap()
+                .contains(ClipboardFileAttributes::DIRECTORY)
+        );
+        assert!(
+            snapshot.entries[1]
+                .descriptor
+                .attributes
+                .unwrap()
+                .contains(ClipboardFileAttributes::DIRECTORY)
+        );
+        assert_eq!(
+            snapshot.entries[2].descriptor.relative_path.as_deref(),
+            Some("folder")
+        );
+        assert_eq!(snapshot.entries[2].descriptor.name, "child.txt");
+
+        let size = read_local_file(
+            &FileContentsRequest {
+                stream_id: 1,
+                index: 0,
+                flags: FileContentsFlags::SIZE,
+                position: 0,
+                requested_size: 8,
+                data_id: None,
+            },
+            &snapshot.entries[0],
+        );
+        assert_eq!(size.data_as_size().unwrap(), 6);
+
+        let range = read_local_file(
+            &FileContentsRequest {
+                stream_id: 2,
+                index: 0,
+                flags: FileContentsFlags::RANGE,
+                position: 2,
+                requested_size: 3,
+                data_id: None,
+            },
+            &snapshot.entries[0],
+        );
+        assert_eq!(range.data(), b"cde");
+
+        fs::write(&file_path, b"replaced").unwrap();
+        let stale = read_local_file(
+            &FileContentsRequest {
+                stream_id: 3,
+                index: 0,
+                flags: FileContentsFlags::RANGE,
+                position: 0,
+                requested_size: 2,
+                data_id: None,
+            },
+            &snapshot.entries[0],
+        );
+        assert!(stale.is_error());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_staging_handles_folders_and_requires_exact_chunks() {
+        let (state, os) = fake_clipboard();
+        let staging = StagingLayout::new();
+        let active_epoch = Arc::new(AtomicU64::new(1));
+        let active_transfer = Arc::new(AtomicU64::new(1));
+        let mut worker =
+            ClipboardWorkerState::new(os, active_epoch, active_transfer, staging.clone());
+        let files = vec![
+            FileDescriptor::new("folder").with_attributes(ClipboardFileAttributes::DIRECTORY),
+            FileDescriptor::new("payload.bin")
+                .with_relative_path("folder")
+                .with_attributes(ClipboardFileAttributes::NORMAL)
+                .with_file_size(3),
+        ];
+        let prepared = worker.execute(ClipboardWork::PrepareRemoteFiles {
+            id: 1,
+            epoch: 1,
+            transfer_id: 1,
+            files,
+        });
+        assert!(matches!(
+            prepared,
+            ClipboardResult::RemoteFilesPrepared { result: Ok(_), .. }
+        ));
+
+        let wrong_offset = worker.execute(ClipboardWork::StoreRemoteChunk {
+            id: 2,
+            epoch: 1,
+            transfer_id: 1,
+            index: 1,
+            offset: 1,
+            expected_size: 3,
+            data: b"abc".to_vec(),
+        });
+        assert!(matches!(
+            wrong_offset,
+            ClipboardResult::RemoteChunkStored { result: Err(_), .. }
+        ));
+        let stored = worker.execute(ClipboardWork::StoreRemoteChunk {
+            id: 3,
+            epoch: 1,
+            transfer_id: 1,
+            index: 1,
+            offset: 0,
+            expected_size: 3,
+            data: b"abc".to_vec(),
+        });
+        assert!(matches!(
+            stored,
+            ClipboardResult::RemoteChunkStored { result: Ok(()), .. }
+        ));
+        let published = worker.execute(ClipboardWork::PublishRemoteFiles {
+            id: 4,
+            epoch: 1,
+            transfer_id: 1,
+            sizes: vec![(1, 3)],
+        });
+        assert!(matches!(
+            published,
+            ClipboardResult::RemoteFilesPublished { result: Ok(()), .. }
+        ));
+        let published_paths = state.lock().unwrap().files.clone().unwrap();
+        assert_eq!(published_paths.len(), 1);
+        assert_eq!(
+            fs::read(published_paths[0].join("payload.bin")).unwrap(),
+            b"abc"
+        );
+        let _ = fs::remove_dir_all(staging.root);
+    }
+
+    #[test]
+    fn cancelled_remote_stage_cannot_publish_stale_files() {
+        let (state, os) = fake_clipboard();
+        let staging = StagingLayout::new();
+        let active_epoch = Arc::new(AtomicU64::new(1));
+        let active_transfer = Arc::new(AtomicU64::new(7));
+        let worker_transfer = active_transfer.clone();
+        let mut worker =
+            ClipboardWorkerState::new(os, active_epoch, worker_transfer, staging.clone());
+        let files = vec![FileDescriptor::new("stale.txt").with_file_size(0)];
+        let prepared = worker.execute(ClipboardWork::PrepareRemoteFiles {
+            id: 1,
+            epoch: 1,
+            transfer_id: 7,
+            files,
+        });
+        assert!(matches!(
+            prepared,
+            ClipboardResult::RemoteFilesPrepared { result: Ok(_), .. }
+        ));
+
+        active_transfer.store(0, Ordering::Release);
+        let published = worker.execute(ClipboardWork::PublishRemoteFiles {
+            id: 2,
+            epoch: 1,
+            transfer_id: 7,
+            sizes: vec![(0, 0)],
+        });
+        assert!(matches!(
+            published,
+            ClipboardResult::RemoteFilesPublished { result: Err(_), .. }
+        ));
+        assert!(state.lock().unwrap().files.is_none());
+        assert!(!staging.root.join("transfer-7").exists());
+        let _ = fs::remove_dir_all(staging.root);
+    }
+
+    #[test]
+    fn stale_root_cleanup_handles_a_non_file_clipboard() {
+        let (_state, mut os) = fake_clipboard();
+        let parent = test_path("stale-cleanup");
+        let staging = StagingLayout::new_in(parent.clone());
+        let stale_root = staging.parent.join(format!(
+            "{STAGING_ROOT_PREFIX}stale-test-{}",
+            NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&stale_root).unwrap();
+
+        let cleanup_now = SystemTime::now() + STAGING_MIN_AGE + Duration::from_secs(1);
+        for _ in 0..100 {
+            staging.cleanup_abandoned_at(&mut *os, cleanup_now);
+            if !stale_root.exists() {
+                break;
+            }
+            thread::yield_now();
+        }
+
+        let removed = !stale_root.exists();
+        if stale_root.exists() {
+            fs::remove_dir(&stale_root).unwrap();
+        }
+        let _ = fs::remove_dir_all(staging.root);
+        let _ = fs::remove_dir_all(parent);
+        assert!(removed);
+    }
+
+    #[test]
+    fn oversized_local_file_snapshot_queues_a_visible_failure() {
+        let root = test_path("local-cap-notification");
+        fs::create_dir_all(&root).unwrap();
+        let oversized = root.join("oversized.bin");
+        File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_FILE_TOTAL_BYTES + 1)
+            .unwrap();
+
+        let (state, os) = fake_clipboard();
+        state.lock().unwrap().files = Some(vec![oversized]);
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        backend_mut(&mut cliprdr).on_request_format_list();
+        bridge.pump(&mut cliprdr);
+
+        assert!(bridge.take_file_limit_notification());
+        assert!(!bridge.take_file_limit_notification());
+        drop(cliprdr);
+        drop(bridge);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_remote_declared_total_queues_a_visible_failure() {
+        let (_state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        let file_format = ClipboardFormat::new(ClipboardFormatId::new(0xC0FE))
+            .with_name(ClipboardFormatName::new_static(FORMAT_NAME_FILE_LIST));
+        bridge.remote_formats = vec![file_format.clone()];
+        bridge.paste_state = PasteState::Requested {
+            format: file_format.id(),
+            requested_at_ms: 0,
+        };
+        bridge.handle_remote_file_list(
+            vec![FileDescriptor::new("oversized.bin").with_file_size(MAX_FILE_TOTAL_BYTES + 1)],
+            None,
+        );
+        bridge.pump(&mut cliprdr);
+
+        assert!(bridge.take_file_limit_notification());
+        assert!(!bridge.take_file_limit_notification());
+    }
+
+    #[test]
+    fn oversized_remote_observed_total_queues_a_visible_failure() {
+        let (_state, os) = fake_clipboard();
+        let (backend, mut bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let mut cliprdr = ready_client(backend);
+        bridge.pump(&mut cliprdr);
+        let file_format = ClipboardFormat::new(ClipboardFormatId::new(0xC0FE))
+            .with_name(ClipboardFormatName::new_static(FORMAT_NAME_FILE_LIST));
+        bridge.remote_formats = vec![file_format.clone()];
+        bridge.paste_state = PasteState::Requested {
+            format: file_format.id(),
+            requested_at_ms: 0,
+        };
+        bridge.handle_remote_file_list(
+            vec![
+                FileDescriptor::new("first.bin"),
+                FileDescriptor::new("second.bin"),
+            ],
+            None,
+        );
+        bridge.pump(&mut cliprdr);
+
+        let first_stream = bridge
+            .remote_transfer
+            .as_ref()
+            .and_then(|transfer| transfer.pending)
+            .expect("first size request")
+            .stream_id;
+        let mut out = Vec::new();
+        bridge.handle_remote_file_contents_received(
+            OwnedFileContentsResponse::new_size_response(first_stream, MAX_FILE_TOTAL_BYTES),
+            &mut cliprdr,
+            &mut out,
+        );
+        let second_stream = bridge
+            .remote_transfer
+            .as_ref()
+            .and_then(|transfer| transfer.pending)
+            .expect("second size request")
+            .stream_id;
+        bridge.handle_remote_file_contents_received(
+            OwnedFileContentsResponse::new_size_response(second_stream, 1),
+            &mut cliprdr,
+            &mut out,
+        );
+
+        assert!(bridge.take_file_limit_notification());
+        assert!(!bridge.take_file_limit_notification());
+    }
+
+    #[test]
+    fn remote_path_validation_rejects_traversal_reserved_names_and_collisions() {
+        let staging = StagingLayout::new();
+        let traversal = FileDescriptor::new("escape.txt").with_relative_path("..\\outside");
+        assert!(staging.create_remote_stage(1, &[traversal]).is_err());
+        let reserved = FileDescriptor::new("CON");
+        assert!(staging.create_remote_stage(2, &[reserved]).is_err());
+        let collision = vec![
+            FileDescriptor::new("same.txt"),
+            FileDescriptor::new("SAME.TXT"),
+        ];
+        assert!(staging.create_remote_stage(3, &collision).is_err());
+        let _ = fs::remove_dir_all(staging.root);
+    }
+
+    #[test]
+    fn backend_advertises_streaming_file_capabilities_without_exposing_paths() {
+        let (_state, os) = fake_clipboard();
+        let (backend, _bridge) = clipboard_channel_with_clock(os, FakeClock::new());
+        let capabilities = backend.client_capabilities();
+        assert!(capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED));
+        assert!(capabilities.contains(ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA));
+        assert!(capabilities.contains(ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED));
+        assert!(!backend.temporary_directory().is_empty());
+        let debug = format!("{backend:?}");
+        assert!(!debug.contains(backend.temporary_directory()));
     }
 }

@@ -22,7 +22,7 @@ use crate::input::{InputEvent, LatestMouseMove, encode_fastpath_input, to_fastpa
 use crate::stats::{CacheStats, StatsHandle};
 use crate::surface::SurfaceStore;
 use crate::wake::{self, Doorbell, DoorbellReceiver};
-use crate::window::{CursorUpdate, Waker};
+use crate::window::{CursorUpdate, Toast, Waker};
 use ironrdp::connector::DesktopSize;
 use ironrdp::session::{ActiveStageOutput, image::DecodedImage};
 use ironrdp_blocking::Framed;
@@ -57,6 +57,9 @@ const IDLE_WAIT: Duration = Duration::from_millis(250);
 /// polled. 250 ms is below the threshold at which a copy-then-paste feels broken, and
 /// the check is submitted to the clipboard worker and never blocks this session thread.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(250);
+/// IronRDP owns lock and stale stream timers; the session drives its bounded sweep on
+/// this cadence so remote file transfers cannot retain protocol state indefinitely.
+const CLIPBOARD_TIMEOUT_SWEEP: Duration = Duration::from_secs(5);
 
 /// Services the session drives alongside the pixel stream.
 ///
@@ -293,6 +296,7 @@ fn pump(
     wake_rx: &DoorbellReceiver,
 ) -> SessionEnd {
     let mut last_clipboard_poll = Instant::now();
+    let mut last_clipboard_timeout = Instant::now();
     // A resize waiting for the Display Control channel to open, with when it was asked.
     let mut pending_resize: Option<(SessionCommand, Instant)> = None;
     // The latest Display Control layout written to the wire. It remains separate from
@@ -373,7 +377,9 @@ fn pump(
         let clipboard_batch_full = match service_clipboard(
             established,
             services,
+            waker,
             &mut last_clipboard_poll,
+            &mut last_clipboard_timeout,
             &mut turn_deadline,
         ) {
             Ok(batch_full) => batch_full,
@@ -552,7 +558,9 @@ fn pump(
 fn service_clipboard(
     established: &mut Established,
     services: &mut SessionServices,
+    waker: &Waker,
     last_poll: &mut Instant,
+    last_timeout: &mut Instant,
     turn_deadline: &mut Option<Instant>,
 ) -> Result<bool, ConnectError> {
     let Some(bridge) = services.clipboard.as_mut() else {
@@ -567,13 +575,44 @@ fn service_clipboard(
         *last_poll = Instant::now();
     }
 
-    let Some(cliprdr) = established.stage.get_svc_processor_mut::<CliprdrClient>() else {
+    if established
+        .stage
+        .get_svc_processor_mut::<CliprdrClient>()
+        .is_none()
+    {
         // The server never joined CLIPRDR. Queued actions have nowhere to go; draining
         // them keeps the channel from growing without bound for the life of the session.
         bridge.discard_pending();
         return Ok(false);
-    };
+    }
 
+    if last_timeout.elapsed() >= CLIPBOARD_TIMEOUT_SWEEP {
+        let batch = {
+            let cliprdr = established
+                .stage
+                .get_svc_processor_mut::<CliprdrClient>()
+                .expect("clipboard processor was checked above");
+            cliprdr
+                .drive_timeouts()
+                .map_err(|e| ConnectError::Protocol(describe(&e)))?
+        };
+        let encoded = established
+            .stage
+            .process_svc_processor_messages(batch)
+            .map_err(|e| ConnectError::Protocol(describe(&e)))?;
+        write_framed(
+            &mut established.framed,
+            &encoded,
+            write_deadline(turn_deadline),
+        )
+        .map_err(ConnectError::Io)?;
+        *last_timeout = Instant::now();
+    }
+
+    let cliprdr = established
+        .stage
+        .get_svc_processor_mut::<CliprdrClient>()
+        .expect("clipboard processor was checked above");
     let (batches, batch_full) = bridge.pump_bounded(cliprdr);
     for batch in batches {
         let encoded = established
@@ -586,6 +625,13 @@ fn service_clipboard(
             write_deadline(turn_deadline),
         )
         .map_err(ConnectError::Io)?;
+    }
+    if bridge.take_file_limit_notification() {
+        let _ = waker.toast(Toast {
+            warn: false,
+            title: "Clipboard transfer failed".to_owned(),
+            body: "Files exceed the clipboard transfer limit".to_owned(),
+        });
     }
     Ok(batch_full)
 }
