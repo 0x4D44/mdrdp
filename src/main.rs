@@ -50,6 +50,73 @@ fn usage() -> String {
     mdrdp::cli::help_text(false)
 }
 
+/// Turn the shared live stage feed into concise terminal progress. `status:` events are
+/// emitted immediately before a blocking operation; completed launcher stages remain in the
+/// same feed but the direct terminal skips their redundant summary lines.
+fn human_progress_line(stage: &mdrdp::connect::LiveStage) -> Option<String> {
+    if stage.name.starts_with("status:") {
+        return stage
+            .qualifier
+            .as_deref()
+            .map(|detail| format!("  {detail} …"));
+    }
+
+    match stage.name.as_str() {
+        "tcp_connect" => stage
+            .qualifier
+            .as_deref()
+            .map(|peer| format!("  TCP connection opened ({peer})")),
+        // The status event above already told the terminal which blocking operation began.
+        // Keeping these completion marks for the JSON/UI feed avoids duplicate terminal noise.
+        "x224_negotiation" | "tls_handshake" | "post_tls_sequence" => None,
+        "Credssp" => Some("  waiting for CredSSP authentication …".to_owned()),
+        "LicensingExchange" | "LicensingExchange (inline)" => {
+            Some("  waiting for RDP licensing …".to_owned())
+        }
+        "CapabilitiesExchange" => Some("  waiting for RDP capabilities …".to_owned()),
+        "ssh-spawn" => Some("  SSH tunnel process started".to_owned()),
+        "tunnel-up" => Some("  SSH tunnel ready".to_owned()),
+        "probe" => Some("  native server probe complete".to_owned()),
+        "handshake" => Some("  native video handshake complete".to_owned()),
+        _ => Some(format!("  waiting for {} …", stage.name)),
+    }
+}
+
+/// Own the feed forwarder so a direct terminal drains queued progress before `run` returns
+/// an immediate connection error. The launcher keeps its historical detached pipe semantics.
+struct LiveProgress {
+    sender: Option<mpsc::Sender<mdrdp::connect::LiveStage>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    join_on_drop: bool,
+}
+
+impl LiveProgress {
+    fn sender(&self) -> Option<mpsc::Sender<mdrdp::connect::LiveStage>> {
+        self.sender.as_ref().cloned()
+    }
+
+    fn finish(&mut self) {
+        self.sender.take();
+        if self.join_on_drop {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        } else {
+            // The launcher reader owns the other end of stdout and already has the
+            // historical detached-thread lifetime; dropping the handle keeps that contract.
+            self.thread.take();
+        }
+    }
+}
+
+impl Drop for LiveProgress {
+    fn drop(&mut self) {
+        // Close our copy first; a sender clone in a just-finished establish call drops during
+        // unwinding before this owner, so the receiver can always observe channel closure.
+        self.finish();
+    }
+}
+
 /// The missing-RDP-account error, raised by `reconcile` for an RDP-only target
 /// and by the RDP connect arm when a native-capable target lands on RDP after
 /// all — the same words either way, so where it fires is invisible to the user.
@@ -934,24 +1001,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // With --stage-json each connect stage goes to stdout as one JSON line, live, so
     // a launcher can drive a progress display. The forwarder thread ends when the
     // channel does; stdout carries only this protocol, human chatter stays on stderr.
-    // Built before the transport decision: a native probe feeds the same stream.
-    let live_stages = stage_json.then(|| {
+    // Direct terminal sessions use the same feed for concise human progress. Built before
+    // the transport decision: an RDP or native probe can report through it.
+    let mut live_progress = {
         let (tx, rx) = mpsc::channel::<mdrdp::connect::LiveStage>();
-        std::thread::spawn(move || {
-            while let Ok(stage) = rx.recv() {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "stage",
-                        "state": stage.name,
-                        "elapsed_ms": stage.elapsed_ms,
-                        "qualifier": stage.qualifier,
-                    })
-                );
-            }
-        });
-        tx
-    });
+        let thread = if stage_json {
+            std::thread::spawn(move || {
+                while let Ok(stage) = rx.recv() {
+                    // Pre-operation statuses are for a human terminal. Filtering them here
+                    // keeps the existing launcher JSON event names and row semantics exact.
+                    if stage.name.starts_with("status:") {
+                        continue;
+                    }
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "stage",
+                            "state": stage.name,
+                            "elapsed_ms": stage.elapsed_ms,
+                            "qualifier": stage.qualifier,
+                        })
+                    );
+                }
+            })
+        } else {
+            std::thread::spawn(move || {
+                while let Ok(stage) = rx.recv() {
+                    if let Some(line) = human_progress_line(&stage) {
+                        eprintln!("{line}");
+                    }
+                }
+            })
+        };
+        LiveProgress {
+            sender: Some(tx),
+            thread: Some(thread),
+            join_on_drop: !stage_json,
+        }
+    };
 
     // ---- The transport decision (native HLD §4) ----
     // `Never` costs nothing. `Auto` probes only hosts the local deploy record names,
@@ -989,7 +1076,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &target.host,
             target.ssh_user.as_deref(),
             native_display,
-            live_stages.as_ref(),
+            live_progress.sender.as_ref(),
         ) {
             Ok(transport) => Some(transport),
             Err(failure) if always => {
@@ -1308,7 +1395,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // The same --capture opt-in that dumps undecodable ClearCodec tiles also
             // dumps the first few AVC444 payloads for offline replay.
             avc_capture: capture.as_ref().map(std::path::PathBuf::from),
-            live_stages,
+            live_stages: live_progress.sender(),
             // With --stage-json, a first-sight certificate is the launcher's question:
             // emit a cert_prompt event and block on one decision line from stdin. EOF or
             // garbage is a rejection — trust fails closed, never open.
@@ -1369,6 +1456,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    // No more connect stages can arrive after either transport returns. Close the feed now so
+    // direct terminal output is complete before the connected banner and session window.
+    live_progress.finish();
 
     let desktop = match &connected {
         Connected::Rdp(established) => established.desktop_size,
@@ -2249,6 +2339,36 @@ fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_progress_renders_preflight_and_suppresses_duplicate_completion() {
+        let resolving = mdrdp::connect::LiveStage {
+            name: "status:dns_resolve".to_owned(),
+            elapsed_ms: 0.0,
+            qualifier: Some("resolving DNS/FQDN for temper".to_owned()),
+        };
+        assert_eq!(
+            human_progress_line(&resolving).as_deref(),
+            Some("  resolving DNS/FQDN for temper …")
+        );
+
+        let x224 = mdrdp::connect::LiveStage {
+            name: "x224_negotiation".to_owned(),
+            elapsed_ms: 1.0,
+            qualifier: Some("HYBRID_EX requested".to_owned()),
+        };
+        assert_eq!(human_progress_line(&x224), None);
+
+        let ssh = mdrdp::connect::LiveStage {
+            name: "ssh-spawn".to_owned(),
+            elapsed_ms: 2.0,
+            qualifier: None,
+        };
+        assert_eq!(
+            human_progress_line(&ssh).as_deref(),
+            Some("  SSH tunnel process started")
+        );
+    }
 
     #[test]
     fn malformed_settings_fail_closed_for_clipboard_sharing() {

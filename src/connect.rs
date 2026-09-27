@@ -21,7 +21,7 @@ use rustls::{ClientConnection, StreamOwned};
 use serde::Serialize;
 use std::fmt;
 use std::io::{Read as _, Write as _};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -212,10 +212,31 @@ impl Trace {
         });
         self.last = now;
     }
+
+    /// Send a human-only status before a blocking operation starts.
+    ///
+    /// These events deliberately do not enter the report or advance its clock. The
+    /// launcher filters the `status:` names, while a direct terminal renders them as
+    /// an honest indication of where the socket is waiting.
+    fn status(&self, name: &'static str, detail: Option<String>) {
+        if let Some(live) = &self.live {
+            let _ = live.send(LiveStage {
+                name: name.to_owned(),
+                elapsed_ms: ms(self.last.elapsed()),
+                qualifier: detail,
+            });
+        }
+    }
 }
 
 fn ms(d: Duration) -> f64 {
     (d.as_micros() as f64) / 1000.0
+}
+
+/// Resolve every address before opening the socket. Keeping the complete ordered list lets
+/// `TcpStream::connect` retain its built-in IPv6/IPv4 fallback behaviour.
+fn resolve_target(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    (host, port).to_socket_addrs().map(Iterator::collect)
 }
 
 /// Static channels worth naming in a report.
@@ -679,7 +700,18 @@ pub fn establish(
     let target = format!("{}:{}", opts.host, opts.port);
 
     // --- TCP -------------------------------------------------------------------
-    let tcp = TcpStream::connect((opts.host.as_str(), opts.port))?;
+    trace.status(
+        "status:dns_resolve",
+        Some(format!("resolving DNS/FQDN for {}", opts.host)),
+    );
+    let addresses = resolve_target(&opts.host, opts.port)?;
+    trace.status(
+        "status:tcp_connect",
+        Some(format!("opening TCP connection to {target}")),
+    );
+    // Pass every resolved address in resolver order so the standard library still tries
+    // the alternatives when the first family or address refuses the connection.
+    let tcp = TcpStream::connect(addresses.as_slice())?;
     tcp.set_nodelay(true)?;
     trace.mark("tcp_connect", Some(tcp.peer_addr()?.to_string()));
 
@@ -808,6 +840,10 @@ pub fn establish(
 
     // --- X.224 security negotiation --------------------------------------------
     let mut framed = Framed::new(tcp);
+    trace.status(
+        "status:x224_negotiation",
+        Some("waiting for X.224 security negotiation".to_owned()),
+    );
     let should_upgrade = connect_begin(&mut framed, &mut connector)
         .map_err(|e| ConnectError::Protocol(describe(&e)))?;
     trace.mark("x224_negotiation", Some("HYBRID_EX requested".to_owned()));
@@ -847,6 +883,10 @@ pub fn establish(
     let mut tls = StreamOwned::new(tls_conn, stream);
 
     // Drive the handshake to completion so the certificate is available.
+    trace.status(
+        "status:tls_handshake",
+        Some("waiting for TLS handshake and certificate".to_owned()),
+    );
     tls.flush()?;
 
     let (fingerprint, public_key) = {
@@ -896,6 +936,10 @@ pub fn establish(
     };
     let subscriber = tracing_subscriber::registry().with(stage_log.clone());
     stage_log.start();
+    trace.status(
+        "status:protocol",
+        Some("waiting for CredSSP, logon, and RDP capabilities".to_owned()),
+    );
     let result = tracing::subscriber::with_default(subscriber, || {
         connect_finalize(
             upgraded,
@@ -987,6 +1031,28 @@ mod tests {
     use super::*;
     use std::io::{self, Read, Write};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn preflight_status_is_live_without_changing_report_stages() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut trace = Trace::new(Some(tx));
+
+        trace.status("status:dns_resolve", Some("resolving DNS/FQDN".to_owned()));
+        trace.mark("tcp_connect", Some("127.0.0.1:3389".to_owned()));
+
+        let live: Vec<LiveStage> = rx.try_iter().collect();
+        assert_eq!(live[0].name, "status:dns_resolve");
+        assert_eq!(live[0].qualifier.as_deref(), Some("resolving DNS/FQDN"));
+        assert_eq!(live[1].name, "tcp_connect");
+        assert_eq!(trace.stages.len(), 1);
+        assert_eq!(trace.stages[0].name, "tcp_connect");
+    }
+
+    #[test]
+    fn target_resolution_is_separate_and_does_not_open_a_socket() {
+        let addresses = resolve_target("127.0.0.1", 3389).expect("numeric host resolves");
+        assert_eq!(addresses, vec!["127.0.0.1:3389".parse().unwrap()]);
+    }
 
     struct DribblingWriter {
         bytes: Vec<u8>,
