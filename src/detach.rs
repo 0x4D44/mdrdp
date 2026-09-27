@@ -37,6 +37,18 @@ pub const DETACHED_ENV: &str = "MDRDP_DETACHED";
 /// the two cannot drift apart.
 pub const CONNECTED_MARKER: &str = "connected:";
 
+/// Printed just before a session reads its saved password from the OS credential store,
+/// and [`KEYCHAIN_DONE_MARKER`] just after. On macOS that read can block on a Keychain
+/// access dialog (every rebuild of an ad-hoc-signed binary re-asks), which may open on
+/// another desktop. The detaching parent pairs the two to tell "waiting on a dialog"
+/// apart from "still connecting".
+pub const KEYCHAIN_WAIT_MARKER: &str = "keychain: reading the saved password";
+pub const KEYCHAIN_DONE_MARKER: &str = "keychain: password read";
+
+/// How long a keychain read may block before the parent tells the user to look for
+/// the access dialog. A read that needs no dialog finishes in milliseconds.
+const KEYCHAIN_HINT_AFTER: Duration = Duration::from_secs(3);
+
 /// Logs older than this are removed when a new one is created, so detached runs never
 /// accumulate files forever.
 const LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -96,6 +108,17 @@ fn log_reports_connected(log: &str) -> bool {
     log.lines().any(|l| l.starts_with(CONNECTED_MARKER))
 }
 
+/// Whether the child's most recent keychain marker is a read that has not finished.
+fn log_waits_on_keychain(log: &str) -> bool {
+    log.lines()
+        .rev()
+        .find(|l| l.starts_with(KEYCHAIN_WAIT_MARKER) || l.starts_with(KEYCHAIN_DONE_MARKER))
+        .is_some_and(|l| l.starts_with(KEYCHAIN_WAIT_MARKER))
+}
+
+const KEYCHAIN_HINT: &str = "waiting for the saved password — if macOS is asking to allow \
+     mdrdp access to your keychain, answer the dialog (it may be on another desktop)";
+
 /// How the detached startup went, as far as the lingering parent could see.
 pub enum StartupOutcome {
     /// The child connected, or was still healthy when the grace ran out.
@@ -149,6 +172,9 @@ pub fn respawn(waits_for_connect: bool) -> Result<StartupOutcome, String> {
         LAUNCHER_GRACE
     };
     let deadline = Instant::now() + grace;
+    // When the keychain read began, as first observed; reset once it finishes.
+    let mut keychain_wait_seen: Option<Instant> = None;
+    let mut keychain_hinted = false;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -162,17 +188,36 @@ pub fn respawn(waits_for_connect: bool) -> Result<StartupOutcome, String> {
             Ok(None) => {}
             Err(e) => return Err(format!("could not watch the detached process: {e}")),
         }
-        if waits_for_connect
-            && std::fs::read_to_string(&log_path).is_ok_and(|log| log_reports_connected(&log))
-        {
+        let log_text = if waits_for_connect {
+            std::fs::read_to_string(&log_path).ok()
+        } else {
+            None
+        };
+        if log_text.as_deref().is_some_and(log_reports_connected) {
             eprintln!(
                 "connected — running in the background (log: {})",
                 log_path.display()
             );
             return Ok(StartupOutcome::Running);
         }
+        let on_keychain = log_text.as_deref().is_some_and(log_waits_on_keychain);
+        if on_keychain {
+            let since = *keychain_wait_seen.get_or_insert_with(Instant::now);
+            if !keychain_hinted && since.elapsed() >= KEYCHAIN_HINT_AFTER {
+                eprintln!("{KEYCHAIN_HINT}");
+                keychain_hinted = true;
+            }
+        } else {
+            keychain_wait_seen = None;
+        }
         if Instant::now() >= deadline {
-            if waits_for_connect {
+            if on_keychain {
+                eprintln!(
+                    "still waiting for keychain access — running in the background; \
+                     it connects once the dialog is answered (log: {})",
+                    log_path.display()
+                );
+            } else if waits_for_connect {
                 eprintln!(
                     "still starting — running in the background (log: {})",
                     log_path.display()
@@ -294,6 +339,25 @@ mod tests {
                 "{flags:?} must stay attached"
             );
         }
+    }
+
+    #[test]
+    fn a_keychain_read_is_pending_until_its_done_marker() {
+        let wait = format!("mdrdp v0.1.1\naudio: 48000 Hz\n{KEYCHAIN_WAIT_MARKER} …\n");
+        assert!(log_waits_on_keychain(&wait));
+        assert!(!log_waits_on_keychain(&format!(
+            "{wait}{KEYCHAIN_DONE_MARKER}\nconnecting to kiln:3389 …\n"
+        )));
+        assert!(
+            !log_waits_on_keychain("mdrdp v0.1.1\nconnecting to kiln:3389 …\n"),
+            "no keychain read at all is not a wait"
+        );
+        assert!(
+            log_waits_on_keychain(&format!(
+                "{KEYCHAIN_WAIT_MARKER}\n{KEYCHAIN_DONE_MARKER}\n{KEYCHAIN_WAIT_MARKER}\n"
+            )),
+            "the latest read decides"
+        );
     }
 
     #[test]

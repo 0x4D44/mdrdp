@@ -1245,13 +1245,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // The reason names the store failure kind, never a secret.
                 Err(e) => ask_password_over_pipe(&target.keychain_account, &e.to_string())?,
             }
-        } else if mdrdp::detach::already_detached() {
-            // No terminal behind us: reading the tty from a background process group would
-            // stop the process on SIGTTIN, invisibly. Fail with a message in the log — the
-            // lingering parent replays it — rather than hang where nobody can answer.
-            mdrdp::creds::lookup(&target.keychain_account)?
         } else {
-            mdrdp::creds::lookup_or_prompt(&target.keychain_account)?
+            // The read can block on a macOS Keychain access dialog; the markers let the
+            // detaching parent say so instead of a bare "still starting".
+            eprintln!(
+                "{} (the OS may ask to allow access) …",
+                mdrdp::detach::KEYCHAIN_WAIT_MARKER
+            );
+            let secret = if mdrdp::detach::already_detached() {
+                // No terminal behind us: reading the tty from a background process group
+                // would stop the process on SIGTTIN, invisibly. Fail with a message in the
+                // log — the lingering parent replays it — rather than hang where nobody
+                // can answer.
+                mdrdp::creds::lookup(&target.keychain_account)?
+            } else {
+                mdrdp::creds::lookup_or_prompt(&target.keychain_account)?
+            };
+            eprintln!("{}", mdrdp::detach::KEYCHAIN_DONE_MARKER);
+            secret
         };
         // A session that will open fullscreen connects AT the resolution and scale the
         // window would otherwise renegotiate to. Two wins: the server renders at the right
