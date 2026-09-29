@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=2
-- **State history:** Open (2026-08-23T21:46:28Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T21:48:01Z, deltic:auto role=fix run=fix-20260823T214751Z-79cfb27f branch=task/bug-MDR-BUG-FLU-00078-run-fix-20260823T214751Z-79cfb27f code=bcfc91f gate=manual)
+- **State history:** Open (2026-08-23T21:46:28Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T21:48:01Z, deltic:auto role=fix run=fix-20260823T214751Z-79cfb27f branch=task/bug-MDR-BUG-FLU-00078-run-fix-20260823T214751Z-79cfb27f code=c2583d9fe98642a34c7c723205648704ae6a70f1 gate=manual)
 
 ## Observation
 
@@ -27,7 +27,7 @@ The integrated LocalSystem service starts, but every console-worker launch fails
 
 ## Fix
 
-`bcfc91f5f7a0328665b1cdf700732359ea9db3e0` changes `launch_worker` to request
+`c2583d9fe98642a34c7c723205648704ae6a70f1` changes `launch_worker` to request
 `TOKEN_ALL_ACCESS` from `DuplicateTokenEx` before assigning the active console
 session to the duplicated primary token.
 
@@ -65,3 +65,12 @@ not reachable: port 3389 timed out and port 22 reported the host down. No
 service, worker, or console-session evidence is claimed. The claim was
 released; this remains Fixed and indeterminate pending the required Windows
 runtime check.
+
+2026-09-29: Provenance correction: the earlier verifier tree recorded the
+pre-rebase task SHA `bcfc91f5f7a0328665b1cdf700732359ea9db3e0`; the landed fix is
+`c2583d9fe98642a34c7c723205648704ae6a70f1`, an ancestor of `origin/main`. The
+Rhydra agent, input-state, and CLI tests passed 38/38, 6/6, and 4/4, and the
+Windows cross-check compiled the service. No service regression test exercises
+the LocalSystem launch. Quench was reachable but `quser` showed an active RDP
+session, so the runtime observation was not rerun; this remains Fixed and
+indeterminate for closure.

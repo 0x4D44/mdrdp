@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=1
-- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-14T21:13:36Z, deltic:auto role=fix run=fix-20260914T204351Z-8b2550a0 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0 code=1f8674a gate=manual) -> Open (2026-09-14T23:25:45Z, Codex, Arthur reports continued flicker on 0.1.247; successful submissions racing incoming frames leave the luma wait bypassed) -> Fixed (2026-09-14T23:53:12Z, deltic:auto role=fix run=fix-20260914T232621Z-8551b907 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T232621Z-8551b907 code=c3ac64e gate=manual)
+- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-14T21:13:36Z, deltic:auto role=fix run=fix-20260914T204351Z-8b2550a0 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0 code=1f8674a gate=manual) -> Open (2026-09-14T23:25:45Z, Codex, Arthur reports continued flicker on 0.1.247; successful submissions racing incoming frames leave the luma wait bypassed) -> Fixed (2026-09-14T23:53:12Z, deltic:auto role=fix run=fix-20260914T232621Z-8551b907 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T232621Z-8551b907 code=c828aa2174c3e4a78cb0c0219c92652a5dab30d5 gate=manual)
 
 ## Observation
 
@@ -32,7 +32,7 @@ Evidence fingerprint: `manual:v1:avc444-luma-and-chroma-presentations-still-alte
 
 ### Snapshot acknowledgement correction — 0.1.248
 
-Integrated code `c3ac64e`, version landing `4c61c94`. Ready batch tokens are
+Integrated code `c828aa2174c3e4a78cb0c0219c92652a5dab30d5`, version landing `4c61c94`. Ready batch tokens are
 captured with snapshots and acknowledged independently of producer activity.
 Newer luma retains its own bounded pending coverage/deadline. Failed submissions
 remain retryable, timer-only expiry releases work, and lifecycle changes do not
@@ -99,3 +99,14 @@ address also timed out, so the previously recorded `192.0.2.171` is stale.
 No screenshot, metrics, or live visual evidence is claimed. The claim was
 released; this remains Fixed and indeterminate pending a reachable affected
 Temper session.
+
+2026-09-29: Provenance correction: the latest Fixed transition recorded the
+pre-rebase task SHA `c3ac64e`; its landed snapshot-acknowledgement fix is
+`c828aa2174c3e4a78cb0c0219c92652a5dab30d5`. The adaptive-wait follow-up
+`e490605aa1e1e43674afaeaa9da2e3bdc8415e4b` is also on `origin/main`. The
+focused surface, window, and graphics suites passed 76/76, 72/72, and 65/65.
+Reverting the snapshot-token check made
+`stale_completed_snapshot_ack_cannot_clear_a_newer_or_reset_wait` fail on its
+ready-token assertion; restoring the fix passed. The full root and Windows gates
+passed. Temper had an active RDP session, so this verifier did not rerun the
+original visual observation. This remains Fixed and indeterminate for closure.

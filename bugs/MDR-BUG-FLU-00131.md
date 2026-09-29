@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-16T06:45:34Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-16T07:00:53Z, deltic:auto role=fix run=fix-20260916T064547Z-3e6476f9 branch=task/bug-MDR-BUG-FLU-00131-run-fix-20260916T064547Z-3e6476f9 code=27ce02a8f09ca9ec471cad07b0fc0c5e6f947bcc gate=manual)
+- **State history:** Open (2026-09-16T06:45:34Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-16T07:00:53Z, deltic:auto role=fix run=fix-20260916T064547Z-3e6476f9 branch=task/bug-MDR-BUG-FLU-00131-run-fix-20260916T064547Z-3e6476f9 code=02e32d1a25cebec562804031773648c287a68f4e gate=manual)
 
 ## Observation
 
@@ -50,5 +50,14 @@ message, then returned `session_end=graceful`. Windows subsequently reported the
 session disconnected. Physical monitor off/on remains unverified. This is additional
 fixer evidence, not independent closure. See
 `wrk_journals/2026.09.16 - JRN - fullscreen resolution restoration.md` for details.
+
+2026-09-29: Provenance correction: the Fixed transition recorded the pre-rebase
+task SHA `27ce02a8f09ca9ec471cad07b0fc0c5e6f947bcc`; the landed fix is
+`02e32d1a25cebec562804031773648c287a68f4e`, an ancestor of `origin/main`. The
+EGFX reset-size regression passed; substituting the activation dimensions made
+it fail on its restore assertion, and restoring the fix passed. The full root,
+vendored, Clippy, formatting, and Windows gates passed. Kiln had an active RDP
+session, so the original live observation was not rerun; physical monitor
+off/on remains unverified. This remains Fixed and indeterminate for closure.
 
 ## Notes
