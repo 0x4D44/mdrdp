@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "mdrdp"
-version = "0.1.261"
+version = "0.1.262"
 dependencies = [
  "ab_glyph",
  "arboard",
