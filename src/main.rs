@@ -1247,6 +1247,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         AudioPlayback::disabled(audio_ring.clone())
     };
+    // The local playback volume, restored from the last session against this target —
+    // a remote host resets its own volume on every logon, which is why this one exists.
+    // A target never seen before plays at full volume, as it always has.
+    let playback_volume = playback.is_active().then(|| {
+        let volume = audio_ring.volume();
+        let remembered = state_path
+            .as_ref()
+            .map(|p| mdrdp::state::SessionState::load_from(p))
+            .and_then(|s| s.audio_for(&state_key));
+        if let Some((level, muted)) = remembered {
+            volume.set_level(level);
+            volume.set_muted(muted);
+            eprintln!(
+                "audio: volume {level}%{}",
+                if muted { ", muted" } else { "" }
+            );
+        }
+        volume
+    });
     // The native transport carries its own audio on the auxiliary channel, so it
     // wants the device and the ring but never an RDPSND channel.
     let native_audio = if is_native && playback.is_active() {
@@ -1561,7 +1580,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         script.spawn(input_tx.clone());
     }
     let window = SessionWindow::new(event_loop, window_config, Arc::clone(&store), input_tx)?
-        .with_latest_mouse_move(Some(Arc::clone(&latest_mouse_move)));
+        .with_latest_mouse_move(Some(Arc::clone(&latest_mouse_move)))
+        .with_volume(playback_volume.clone());
     let session_stats = StatsHandle::new();
     let session_started = std::time::Instant::now();
     let resource_start = process_snapshot();
@@ -1728,6 +1748,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state_key_for_exit = state_key.clone();
     let state_path_for_exit = state_path.clone();
     let fullscreen_for_exit = Arc::clone(&fullscreen_at_exit);
+    let volume_for_exit = playback_volume.clone();
     // The epilogue runs from the exit hook so a Cmd+Q cannot skip it, and the post-`run`
     // path only covers the case where the hook somehow did not fire. This flag is what
     // keeps it to exactly one report either way.
@@ -1802,6 +1823,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &state_key_for_exit,
                 fullscreen_for_exit.load(std::sync::atomic::Ordering::Relaxed),
             );
+            // Only a session that had audio has a volume worth remembering; one with
+            // playback off must not overwrite the level the user last chose.
+            if let Some(volume) = &volume_for_exit {
+                state.set_audio(&state_key_for_exit, volume.level(), volume.muted());
+            }
             if let Err(e) = state.save_to(path) {
                 eprintln!("warning: could not remember the window state: {e}");
             }

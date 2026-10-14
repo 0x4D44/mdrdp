@@ -43,7 +43,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -701,6 +701,96 @@ impl RingBuf {
     }
 }
 
+/// The local playback volume, as a 0–100 slider level plus a mute switch.
+///
+/// This is mdrdp's own knob, applied where the device pulls samples
+/// ([`AudioRing::pop_into`]), so it covers RDPSND and the native transport alike and a
+/// change is heard at once rather than after the queued audio drains. It is
+/// deliberately not the remote host's volume: a new logon resets that, and the whole
+/// point is that this one is remembered per host (`crate::state`).
+///
+/// Cloning shares the same setting — a handle, not a value. Both fields are atomics so
+/// the realtime callback can read them without a lock.
+#[derive(Clone, Debug)]
+pub struct AudioVolume {
+    level: Arc<AtomicU8>,
+    muted: Arc<AtomicBool>,
+}
+
+impl Default for AudioVolume {
+    fn default() -> Self {
+        Self {
+            level: Arc::new(AtomicU8::new(Self::MAX)),
+            muted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl AudioVolume {
+    /// Full volume: samples pass through untouched.
+    pub const MAX: u8 = 100;
+    /// One menu step.
+    pub const STEP: u8 = 10;
+
+    /// The slider level, 0–100.
+    pub fn level(&self) -> u8 {
+        self.level.load(Ordering::Relaxed)
+    }
+
+    /// Set the level, clamped to 0–100.
+    pub fn set_level(&self, level: u8) {
+        self.level.store(level.min(Self::MAX), Ordering::Relaxed);
+    }
+
+    /// Raise by one step, saturating at 100. Returns the new level.
+    pub fn step_up(&self) -> u8 {
+        let next = self.level().saturating_add(Self::STEP).min(Self::MAX);
+        self.set_level(next);
+        next
+    }
+
+    /// Lower by one step, saturating at 0. Returns the new level.
+    pub fn step_down(&self) -> u8 {
+        let next = self.level().saturating_sub(Self::STEP);
+        self.set_level(next);
+        next
+    }
+
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// The linear factor applied to each sample. The slider is perceptual, so the
+    /// factor is the level squared: 50% is about -12 dB, which sounds like "half"
+    /// where a linear 0.5 (-6 dB) barely sounds quieter.
+    pub fn gain(&self) -> f32 {
+        if self.muted() {
+            return 0.0;
+        }
+        let fraction = f32::from(self.level()) / f32::from(Self::MAX);
+        fraction * fraction
+    }
+
+    /// Scale `out` in place. Realtime-safe: no allocation, no lock.
+    pub fn apply(&self, out: &mut [f32]) {
+        let gain = self.gain();
+        if gain == 1.0 {
+            return;
+        }
+        if gain == 0.0 {
+            out.fill(0.0);
+            return;
+        }
+        for sample in out {
+            *sample *= gain;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PushResult {
     dropped: u64,
@@ -719,6 +809,8 @@ pub struct AudioRing {
     /// Shared gate latched off by a fatal cpal stream error. Producers then stop decoding
     /// and queuing packets while the callback emits silence, leaving the RDP session alive.
     enabled: Arc<AtomicBool>,
+    /// The local volume, applied on the consumer side of the ring.
+    volume: AudioVolume,
 }
 
 impl fmt::Debug for AudioRing {
@@ -736,6 +828,7 @@ impl AudioRing {
             buf: Arc::new(Mutex::new(RingBuf::new(capacity_samples))),
             stats,
             enabled: Arc::new(AtomicBool::new(true)),
+            volume: AudioVolume::default(),
         }
     }
 
@@ -751,6 +844,7 @@ impl AudioRing {
             ))),
             stats,
             enabled: Arc::new(AtomicBool::new(true)),
+            volume: AudioVolume::default(),
         }
     }
 
@@ -808,6 +902,11 @@ impl AudioRing {
         }
     }
 
+    /// The volume this ring plays at. Shared: changing it changes playback.
+    pub fn volume(&self) -> AudioVolume {
+        self.volume.clone()
+    }
+
     /// Permanently stop playback for this ring after a fatal device error.
     fn disable(&self) {
         self.enabled.store(false, Ordering::Release);
@@ -830,6 +929,8 @@ impl AudioRing {
             let is_underrun = guard.pop_into(out);
             (is_underrun, guard.samples.len(), guard.capacity)
         };
+        // Outside the lock: the producer never waits on the multiply.
+        self.volume.apply(out);
         self.stats.note_depth(depth, capacity);
         if is_underrun {
             self.stats.note_underrun();
@@ -1912,6 +2013,44 @@ mod tests {
             stats.snapshot().last_underrun_ms,
             "a single gap has the same first and last timestamp"
         );
+    }
+
+    #[test]
+    fn the_ring_plays_at_its_volume_and_a_change_applies_to_already_queued_audio() {
+        let (ring, _) = ring(8);
+        let volume = ring.volume();
+        ring.push(&[1.0, -1.0, 0.5, -0.5]);
+        volume.set_level(50);
+        let mut out = [0.0f32; 2];
+        ring.pop_into(&mut out);
+        assert_eq!(
+            out,
+            [0.25, -0.25],
+            "50% is the perceptual quarter, not linear half"
+        );
+        volume.set_muted(true);
+        ring.pop_into(&mut out);
+        assert_eq!(out, [0.0, 0.0], "mute silences what was queued before it");
+        volume.set_muted(false);
+        volume.set_level(100);
+        ring.push(&[0.75]);
+        let mut one = [0.0f32; 1];
+        ring.pop_into(&mut one);
+        assert_eq!(one, [0.75], "full volume passes samples through untouched");
+    }
+
+    #[test]
+    fn volume_steps_saturate_at_both_ends_and_set_level_clamps() {
+        let volume = AudioVolume::default();
+        assert_eq!(volume.level(), 100);
+        assert_eq!(volume.step_up(), 100);
+        volume.set_level(5);
+        assert_eq!(volume.step_down(), 0);
+        assert_eq!(volume.step_down(), 0);
+        assert_eq!(volume.step_up(), 10);
+        volume.set_level(250);
+        assert_eq!(volume.level(), 100);
+        assert_eq!(volume.gain(), 1.0);
     }
 
     #[test]

@@ -34,6 +34,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CustomCursor, Fullscreen, Window, WindowAttributes, WindowId};
 
+use crate::audio::AudioVolume;
 use crate::input::{self, InputEvent, PointerMap};
 use crate::session::SessionCommand;
 use crate::stats::{SessionStats, StatsHandle};
@@ -1136,6 +1137,8 @@ pub struct SessionWindow {
     /// path persists it so the next launch can restore it. An atomic rather than a
     /// return value because the Cmd+Q path never returns (see [`Self::on_exit`]).
     fullscreen_state: Arc<AtomicBool>,
+    /// The local playback volume the Session menu adjusts, when the session has audio.
+    volume: Option<AudioVolume>,
 }
 
 impl SessionWindow {
@@ -1181,6 +1184,7 @@ impl SessionWindow {
             diagnostics: None,
             transients: None,
             fullscreen_state,
+            volume: None,
         })
     }
 
@@ -1214,6 +1218,13 @@ impl SessionWindow {
     /// rides the Ctrl+Alt+S overlay while the condition lasts.
     pub fn with_transients(mut self, watch: Box<dyn FnMut() -> TransientReport>) -> Self {
         self.transients = Some(watch);
+        self
+    }
+
+    /// Give the Session menu a volume to adjust. Optional: without it (no audio
+    /// device, or playback off in Settings) the menu offers no volume items.
+    pub fn with_volume(mut self, volume: Option<AudioVolume>) -> Self {
+        self.volume = volume;
         self
     }
 
@@ -1281,6 +1292,7 @@ impl SessionWindow {
             diagnostics,
             transients,
             fullscreen_state,
+            volume,
         } = self;
         let mut app = SessionApp::new(config, store, input, stats);
         app.damage = damage;
@@ -1290,6 +1302,7 @@ impl SessionWindow {
         app.diagnostics = diagnostics;
         app.transients = transients;
         app.fullscreen_state = fullscreen_state;
+        app.volume = volume;
         // Menu activations arrive on muda's own channel; forward them into the loop so
         // they are handled on the main thread with the rest of the window state. The
         // handler is process-global, which is fine: this process has one window.
@@ -1426,6 +1439,8 @@ struct SessionApp {
     about_icon: Option<egui::TextureHandle>,
     /// The native session menu bar; its guard detaches the menu before freeing its items.
     menu: Option<session_menu::SessionMenuBar>,
+    /// The local playback volume the Session menu adjusts, if the session has audio.
+    volume: Option<AudioVolume>,
     /// Last 1 Hz diagnostics refresh, used with `ControlFlow::WaitUntil`.
     last_diag_refresh: Instant,
     /// Transient-condition poll, when the caller wired one up.
@@ -1500,6 +1515,7 @@ impl SessionApp {
             fullscreen,
             occluded: false,
             fullscreen_state: Arc::new(AtomicBool::new(fullscreen)),
+            volume: None,
             windowed_session,
             resize_settle: None,
             display_follow: DisplayFollow::new(),
@@ -1713,6 +1729,22 @@ impl SessionApp {
                         }
                     }
                     Err(e) => eprintln!("could not prepare the SSH key: {e}"),
+                }
+            }
+            session_menu::VOLUME_UP | session_menu::VOLUME_DOWN | session_menu::MUTE => {
+                if let Some(volume) = &self.volume {
+                    match id {
+                        session_menu::VOLUME_UP => {
+                            volume.step_up();
+                        }
+                        session_menu::VOLUME_DOWN => {
+                            volume.step_down();
+                        }
+                        _ => volume.set_muted(!volume.muted()),
+                    }
+                    if let Some(menu) = &self.menu {
+                        menu.show_volume(volume);
+                    }
                 }
             }
             session_menu::FULLSCREEN => self.set_fullscreen_mode(!self.fullscreen),
@@ -2540,7 +2572,7 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         window.request_redraw();
         self.window = Some(window.clone());
         self.presenter = Some(presenter);
-        self.menu = Some(session_menu::install(&window));
+        self.menu = Some(session_menu::install(&window, self.volume.as_ref()));
         self.observe_display();
 
         // Scripted runs cannot click a native menu, so `MDRDP_OPEN_DIAG=cache,latency,
@@ -2986,9 +3018,14 @@ mod session_menu {
     //! macOS puts these in the system menu bar; Windows in the window's own bar.
     //! Ids are plain strings matched in `SessionApp::handle_menu`.
 
-    use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+    use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    use crate::audio::AudioVolume;
 
     pub const DISCONNECT: &str = "session.disconnect";
+    pub const VOLUME_UP: &str = "session.volume_up";
+    pub const VOLUME_DOWN: &str = "session.volume_down";
+    pub const MUTE: &str = "session.mute";
     pub const COPY_AVC444: &str = "session.copy_avc444_script";
     pub const COPY_CLEARCODEC: &str = "session.copy_clearcodec_script";
     pub const COPY_60FPS: &str = "session.copy_60fps_script";
@@ -3005,11 +3042,28 @@ mod session_menu {
     /// those objects drop.
     pub struct SessionMenuBar {
         _menu: Menu,
+        /// The volume read-out and Mute tick, present when the session has audio.
+        volume_items: Option<(MenuItem, CheckMenuItem)>,
         #[cfg(target_os = "macos")]
         installed_for_nsapp: bool,
     }
 
+    /// The read-out line above the volume items.
+    pub(super) fn volume_label(volume: &AudioVolume) -> String {
+        format!("Volume: {}%", volume.level())
+    }
+
     impl SessionMenuBar {
+        /// Bring the volume read-out and Mute tick in line with `volume`. muda toggles a
+        /// check item on click by itself; setting it from the model keeps the two from
+        /// drifting whatever order that happens in.
+        pub(super) fn show_volume(&self, volume: &AudioVolume) {
+            if let Some((label, mute)) = &self.volume_items {
+                label.set_text(volume_label(volume));
+                mute.set_checked(volume.muted());
+            }
+        }
+
         /// Stop the native application from reaching menu items owned by this guard.
         ///
         /// `muda::Menu::drop` clears only muda's child maps on macOS; it does not clear
@@ -3030,7 +3084,7 @@ mod session_menu {
         }
     }
 
-    pub fn install(window: &winit::window::Window) -> SessionMenuBar {
+    pub fn install(window: &winit::window::Window, volume: Option<&AudioVolume>) -> SessionMenuBar {
         let menu = Menu::new();
 
         #[cfg(target_os = "macos")]
@@ -3053,8 +3107,22 @@ mod session_menu {
             &MenuItem::with_id(COPY_60FPS, "Copy 60 fps enable script", true, None),
             &MenuItem::with_id(COPY_SSH_SETUP, "Copy SSH setup script", true, None),
             &PredefinedMenuItem::separator(),
-            &MenuItem::with_id(DISCONNECT, "Disconnect", true, None),
         ]);
+        // Local playback volume, remembered per host. Deliberately no accelerators:
+        // every key chord belongs to the remote desktop unless claimed for a reason.
+        let volume_items = volume.map(|volume| {
+            let label = MenuItem::new(volume_label(volume), false, None);
+            let mute = CheckMenuItem::with_id(MUTE, "Mute", true, volume.muted(), None);
+            let _ = session.append_items(&[
+                &label,
+                &MenuItem::with_id(VOLUME_UP, "Volume up", true, None),
+                &MenuItem::with_id(VOLUME_DOWN, "Volume down", true, None),
+                &mute,
+                &PredefinedMenuItem::separator(),
+            ]);
+            (label, mute)
+        });
+        let _ = session.append(&MenuItem::with_id(DISCONNECT, "Disconnect", true, None));
         let _ = menu.append(&session);
 
         let view = Submenu::new("View", true);
@@ -3112,6 +3180,7 @@ mod session_menu {
 
         SessionMenuBar {
             _menu: menu,
+            volume_items,
             #[cfg(target_os = "macos")]
             installed_for_nsapp: true,
         }

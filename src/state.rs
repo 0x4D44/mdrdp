@@ -1,4 +1,5 @@
-//! Remembered per-target window state — currently just "was it fullscreen?".
+//! Remembered per-target state — whether the window was fullscreen, and the local
+//! playback volume and mute.
 //!
 //! This is *derived UI state*, not user data, which drives two decisions that differ
 //! from `crate::favourites`:
@@ -24,6 +25,13 @@ pub struct TargetState {
     /// Whether the session window was fullscreen when it closed.
     #[serde(default)]
     pub fullscreen: bool,
+    /// The local playback level (0–100) when the session closed. `None` until the
+    /// target has had a session with audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u8>,
+    /// Whether local playback was muted when the session closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted: Option<bool>,
 }
 
 /// On-disk shape: a table of targets keyed by `host:port`.
@@ -91,6 +99,19 @@ impl SessionState {
         self.targets.entry(key.to_owned()).or_default().fullscreen = fullscreen;
     }
 
+    /// The remembered playback `(level, muted)` for this target, if any session against
+    /// it has recorded one.
+    pub fn audio_for(&self, key: &str) -> Option<(u8, bool)> {
+        let t = self.targets.get(key)?;
+        Some((t.volume?, t.muted.unwrap_or(false)))
+    }
+
+    pub fn set_audio(&mut self, key: &str, level: u8, muted: bool) {
+        let t = self.targets.entry(key.to_owned()).or_default();
+        t.volume = Some(level);
+        t.muted = Some(muted);
+    }
+
     /// Save to `path`, atomically (same temp-and-rename dance as the favourites file, so
     /// a crash mid-write cannot leave a truncated file).
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
@@ -101,8 +122,9 @@ impl SessionState {
         let file = StateFile {
             target: self.targets.clone(),
         };
-        let text = toml::to_string_pretty(&file)
-            .expect("TargetState serializes without error: plain bools under string keys");
+        let text = toml::to_string_pretty(&file).expect(
+            "TargetState serializes without error: plain bools and integers under string keys",
+        );
 
         let tmp_path = dir.join(format!(".state.toml.tmp.{}", std::process::id()));
         {
@@ -149,6 +171,43 @@ mod tests {
             loaded.fullscreen_for("never-seen:3389"),
             None,
             "an unseen target has no remembered state"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_state_round_trips_per_target_beside_fullscreen() {
+        let dir = tmpdir().join("audio");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.toml");
+
+        let mut state = SessionState::default();
+        state.set_fullscreen("quench:3389", true);
+        state.set_audio("quench:3389", 30, true);
+        state.set_audio("temper:3389", 70, false);
+        state.save_to(&path).expect("save");
+
+        let loaded = SessionState::load_from(&path);
+        assert_eq!(loaded.audio_for("quench:3389"), Some((30, true)));
+        assert_eq!(loaded.audio_for("temper:3389"), Some((70, false)));
+        assert_eq!(loaded.fullscreen_for("quench:3389"), Some(true));
+        assert_eq!(loaded.audio_for("never-seen:3389"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_file_from_before_audio_was_remembered_still_loads() {
+        let dir = tmpdir().join("legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.toml");
+        fs::write(&path, "[target.\"quench:3389\"]\nfullscreen = true\n").unwrap();
+
+        let loaded = SessionState::load_from(&path);
+        assert_eq!(loaded.fullscreen_for("quench:3389"), Some(true));
+        assert_eq!(
+            loaded.audio_for("quench:3389"),
+            None,
+            "no remembered volume means the default, not a silent 0"
         );
         let _ = fs::remove_dir_all(&dir);
     }
