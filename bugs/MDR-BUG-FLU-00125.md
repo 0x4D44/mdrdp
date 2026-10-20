@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00125 — Scripted duration close can hang past its deadline
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** session/lifecycle
 - **Raised:** 2026-08-26T14:03:10Z
 - **Discovery source:** Automation
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20261020T225938Z-7b868a70
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00125-run-fix-20261020T225938Z-7b868a70
-- **Owner base:** e39a54ee1a46f7046bad32347bedd6eee7a76949
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-10-20T22:59:38Z
-- **Owner until:** 2026-10-21T02:59:38Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-26T14:03:10Z, raised via `deltic bugs new`)
+- **State history:** Open (2026-08-26T14:03:10Z, raised via `deltic bugs new`) -> Fixed (2026-10-20T23:17:37Z, deltic:auto role=fix run=fix-20261020T225938Z-7b868a70 branch=task/bug-MDR-BUG-FLU-00125-run-fix-20261020T225938Z-7b868a70 code=2d0623b gate=manual)
 
 ## Observation
 
