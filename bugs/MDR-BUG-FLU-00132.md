@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00132 — clippy -D warnings red on rust 1.98.1: chunks_exact_to_as_chunks at 30 existing sites
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Low
 - **Area:** build
 - **Raised:** 2026-10-14T23:07:35Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20261020T225302Z-3c21586f
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00132-run-fix-20261020T225302Z-3c21586f
-- **Owner base:** 3f1a2706b08a8e411abf4873353eea8649c48f53
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-10-20T22:53:02Z
-- **Owner until:** 2026-10-21T02:53:02Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-10-14T23:07:35Z, raised via `deltic bugs new --land` model=claude-opus-5-5@medium)
+- **State history:** Open (2026-10-14T23:07:35Z, raised via `deltic bugs new --land` model=claude-opus-5-5@medium) -> Fixed (2026-10-20T22:59:20Z, deltic:auto role=fix run=fix-20261020T225302Z-3c21586f branch=task/bug-MDR-BUG-FLU-00132-run-fix-20261020T225302Z-3c21586f code=102f9fc7549043240a5f55118d115ffc391e141e gate=manual)
 
 ## Observation
 
