@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00104 — Non-AVC surface updates leave stale AVC444 detail attached
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/codec-switch
 - **Raised:** 2026-08-24T12:03:48Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20261020T224519Z-f7c387c1
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00104-run-fix-20261020T224519Z-f7c387c1
-- **Owner base:** 2901544b8b022f20f2eff81d18eb8fa8953f88e3
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-10-20T22:45:19Z
-- **Owner until:** 2026-10-21T02:45:19Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
-- **Attempts:** fix=0, doubt=0, indeterminate=1
-- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T12:22:44Z, deltic:auto role=fix run=fix-20260824T121141Z-3afa245c branch=task/bug-MDR-BUG-FLU-00104-run-fix-20260824T121141Z-3afa245c code=0db0fa9 gate=manual) -> Open (2026-09-14T08:44:38Z, 0x4D44/Codex verify run=verify-20260914T083004Z-d8306d1e, the root invalidation mutant remained green because a later luma policy independently clears chroma, model=codex@max)
+- **Attempts:** fix=0, doubt=0, indeterminate=0
+- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T12:22:44Z, deltic:auto role=fix run=fix-20260824T121141Z-3afa245c branch=task/bug-MDR-BUG-FLU-00104-run-fix-20260824T121141Z-3afa245c code=0db0fa9 gate=manual) -> Open (2026-09-14T08:44:38Z, 0x4D44/Codex verify run=verify-20260914T083004Z-d8306d1e, the root invalidation mutant remained green because a later luma policy independently clears chroma, model=codex@max) -> Fixed (2026-10-20T22:50:16Z, deltic:auto role=fix run=fix-20261020T224519Z-f7c387c1 branch=task/bug-MDR-BUG-FLU-00104-run-fix-20261020T224519Z-f7c387c1 code=efbfb2c013a357dfaecf10f029724c74a17a4375 gate=manual)
 
 ## Observation
 
