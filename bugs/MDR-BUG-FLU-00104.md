@@ -6,15 +6,15 @@
 - **Area:** graphics/codec-switch
 - **Raised:** 2026-08-24T12:03:48Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20261020T225327Z-5909ce92
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00104-run-verify-20261020T225327Z-5909ce92
+- **Owner base:** 2f0e3892ac447840e3f8a00b9dc2cd8e54883609
+- **Owner fingerprint:** sha256:b7433c9afa012997e6cd8a24ae55f6189a5210d0a5fa2493106599ecad4dd9a3
+- **Owner since:** 2026-10-20T22:53:27Z
+- **Owner until:** 2026-10-21T02:53:27Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
