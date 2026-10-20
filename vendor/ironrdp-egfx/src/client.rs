@@ -3069,7 +3069,7 @@ mod tests {
 
     #[test]
     fn a_non_avc_update_drops_stale_chroma_before_the_next_luma_pass() {
-        let (mut client, _rx) = avc444_client(64, 48);
+        let (mut client, rx) = avc444_client(64, 48);
         let full = Avc444BitmapStream {
             encoding: Encoding::LUMA_AND_CHROMA,
             stream1: avc420_sub_stream(vec![wire_rect(0, 0, 64, 48)], &[10, 0, 0]),
@@ -3105,6 +3105,27 @@ mod tests {
         assert!(
             client.avc444_buffers.contains_key(&1),
             "a partial destination mutation must preserve disjoint AVC444 state"
+        );
+
+        let _ = rx.try_iter().count();
+        let chroma_only = Avc444BitmapStream {
+            encoding: Encoding::CHROMA,
+            stream1: avc420_sub_stream(vec![wire_rect(0, 0, 32, 24)], &[40, 0, 0]),
+            stream2: None,
+        };
+        deliver_avc444(&mut client, Codec1Type::Avc444v2, &chroma_only);
+
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Failure(reason) if reason == "avc444 chroma-only missing luma baseline"
+            )),
+            "chroma over a non-AVC mutation must require a fresh regional luma baseline: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(event, Event::Update { .. })),
+            "chroma without a regional luma baseline must not repaint: {events:?}"
         );
 
         let luma_only = Avc444BitmapStream {
