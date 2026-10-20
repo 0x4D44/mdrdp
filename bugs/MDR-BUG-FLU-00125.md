@@ -6,15 +6,15 @@
 - **Area:** session/lifecycle
 - **Raised:** 2026-08-26T14:03:10Z
 - **Discovery source:** Automation
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
+- **Owner:** deltic:manual
+- **Owner role:** fix
+- **Owner run:** fix-20261020T225938Z-7b868a70
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLU-00125-run-fix-20261020T225938Z-7b868a70
+- **Owner base:** e39a54ee1a46f7046bad32347bedd6eee7a76949
 - **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner since:** 2026-10-20T22:59:38Z
+- **Owner until:** 2026-10-21T02:59:38Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
