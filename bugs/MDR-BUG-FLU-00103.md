@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00103 — Odd-sized AVC444 edge chroma is discarded by later luma
 
-- **State:** Open
+- **State:** Blocked
 - **Priority:** Must
 - **Severity:** High
 - **Area:** graphics/avc444
 - **Raised:** 2026-08-24T12:03:48Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20261020T225045Z-708bc9fb
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00103-run-fix-20261020T225045Z-708bc9fb
-- **Owner base:** c00cf2634da080bbc9886089a32d2b653bc69c4f
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-10-20T22:50:45Z
-- **Owner until:** 2026-10-21T02:50:45Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T12:13:16Z, deltic:auto role=fix run=fix-20260824T120414Z-824ae691 branch=task/bug-MDR-BUG-FLU-00103-run-fix-20260824T120414Z-824ae691 code=404b723 gate=manual) -> Open (2026-09-14T08:22:56Z, 0x4D44/Codex verify run=verify-20260914T080750Z-2601c231, original later-luma symptom persists after a subsequent rendering-policy change, model=codex@max)
+- **State history:** Open (2026-08-24T12:03:48Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-24T12:13:16Z, deltic:auto role=fix run=fix-20260824T120414Z-824ae691 branch=task/bug-MDR-BUG-FLU-00103-run-fix-20260824T120414Z-824ae691 code=404b723 gate=manual) -> Open (2026-09-14T08:22:56Z, 0x4D44/Codex verify run=verify-20260914T080750Z-2601c231, original later-luma symptom persists after a subsequent rendering-policy change, model=codex@max) -> Blocked (2026-10-20T22:52:22Z, 0x4D44/Codex: Arthur must decide whether odd-edge auxiliary chroma may survive a later luma subframe; [MS-RDPEGFX 3.3.8.3.2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/8131c1bc-1af8-4907-a05a-f72f4581160f) and [3.3.8.3.3](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/781406c3-5e24-4f2b-b6ff-42b76bf64f6d) require luma rectangles to use only the main view, while preserving old detail conflicts with Closed MDR-BUG-FLU-00119's chroma-ghost regression; define the desired protocol exception and ghost-safe acceptance criteria before code changes)
 
 ## Observation
 
