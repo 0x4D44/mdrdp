@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00067 — AVC444 transient luma changes can pin valid chroma detail in permanent 4:2:0 fallback
 
-- **State:** Open
+- **State:** Blocked
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rdp/avc444-rendering
 - **Raised:** 2026-08-23T20:34:24Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20261020T224038Z-4d4aa929
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00067-run-fix-20261020T224038Z-4d4aa929
-- **Owner base:** 039fe28e49f10e313121f609473aae199dfc5db0
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-10-20T22:40:38Z
-- **Owner until:** 2026-10-21T02:40:38Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-23T20:45:22Z, deltic:auto role=fix run=fix-20260823T203614Z-16b2f89b branch=task/bug-MDR-BUG-FLU-00067-run-fix-20260823T203614Z-16b2f89b code=49805c0bc37268473237bf80e756e2cb7a286d6e gate=manual) -> Open (2026-09-13T05:45:26Z, independent verifier: the original return-to-A regression passed only on superseded commit 49805c0; current HEAD replaces that implementation with dea775e and the original symptom still fails, model=codex@max)
+- **State history:** Open (2026-08-23T20:34:24Z, raised via `deltic bugs new` model=gpt-5.6-sol@high) -> Fixed (2026-08-23T20:45:22Z, deltic:auto role=fix run=fix-20260823T203614Z-16b2f89b branch=task/bug-MDR-BUG-FLU-00067-run-fix-20260823T203614Z-16b2f89b code=49805c0bc37268473237bf80e756e2cb7a286d6e gate=manual) -> Open (2026-09-13T05:45:26Z, independent verifier: the original return-to-A regression passed only on superseded commit 49805c0; current HEAD replaces that implementation with dea775e and the original symptom still fails, model=codex@max) -> Blocked (2026-10-20T22:43:21Z, 0x4D44/Codex: Arthur must decide whether to override the main-view-only rule in [MS-RDPEGFX 3.3.8.3.3](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/781406c3-5e24-4f2b-b6ff-42b76bf64f6d) by restoring cached auxiliary detail when LC=1 returns to a prior full YUV420 block state; this conflicts with that rule and Closed MDR-BUG-FLU-00119, so define the intended behavior and ghost-safety criteria before implementation)
 
 ## Observation
 
@@ -40,3 +40,5 @@ test and all source mutations were removed; the source diff is empty. The sympto
 therefore persists on current HEAD and this record is reopened for a new fix.
 
 ## Notes
+
+2026-10-20: The current `Yuv444Buffer::apply_luma` clears auxiliary coverage and writes the main frame's U/V averages. This matches MS-RDPEGFX 3.3.8.3.3, which requires main-view-only color conversion for luma rectangles. Closed MDR-BUG-FLU-00119 requires the same retirement to prevent old chroma ghosts. No code change is safe until Arthur resolves whether this product should override the protocol behavior and defines a guard that preserves the closed regression.
