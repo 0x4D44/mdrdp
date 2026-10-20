@@ -181,9 +181,11 @@ fn main() {
     for t in 1..frames.len().saturating_sub(1) {
         let (mut count, mut worst, mut flips) = (0usize, 0u8, 0usize);
         for ((p, c), n) in frames[t - 1]
-            .chunks_exact(4)
-            .zip(frames[t].chunks_exact(4))
-            .zip(frames[t + 1].chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(frames[t].as_chunks::<4>().0.iter())
+            .zip(frames[t + 1].as_chunks::<4>().0.iter())
         {
             let over = c[2].saturating_sub(p[2].max(n[2]));
             if over > 40 {
@@ -279,7 +281,7 @@ fn overlaps(a: &ExclusiveRectangle, b: &ExclusiveRectangle) -> bool {
 fn mean_rgb(rgba: &[u8]) -> (f64, f64, f64) {
     let n = (rgba.len() / 4) as f64;
     let (mut r, mut g, mut b) = (0f64, 0f64, 0f64);
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0.iter() {
         r += f64::from(px[0]);
         g += f64::from(px[1]);
         b += f64::from(px[2]);
@@ -291,7 +293,12 @@ fn mean_rgb(rgba: &[u8]) -> (f64, f64, f64) {
 fn pixel_moves(prev: &[u8], cur: &[u8], thresh: u16) -> (usize, u16) {
     let mut moved = 0usize;
     let mut maxd = 0u16;
-    for (p, c) in prev.chunks_exact(4).zip(cur.chunks_exact(4)) {
+    for (p, c) in prev
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(cur.as_chunks::<4>().0.iter())
+    {
         let d = u16::from(p[0].abs_diff(c[0]))
             + u16::from(p[1].abs_diff(c[1]))
             + u16::from(p[2].abs_diff(c[2]));
@@ -305,7 +312,7 @@ fn pixel_moves(prev: &[u8], cur: &[u8], thresh: u16) -> (usize, u16) {
 
 fn write_ppm(path: &str, rgba: &[u8], w: usize, h: usize) {
     let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0.iter() {
         out.extend_from_slice(&px[..3]);
     }
     std::fs::write(path, out).unwrap();

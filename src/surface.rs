@@ -329,7 +329,7 @@ impl Surface {
         for row in dest.top..dest.bottom {
             let start = self.row_start(row) + dest.left as usize * BPP;
             let end = start + dest.width() as usize * BPP;
-            for px in self.pixels[start..end].chunks_exact_mut(BPP) {
+            for px in self.pixels[start..end].as_chunks_mut::<BPP>().0.iter_mut() {
                 px.copy_from_slice(&rgba);
             }
         }
@@ -449,7 +449,12 @@ impl Surface {
             let dst_off = self.row_start(dest.top + row) + dest.left as usize * BPP;
             let src_row = &src[src_off..src_off + row_px * BPP];
             let dst_row = &mut self.pixels[dst_off..dst_off + row_px * BPP];
-            for (s, d) in src_row.chunks_exact(BPP).zip(dst_row.chunks_exact_mut(BPP)) {
+            for (s, d) in src_row
+                .as_chunks::<BPP>()
+                .0
+                .iter()
+                .zip(dst_row.as_chunks_mut::<BPP>().0.iter_mut())
+            {
                 d[0] = s[2];
                 d[1] = s[1];
                 d[2] = s[0];
@@ -1988,7 +1993,7 @@ impl SurfaceStore {
 
     /// Convert BGRA (what the ClearCodec decoder emits) to RGBA in place.
     pub fn bgra_to_rgba_in_place(buf: &mut [u8]) {
-        for px in buf.chunks_exact_mut(BPP) {
+        for px in buf.as_chunks_mut::<BPP>().0.iter_mut() {
             px.swap(0, 2);
         }
     }
@@ -2067,9 +2072,9 @@ mod tests {
         let off = (3 + 1) * BPP;
         assert_eq!(&s.pixels()[off..off + BPP], &[30, 20, 10, 40]); // RGBA
         // Every other pixel untouched.
-        for (i, px) in s.pixels().chunks_exact(BPP).enumerate() {
+        for (i, px) in s.pixels().as_chunks::<BPP>().0.iter().enumerate() {
             if i != 4 {
-                assert_eq!(px, [0, 0, 0, 0], "pixel {i} should be untouched");
+                assert_eq!(*px, [0, 0, 0, 0], "pixel {i} should be untouched");
             }
         }
     }
@@ -3817,7 +3822,9 @@ mod tests {
 
             let rows = surface
                 .pixels()
-                .chunks_exact(3 * BPP)
+                .as_chunks::<{ 3 * BPP }>()
+                .0
+                .iter()
                 .map(|row| row[0])
                 .collect::<Vec<_>>();
             assert_eq!(rows, expected);
@@ -3839,7 +3846,9 @@ mod tests {
         assert_eq!(
             surface
                 .pixels()
-                .chunks_exact(BPP)
+                .as_chunks::<BPP>()
+                .0
+                .iter()
                 .map(|pixel| pixel[0])
                 .collect::<Vec<_>>(),
             [1, 1, 2, 3]

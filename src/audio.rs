@@ -152,11 +152,13 @@ pub fn choose_format(offered: &[AudioFormat]) -> Result<AudioFormat, NoUsableFor
 /// Decode little-endian 16-bit PCM bytes into `f32` samples in `[-1.0, 1.0]`.
 ///
 /// A trailing odd byte — a truncated wave payload, the obvious hostile/corrupt input — is
-/// silently dropped rather than read out of bounds or panicked on: [`slice::chunks_exact`]
-/// simply never yields a partial chunk.
+/// silently dropped rather than read out of bounds or panicked on: splitting into fixed
+/// pairs leaves the trailing byte outside the complete-pair slice.
 pub fn pcm16_le_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
         .collect()
 }
@@ -181,7 +183,9 @@ pub fn duplicate_mono_to_stereo(mono: &[f32]) -> Vec<f32> {
 /// rather than indexed out of bounds.
 pub fn downmix_stereo_to_mono(stereo: &[f32]) -> Vec<f32> {
     stereo
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (pair[0] + pair[1]) * 0.5)
         .collect()
 }

@@ -18,8 +18,10 @@ use serde::{Deserialize, Serialize};
 /// expected to have rejected mismatched frame sizes before getting here.
 pub fn changed_pixels(reference: &[u8], frame: &[u8], threshold: u8) -> usize {
     reference
-        .chunks_exact(4)
-        .zip(frame.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(frame.as_chunks::<4>().0.iter())
         .filter(|(a, b)| {
             let delta = |i: usize| a[i].abs_diff(b[i]);
             delta(0).max(delta(1)).max(delta(2)) > threshold
@@ -391,7 +393,7 @@ mod tests {
     /// `n` pixels lifted by `delta` on all three colour channels; alpha left alone.
     fn with_changed(base: &[u8], n: usize, delta: u8) -> Vec<u8> {
         let mut out = base.to_vec();
-        for px in out.chunks_exact_mut(4).take(n) {
+        for px in out.as_chunks_mut::<4>().0.iter_mut().take(n) {
             for ch in px.iter_mut().take(3) {
                 *ch = ch.saturating_add(delta);
             }
@@ -422,10 +424,10 @@ mod tests {
         let base = flat(40);
         let mut alpha_only = base.clone();
         let mut blue_only = base.clone();
-        for px in alpha_only.chunks_exact_mut(4) {
+        for px in alpha_only.as_chunks_mut::<4>().0.iter_mut() {
             px[3] = 255;
         }
-        for px in blue_only.chunks_exact_mut(4) {
+        for px in blue_only.as_chunks_mut::<4>().0.iter_mut() {
             px[0] = 255;
         }
         assert_eq!(

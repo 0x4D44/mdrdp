@@ -486,7 +486,9 @@ mod tests {
         // Some pixel in the band is white text, not just the pill.
         assert!(
             quench.rgba[..band]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[0] > 240 && p[1] > 240 && p[2] > 240 && p[3] > 200),
             "no text pixels in the label band"
         );

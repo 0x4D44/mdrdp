@@ -3421,11 +3421,15 @@ fn decode_png_file(path: &Path, max_bytes: usize) -> Result<(usize, usize, Vec<u
     let rgba = match frame.color_type {
         png::ColorType::Rgba => buffer,
         png::ColorType::Rgb => buffer
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
             .collect(),
         png::ColorType::GrayscaleAlpha => buffer
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
             .collect(),
         png::ColorType::Grayscale => buffer
@@ -3929,7 +3933,9 @@ fn content_fingerprint(content: &ClipboardContent) -> [u8; 32] {
 /// and invalid sequences (including lone surrogates) are replaced with U+FFFD.
 fn decode_utf16le_text(bytes: &[u8]) -> String {
     let mut units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     while units.last() == Some(&0) {
@@ -3994,8 +4000,10 @@ fn encode_dib(
     put_u32(&mut out, 56, 0x7352_4742); // LCS_sRGB
 
     for (source, destination) in rgba
-        .chunks_exact(4)
-        .zip(out[DIB_HEADER_SIZE..].chunks_exact_mut(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out[DIB_HEADER_SIZE..].as_chunks_mut::<4>().0.iter_mut())
     {
         destination[0] = source[2]; // B
         destination[1] = source[1]; // G

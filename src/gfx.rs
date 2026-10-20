@@ -1197,12 +1197,12 @@ mod tests {
             out.u = vec![u; (WIDTH / 2) * (HEIGHT / 2)];
             out.v = vec![v; (WIDTH / 2) * (HEIGHT / 2)];
             if aux != 0 {
-                for row in out.y.chunks_exact_mut(WIDTH) {
+                for row in out.y.as_chunks_mut::<WIDTH>().0.iter_mut() {
                     row[..WIDTH / 2].fill(u);
                     row[WIDTH / 2..].fill(v);
                 }
                 for plane in [&mut out.u, &mut out.v] {
-                    for row in plane.chunks_exact_mut(WIDTH / 2) {
+                    for row in plane.as_chunks_mut::<{ WIDTH / 2 }>().0.iter_mut() {
                         row[..WIDTH / 4].fill(u);
                         row[WIDTH / 4..].fill(v);
                     }
@@ -1896,8 +1896,10 @@ mod tests {
         assert!(
             visible
                 .pixels()
-                .chunks_exact(BPP)
-                .all(|pixel| pixel == [0xA0, 0xB0, 0xC0, 0xFF]),
+                .as_chunks::<BPP>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [0xA0, 0xB0, 0xC0, 0xFF]),
             "sparse writes must not retire the old output before replacement coverage is full"
         );
         drop(guard);
@@ -1923,8 +1925,10 @@ mod tests {
         assert!(
             visible
                 .pixels()
-                .chunks_exact(BPP)
-                .all(|pixel| pixel == [0x33, 0x22, 0x11, 0xFF])
+                .as_chunks::<BPP>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [0x33, 0x22, 0x11, 0xFF])
         );
     }
 

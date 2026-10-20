@@ -192,7 +192,7 @@ fn copy_rows_bgra(src: &[u32], width: usize, height: usize, dst: &mut [u8], dst_
         let Some(d) = dst.get_mut(y * dst_stride..y * dst_stride + row_bytes) else {
             return;
         };
-        for (px, out) in s.iter().zip(d.chunks_exact_mut(4)) {
+        for (px, out) in s.iter().zip(d.as_chunks_mut::<4>().0.iter_mut()) {
             out.copy_from_slice(&(px | 0xFF00_0000).to_le_bytes());
         }
     }
