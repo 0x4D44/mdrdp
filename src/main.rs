@@ -206,6 +206,15 @@ impl ActiveSession {
     }
 }
 
+/// Give session shutdown the first chance to send its disconnect before best-effort
+/// exit work touches the filesystem. A stalled state write must not leave the remote
+/// session connected while the window is already closing.
+fn disconnect_before_best_effort_io<T>(disconnect: impl FnOnce() -> T, io: impl FnOnce()) -> T {
+    let result = disconnect();
+    io();
+    result
+}
+
 /// Everything the connection needs, after favourites and flags have been reconciled.
 #[derive(Debug)]
 struct Target {
@@ -1812,32 +1821,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let presence_stop_for_exit = Arc::clone(&presence_stop);
     let window = window.on_exit(move || {
         presence_stop_for_exit.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(dir) = &presence_dir {
-            mdrdp::presence::remove_from(dir, std::process::id());
-        }
-        // Remember how the window closed, fullscreen-wise, so the next launch of this
-        // target can open the same way. Best-effort: a failed save costs one toggle.
-        if let Some(path) = &state_path_for_exit {
-            let mut state = mdrdp::state::SessionState::load_from(path);
-            state.set_fullscreen(
-                &state_key_for_exit,
-                fullscreen_for_exit.load(std::sync::atomic::Ordering::Relaxed),
-            );
-            // Only a session that had audio has a volume worth remembering; one with
-            // playback off must not overwrite the level the user last chose.
-            if let Some(volume) = &volume_for_exit {
-                state.set_audio(&state_key_for_exit, volume.level(), volume.muted());
-            }
-            if let Err(e) = state.save_to(path) {
-                eprintln!("warning: could not remember the window state: {e}");
-            }
-        }
-        let handle = slot_for_exit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(handle) = handle {
-            let end = handle.shutdown();
+        let end = disconnect_before_best_effort_io(
+            || {
+                slot_for_exit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .map(ActiveSession::shutdown)
+            },
+            || {
+                if let Some(dir) = &presence_dir {
+                    mdrdp::presence::remove_from(dir, std::process::id());
+                }
+                // Remember how the window closed, fullscreen-wise, so the next launch
+                // can open the same way. Best-effort: a failed save costs one toggle.
+                if let Some(path) = &state_path_for_exit {
+                    let mut state = mdrdp::state::SessionState::load_from(path);
+                    state.set_fullscreen(
+                        &state_key_for_exit,
+                        fullscreen_for_exit.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    // Only a session that had audio has a volume worth remembering; one
+                    // with playback off must not overwrite the level last chosen.
+                    if let Some(volume) = &volume_for_exit {
+                        state.set_audio(&state_key_for_exit, volume.level(), volume.muted());
+                    }
+                    if let Err(e) = state.save_to(path) {
+                        eprintln!("warning: could not remember the window state: {e}");
+                    }
+                }
+            },
+        );
+        if let Some(end) = end {
             eprintln!("session ended: {end:?}");
             if let Some(path) = &metrics_path_for_exit {
                 match write_session_metrics(
@@ -2365,6 +2380,39 @@ fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_disconnect_finishes_before_best_effort_exit_io_starts() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum ExitStep {
+            Disconnect,
+            Persistence,
+        }
+
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let disconnect_events = events_tx.clone();
+        let worker = std::thread::spawn(move || {
+            disconnect_before_best_effort_io(
+                move || disconnect_events.send(ExitStep::Disconnect).unwrap(),
+                move || {
+                    events_tx.send(ExitStep::Persistence).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            );
+        });
+
+        // Keep persistence blocked until both ordering observations are taken. If the
+        // exit path regresses to persistence-first, the second receive times out; release
+        // it before asserting so even the failing test joins its worker.
+        let first = events_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let second = events_rx.recv_timeout(std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(first, Ok(ExitStep::Disconnect));
+        assert_eq!(second, Ok(ExitStep::Persistence));
+    }
 
     #[test]
     fn human_progress_renders_preflight_and_suppresses_duplicate_completion() {

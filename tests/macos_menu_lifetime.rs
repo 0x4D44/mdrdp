@@ -24,25 +24,42 @@ fn main() {
 
     let event_loop = SessionWindow::event_loop().expect("create the one AppKit event loop");
     let (input_tx, _input_rx) = mpsc::channel::<InputEvent>();
+    let (exit_tx, exit_rx) = mpsc::channel();
     let window = SessionWindow::new(
         event_loop,
         WindowConfig::new("mdrdp menu lifetime probe", 64, 64),
         Arc::new(Mutex::new(SurfaceStore::new())),
         WakingSender::silent(input_tx),
     )
-    .expect("create probe window");
+    .expect("create probe window")
+    .on_exit(move || {
+        let _ = exit_tx.send(());
+    });
 
     let waker = window.waker();
     let (observed_tx, observed_rx) = mpsc::channel();
+    let (observed_ready_tx, observed_ready_rx) = mpsc::channel();
+    // Scripted --duration also closes from a sleeping worker thread. Keep that close
+    // on the same path while verifying both the AppKit menu and LoopExiting hook.
     let closer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
         DispatchQueue::main().exec_async(move || {
             let _ = observed_tx.send(session_menu_attached());
-            let _ = waker.close();
+            let _ = observed_ready_tx.send(());
         });
+        observed_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("main-thread menu observation");
+        assert!(
+            waker.close(),
+            "the worker-thread close event must be accepted"
+        );
     });
     let _event_loop = window.run().expect("run and close the probe window");
     closer.join().expect("probe closer thread");
+    exit_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the LoopExiting hook must run for a worker-thread close");
     assert!(
         observed_rx
             .recv()
