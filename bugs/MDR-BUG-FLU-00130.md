@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00130 — AVC444 luma and chroma presentations still alternate on coloured terminal content
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** Medium
 - **Area:** graphics/avc444
 - **Raised:** 2026-09-14T20:41:13Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261021T044441Z-f5e76821
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00130-run-verify-20261021T044441Z-f5e76821
-- **Owner base:** 1cc9deed16e35f3328241ce40226be8fa41b8367
-- **Owner fingerprint:** sha256:227da9cf52f1e4535f581090e086d8d61f79c5197765a7b86161328ca918dc8a
-- **Owner since:** 2026-10-21T04:44:41Z
-- **Owner until:** 2026-10-21T08:44:41Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
-- **Attempts:** fix=0, doubt=0, indeterminate=1
-- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-14T21:13:36Z, deltic:auto role=fix run=fix-20260914T204351Z-8b2550a0 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0 code=1f8674a gate=manual) -> Open (2026-09-14T23:25:45Z, Codex, Arthur reports continued flicker on 0.1.247; successful submissions racing incoming frames leave the luma wait bypassed) -> Fixed (2026-09-14T23:53:12Z, deltic:auto role=fix run=fix-20260914T232621Z-8551b907 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T232621Z-8551b907 code=c828aa2174c3e4a78cb0c0219c92652a5dab30d5 gate=manual)
+- **Attempts:** fix=0, doubt=0, indeterminate=0
+- **State history:** Open (2026-09-14T20:41:13Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-14T21:13:36Z, deltic:auto role=fix run=fix-20260914T204351Z-8b2550a0 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T204351Z-8b2550a0 code=1f8674a gate=manual) -> Open (2026-09-14T23:25:45Z, Codex, Arthur reports continued flicker on 0.1.247; successful submissions racing incoming frames leave the luma wait bypassed) -> Fixed (2026-09-14T23:53:12Z, deltic:auto role=fix run=fix-20260914T232621Z-8551b907 branch=task/bug-MDR-BUG-FLU-00130-run-fix-20260914T232621Z-8551b907 code=c828aa2174c3e4a78cb0c0219c92652a5dab30d5 gate=manual) -> Closed (2026-10-21T04:46:29Z, deltic:manual role=verify run=verify-20261021T044441Z-f5e76821 verified_fix_run=fix-20260914T232621Z-8551b907 verdict=close)
 
 ## Observation
 
@@ -64,6 +64,10 @@ Existing Windows warnings and standalone vendored formatting drift remain.
 Design and full evidence are in the 2026.09.14 bounded AVC444 luma-wait HLD and
 journal. This is Fixed, not independently visually verified: a live affected
 terminal session still needs to confirm the reported flicker has improved.
+
+### Verification summary (2026-10-21T04:46:29Z, deltic:auto run=verify-20261021T044441Z-f5e76821 verified_fix_run=fix-20260914T232621Z-8551b907 verdict=close)
+
+Verifier note: Manual verify: User confirms the live Temper colored terminal/patterned bars no longer flicker on current builds. Fix c828aa2 is on origin/main. stale_completed_snapshot_ack_cannot_clear_a_newer_or_reset_wait passed, failed when the token check was weakened to accept any Some batch (assertion: left None, right Some(2)), then passed after restoration. Surface/window/graphics suites passed 76/72/65. This worktree also passed fmt, scoped Clippy, and Windows cross-check; only documented vendored and missing-icon warnings appeared. No separate verifier-owned Temper session.
 
 ## Notes
 
