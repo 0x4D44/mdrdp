@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00014 — Session-lost dialog shows IronRDP's raw error chain, rustc and build-machine paths included, as the user-facing explanation
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Low
 - **Area:** ui
 - **Raised:** 2026-08-19T14:35:00Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261021T211328Z-caa9a50b
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00014-run-verify-20261021T211328Z-caa9a50b
-- **Owner base:** af0c493b7b312c8da4712d417cd4a186e1f015c0
-- **Owner fingerprint:** sha256:5cdb67f08b21d6b0b2e4eef9742715e99a38b97ed9a23428627e82b8708ced97
-- **Owner since:** 2026-10-21T21:13:28Z
-- **Owner until:** 2026-10-22T01:13:28Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T14:35:00Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-19T15:00:00Z, claude on flux, fix commit on task branch — regression tests proven red-then-green, both dialog states confirmed on screen; integrated code=0e03238aa4c84f44b6ec68b8d31ca3f95492b8d5)
+- **State history:** Open (2026-08-19T14:35:00Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-19T15:00:00Z, claude on flux, fix commit on task branch — regression tests proven red-then-green, both dialog states confirmed on screen; integrated code=0e03238aa4c84f44b6ec68b8d31ca3f95492b8d5) -> Closed (2026-10-21T21:13:36Z, deltic:manual role=verify run=verify-20261021T211328Z-caa9a50b verified_fix_run=manual:0e03238aa4c84f44b6ec68b8d31ca3f95492b8d5 verdict=close)
 
 ## Observation
 
@@ -105,6 +105,10 @@ The third mutation's output also caught an unfaithful fixture: the test built
 both tests now build the error the way the live path does. Confirmed on screen in both
 states, including a chain long enough to force the grow. Full lib suite (630), fmt,
 clippy `-D warnings`, and `check-windows.sh` all green.
+
+### Verification summary (2026-10-21T21:13:36Z, deltic:auto run=verify-20261021T211328Z-caa9a50b verified_fix_run=manual:0e03238aa4c84f44b6ec68b8d31ca3f95492b8d5 verdict=close)
+
+Verifier note: Manual verify: Arthur confirms the Session-lost explanation is readable on current builds. disconnect::tests passed 16/16, including the selected chain-stripping test. Making strip_call_sites return the raw chain failed that assertion with rustc, vendor and Cargo registry paths still present. The current dialog tests also confirm the user sentence opens while the technical chain stays behind its disclosure.
 
 ## Residual
 
