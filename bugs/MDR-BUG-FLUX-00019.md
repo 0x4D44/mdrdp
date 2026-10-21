@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00019 — RDP sessions get no audio channel from any test host: mdrdp requests rdpsnd but the server never opens it
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** audio/rdp
 - **Raised:** 2026-08-19T21:20:19Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261021T211344Z-acfdbe06
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00019-run-verify-20261021T211344Z-acfdbe06
-- **Owner base:** d484c3d8b4bd821c527cce489c9fddd38e63a557
-- **Owner fingerprint:** sha256:72fb4c778f99cdfe0f8bffd548023375dc2da162bc5eb93885bd4de561dc6394
-- **Owner since:** 2026-10-21T21:13:44Z
-- **Owner until:** 2026-10-22T01:13:44Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T21:20:19Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-20T10:50:51Z, manual land on task/20260820-TSK-HUM-fix-rdp-audio-channel-negotiation, model=claude-opus-5@high, integrated code=7a6b2d0063ae00cb77944129b86c4eee971fc4d0)
+- **State history:** Open (2026-08-19T21:20:19Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-20T10:50:51Z, manual land on task/20260820-TSK-HUM-fix-rdp-audio-channel-negotiation, model=claude-opus-5@high, integrated code=7a6b2d0063ae00cb77944129b86c4eee971fc4d0) -> Closed (2026-10-21T21:13:50Z, deltic:manual role=verify run=verify-20261021T211344Z-acfdbe06 verified_fix_run=manual:7a6b2d0063ae00cb77944129b86c4eee971fc4d0 verdict=close)
 
 ## Observation
 
@@ -117,6 +117,10 @@ with them.
   format exchange — nothing was playing on the remote desktop`
 - `.wav` playing in the session — `audio: 215 packets at 44100 Hz/2ch, 0 dropped to
   overrun, 10 underruns`
+
+### Verification summary (2026-10-21T21:13:50Z, deltic:auto run=verify-20261021T211344Z-acfdbe06 verified_fix_run=manual:7a6b2d0063ae00cb77944129b86c4eee971fc4d0 verdict=close)
+
+Verifier note: Manual verify: Arthur confirms current builds handle RDP audio as expected. audio::tests::a_channel_the_server_opened_and_never_spoke_on_is_not_called_a_refusal passed 1/1. Disabling the accepted DVC-open count made the selected test report no channel despite two accepted opens. The fix reports measured channel opens and distinguishes an idle audio handshake from a server refusal.
 
 ## Notes
 
