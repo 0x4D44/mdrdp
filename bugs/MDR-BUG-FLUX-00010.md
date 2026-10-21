@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00010 — AVC444: one-frame colour overshoot (blue tint) when content changes under a luma-only frame
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** gfx
 - **Raised:** 2026-08-19T07:20:46Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261021T211256Z-743e0a33
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00010-run-verify-20261021T211256Z-743e0a33
-- **Owner base:** 8a5464d8d96afb92e19650fa06a39741f4552655
-- **Owner fingerprint:** sha256:cd7a53b42380fdb3aa9ce4ab9bfc38a6211fecccff7e974911ec5072d2aa048b
-- **Owner since:** 2026-10-21T21:12:56Z
-- **Owner until:** 2026-10-22T01:12:56Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T07:20:46Z, raised via `deltic bugs new`); Fixed (2026-08-19T08:15:00Z, claude on flux, fix commit 0345af8aa8fe33d4cdcbe98879a1a1ddb5ba2c85 on task branch — regression tests proven red-then-green, oracle 10/10, replay blue-flips 1,706 -> 0; integrated code=d0dd6575c99e1bd1e167c18c51c3fd3b599eb171)
+- **State history:** Open (2026-08-19T07:20:46Z, raised via `deltic bugs new`); Fixed (2026-08-19T08:15:00Z, claude on flux, fix commit 0345af8aa8fe33d4cdcbe98879a1a1ddb5ba2c85 on task branch — regression tests proven red-then-green, oracle 10/10, replay blue-flips 1,706 -> 0; integrated code=d0dd6575c99e1bd1e167c18c51c3fd3b599eb171) -> Closed (2026-10-21T21:13:04Z, deltic:manual role=verify run=verify-20261021T211256Z-743e0a33 verified_fix_run=manual:d0dd6575c99e1bd1e167c18c51c3fd3b599eb171 verdict=close)
 
 ## Observation
 
@@ -68,6 +68,10 @@ payloads: blue-flips 1,706 -> **0**; first-paint mean B 71 -> 25 (true value 8.4
 is the information-forced 4:2:0 floor until chroma arrives). FreeRDP differential
 oracle still 10/10 (virgin path untouched). Full suite, clippy `-D warnings`,
 fmt, `check-windows.sh` all green.
+
+### Verification summary (2026-10-21T21:13:04Z, deltic:auto run=verify-20261021T211256Z-743e0a33 verified_fix_run=manual:d0dd6575c99e1bd1e167c18c51c3fd3b599eb171 verdict=close)
+
+Verifier note: Manual verify: Arthur confirms the one-frame blue tint is absent on current builds. The later main-view-only luma policy superseded the original stale-chroma implementation. Current gfx::tests::avc444_luma_repaint_retires_old_chroma_with_the_same_block_average passed 1/1, and a_luma_pass_replaces_previously_delivered_chroma_detail passed 1/1. Preserving old odd-position auxiliary samples made the selected repaint test fail with [112,255,255,255] instead of [235,235,235,255].
 
 ## Notes
 
