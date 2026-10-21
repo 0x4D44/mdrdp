@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00082 — Rhydra cold-starts black when the Windows console is locked
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** rhydra/secure-desktop
 - **Raised:** 2026-08-23T22:04:30Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261021T044801Z-eb174d44
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00082-run-verify-20261021T044801Z-eb174d44
-- **Owner base:** 473eda91d41838e9eb3c136c7677b52b9b75fba6
-- **Owner fingerprint:** sha256:36086110882c16a787bbd6a1fb274839195248641e8703de4873d0a7f5347ca4
-- **Owner since:** 2026-10-21T04:48:01Z
-- **Owner until:** 2026-10-21T08:48:01Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
-- **Attempts:** fix=0, doubt=0, indeterminate=2
-- **State history:** Open (2026-08-23T22:04:30Z, raised via `deltic bugs new`) -> Fixed (2026-08-23T22:11:32Z, deltic:auto role=fix run=fix-20260823T220531Z-aad19780 branch=task/bug-MDR-BUG-FLU-00082-run-fix-20260823T220531Z-aad19780 code=795ccf1047c834120bbeef569fd5fd65fd3b9324 gate=manual)
+- **Attempts:** fix=0, doubt=0, indeterminate=0
+- **State history:** Open (2026-08-23T22:04:30Z, raised via `deltic bugs new`) -> Fixed (2026-08-23T22:11:32Z, deltic:auto role=fix run=fix-20260823T220531Z-aad19780 branch=task/bug-MDR-BUG-FLU-00082-run-fix-20260823T220531Z-aad19780 code=795ccf1047c834120bbeef569fd5fd65fd3b9324 gate=manual) -> Closed (2026-10-21T04:48:50Z, deltic:manual role=verify run=verify-20261021T044801Z-eb174d44 verified_fix_run=fix-20260823T220531Z-aad19780 verdict=close)
 
 ## Observation
 
@@ -31,6 +31,10 @@ Restarting RhydraAgent while Quench is on the Winlogon PIN desktop starts a heal
 attach to the live input desktop before DPI setup and before it creates or replaces
 children. It repeats the desktop synchronisation before each reconcile pass, so a
 locked service start and later desktop transitions use the active Winlogon desktop.
+
+### Verification summary (2026-10-21T04:48:50Z, deltic:auto run=verify-20261021T044801Z-eb174d44 verified_fix_run=fix-20260823T220531Z-aad19780 verdict=close)
+
+Verifier note: Manual verify: User confirms that on current Quench builds, a new viewer started while PIN-locked shows the PIN desktop. Fix 795ccf1 attaches the reconcile thread to the live input desktop before DPI setup/child creation and resynchronizes before each pass. Rhydra library tests passed 351/351; Windows cross-check passed. There is no automated black-frame regression: the Winlogon path is Windows-only and the existing Windows test is excluded on macOS; cross-check only compiles it. No service restart or viewer takeover by verifier.
 
 ## Notes
 
