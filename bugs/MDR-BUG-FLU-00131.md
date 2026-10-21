@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00131 — Fullscreen resolution restoration is discarded after an EGFX-only resize
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** session/resolution
 - **Raised:** 2026-09-16T06:45:34Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261021T044019Z-8e1b778c
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00131-run-verify-20261021T044019Z-8e1b778c
-- **Owner base:** 21d94d045c34e1d8d9702093e91f734997c6cc80
-- **Owner fingerprint:** sha256:005797371a9d7c1144d222659a59ca00cc7ebe2211bdb049ff0863f155224e15
-- **Owner since:** 2026-10-21T04:40:19Z
-- **Owner until:** 2026-10-21T08:40:19Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-09-16T06:45:34Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-16T07:00:53Z, deltic:auto role=fix run=fix-20260916T064547Z-3e6476f9 branch=task/bug-MDR-BUG-FLU-00131-run-fix-20260916T064547Z-3e6476f9 code=02e32d1a25cebec562804031773648c287a68f4e gate=manual)
+- **State history:** Open (2026-09-16T06:45:34Z, raised via `deltic bugs new --land`) -> Fixed (2026-09-16T07:00:53Z, deltic:auto role=fix run=fix-20260916T064547Z-3e6476f9 branch=task/bug-MDR-BUG-FLU-00131-run-fix-20260916T064547Z-3e6476f9 code=02e32d1a25cebec562804031773648c287a68f4e gate=manual) -> Closed (2026-10-21T04:44:30Z, deltic:manual role=verify run=verify-20261021T044019Z-8e1b778c verified_fix_run=fix-20260916T064547Z-3e6476f9 verdict=close)
 
 ## Observation
 
@@ -59,5 +59,9 @@ it fail on its restore assertion, and restoring the fix passed. The full root,
 vendored, Clippy, formatting, and Windows gates passed. Kiln had an active RDP
 session, so the original live observation was not rerun; physical monitor
 off/on remains unverified. This remains Fixed and indeterminate for closure.
+
+### Verification summary (2026-10-21T04:44:30Z, deltic:auto run=verify-20261021T044019Z-8e1b778c verified_fix_run=fix-20260916T064547Z-3e6476f9 verdict=close)
+
+Verifier note: Manual verify: User confirms current builds restore fullscreen resolution after monitor power-off/return. Fix 02e32d1 is on origin/main. All three targeted resize regressions passed; replacing the decision with the activation-size-only comparison made a_reset_graphics_size_forces_restore_even_when_activation_size_matches fail on its restore assertion, then pass after restoration. The 99-test session family, fmt, scoped Clippy, and Windows cross-check passed. Existing warnings: vendored unfulfilled_lint_expectations and Windows missing icon. No separate live Kiln session.
 
 ## Notes
