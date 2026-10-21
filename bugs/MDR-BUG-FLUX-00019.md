@@ -6,15 +6,15 @@
 - **Area:** audio/rdp
 - **Raised:** 2026-08-19T21:20:19Z
 - **Discovery source:** Agent
-- **Owner:** -
-- **Owner role:** -
-- **Owner run:** -
-- **Owner host:** -
-- **Owner branch:** -
-- **Owner base:** -
-- **Owner fingerprint:** -
-- **Owner since:** -
-- **Owner until:** -
+- **Owner:** deltic:manual
+- **Owner role:** verify
+- **Owner run:** verify-20261021T211344Z-acfdbe06
+- **Owner host:** flux
+- **Owner branch:** task/bug-MDR-BUG-FLUX-00019-run-verify-20261021T211344Z-acfdbe06
+- **Owner base:** d484c3d8b4bd821c527cce489c9fddd38e63a557
+- **Owner fingerprint:** sha256:72fb4c778f99cdfe0f8bffd548023375dc2da162bc5eb93885bd4de561dc6394
+- **Owner since:** 2026-10-21T21:13:44Z
+- **Owner until:** 2026-10-22T01:13:44Z
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
