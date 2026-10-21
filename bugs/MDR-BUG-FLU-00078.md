@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00078 — Rhydra service cannot move its worker token into the console session
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** Rhydra service
 - **Raised:** 2026-08-23T21:46:28Z
 - **Discovery source:** Agent
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261021T044648Z-68766696
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00078-run-verify-20261021T044648Z-68766696
-- **Owner base:** 0abde6b897b815d9618732a10a86ec8c62f59f2f
-- **Owner fingerprint:** sha256:bb9030261f6d6ef010bcb261d3c96d3437a0b74da26d46c55c0c7602f4509fa7
-- **Owner since:** 2026-10-21T04:46:48Z
-- **Owner until:** 2026-10-21T08:46:48Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
-- **Attempts:** fix=0, doubt=0, indeterminate=2
-- **State history:** Open (2026-08-23T21:46:28Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T21:48:01Z, deltic:auto role=fix run=fix-20260823T214751Z-79cfb27f branch=task/bug-MDR-BUG-FLU-00078-run-fix-20260823T214751Z-79cfb27f code=c2583d9fe98642a34c7c723205648704ae6a70f1 gate=manual)
+- **Attempts:** fix=0, doubt=0, indeterminate=0
+- **State history:** Open (2026-08-23T21:46:28Z, raised via `deltic bugs new` model=gpt-5.6-sol@xhigh) -> Fixed (2026-08-23T21:48:01Z, deltic:auto role=fix run=fix-20260823T214751Z-79cfb27f branch=task/bug-MDR-BUG-FLU-00078-run-fix-20260823T214751Z-79cfb27f code=c2583d9fe98642a34c7c723205648704ae6a70f1 gate=manual) -> Closed (2026-10-21T04:47:47Z, deltic:manual role=verify run=verify-20261021T044648Z-68766696 verified_fix_run=fix-20260823T214751Z-79cfb27f verdict=close)
 
 ## Observation
 
@@ -30,6 +30,10 @@ The integrated LocalSystem service starts, but every console-worker launch fails
 `c2583d9fe98642a34c7c723205648704ae6a70f1` changes `launch_worker` to request
 `TOKEN_ALL_ACCESS` from `DuplicateTokenEx` before assigning the active console
 session to the duplicated primary token.
+
+### Verification summary (2026-10-21T04:47:47Z, deltic:auto run=verify-20261021T044648Z-68766696 verified_fix_run=fix-20260823T214751Z-79cfb27f verdict=close)
+
+Verifier note: Manual verify: User confirms the Quench Rhydra worker starts and works on current builds. Fix c2583d9 requests TOKEN_ALL_ACCESS from DuplicateTokenEx before SetTokenInformation(TokenSessionId), addressing the denied token-session assignment. No automated LocalSystem service-launch regression exists; the Windows cross-check compiles but cannot execute it. The Rhydra library suite passed 351/351; Windows cross-check passed. Existing unused visual_flow, vendored lint, and missing-icon warnings were emitted. I did not restart the service; user runtime confirmation is the service evidence.
 
 ## Notes
 
