@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00013 — Session-lost dialog is a fixed 300 px, so a long failure string pushes Reconnect and Close off the window
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** ui
 - **Raised:** 2026-08-19T14:07:49Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261021T211311Z-65474f4a
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00013-run-verify-20261021T211311Z-65474f4a
-- **Owner base:** 215176f09537fe62c36f6238a71e9b32fcdbc689
-- **Owner fingerprint:** sha256:7f25c35ddc070c9677d63fbbd1af2064ed5018fa117c69ae99a58f050528418e
-- **Owner since:** 2026-10-21T21:13:11Z
-- **Owner until:** 2026-10-22T01:13:11Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T14:07:49Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-19T14:20:00Z, claude on flux, fix commit 64411fbbc8d2b3c147fef0d2f23d48e22fd9fae5 on task branch — regression tests proven red-then-green, dialog confirmed on screen; integrated code=07696d0a7d6e8ac7af8d9cab1a704488bde0dfed)
+- **State history:** Open (2026-08-19T14:07:49Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-19T14:20:00Z, claude on flux, fix commit 64411fbbc8d2b3c147fef0d2f23d48e22fd9fae5 on task branch — regression tests proven red-then-green, dialog confirmed on screen; integrated code=07696d0a7d6e8ac7af8d9cab1a704488bde0dfed) -> Closed (2026-10-21T21:13:19Z, deltic:manual role=verify run=verify-20261021T211311Z-65474f4a verified_fix_run=manual:07696d0a7d6e8ac7af8d9cab1a704488bde0dfed verdict=close)
 
 ## Observation
 
@@ -70,6 +70,10 @@ so text a scroll area has scrolled out of view is not miscounted as overflow.
 Confirmed on screen with a throwaway example: the reported failure opens a
 480x344 window with both buttons visible. `cargo test --lib ui::`, `cargo fmt`,
 `cargo clippy --all-targets -D warnings` all green.
+
+### Verification summary (2026-10-21T21:13:19Z, deltic:auto run=verify-20261021T211311Z-65474f4a verified_fix_run=manual:07696d0a7d6e8ac7af8d9cab1a704488bde0dfed verdict=close)
+
+Verifier note: Manual verify: Arthur confirms the Session-lost dialog keeps its buttons visible on current builds. ui::end_dialog::tests passed 10/10, including opening_the_details_grows_the_window_instead_of_losing_the_buttons. Forcing the height fitter to MIN_HEIGHT made that selected test lose Reconnect and Close.
 
 ## Notes
 
