@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00125 — Scripted duration close can hang past its deadline
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Should
 - **Severity:** High
 - **Area:** session/lifecycle
 - **Raised:** 2026-08-26T14:03:10Z
 - **Discovery source:** Automation
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261021T043212Z-c94974fd
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00125-run-verify-20261021T043212Z-c94974fd
-- **Owner base:** 5f40f6c1524afcd5dd1daea8c8f6c5987c4526c6
-- **Owner fingerprint:** sha256:903e5a47ab1558cd9d7900d04fb497b2b37845b372a177a373b558632dcdbe1e
-- **Owner since:** 2026-10-21T04:32:12Z
-- **Owner until:** 2026-10-21T08:32:12Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-26T14:03:10Z, raised via `deltic bugs new`) -> Fixed (2026-10-20T23:17:37Z, deltic:auto role=fix run=fix-20261020T225938Z-7b868a70 branch=task/bug-MDR-BUG-FLU-00125-run-fix-20261020T225938Z-7b868a70 code=2d0623b gate=manual)
+- **State history:** Open (2026-08-26T14:03:10Z, raised via `deltic bugs new`) -> Fixed (2026-10-20T23:17:37Z, deltic:auto role=fix run=fix-20261020T225938Z-7b868a70 branch=task/bug-MDR-BUG-FLU-00125-run-fix-20261020T225938Z-7b868a70 code=2d0623b gate=manual) -> Closed (2026-10-21T04:39:44Z, deltic:manual role=verify run=verify-20261021T043212Z-c94974fd verified_fix_run=fix-20261020T225938Z-7b868a70 verdict=close)
 
 ## Observation
 
@@ -28,5 +28,9 @@ A release mdrdp 0.1.237 run against Quench connected successfully, but --duratio
 ## Fix
 
 <unfixed — raised only>
+
+### Verification summary (2026-10-21T04:39:44Z, deltic:auto run=verify-20261021T043212Z-c94974fd verified_fix_run=fix-20261020T225938Z-7b868a70 verdict=close)
+
+Verifier note: Manual verify: On current builds, the user confirms scripted --duration exits by its deadline; version and host were not supplied. Fix 2d0623b moves session shutdown ahead of best-effort exit I/O. The selected ordering regression passed, failed at the Disconnect-before-Persistence assertion when mutated to I/O-first (left Ok(Persistence), right Ok(Disconnect)), and passed after restoration. The mdrdp binary tests passed 19/19; the macOS exit-hook probe, fmt, and scoped Clippy passed. Clippy emitted the existing vendored unfulfilled_lint_expectations warning. No separate live Quench run was mad...
 
 ## Notes
