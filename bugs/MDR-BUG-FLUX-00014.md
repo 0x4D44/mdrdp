@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T14:35:00Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-19T15:00:00Z, claude on flux, fix commit on task branch — regression tests proven red-then-green, both dialog states confirmed on screen)
+- **State history:** Open (2026-08-19T14:35:00Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-19T15:00:00Z, claude on flux, fix commit on task branch — regression tests proven red-then-green, both dialog states confirmed on screen; integrated code=0e03238aa4c84f44b6ec68b8d31ca3f95492b8d5)
 
 ## Observation
 

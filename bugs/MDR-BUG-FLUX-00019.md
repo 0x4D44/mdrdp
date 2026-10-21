@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T21:20:19Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-20T10:50:51Z, manual land on task/20260820-TSK-HUM-fix-rdp-audio-channel-negotiation, model=claude-opus-5@high)
+- **State history:** Open (2026-08-19T21:20:19Z, raised via `deltic bugs new` model=claude-opus-5@high); Fixed (2026-08-20T10:50:51Z, manual land on task/20260820-TSK-HUM-fix-rdp-audio-channel-negotiation, model=claude-opus-5@high, integrated code=7a6b2d0063ae00cb77944129b86c4eee971fc4d0)
 
 ## Observation
 

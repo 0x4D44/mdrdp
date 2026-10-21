@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T06:42:42Z, raised via `deltic bugs new`); Fixed (2026-08-19T07:05:00Z, claude on flux, fix commit 4763ba49ebc102dfa69ca3f16282d39536a597ff on task branch — regression tests proven red-then-green, oracle 10/10, offline replay of captured payloads stable)
+- **State history:** Open (2026-08-19T06:42:42Z, raised via `deltic bugs new`); Fixed (2026-08-19T07:05:00Z, claude on flux, fix commit 4763ba49ebc102dfa69ca3f16282d39536a597ff on task branch — regression tests proven red-then-green, oracle 10/10, offline replay of captured payloads stable; integrated code=c5f2debaf649789e4eb114da14fd86806993281e)
 
 ## Observation
 

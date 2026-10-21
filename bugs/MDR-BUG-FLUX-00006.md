@@ -19,7 +19,7 @@
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-18T21:54:06Z, raised via `deltic bugs new` model=claude-fable-5@high); Fixed (2026-08-18T21:56:00Z, manual land, fix authored same session by claude-fable-5@high)
+- **State history:** Open (2026-08-18T21:54:06Z, raised via `deltic bugs new` model=claude-fable-5@high); Fixed (2026-08-18T21:56:00Z, manual land, fix authored same session by claude-fable-5@high, integrated code=b18bbab84082f14f42bc076cde4e36b895aa7f72)
 
 ## Observation
 
