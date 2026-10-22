@@ -1,25 +1,25 @@
 # MDR-BUG-FLUX-00007 — AVC444 luma pass clobbers delivered chroma: colour of dithered content pumps on LC=1/LC=2 alternation
 
-- **State:** Fixed
+- **State:** Closed
 - **Priority:** Must
 - **Severity:** High
 - **Area:** gfx
 - **Raised:** 2026-08-19T06:42:42Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** verify
-- **Owner run:** verify-20261022T232503Z-fedab8da
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLUX-00007-run-verify-20261022T232503Z-fedab8da
-- **Owner base:** 4e0e213ae3c602b4da35a7268e79003e06f4f84e
-- **Owner fingerprint:** sha256:bc43cb0891d30b84bfa02af7b0d7ec7cc618b3894bd139b21bf95223e6f24026
-- **Owner since:** 2026-10-22T23:25:03Z
-- **Owner until:** 2026-10-23T03:25:03Z
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
+- **Owner fingerprint:** -
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-08-19T06:42:42Z, raised via `deltic bugs new`); Fixed (2026-08-19T07:05:00Z, claude on flux, fix commit 4763ba49ebc102dfa69ca3f16282d39536a597ff on task branch — regression tests proven red-then-green, oracle 10/10, offline replay of captured payloads stable; integrated code=c5f2debaf649789e4eb114da14fd86806993281e)
+- **State history:** Open (2026-08-19T06:42:42Z, raised via `deltic bugs new`); Fixed (2026-08-19T07:05:00Z, claude on flux, fix commit 4763ba49ebc102dfa69ca3f16282d39536a597ff on task branch — regression tests proven red-then-green, oracle 10/10, offline replay of captured payloads stable; integrated code=c5f2debaf649789e4eb114da14fd86806993281e) -> Closed (2026-10-22T23:31:48Z, deltic:manual role=verify run=verify-20261022T232503Z-fedab8da verified_fix_run=manual:c5f2debaf649789e4eb114da14fd86806993281e verdict=close)
 
 ## Observation
 
@@ -63,6 +63,10 @@ with the fix disabled, green with it); FreeRDP differential oracle
 captured payloads shows zero moved pixels across all L/C alternations after the
 first chroma delivery; full suite 577+13+5 green; clippy/fmt clean;
 check-windows.sh green; live temper sessions re-verified.
+
+### Verification summary (2026-10-22T23:31:48Z, deltic:auto run=verify-20261022T232503Z-fedab8da verified_fix_run=manual:c5f2debaf649789e4eb114da14fd86806993281e verdict=close)
+
+Verifier note: Manual verify: Arthur confirmed the original moving solid bar/static ▒ tail is steady on current builds. gfx::tests::repeated_lc1_lc2_refreshes_do_not_pump_the_presented_pixels passed 1/1 (base 804c585, test 7297dd8), cycling LC1/LC2 three times. With the wait lookup bypassed it failed on the visible-pixel assertion: LC1 gray [100,100,100,255] replaced steady [0,119,255,255]; restored wait passed. Provenance on origin/main: original fix c5f2deb; presentation wait c4d8a02, ack fix c828aa2, policy update e402904.
 
 ## Notes
 
