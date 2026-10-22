@@ -1045,6 +1045,7 @@ mod tests {
         WireToSurface1Pdu,
     };
     use ironrdp_graphics::clearcodec::{ClearCodecDecoder, ClearCodecEncoder, ClearCodecRect};
+    use std::time::Duration;
 
     const BPP: usize = 4;
 
@@ -2485,6 +2486,133 @@ mod tests {
         );
         assert_eq!(snapshot.pixels[..4], [235, 235, 235, 255]);
         assert_eq!(snapshot.pixels[16 * 4..17 * 4], [80, 80, 80, 255]);
+    }
+
+    #[test]
+    fn repeated_lc1_lc2_refreshes_do_not_pump_the_presented_pixels() {
+        use crate::window::copy_presentation_when_due;
+
+        let store = store();
+        let handler = GfxHandler::new(Arc::clone(&store));
+        let mut client =
+            GraphicsPipelineClient::new(Box::new(handler), Some(Box::new(TaggedYuvDecoder)));
+        process_pdu(
+            &mut client,
+            GfxPdu::CreateSurface(ironrdp_egfx::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 32,
+                height: 16,
+                pixel_format: PixelFormat::XRgb,
+            }),
+        );
+        process_pdu(
+            &mut client,
+            GfxPdu::MapSurfaceToOutput(ironrdp_egfx::pdu::MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }),
+        );
+        let full = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 32,
+            bottom: 16,
+        };
+        const PROBE_OFFSET: usize = (3 * 32 + 3) * 4;
+
+        // This stationary color is encoded as a main luma view plus auxiliary
+        // 4:4:4 detail. A main-view-only LC=1 refresh temporarily reduces the
+        // decoded pixel to grayscale; matching LC=2 restores the same color.
+        process_pdu(
+            &mut client,
+            avc444_pdu(
+                Encoding::LUMA_AND_CHROMA,
+                vec![full.clone()],
+                &[100, 128, 128, 0],
+                Some((vec![full.clone()], &[0, 220, 50, 1])),
+            ),
+        );
+        let mut snapshot = crate::surface::PresentationSnapshot::default();
+        let mut presented = {
+            let mut pixels = store.lock().unwrap();
+            assert_eq!(
+                pixels.copy_presentation_state(&mut snapshot),
+                crate::surface::PresentationCopy::Copied
+            );
+            pixels.acknowledge_presentation(snapshot.avc444_batch);
+            snapshot.stamp
+        };
+        let steady_color: [u8; 4] = snapshot.pixels[PROBE_OFFSET..PROBE_OFFSET + 4]
+            .try_into()
+            .unwrap();
+        assert_ne!(steady_color[0], steady_color[1], "fixture must be colored");
+
+        for _ in 0..3 {
+            // The decoded surface demonstrates the old visible failure mode: LC=1
+            // alone is a different tone until the matching LC=2 arrives.
+            process_pdu(
+                &mut client,
+                avc444_pdu(
+                    Encoding::LUMA,
+                    vec![full.clone()],
+                    &[100, 128, 128, 0],
+                    None,
+                ),
+            );
+            assert_eq!(pixel_at(&store, 1, 3, 3), [100, 100, 100, 0xFF]);
+
+            let deadline = store
+                .lock()
+                .unwrap()
+                .presentation_not_before(Some(presented));
+            let mut pixels = store.lock().unwrap();
+            let attempted_at = deadline
+                .map(|deadline| deadline - Duration::from_millis(1))
+                .unwrap_or_else(Instant::now);
+            let copy = copy_presentation_when_due(
+                &mut pixels,
+                &mut snapshot,
+                Some(presented),
+                None,
+                attempted_at,
+                (32, 16),
+            );
+            assert_eq!(
+                &snapshot.pixels[PROBE_OFFSET..PROBE_OFFSET + 4],
+                &steady_color,
+                "an LC=1-only repaint must not pump the presented color"
+            );
+            assert_eq!(
+                copy,
+                Err(deadline.expect("LC=1 must defer presentation until chroma catches up"))
+            );
+            drop(pixels);
+
+            process_pdu(
+                &mut client,
+                avc444_pdu(Encoding::CHROMA, vec![full.clone()], &[0, 220, 50, 1], None),
+            );
+            let mut pixels = store.lock().unwrap();
+            assert_eq!(
+                copy_presentation_when_due(
+                    &mut pixels,
+                    &mut snapshot,
+                    Some(presented),
+                    None,
+                    Instant::now(),
+                    (32, 16),
+                ),
+                Ok(crate::surface::PresentationCopy::Copied)
+            );
+            assert_eq!(
+                &snapshot.pixels[PROBE_OFFSET..PROBE_OFFSET + 4],
+                &steady_color,
+                "the stationary color must be the same after each LC=2 catch-up"
+            );
+            pixels.acknowledge_presentation(snapshot.avc444_batch);
+            presented = snapshot.stamp;
+        }
     }
 
     /// Output mapping PDUs must display a surface; unsupported RAIL mappings must not

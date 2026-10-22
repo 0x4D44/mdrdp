@@ -386,7 +386,7 @@ fn pending_presentation_deadline(
     .max()
 }
 
-fn copy_presentation_when_due(
+pub(crate) fn copy_presentation_when_due(
     store: &mut SurfaceStore,
     snapshot: &mut PresentationSnapshot,
     presented: Option<PresentationStamp>,
