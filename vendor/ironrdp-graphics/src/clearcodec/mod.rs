@@ -122,6 +122,23 @@ impl WrittenRegions {
         true
     }
 
+    /// Row-major per-pixel coverage over a `width` x `height` bitmap.
+    fn mask(&self, width: u16, height: u16) -> Vec<bool> {
+        let width = usize::from(width);
+        let height = usize::from(height);
+        let mut mask = vec![false; width * height];
+        for region in &self.regions {
+            let right = usize::from(region.right).min(width);
+            let bottom = usize::from(region.bottom).min(height);
+            for y in usize::from(region.top)..bottom {
+                for x in usize::from(region.left)..right {
+                    mask[y * width + x] = true;
+                }
+            }
+        }
+        mask
+    }
+
     fn mark_linear(&mut self, start: usize, count: usize, width: u16, height: u16) {
         let width = usize::from(width);
         let height = usize::from(height);
@@ -299,18 +316,37 @@ impl ClearCodecDecoder {
                     "cached glyph smaller than destination"
                 ));
             }
+            let written_regions = if !capture_coverage || width == 0 || height == 0 {
+                Vec::new()
+            } else if let Some(mask) = &entry.written_mask {
+                // A sparse definition proves only the pixels its stream supplied. The
+                // mask is row-major over the cached bytes, so it follows a reshaped hit
+                // pixel for pixel exactly as the bytes do.
+                let mut written = WrittenRegions::default();
+                let mut index = 0;
+                while index < pixel_count {
+                    if !mask.get(index).copied().unwrap_or(false) {
+                        index += 1;
+                        continue;
+                    }
+                    let start = index;
+                    while index < pixel_count && mask.get(index).copied().unwrap_or(false) {
+                        index += 1;
+                    }
+                    written.mark_linear(start, index - start, width, height);
+                }
+                written.regions
+            } else {
+                vec![ClearCodecRect {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                }]
+            };
             return Ok(ClearCodecDecode {
                 pixels: entry.pixels[..needed].to_vec(),
-                written_regions: if capture_coverage && width > 0 && height > 0 {
-                    vec![ClearCodecRect {
-                        left: 0,
-                        top: 0,
-                        right: width,
-                        bottom: height,
-                    }]
-                } else {
-                    Vec::new()
-                },
+                written_regions,
             });
         }
 
@@ -344,21 +380,25 @@ impl ClearCodecDecoder {
             self.decode_composite(composite, &mut output, width, height, &mut written)?;
         }
 
-        // A glyph cache entry must be a complete bitmap. A sparse decode over a caller
-        // seed contains destination-specific pixels outside its explicit writes, so
-        // replaying it as a full glyph would claim coverage for the wrong content.
-        if cache_candidate
-            && written
-                .as_ref()
-                .is_some_and(|written| written.is_full(width, height))
-        {
+        // Every GLYPH_INDEX definition is cached, sparse or not. Like FreeRDP, store the
+        // composed destination: the server's copy of this glyph is what is now on screen,
+        // seed pixels included. Skipping a sparse definition left the index holding an
+        // older glyph, so the server's next GLYPH_HIT repainted that stale bitmap (or
+        // missed and dropped the tile). The mask keeps a later hit from claiming coverage
+        // for the seed pixels.
+        if cache_candidate {
             if let Some(glyph_index) = stream.glyph_index {
+                let written_mask = written
+                    .as_ref()
+                    .filter(|written| !written.is_full(width, height))
+                    .map(|written| written.mask(width, height));
                 self.glyph_cache.store(
                     glyph_index,
                     GlyphEntry {
                         width,
                         height,
                         pixels: output.clone(),
+                        written_mask,
                     },
                 );
             }
@@ -413,13 +453,16 @@ impl ClearCodecDecoder {
             for band in &bands {
                 let band_height = band.y_end - band.y_start + 1;
                 for (col_offset, vbar) in band.vbars.iter().enumerate() {
+                    // mdrdp patch: resolve before clipping. A V-bar outside the tile still
+                    // advances the caches, as in FreeRDP; skipping it shifted every later
+                    // cache index off the server's, so subsequent hits replayed the wrong
+                    // columns.
+                    let full_vbar =
+                        self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg)?;
                     let x = usize::from(band.x_start) + col_offset;
                     if x >= w {
                         continue;
                     }
-
-                    let full_vbar =
-                        self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg)?;
 
                     // Blit the full V-bar column into the output
                     let pixel_rows = full_vbar.pixels.len() / 3;
@@ -466,7 +509,14 @@ impl ClearCodecDecoder {
                     .vbar_cache
                     .get_vbar(*index)
                     .ok_or_else(|| invalid_field_err!("vbarIndex", "V-bar cache miss on hit"))?;
-                Ok(cached.clone())
+                // mdrdp patch: replay at the CURRENT band height, as FreeRDP does
+                // (clear.c resizes a mismatched entry to vBarHeight). Blitting the cached
+                // length painted a taller bar below yEnd and left a shorter one's
+                // remaining rows stale. Missing rows are black, matching FreeRDP's
+                // zero-filled resize.
+                let mut pixels = cached.pixels.clone();
+                pixels.resize(usize::from(band_height) * 3, 0);
+                Ok(FullVBar { pixels })
             }
             VBar::ShortCacheHit { index, y_on } => {
                 let cached_short = self
@@ -709,6 +759,7 @@ impl ClearCodecEncoder {
                     width,
                     height,
                     pixels: bgra.to_vec(),
+                    written_mask: None,
                 },
             );
             self.next_glyph_index = (idx + 1) % GLYPH_CACHE_WRAP;
@@ -1101,4 +1152,5 @@ mod tests {
             assert_eq!(seg.run_length, 1);
         }
     }
+
 }

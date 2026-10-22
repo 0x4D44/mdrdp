@@ -14,6 +14,10 @@ pub struct GlyphEntry {
     pub height: u16,
     /// BGRA pixel data (4 bytes per pixel).
     pub pixels: Vec<u8>,
+    /// mdrdp patch: which pixels the defining stream supplied, in row-major order.
+    /// `None` means all of them. A sparse definition still caches its composed pixels,
+    /// but a later hit must not claim coverage for the seed pixels it carried along.
+    pub written_mask: Option<Vec<bool>>,
 }
 
 /// Glyph cache for ClearCodec bitmap deduplication.
@@ -71,6 +75,7 @@ mod tests {
             width: 8,
             height: 16,
             pixels: vec![0xFF; 8 * 16 * 4],
+            written_mask: None,
         };
         assert!(cache.store(42, entry));
         let retrieved = cache.get(42).unwrap();
@@ -92,6 +97,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![0; 4],
+            written_mask: None,
         };
         assert!(!cache.store(4000, entry));
     }

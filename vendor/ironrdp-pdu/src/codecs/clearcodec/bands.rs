@@ -110,7 +110,7 @@ fn decode_single_band<'a>(src: &mut ReadCursor<'a>) -> DecodeResult<Band<'a>> {
     let mut vbars = Vec::with_capacity(column_count);
 
     for _ in 0..column_count {
-        let vbar = decode_vbar(src, height)?;
+        let vbar = decode_vbar(src)?;
         vbars.push(vbar);
     }
 
@@ -126,7 +126,7 @@ fn decode_single_band<'a>(src: &mut ReadCursor<'a>) -> DecodeResult<Band<'a>> {
     })
 }
 
-fn decode_vbar<'a>(src: &mut ReadCursor<'a>, band_height: u16) -> DecodeResult<VBar<'a>> {
+fn decode_vbar<'a>(src: &mut ReadCursor<'a>) -> DecodeResult<VBar<'a>> {
     ensure_size!(ctx: "VBar", in: src, size: 2);
     let first_word = src.read_u16();
 
@@ -170,14 +170,17 @@ fn decode_vbar<'a>(src: &mut ReadCursor<'a>, band_height: u16) -> DecodeResult<V
         return Err(invalid_field_err!("shortVBarCacheMiss", "shortVBarYOff < shortVBarYOn"));
     }
 
-    if u16::from(y_off) > band_height {
+    // mdrdp patch: a short V-bar may run past the bottom of the band that defines it.
+    // FreeRDP caches every encoded pixel and clips only when painting, and the decoder's
+    // reconstruction clips to the band. Rejecting it dropped the whole tile and skipped its
+    // cache insertions, so later hits on those indices missed or replayed older bars.
+    let pixel_count = y_off - y_on;
+    if u16::from(pixel_count) > MAX_BAND_HEIGHT {
         return Err(invalid_field_err!(
             "shortVBarCacheMiss",
-            "shortVBarYOff exceeds band height"
+            "short V-bar longer than the maximum band height"
         ));
     }
-
-    let pixel_count = y_off - y_on;
     let pixel_byte_count = usize::from(pixel_count) * 3;
     ensure_size!(ctx: "ShortVBarCacheMiss", in: src, size: pixel_byte_count);
     let pixel_data = src.read_slice(pixel_byte_count);
@@ -198,7 +201,7 @@ mod tests {
         // Bit 15 set, index = 42
         let data = (0x8000u16 | 42).to_le_bytes();
         let mut cursor = ReadCursor::new(&data);
-        let vbar = decode_vbar(&mut cursor, 10).unwrap();
+        let vbar = decode_vbar(&mut cursor).unwrap();
         match vbar {
             VBar::CacheHit { index } => assert_eq!(index, 42),
             _ => panic!("expected CacheHit"),
@@ -212,7 +215,7 @@ mod tests {
         data.extend_from_slice(&(0x4000u16 | 100).to_le_bytes());
         data.push(5); // yOn
         let mut cursor = ReadCursor::new(&data);
-        let vbar = decode_vbar(&mut cursor, 10).unwrap();
+        let vbar = decode_vbar(&mut cursor).unwrap();
         match vbar {
             VBar::ShortCacheHit { index, y_on } => {
                 assert_eq!(index, 100);
@@ -233,7 +236,7 @@ mod tests {
         // 3 pixels * 3 bytes = 9 bytes BGR data
         data.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]);
         let mut cursor = ReadCursor::new(&data);
-        let vbar = decode_vbar(&mut cursor, 10).unwrap();
+        let vbar = decode_vbar(&mut cursor).unwrap();
         match vbar {
             VBar::ShortCacheMiss(miss) => {
                 assert_eq!(miss.y_on, 2);

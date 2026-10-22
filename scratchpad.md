@@ -2,6 +2,16 @@
 
 Out-of-scope observations. A separate human-invoked review triages these.
 
+- [ ] 2026-10-23: ClearCodec static review (Astra) items deliberately not fixed. (a) The
+  8192-per-axis tile cap (`vendor/ironrdp-graphics/src/clearcodec/mod.rs:MAX_DECODE_DIM`,
+  `src/surface.rs:extract_with_zero_padding`) rejects updates on a surface wider than 8192,
+  which only multi-monitor (out of scope) produces; a byte budget would lift it. (b)
+  `src/surface.rs:abort_frame` makes `FrameState::Aborted` terminal, which blocks every later
+  present; it is reached only through EGFX protocol errors that propagate out of DVC
+  processing, so it is assumed, not verified, that the session ends there. (c) A full V-bar
+  hit on a never-filled slot still fails the whole tile (`resolve_vbar`); FreeRDP paints
+  zeros and keeps going, which keeps the cache cursors in step with the server.
+
 - [ ] 2026-08-17: spike-server must force an IDR on every new video client connect —
   Quick Sync exposes no out-of-band sequence header (`sequence_header_available:false`),
   so a mid-GOP joiner is undecodable until the next scheduled IDR

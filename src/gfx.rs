@@ -1281,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_clearcodec_decode_is_not_cached_as_a_full_glyph() {
+    fn sparse_clearcodec_glyph_replays_without_claiming_full_coverage() {
         let seed: Vec<u8> = [0x10u8, 0x20, 0x30, 0xFF]
             .iter()
             .copied()
@@ -1305,9 +1305,16 @@ mod tests {
             42,
             0,
         ];
-        assert!(
-            decoder.decode_over_with_coverage(&hit, 2, 2, None).is_err(),
-            "a sparse seeded bitmap must not be available as a full glyph hit"
+        // The server caches what it now shows, so the hit replays the composed bitmap
+        // (FreeRDP stores the destination). Only the stream-supplied pixel is proven:
+        // replaying must not retire a replacement fallback for the seeded three.
+        let replayed = decoder
+            .decode_over_with_coverage(&hit, 2, 2, None)
+            .expect("a sparse definition must still be cached for the server's hit");
+        assert_eq!(replayed.pixels, decoded.pixels);
+        assert_eq!(
+            replayed.written_regions, decoded.written_regions,
+            "a sparse seeded bitmap must not replay as full coverage"
         );
     }
 
@@ -3296,5 +3303,268 @@ mod tests {
             1,
             "a surviving surface keeps its codec state across a reset"
         );
+    }
+
+    /// ClearCodec redraw regressions found by static review against FreeRDP clear.c.
+    ///
+    /// They live here, not in the vendored graphics crate, because that crate's own
+    /// test build resolves the crates.io `ironrdp-pdu` and so never runs the patched
+    /// band parser these streams depend on.
+    mod clearcodec_redraw {
+        use ironrdp_graphics::clearcodec::{ClearCodecDecoder, ClearCodecRect};
+
+        const GLYPH_INDEX: u8 = 0x01;
+        const GLYPH_HIT: u8 = 0x02;
+
+        const RED: [u8; 3] = [0x00, 0x00, 0xFF];
+        const GREEN: [u8; 3] = [0x00, 0xFF, 0x00];
+        const BLUE: [u8; 3] = [0xFF, 0x00, 0x00];
+
+        fn bgra(bgr: [u8; 3]) -> [u8; 4] {
+            [bgr[0], bgr[1], bgr[2], 0xFF]
+        }
+
+        fn seed(width: u16, height: u16, bgr: [u8; 3]) -> Vec<u8> {
+            bgra(bgr)
+                .iter()
+                .copied()
+                .cycle()
+                .take(usize::from(width) * usize::from(height) * 4)
+                .collect()
+        }
+
+        /// A stream carrying only the given layers, with an optional glyph index.
+        fn composite_stream(
+            glyph_index: Option<u16>,
+            residual: &[u8],
+            bands: &[u8],
+            subcodecs: &[u8],
+        ) -> Vec<u8> {
+            let mut stream = vec![
+                if glyph_index.is_some() {
+                    GLYPH_INDEX
+                } else {
+                    0
+                },
+                0x00,
+            ];
+            if let Some(index) = glyph_index {
+                stream.extend_from_slice(&index.to_le_bytes());
+            }
+            for layer in [residual, bands, subcodecs] {
+                stream.extend_from_slice(&u32::try_from(layer.len()).unwrap().to_le_bytes());
+            }
+            for layer in [residual, bands, subcodecs] {
+                stream.extend_from_slice(layer);
+            }
+            stream
+        }
+
+        fn band(x_start: u16, x_end: u16, y_start: u16, y_end: u16, vbars: &[u8]) -> Vec<u8> {
+            let mut band = Vec::new();
+            for field in [x_start, x_end, y_start, y_end] {
+                band.extend_from_slice(&field.to_le_bytes());
+            }
+            band.extend_from_slice(&[0, 0, 0]); // black background
+            band.extend_from_slice(vbars);
+            band
+        }
+
+        fn short_vbar_miss(y_on: u8, pixels: &[[u8; 3]]) -> Vec<u8> {
+            let y_off = y_on + u8::try_from(pixels.len()).unwrap();
+            let mut vbar = vec![y_on, y_off];
+            for pixel in pixels {
+                vbar.extend_from_slice(pixel);
+            }
+            vbar
+        }
+
+        fn vbar_hit(index: u16) -> Vec<u8> {
+            (0x8000 | index).to_le_bytes().to_vec()
+        }
+
+        fn short_vbar_hit(index: u16, y_on: u8) -> Vec<u8> {
+            let mut vbar = (0x4000 | index).to_le_bytes().to_vec();
+            vbar.push(y_on);
+            vbar
+        }
+
+        fn pixel(pixels: &[u8], width: u16, x: u16, y: u16) -> [u8; 4] {
+            let offset = (usize::from(y) * usize::from(width) + usize::from(x)) * 4;
+            pixels[offset..offset + 4].try_into().unwrap()
+        }
+
+        #[test]
+        fn a_sparse_glyph_definition_replaces_the_older_entry_at_its_index() {
+            let mut decoder = ClearCodecDecoder::new();
+            // Index 7 first holds a fully supplied blue/blue glyph.
+            decoder
+                .decode(
+                    &composite_stream(Some(7), &[BLUE[0], BLUE[1], BLUE[2], 2], &[], &[]),
+                    2,
+                    1,
+                )
+                .unwrap();
+
+            // Redefine index 7 over a green destination, supplying only the left pixel.
+            let mut raw = Vec::new();
+            for field in [0u16, 0, 1, 1] {
+                raw.extend_from_slice(&field.to_le_bytes());
+            }
+            raw.extend_from_slice(&3u32.to_le_bytes());
+            raw.push(0x00); // SubcodecId::Raw
+            raw.extend_from_slice(&RED);
+            let defined = decoder
+                .decode_over_with_coverage(
+                    &composite_stream(Some(7), &[], &[], &raw),
+                    2,
+                    1,
+                    Some(seed(2, 1, GREEN)),
+                )
+                .unwrap();
+            assert_eq!(defined.pixels, [bgra(RED), bgra(GREEN)].concat());
+
+            // FreeRDP caches the composed destination, so the server's hit replays red/green.
+            let hit = [GLYPH_INDEX | GLYPH_HIT, 0x01, 7, 0];
+            let replayed = decoder.decode_over_with_coverage(&hit, 2, 1, None).unwrap();
+            assert_eq!(
+                replayed.pixels, defined.pixels,
+                "a hit must replay the latest definition, not the older blue glyph"
+            );
+            assert_eq!(
+                replayed.written_regions,
+                vec![ClearCodecRect {
+                    left: 0,
+                    top: 0,
+                    right: 1,
+                    bottom: 1,
+                }],
+                "a hit claims coverage only for pixels its definition supplied"
+            );
+
+            // Reshaped hits carry the mask pixel for pixel, as they carry the bytes.
+            let reshaped = decoder.decode_over_with_coverage(&hit, 1, 2, None).unwrap();
+            assert_eq!(
+                reshaped.written_regions,
+                vec![ClearCodecRect {
+                    left: 0,
+                    top: 0,
+                    right: 1,
+                    bottom: 1,
+                }]
+            );
+        }
+
+        #[test]
+        fn a_short_vbar_longer_than_its_band_is_cached_whole_and_painted_clipped() {
+            let mut decoder = ClearCodecDecoder::new();
+            // A two-row band whose short V-bar carries four rows (yOn=0, yOff=4).
+            let defining = band(0, 0, 0, 1, &short_vbar_miss(0, &[RED, GREEN, BLUE, RED]));
+            let painted = decoder
+                .decode_over_with_coverage(
+                    &composite_stream(None, &[], &defining, &[]),
+                    1,
+                    4,
+                    Some(seed(1, 4, GREEN)),
+                )
+                .expect("a short V-bar past the band end must not reject the tile");
+            assert_eq!(pixel(&painted.pixels, 1, 0, 0), bgra(RED));
+            assert_eq!(pixel(&painted.pixels, 1, 0, 1), bgra(GREEN));
+            assert_eq!(
+                pixel(&painted.pixels, 1, 0, 2),
+                bgra(GREEN),
+                "row 2 is the seed"
+            );
+            assert_eq!(
+                painted.written_regions,
+                vec![ClearCodecRect {
+                    left: 0,
+                    top: 0,
+                    right: 1,
+                    bottom: 2,
+                }]
+            );
+
+            // The whole short V-bar entered the cache: a four-row band replays all four rows.
+            let replay = band(0, 0, 0, 3, &short_vbar_hit(0, 0));
+            let replayed = decoder
+                .decode(&composite_stream(None, &[], &replay, &[]), 1, 4)
+                .unwrap();
+            assert_eq!(
+                replayed,
+                [bgra(RED), bgra(GREEN), bgra(BLUE), bgra(RED)].concat()
+            );
+        }
+
+        #[test]
+        fn a_full_vbar_hit_replays_at_the_current_band_height() {
+            let mut decoder = ClearCodecDecoder::new();
+            // Full V-bar 0: four red rows.
+            let defining = band(0, 0, 0, 3, &short_vbar_miss(0, &[RED; 4]));
+            decoder
+                .decode(&composite_stream(None, &[], &defining, &[]), 1, 4)
+                .unwrap();
+
+            // Replayed into a two-row band, it must not paint rows 2 and 3.
+            let shorter = band(0, 0, 0, 1, &vbar_hit(0));
+            let decoded = decoder
+                .decode_over_with_coverage(
+                    &composite_stream(None, &[], &shorter, &[]),
+                    1,
+                    4,
+                    Some(seed(1, 4, GREEN)),
+                )
+                .unwrap();
+            assert_eq!(
+                decoded.pixels,
+                [bgra(RED), bgra(RED), bgra(GREEN), bgra(GREEN)].concat()
+            );
+            assert_eq!(
+                decoded.written_regions,
+                vec![ClearCodecRect {
+                    left: 0,
+                    top: 0,
+                    right: 1,
+                    bottom: 2,
+                }]
+            );
+        }
+
+        #[test]
+        fn a_vbar_clipped_outside_the_tile_still_enters_the_caches() {
+            let mut decoder = ClearCodecDecoder::new();
+            // A one-pixel-wide tile whose band also encodes column 1, outside the tile.
+            let defining = band(
+                0,
+                1,
+                0,
+                0,
+                &[short_vbar_miss(0, &[RED]), short_vbar_miss(0, &[BLUE])].concat(),
+            );
+            let painted = decoder
+                .decode(&composite_stream(None, &[], &defining, &[]), 1, 1)
+                .unwrap();
+            assert_eq!(painted, bgra(RED));
+
+            // The server cached the clipped column at short index 1 and full index 1.
+            let short_replay = band(0, 0, 0, 0, &short_vbar_hit(1, 0));
+            let replayed = decoder
+                .decode(&composite_stream(None, &[], &short_replay, &[]), 1, 1)
+                .unwrap();
+            assert_eq!(
+                replayed,
+                bgra(BLUE),
+                "short index 1 must hold the clipped column"
+            );
+            let full_replay = band(0, 0, 0, 0, &vbar_hit(1));
+            let replayed = decoder
+                .decode(&composite_stream(None, &[], &full_replay, &[]), 1, 1)
+                .unwrap();
+            assert_eq!(
+                replayed,
+                bgra(BLUE),
+                "full index 1 must hold the clipped column"
+            );
+        }
     }
 }

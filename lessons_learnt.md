@@ -6,6 +6,15 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Vendored graphics tests link crates.io `ironrdp-pdu`, not vendor/; test patched parsing in `gfx.rs` (`clearcodec_redraw`).
+  `vendor/ironrdp-graphics/Cargo.lock` pins registry `ironrdp-pdu` 0.9.0, so
+  `test-vendored.sh` runs the decoder against upstream's band parser, which still
+  transposes short-V-bar yOn/yOff. A stream valid for our patched parser fails there.
+  mdrdp's own build applies `[patch.crates-io]`, so its tests see the real pairing.
+- A ClearCodec cache entry the server wrote must be written here too, even when clipped or sparse (`clearcodec::decode_composite`).
+  Windows tracks glyph and V-bar indices by its own cursor. Skipping a sparse glyph,
+  a clipped V-bar or a whole rejected tile leaves an older entry at that index, and the
+  next hit repaints stale pixels. FreeRDP stores the composed destination and clips paint only.
 - EGFX-only resize leaves activation dimensions stale; compare live output and last sent layout (`session.rs:service_resize`).
   ResetGraphics can complete a resize without Deactivate All. Suppress a duplicate only
   when its target matches the current output and no contrary layout was last sent;
