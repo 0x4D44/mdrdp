@@ -6,6 +6,10 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- Local text can hide an image beside it; announce every representation (`clipboard.rs:read_local_snapshot`).
+  `get_content` returns one value, so a Deltic screenshot (PNG + its path as text)
+  reached Windows as the macOS path only. Text now announces `CF_DIB` too when
+  `OsClipboard::get_image` finds a picture; the poll still reads text alone.
 - Vendored graphics tests link crates.io `ironrdp-pdu`, not vendor/; test patched parsing in `gfx.rs` (`clearcodec_redraw`).
   `vendor/ironrdp-graphics/Cargo.lock` pins registry `ironrdp-pdu` 0.9.0, so
   `test-vendored.sh` runs the decoder against upstream's band parser, which still

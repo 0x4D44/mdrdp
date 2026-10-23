@@ -34,8 +34,12 @@
 //! file's bytes, and for any file list `CF_UNICODETEXT` with the file names. So a copied picture
 //! pastes as a file in Explorer and as a picture in Paint. When the list itself cannot be
 //! announced (a limit, a symlink, or a peer without file streaming), those extra formats are
-//! announced alone. Images use standard uncompressed `CF_DIB` bitmap data, with strict size
-//! checks around every decode and encode operation.
+//! announced alone. Text announces `CF_UNICODETEXT`, followed by `CF_DIB` when an image sits
+//! beside it: Deltic puts a screenshot beside its path, Office a rendered picture beside cells.
+//! Text targets keep the text and picture targets get the image, as on Windows itself. Only
+//! the text is polled; the image is read once per change to announce it, and again on request.
+//! Images use standard uncompressed `CF_DIB` bitmap data, with strict size checks around every
+//! decode and encode operation.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1357,6 +1361,11 @@ pub trait OsClipboard: Send {
     /// Reads current clipboard content, preferring a file list, then text, then an image
     /// (see [`choose_local_content`]).
     fn get_content(&mut self) -> Result<ClipboardContent, String>;
+    /// Reads the image representation alone, even when text would win [`Self::get_content`].
+    /// `Ok(None)` means the clipboard holds no image.
+    fn get_image(&mut self) -> Result<Option<ClipboardContent>, String> {
+        Ok(None)
+    }
     /// Replaces the clipboard with text, RGBA image, or file-list content.
     fn set_content(&mut self, content: ClipboardContent) -> Result<(), String>;
     /// Reads the native file-list representation when the platform provides one.
@@ -1413,16 +1422,18 @@ impl OsClipboard for ArboardClipboard {
                 Err(arboard::Error::ContentNotAvailable) => Ok(None),
                 Err(error) => Err(error.to_string()),
             },
-            |clipboard| match clipboard.get_image() {
-                Ok(image) => {
-                    image_content(image.width, image.height, image.bytes.into_owned()).map(Some)
-                }
-                Err(arboard::Error::ContentNotAvailable) => Ok(None),
-                Err(error) => Err(error.to_string()),
-            },
+            read_arboard_image,
         );
         if result.is_err() {
             // Nothing usable was read. Drop the handle so a poisoned one is recreated next time.
+            self.inner = None;
+        }
+        result
+    }
+
+    fn get_image(&mut self) -> Result<Option<ClipboardContent>, String> {
+        let result = read_arboard_image(self.ensure()?);
+        if result.is_err() {
             self.inner = None;
         }
         result
@@ -1516,6 +1527,16 @@ fn choose_local_content<T: ?Sized>(
         Err("clipboard holds no file list, text, or image".to_string())
     } else {
         Err(failures.join("; "))
+    }
+}
+
+fn read_arboard_image(
+    clipboard: &mut arboard::Clipboard,
+) -> Result<Option<ClipboardContent>, String> {
+    match clipboard.get_image() {
+        Ok(image) => image_content(image.width, image.height, image.bytes.into_owned()).map(Some),
+        Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -3270,11 +3291,17 @@ fn read_local_snapshot(
 ) -> Result<LocalClipboardSnapshot, String> {
     let content = os.get_content()?;
     match content {
-        ClipboardContent::Text(_) => Ok(LocalClipboardSnapshot {
-            formats: text_formats(),
-            files: None,
-            file_error: None,
-        }),
+        ClipboardContent::Text(_) => {
+            let mut formats = text_formats();
+            if side_image_fits(os, max_image_bytes) {
+                formats.extend(image_formats());
+            }
+            Ok(LocalClipboardSnapshot {
+                formats,
+                files: None,
+                file_error: None,
+            })
+        }
         ClipboardContent::Image { .. } => Ok(LocalClipboardSnapshot {
             formats: image_formats(),
             files: None,
@@ -3296,6 +3323,21 @@ fn read_local_snapshot(
                     file_error: Some(error),
                 }),
             }
+        }
+    }
+}
+
+/// Whether an image beside the clipboard's text can be served as `CF_DIB`. A failed read or an
+/// oversized image only withholds the picture; the text is still announced.
+fn side_image_fits(os: &mut dyn OsClipboard, max_image_bytes: usize) -> bool {
+    match os.get_image() {
+        Ok(Some(ClipboardContent::Image { width, height, .. })) => {
+            dib_size(width, height).is_ok_and(|size| size <= max_image_bytes)
+        }
+        Ok(_) => false,
+        Err(error) => {
+            debug!(%error, "image beside clipboard text could not be read; announcing text only");
+            false
         }
     }
 }
@@ -3697,6 +3739,34 @@ fn read_local_data(
         Ok(ClipboardContent::Text(text)) if format == ClipboardFormatId::CF_TEXT => {
             OwnedFormatDataResponse::new_string(&text)
         }
+        Ok(ClipboardContent::Text(_))
+            if format == ClipboardFormatId::CF_DIB || format == ClipboardFormatId::CF_DIBV5 =>
+        {
+            match os.get_image() {
+                Ok(Some(ClipboardContent::Image {
+                    width,
+                    height,
+                    rgba,
+                })) => match encode_dib(width, height, &rgba, max_image_bytes) {
+                    Ok(data) => OwnedFormatDataResponse::new_data(data),
+                    Err(error) => {
+                        warn!(%error, "failed to encode the image beside clipboard text; sending error response");
+                        OwnedFormatDataResponse::new_error()
+                    }
+                },
+                Ok(_) => {
+                    debug!(
+                        ?format,
+                        "remote requested an image but the clipboard holds only text"
+                    );
+                    OwnedFormatDataResponse::new_error()
+                }
+                Err(error) => {
+                    warn!(%error, "failed to read the image beside clipboard text; sending error response");
+                    OwnedFormatDataResponse::new_error()
+                }
+            }
+        }
         Ok(ClipboardContent::Image {
             width,
             height,
@@ -3955,6 +4025,18 @@ fn decode_ansi_text(bytes: &[u8]) -> String {
     bytes[..end].iter().map(|&byte| byte as char).collect()
 }
 
+const DIB_HEADER_SIZE: usize = 124;
+
+/// Byte size of the `CF_DIB` [`encode_dib`] produces for an image of these dimensions.
+fn dib_size(width: usize, height: usize) -> Result<usize, String> {
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "clipboard image dimensions overflow".to_string())?
+        .checked_add(DIB_HEADER_SIZE)
+        .ok_or_else(|| "clipboard image is too large".to_string())
+}
+
 /// Encodes a top-down RGBA image as a 32-bit `CF_DIB` (`BITMAPV5HEADER`, `BI_BITFIELDS`).
 /// Explicit channel masks make alpha semantics unambiguous to clients that preserve it.
 fn encode_dib(
@@ -3964,14 +4046,8 @@ fn encode_dib(
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     validate_image_dimensions(width, height, rgba.len())?;
-    let pixel_bytes = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| "clipboard image dimensions overflow".to_string())?;
-    const DIB_HEADER_SIZE: usize = 124;
-    let total = DIB_HEADER_SIZE
-        .checked_add(pixel_bytes)
-        .ok_or_else(|| "clipboard image is too large".to_string())?;
+    let total = dib_size(width, height)?;
+    let pixel_bytes = total - DIB_HEADER_SIZE;
     if total > max_bytes {
         return Err("clipboard image exceeds the size limit".to_string());
     }
@@ -4269,6 +4345,8 @@ mod tests {
         /// How many times the clipboard content was read — the observable proxy for
         /// the "IPC round trip + full allocation" cost `poll_local_change` pays every poll.
         get_text_calls: usize,
+        /// How many times the image beside the text was read on its own.
+        get_image_calls: usize,
     }
 
     struct FakeOsClipboard(Arc<Mutex<FakeClipboardState>>);
@@ -4296,6 +4374,19 @@ mod tests {
                 // advertised, rather than treated as an inaccessible pasteboard.
                 Ok(ClipboardContent::Text(String::new()))
             }
+        }
+
+        fn get_image(&mut self) -> Result<Option<ClipboardContent>, String> {
+            let mut state = self.0.lock().unwrap();
+            state.get_image_calls += 1;
+            Ok(state
+                .image
+                .clone()
+                .map(|(width, height, rgba)| ClipboardContent::Image {
+                    width,
+                    height,
+                    rgba,
+                }))
         }
 
         fn set_content(&mut self, content: ClipboardContent) -> Result<(), String> {
@@ -6255,6 +6346,73 @@ mod tests {
         // A tighter policy ceiling refuses the picture rather than exceeding it.
         let capped = read_local_data(&mut *os, ClipboardFormatId::CF_DIB, 64);
         assert!(capped.is_error());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn text_with_an_image_beside_it_offers_both_and_serves_each() {
+        // Deltic's screenshot shape: the PNG beside its macOS path as text.
+        let (width, height, rgba) = distinct_rgba_3x2();
+        let (state, mut os) = fake_clipboard();
+        {
+            let mut state = state.lock().unwrap();
+            state.text = Some("/Users/me/shot.png".to_string());
+            state.image = Some((width, height, rgba.clone()));
+        }
+
+        let snapshot = read_local_snapshot(&mut *os, MAX_IMAGE_BYTES).unwrap();
+        assert_eq!(
+            snapshot_format_ids(&snapshot),
+            vec![ClipboardFormatId::CF_UNICODETEXT, ClipboardFormatId::CF_DIB],
+            "text stays first so text targets still prefer it"
+        );
+
+        let text = read_local_data(&mut *os, ClipboardFormatId::CF_UNICODETEXT, MAX_IMAGE_BYTES);
+        assert_eq!(decode_utf16le_text(text.data()), "/Users/me/shot.png");
+        let dib = read_local_data(&mut *os, ClipboardFormatId::CF_DIB, MAX_IMAGE_BYTES);
+        assert!(!dib.is_error());
+        assert_eq!(
+            decode_dib(dib.data(), MAX_IMAGE_BYTES).unwrap(),
+            (width, height, rgba)
+        );
+
+        // A tighter policy ceiling withholds the picture but keeps the text.
+        let capped = read_local_snapshot(&mut *os, 64).unwrap();
+        assert_eq!(
+            snapshot_format_ids(&capped),
+            vec![ClipboardFormatId::CF_UNICODETEXT]
+        );
+        assert!(read_local_data(&mut *os, ClipboardFormatId::CF_DIB, 64).is_error());
+
+        // Text alone announces text alone, and an image request for it is refused.
+        state.lock().unwrap().image = None;
+        let snapshot = read_local_snapshot(&mut *os, MAX_IMAGE_BYTES).unwrap();
+        assert_eq!(
+            snapshot_format_ids(&snapshot),
+            vec![ClipboardFormatId::CF_UNICODETEXT]
+        );
+        assert!(read_local_data(&mut *os, ClipboardFormatId::CF_DIB, MAX_IMAGE_BYTES).is_error());
+    }
+
+    #[test]
+    fn polling_text_never_reads_the_image_beside_it() {
+        let (state, os) = fake_clipboard();
+        {
+            let mut state = state.lock().unwrap();
+            state.text = Some("cells".to_string());
+            state.image = Some(test_image());
+        }
+        let root = test_path("poll-side-image");
+        let mut worker = ClipboardWorkerState::new(
+            os,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            StagingLayout::new_in(root.clone()),
+        );
+        assert!(worker.poll_local(0, true));
+        assert!(!worker.poll_local(0, true));
+        assert_eq!(state.lock().unwrap().get_image_calls, 0);
+        drop(worker);
         let _ = fs::remove_dir_all(root);
     }
 
