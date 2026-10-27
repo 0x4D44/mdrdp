@@ -68,7 +68,7 @@ block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2 = "0.6.4"
 # The Dock tile (src/dock.rs) hands a composed RGBA buffer to NSApplication.
-# Already in the tree at this version via winit; only these four classes are
+# Already in the tree at this version via winit; only these AppKit classes are
 # enabled, and the pixels are composed in portable Rust, not AppKit.
 objc2-app-kit = { version = "0.3.2", features = [
     "NSApplication",
@@ -76,6 +76,7 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSGraphics",
     "NSImage",
     "NSImageRep",
+    "NSRunningApplication",
 ] }
 objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"

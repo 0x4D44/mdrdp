@@ -51,6 +51,72 @@ const TEXT: [u8; 3] = [255, 255, 255];
 const FONT: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf");
 const ICON: &[u8] = include_bytes!("../assets/icon/macos/icon-512.png");
 
+/// The Dock process is a background app, so workspace launch notifications omit it.
+/// Poll only sessions with a custom Dock tile, using the event loop's timed work.
+#[cfg(target_os = "macos")]
+pub(crate) const RESTART_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(any(target_os = "macos", test))]
+struct ProcessTracker<T> {
+    sampled: bool,
+    current: Option<T>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl<T> Default for ProcessTracker<T> {
+    fn default() -> Self {
+        Self {
+            sampled: false,
+            current: None,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl<T: PartialEq> ProcessTracker<T> {
+    /// True when a Dock instance appears or changes after the initial sample.
+    fn observe(&mut self, current: Option<T>) -> bool {
+        let restarted = self.sampled && current.is_some() && self.current != current;
+        self.sampled = true;
+        self.current = current;
+        restarted
+    }
+}
+
+/// Watches the Dock instance while a session has an overridden icon.
+#[cfg(target_os = "macos")]
+pub(crate) struct DockMonitor {
+    process: ProcessTracker<objc2::rc::Retained<objc2_app_kit::NSRunningApplication>>,
+    next_check: std::time::Instant,
+}
+
+#[cfg(target_os = "macos")]
+impl DockMonitor {
+    /// Sample before the caller applies its icon, so a restart racing startup is caught.
+    pub(crate) fn new() -> Self {
+        let mut process = ProcessTracker::default();
+        process.observe(macos::running_dock());
+        Self {
+            process,
+            next_check: std::time::Instant::now() + RESTART_CHECK_INTERVAL,
+        }
+    }
+
+    pub(crate) fn deadline(&self) -> std::time::Instant {
+        self.next_check
+    }
+
+    /// Check at most once per interval. Returns true when the icon should be resent.
+    pub(crate) fn poll(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if now < self.next_check {
+            return false;
+        }
+        self.next_check = now + RESTART_CHECK_INTERVAL;
+        self.process.observe(macos::running_dock())
+    }
+}
+
 /// Put `label` on this process's Dock tile. A no-op off macOS, and on any failure —
 /// a tile is cosmetic and must never take a session down.
 pub fn set_label(label: &str) {
@@ -334,8 +400,16 @@ fn fill_round_rect(
 mod macos {
     use super::Tile;
     use objc2::AnyThread as _;
-    use objc2_app_kit::{NSApplication, NSBitmapImageRep, NSDeviceRGBColorSpace, NSImage};
-    use objc2_foundation::{MainThreadMarker, NSSize};
+    use objc2::rc::Retained;
+    use objc2_app_kit::{
+        NSApplication, NSBitmapImageRep, NSDeviceRGBColorSpace, NSImage, NSRunningApplication,
+    };
+    use objc2_foundation::{MainThreadMarker, NSSize, NSString};
+
+    pub(super) fn running_dock() -> Option<Retained<NSRunningApplication>> {
+        let bundle_id = NSString::from_str("com.apple.dock");
+        NSRunningApplication::runningApplicationsWithBundleIdentifier(&bundle_id).firstObject()
+    }
 
     pub fn apply(tile: &Tile) {
         let Some(mtm) = MainThreadMarker::new() else {
@@ -380,11 +454,50 @@ mod macos {
         // SAFETY: main thread (proven by `mtm`), and a valid `NSImage`.
         unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
     }
+
+    pub fn reapply() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let application = NSApplication::sharedApplication(mtm);
+        let Some(image) = application.applicationIconImage() else {
+            return;
+        };
+        // SAFETY: main thread (proven by `mtm`), and the image is the one already
+        // installed on this NSApplication. Reusing it avoids another retained pixel
+        // buffer every time the Dock restarts.
+        unsafe { application.setApplicationIconImage(Some(&image)) };
+    }
+}
+
+/// Restore this process's existing icon override after the Dock has relaunched.
+#[cfg(target_os = "macos")]
+pub(crate) fn reapply() {
+    macos::reapply();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dock_relaunch_requests_icon_reapplication() {
+        let mut tracker = ProcessTracker::default();
+
+        assert!(!tracker.observe(Some(1)));
+        assert!(!tracker.observe(Some(1)));
+        assert!(!tracker.observe(None));
+        assert!(tracker.observe(Some(2)));
+        assert!(!tracker.observe(Some(2)));
+    }
+
+    #[test]
+    fn dock_start_after_initially_missing_requests_icon_reapplication() {
+        let mut tracker = ProcessTracker::default();
+
+        assert!(!tracker.observe(None));
+        assert!(tracker.observe(Some(1)));
+    }
 
     /// Pixel at (x, y) as RGBA.
     fn px(tile: &Tile, x: u32, y: u32) -> [u8; 4] {

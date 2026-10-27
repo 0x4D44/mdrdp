@@ -1415,6 +1415,9 @@ struct SessionApp {
     resize_settle: Option<Instant>,
     display_follow: DisplayFollow<MonitorSnapshot>,
     monitor_check: Option<Instant>,
+    /// Keeps a custom Dock icon alive across Dock process restarts.
+    #[cfg(target_os = "macos")]
+    dock_monitor: Option<crate::dock::DockMonitor>,
     /// Title diagnostics bookkeeping: last refresh, and the counters at that refresh so
     /// fps and bitrate are deltas rather than lifetime averages.
     last_title_refresh: Instant,
@@ -1520,6 +1523,8 @@ impl SessionApp {
             resize_settle: None,
             display_follow: DisplayFollow::new(),
             monitor_check: None,
+            #[cfg(target_os = "macos")]
+            dock_monitor: None,
             last_title_refresh: Instant::now(),
             title_frames: 0,
             title_bytes: 0,
@@ -2053,6 +2058,10 @@ impl SessionApp {
             self.resize_settle,
             self.redraw_deadline,
             self.monitor_check,
+            #[cfg(target_os = "macos")]
+            self.dock_monitor
+                .as_ref()
+                .map(crate::dock::DockMonitor::deadline),
         ]
         .into_iter()
         .flatten()
@@ -2566,6 +2575,12 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
         // After the window, so AppKit is up and this is its main thread: an unbundled
         // session process otherwise sits in the Dock as a generic "exec" block.
         if let Some(label) = &self.config.dock_label {
+            #[cfg(target_os = "macos")]
+            {
+                // Sample first so a Dock restart racing the first set is seen by the
+                // monitor and the custom tile is sent again.
+                self.dock_monitor = Some(crate::dock::DockMonitor::new());
+            }
             crate::dock::set_label(label);
         }
 
@@ -2644,6 +2659,15 @@ impl ApplicationHandler<SessionEvent> for SessionApp {
     /// Drive diagnostics, settled resizes, presentation retries, and monitor checks.
     /// Arm the earliest deadline even when the remote desktop is idle.
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        #[cfg(target_os = "macos")]
+        if self
+            .dock_monitor
+            .as_mut()
+            .is_some_and(crate::dock::DockMonitor::poll)
+        {
+            crate::dock::reapply();
+        }
+
         if self
             .monitor_check
             .is_some_and(|deadline| Instant::now() >= deadline)
