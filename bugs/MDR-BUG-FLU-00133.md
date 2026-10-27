@@ -30,7 +30,7 @@ Evidence fingerprint: `manual:v1:dock-icons-do-not-return-after-dock-restarts`
 
 ## Fix
 
-### Fix summary (2026-10-27; code=18dc8833c69c944f50d648dcce9f8814ef641fc8)
+### Fix summary (2026-10-27; code=f5723c224694b75dc51d64dce1822a2dc7f56f9a)
 
 `SessionApp` now tracks the running `com.apple.dock` application while a custom Dock label is active. When AppKit reports a different Dock instance, mdrdp reapplies the existing `NSApplication` icon image. The check uses the session event loop's one-second timer and does not run for sessions without a custom icon.
 
@@ -39,3 +39,5 @@ Regression coverage: `dock::tests::dock_relaunch_requests_icon_reapplication` an
 The Dock was not restarted interactively during this fix; visual confirmation remains for an independent verifier.
 
 ## Notes
+
+Provenance correction: `18dc8833c69c944f50d648dcce9f8814ef641fc8` is the integration's version-bump commit; its diff changes only version manifests and lockfiles. The implementation commit is `f5723c224694b75dc51d64dce1822a2dc7f56f9a`, which contains the Dock monitor and icon reapplication changes. The earlier Fixed history entry is retained because ledger history is append-only; the Fix summary names the actual implementation commit.
