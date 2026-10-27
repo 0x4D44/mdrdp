@@ -1,25 +1,25 @@
 # MDR-BUG-FLU-00133 — Dock icons do not return after Dock restarts
 
-- **State:** Open
+- **State:** Fixed
 - **Priority:** Should
 - **Severity:** Medium
 - **Area:** ui
 - **Raised:** 2026-10-27T05:36:27Z
 - **Discovery source:** Human
-- **Owner:** deltic:manual
-- **Owner role:** fix
-- **Owner run:** fix-20261027T053636Z-2a515e06
-- **Owner host:** flux
-- **Owner branch:** task/bug-MDR-BUG-FLU-00133-run-fix-20261027T053636Z-2a515e06
-- **Owner base:** 9db1c1f2d19a8b2f356f99d8b53c35479120d26f
+- **Owner:** -
+- **Owner role:** -
+- **Owner run:** -
+- **Owner host:** -
+- **Owner branch:** -
+- **Owner base:** -
 - **Owner fingerprint:** -
-- **Owner since:** 2026-10-27T05:36:36Z
-- **Owner until:** 2026-10-27T09:36:36Z
+- **Owner since:** -
+- **Owner until:** -
 - **Verify retry after:** -
 - **Held branch:** -
 - **Legacy fixed run:** -
 - **Attempts:** fix=0, doubt=0, indeterminate=0
-- **State history:** Open (2026-10-27T05:36:27Z, raised via `deltic bugs new --land`)
+- **State history:** Open (2026-10-27T05:36:27Z, raised via `deltic bugs new --land`) -> Fixed (2026-10-27T05:48:35Z, deltic:auto role=fix run=fix-20261027T053636Z-2a515e06 branch=task/bug-MDR-BUG-FLU-00133-run-fix-20261027T053636Z-2a515e06 code=18dc8833c69c944f50d648dcce9f8814ef641fc8 gate=manual)
 
 ## Observation
 
