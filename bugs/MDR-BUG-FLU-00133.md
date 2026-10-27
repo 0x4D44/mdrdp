@@ -30,6 +30,12 @@ Evidence fingerprint: `manual:v1:dock-icons-do-not-return-after-dock-restarts`
 
 ## Fix
 
-<unfixed — raised only>
+### Fix summary (2026-10-27; code=18dc8833c69c944f50d648dcce9f8814ef641fc8)
+
+`SessionApp` now tracks the running `com.apple.dock` application while a custom Dock label is active. When AppKit reports a different Dock instance, mdrdp reapplies the existing `NSApplication` icon image. The check uses the session event loop's one-second timer and does not run for sessions without a custom icon.
+
+Regression coverage: `dock::tests::dock_relaunch_requests_icon_reapplication` and `dock::tests::dock_start_after_initially_missing_requests_icon_reapplication`. `deltic timeout 120 cargo test dock::tests --lib </dev/null` passed (9 tests). For fails-before, I disabled `ProcessTracker::observe` restart detection; `deltic timeout 120 cargo test dock::tests::dock_relaunch_requests_icon_reapplication --lib </dev/null` failed at `assert!(tracker.observe(Some(2)))`. Restoring detection made the focused tests pass. `cargo fmt --all -- --check`, `./scripts/check-windows.sh`, and offline viewer metadata validation passed.
+
+The Dock was not restarted interactively during this fix; visual confirmation remains for an independent verifier.
 
 ## Notes
