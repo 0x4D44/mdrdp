@@ -772,7 +772,7 @@ fn respond_to_connect_time_autodetect(
     }
 }
 
-#[expect(single_use_lifetimes)] // anonymous lifetimes in `impl Trait` are unstable
+// Anonymous lifetimes in `impl Trait` are unstable, so keep `'a` explicit.
 fn create_gcc_blocks<'a>(
     config: &Config,
     selected_protocol: nego::SecurityProtocol,
