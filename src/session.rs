@@ -187,6 +187,8 @@ pub fn spawn(
     let join = std::thread::Builder::new()
         .name("mdrdp-session".to_owned())
         .spawn(move || {
+            // Network read/write and frame decode both run here.
+            crate::thread_qos::mark_latency_critical();
             run(
                 established,
                 store,

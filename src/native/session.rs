@@ -136,7 +136,10 @@ impl AckWriter {
         let thread_sender = sender.clone();
         let join = std::thread::Builder::new()
             .name("native-frame-ack".to_owned())
-            .spawn(move || run_ack_writer(&mut socket, receiver, &stop, Box::new(close_window)))?;
+            .spawn(move || {
+                crate::thread_qos::mark_latency_critical();
+                run_ack_writer(&mut socket, receiver, &stop, Box::new(close_window))
+            })?;
         Ok((
             Self {
                 sender: Some(thread_sender),
@@ -777,6 +780,7 @@ pub fn spawn(
     let sparse_join = std::thread::Builder::new()
         .name("native-sparse".to_owned())
         .spawn(move || {
+            crate::thread_qos::mark_latency_critical();
             let end = pump_sparse(&mut sparse_sock, &mut sparse_sink, &sparse_stop);
             let end = finish_video_worker(end, &sparse_stop, || {
                 let _ = sparse_waker.close();
@@ -792,6 +796,7 @@ pub fn spawn(
     let video_join = std::thread::Builder::new()
         .name("native-net".to_owned())
         .spawn(move || {
+            crate::thread_qos::mark_latency_critical();
             let mut on_cursor = |update| {
                 let _ = video_waker.cursor(update);
             };
@@ -817,6 +822,7 @@ pub fn spawn(
     let input_join = std::thread::Builder::new()
         .name("native-input".to_owned())
         .spawn(move || {
+            crate::thread_qos::mark_latency_critical();
             let moves = Arc::clone(&latest_mouse_move);
             let failure = pump_input(
                 input_sock,

@@ -1150,6 +1150,8 @@ impl SessionWindow {
     /// a window — the favourites launcher — must therefore run on *this* loop, which is
     /// why [`event_loop`](Self::event_loop) exists rather than each screen making its own.
     pub fn event_loop() -> Result<EventLoop<SessionEvent>, WindowError> {
+        // The event loop's thread presents every frame and delivers every keystroke.
+        crate::thread_qos::mark_latency_critical();
         let event_loop = EventLoop::<SessionEvent>::with_user_event()
             .build()
             .map_err(|e| WindowError::EventLoop(e.to_string()))?;

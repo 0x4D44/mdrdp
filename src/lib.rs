@@ -39,6 +39,7 @@ pub mod stagelog;
 pub mod state;
 pub mod stats;
 pub mod surface;
+pub mod thread_qos;
 pub mod trust;
 pub mod ui;
 pub mod wake;
