@@ -27,6 +27,13 @@ for dir in vendor/*/; do
             output="$(CARGO_TARGET_DIR="$vendor_target" cargo test \
                 --manifest-path "${dir}Cargo.toml" --locked 2>&1 </dev/null)"
             ;;
+        sspi)
+            # Both builds: mdrdp ships without `kerberos`; the default keeps upstream's suite.
+            output="$(CARGO_TARGET_DIR="$vendor_target" cargo test \
+                --manifest-path "${dir}Cargo.toml" --locked 2>&1 </dev/null \
+                && CARGO_TARGET_DIR="$vendor_target" cargo test \
+                --manifest-path "${dir}Cargo.toml" --locked --no-default-features 2>&1 </dev/null)"
+            ;;
         *)
             output="$(cargo test -p "$pkg" 2>&1 </dev/null)"
             ;;

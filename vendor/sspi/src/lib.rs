@@ -58,19 +58,38 @@ pub mod builders;
 pub mod channel_bindings;
 pub mod credssp;
 pub mod generator;
+#[cfg(feature = "kerberos")]
 pub mod kerberos;
+#[cfg(not(feature = "kerberos"))]
+mod kerberos {
+    pub(crate) const PKG_NAME: &str = "Kerberos";
+}
+#[cfg(feature = "kerberos")]
 pub mod negotiate;
+#[cfg(not(feature = "kerberos"))]
+mod negotiate {
+    pub(crate) const PKG_NAME: &str = "Negotiate";
+}
 pub mod network_client;
 pub mod ntlm;
+#[cfg(feature = "kerberos")]
 mod pk_init;
+#[cfg(feature = "kerberos")]
 pub mod pku2u;
+#[cfg(not(feature = "kerberos"))]
+mod pku2u {
+    pub(crate) const PKG_NAME: &str = "Pku2u";
+}
 pub mod utf16string;
 
 mod auth_identity;
 mod ber;
 mod crypto;
+#[cfg(feature = "kerberos")]
 mod dns;
+#[cfg(feature = "kerberos")]
 mod kdc;
+#[cfg(feature = "kerberos")]
 mod krb;
 mod rustls;
 mod secret;
@@ -102,6 +121,7 @@ pub use utf16string::{
     NonEmpty, U16CStr, U16CString, U16CStringExt, Utf16Str, Utf16String, Utf16StringExt, ZeroizedUtf16String,
 };
 use utils::map_keb_error_code_to_sspi_error;
+#[cfg(feature = "kerberos")]
 pub use utils::modpow;
 
 pub use self::auth_identity::{
@@ -116,14 +136,19 @@ pub use self::builders::{
 use self::builders::{
     ChangePassword, FilledAcceptSecurityContext, FilledAcquireCredentialsHandle, FilledInitializeSecurityContext,
 };
+#[cfg(feature = "kerberos")]
 pub use self::kdc::{detect_kdc_host, detect_kdc_url};
+#[cfg(feature = "kerberos")]
 pub use self::kerberos::config::{KerberosConfig, KerberosServerConfig};
+#[cfg(feature = "kerberos")]
 pub use self::kerberos::{KERBEROS_VERSION, Kerberos, KerberosState};
-#[cfg(feature = "__test-data")]
+#[cfg(all(feature = "__test-data", feature = "kerberos"))]
 pub use self::negotiate::client::FALLBACK_ERROR_KINDS;
+#[cfg(feature = "kerberos")]
 pub use self::negotiate::{Negotiate, NegotiateConfig, NegotiatedProtocol};
 pub use self::ntlm::Ntlm;
 pub use self::ntlm::hash::{NTLM_HASH_PREFIX, NtlmHash, NtlmHashError};
+#[cfg(feature = "kerberos")]
 pub use self::pku2u::{Pku2u, Pku2uConfig, Pku2uState};
 pub use self::secret::Secret;
 use crate::builders::{
@@ -160,14 +185,22 @@ const PACKAGE_ID_NONE: u16 = 0xFFFF;
 pub fn query_security_package_info(package_type: SecurityPackageType) -> Result<PackageInfo> {
     match package_type {
         SecurityPackageType::Ntlm => Ok(ntlm::PACKAGE_INFO.clone()),
+        #[cfg(feature = "kerberos")]
         SecurityPackageType::Kerberos => Ok(kerberos::PACKAGE_INFO.clone()),
+        #[cfg(feature = "kerberos")]
         SecurityPackageType::Negotiate => Ok(negotiate::PACKAGE_INFO.clone()),
+        #[cfg(feature = "kerberos")]
         SecurityPackageType::Pku2u => Ok(pku2u::PACKAGE_INFO.clone()),
         #[cfg(feature = "tsssp")]
         SecurityPackageType::CredSsp => Ok(sspi_cred_ssp::PACKAGE_INFO.clone()),
         SecurityPackageType::Other(s) => Err(Error::new(
             ErrorKind::Unknown,
             format!("queried info about unknown package: {s:?}"),
+        )),
+        #[cfg(not(feature = "kerberos"))]
+        SecurityPackageType::Kerberos | SecurityPackageType::Negotiate | SecurityPackageType::Pku2u => Err(Error::new(
+            ErrorKind::UnsupportedFunction,
+            format!("{package_type} support was not compiled in (enable the `kerberos` feature)"),
         )),
     }
 }
@@ -195,8 +228,11 @@ pub fn query_security_package_info(package_type: SecurityPackageType) -> Result<
 /// * [EnumerateSecurityPackagesW function](https://docs.microsoft.com/en-us/windows/win32/api/sspi/nf-sspi-enumeratesecuritypackagesw)
 pub fn enumerate_security_packages() -> Result<Vec<PackageInfo>> {
     Ok(vec![
+        #[cfg(feature = "kerberos")]
         negotiate::PACKAGE_INFO.clone(),
+        #[cfg(feature = "kerberos")]
         kerberos::PACKAGE_INFO.clone(),
+        #[cfg(feature = "kerberos")]
         pku2u::PACKAGE_INFO.clone(),
         ntlm::PACKAGE_INFO.clone(),
         #[cfg(feature = "tsssp")]
@@ -2253,6 +2289,7 @@ impl From<auth_identity::UsernameError> for Error {
     }
 }
 
+#[cfg(feature = "kerberos")]
 impl From<rsa::Error> for Error {
     fn from(value: rsa::Error) -> Self {
         Error::new(
@@ -2417,6 +2454,7 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
     }
 }
 
+#[cfg(feature = "kerberos")]
 impl From<picky::key::KeyError> for Error {
     fn from(err: picky::key::KeyError) -> Self {
         Self::new(ErrorKind::InternalError, format!("RSA key error: {err:?}"))

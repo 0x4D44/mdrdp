@@ -1,4 +1,6 @@
+#[cfg(feature = "kerberos")]
 use crate::negotiate::ProtocolConfig;
+#[cfg(feature = "kerberos")]
 use crate::{NegotiatedProtocol, Ntlm, Result};
 
 #[derive(Debug, Clone, Default)]
@@ -17,6 +19,7 @@ impl NtlmConfig {
     }
 }
 
+#[cfg(feature = "kerberos")]
 impl ProtocolConfig for NtlmConfig {
     fn new_instance(&self) -> Result<NegotiatedProtocol> {
         Ok(NegotiatedProtocol::Ntlm(Ntlm::with_config(Clone::clone(self))))

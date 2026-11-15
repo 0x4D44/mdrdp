@@ -43,13 +43,37 @@ aws-lc-rs = [
     "rustls?/aws-lc-rs",
     "__install-crypto-provider",
 ]
-default = ["aws-lc-rs"]
+default = [
+    "aws-lc-rs",
+    "kerberos",
+]
+kerberos = [
+    "dep:crypto-bigint",
+    "dep:picky",
+    "dep:rsa",
+    "dep:uuid",
+    "dep:async-dnssd",
+    "dep:curve25519-dalek",
+    "dep:ed25519-dalek",
+    "dep:futures",
+    "dep:p256",
+    "dep:p384",
+    "dep:p521",
+    "dep:pkcs1",
+    "dep:primeorder",
+    "dep:rustcrypto-ff",
+    "dep:rustcrypto-ff_derive",
+    "dep:rustcrypto-group",
+    "dep:tokio",
+]
 dns_resolver = [
+    "kerberos",
     "dep:hickory-resolver",
     "dep:hickory-proto",
     "dep:tokio",
 ]
 network_client = [
+    "kerberos",
     "dep:reqwest",
     "dep:portpicker",
     "dep:rustls-native-certs",
@@ -61,10 +85,12 @@ ring = [
     "__install-crypto-provider",
 ]
 scard = [
+    "kerberos",
     "dep:winscard",
     "dep:cryptoki",
 ]
 tsssp = [
+    "kerberos",
     "dep:rustls",
     "__rustls-used",
 ]
@@ -106,6 +132,7 @@ version = "1.5"
 version = "1"
 
 [dependencies.crypto-bigint]
+optional = true
 version = "0.7"
 features = ["alloc"]
 default-features = false
@@ -144,6 +171,7 @@ default-features = true
 version = "0.2"
 
 [dependencies.picky]
+optional = true
 version = "=7.0.0-rc.25"
 default-features = false
 
@@ -181,6 +209,7 @@ optional = true
 default-features = false
 
 [dependencies.rsa]
+optional = true
 version = "=0.10.0-rc.18"
 default-features = false
 
@@ -225,6 +254,7 @@ default-features = true
 version = "2.5"
 
 [dependencies.uuid]
+optional = true
 version = "1.23"
 features = ["v4"]
 default-features = true
@@ -265,42 +295,55 @@ features = ["env-filter"]
 version = "2.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.async-dnssd]
+optional = true
 version = "0.5"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.curve25519-dalek]
+optional = true
 version = "=5.0.0-rc.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.ed25519-dalek]
+optional = true
 version = "=3.0.0-rc.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.futures]
+optional = true
 version = "0.3"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.p256]
+optional = true
 version = "=0.14.0-rc.14"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.p384]
+optional = true
 version = "=0.14.0-rc.14"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.p521]
+optional = true
 version = "=0.14.0-rc.14"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.pkcs1]
+optional = true
 version = "=0.8.0-rc.4"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.primeorder]
+optional = true
 version = "=0.14.0-rc.14"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.rustcrypto-ff]
+optional = true
 version = "=0.14.0-rc.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.rustcrypto-ff_derive]
+optional = true
 version = "=0.14.0-rc.0"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.rustcrypto-group]
+optional = true
 version = "=0.14.0-rc.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.tokio]
+optional = true
 version = "1.52"
 features = [
     "time",

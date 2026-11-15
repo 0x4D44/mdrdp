@@ -34,6 +34,7 @@ impl KerberosConfig {
     }
 }
 
+#[cfg(feature = "kerberos")]
 impl From<KerberosConfig> for sspi::KerberosConfig {
     fn from(val: KerberosConfig) -> Self {
         sspi::KerberosConfig {
@@ -157,6 +158,13 @@ impl CredsspSequence {
         let service_principal_name = format!("TERMSRV/{}", &server_name);
 
         let client_mode = match kerberos_config {
+            #[cfg(not(feature = "kerberos"))]
+            Some(_) => {
+                return Err(general_err!(
+                    "Kerberos logon requested, but ironrdp-connector was built without the `kerberos` feature"
+                ));
+            }
+            #[cfg(feature = "kerberos")]
             Some(ref krb_config) => {
                 let credssp_config = Box::new(Into::<sspi::KerberosConfig>::into(krb_config.clone()));
                 debug!(?credssp_config);

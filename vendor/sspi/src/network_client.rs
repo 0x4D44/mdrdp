@@ -16,6 +16,7 @@ pub enum NetworkProtocol {
 impl NetworkProtocol {
     pub const ALL: &'static [Self] = &[Self::Tcp, Self::Udp, Self::Http, Self::Https];
 
+    #[cfg(feature = "kerberos")]
     pub(crate) fn from_url_scheme(scheme: &str) -> Option<Self> {
         match scheme {
             "tcp" => Some(Self::Tcp),

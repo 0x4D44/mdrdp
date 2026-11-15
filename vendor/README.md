@@ -119,10 +119,20 @@ CredSSP step answers it with an error instead of an identity (`src/credssp.rs`).
 feature states compile; the password path was proven live against quench the day the
 change landed (CredSSP logon, EGFX frames, graceful shutdown).
 
+### Kerberos is behind an off-by-default `kerberos` feature (2026-11-15)
+
+Pairs with the vendored `sspi` below. The connector now takes `sspi` with
+`default-features = false` and adds `kerberos = ["sspi/kerberos"]` (`scard` implies it).
+`KerberosConfig` stays in the public API; without the feature, a `Some(kerberos_config)`
+is refused with an error naming the feature instead of starting SPNEGO
+(`src/credssp.rs`), and the `From<KerberosConfig> for sspi::KerberosConfig` impl is
+compiled out. mdrdp always passes `kerberos_config: None`, so its CredSSP path is the
+same plain-NTLM one as before.
+
 ### Keeping it honest
 
-The only intended differences from the published crate are the flag and the `scard`
-feature above. To confirm that:
+The only intended differences from the published crate are the flag and the `scard` and
+`kerberos` features above. To confirm that:
 
 ```
 diff -ru ~/.cargo/registry/src/*/ironrdp-connector-0.10.0 vendor/ironrdp-connector
@@ -526,3 +536,47 @@ crate adds `GracefulDisconnectReason::ErrorInfo(ErrorInfo)`; `description()` ret
 same text as before, so anything that only logs the reason is unaffected. mdrdp uses the
 code in `src/disconnect.rs` to tell "the host is rebooting" from "somebody else took your
 session". Remove when upstream exposes the code.
+
+## `sspi` 0.21.3 — Kerberos, SPNEGO and PKU2U behind an off-by-default feature (2026-11-15)
+
+mdrdp logs on with plain NTLM inside CredSSP: `ironrdp-connector` picks
+`ClientMode::Ntlm` whenever `kerberos_config` is `None`, which mdrdp always passes, and
+`src/connect.rs` hands the connector a `NoKerberos` network client that refuses every
+KDC request. Yet the published `sspi` compiles its Kerberos, Negotiate (SPNEGO), PKU2U,
+PKINIT, KDC-discovery and DNS modules unconditionally, and lists their dependencies as
+required — on macOS that includes tokio, async-dnssd, futures, picky, rsa, and the
+RustCrypto P-256/384/521, ed25519 and x25519 release candidates. None of `sspi`'s
+existing features (`aws-lc-rs`, `network_client`, `dns_resolver`, `scard`, `tsssp`)
+removes them.
+
+The vendored crate adds a `kerberos` feature, **on by default** so the crate behaves
+exactly as upstream unless asked otherwise, and gates on it:
+
+- the modules `kerberos`, `negotiate`, `pku2u`, `pk_init`, `kdc`, `krb`, `dns`, their
+  re-exports, and `modpow`;
+- the `Kerberos`, `Negotiate` and `Pku2u` variants of the CredSSP `SspiContext`,
+  `ClientMode` and `ServerMode`, and their match arms (`src/credssp/mod.rs`);
+- `SecretPrivateKey` (`src/secret.rs`), the Kerberos helpers in `src/utils.rs`, NTLM's
+  `ProtocolConfig` impl (a SPNEGO hook, `src/ntlm/config.rs`), `rsa`/`picky` error
+  conversions, and `NetworkProtocol::from_url_scheme`;
+- as optional dependencies: `crypto-bigint`, `picky`, `rsa`, `uuid`, and the macOS-only
+  `async-dnssd`, `futures`, `tokio` and pinned RustCrypto crates.
+
+`network_client`, `dns_resolver`, `scard` and `tsssp` each imply `kerberos`.
+`SecurityPackageType` keeps all its variants (stub modules carry their package names);
+querying a compiled-out package returns `UnsupportedFunction`. NTLM, CredSSP, the
+TSRequest/TSCredentials encoding (`picky-krb`'s `credssp` types, still required) and the
+`NetworkRequest`/`NetworkClient` generator API that `ironrdp-blocking` uses are
+untouched. `url` stays: `NetworkRequest` carries a `url::Url`.
+
+Effect on mdrdp's macOS runtime graph (`cargo tree -e normal`): **362 → 311** crates;
+`Cargo.lock` 639 → 592 entries. Tests: with default features the crate's own suite is
+identical to the pristine 0.21.3 baseline (256 unit, 2 integration, 16 doc); with
+`--no-default-features`, 220 unit tests run — the 36 missing are exactly the tests inside
+the gated modules plus `utils`' two `parse_target_name` tests. `scripts/test-vendored.sh`
+runs both builds.
+
+The previous commit vendors 0.21.3 unmodified (minus `.cargo-ok`, `.github` and the
+upstream Visual Studio `.gitignore`), so `git diff` across this change shows the whole
+patch. Remove when a released `sspi` lets Kerberos be switched off — the change is a
+natural upstream feature request.

@@ -126,3 +126,5 @@ ironrdp-pdu = { path = "vendor/ironrdp-pdu" }
 ironrdp-rdpsnd = { path = "vendor/ironrdp-rdpsnd" }
 # Answer Bandwidth Measure requests; an unanswered probe makes Windows throttle EGFX.
 ironrdp-session = { path = "vendor/ironrdp-session" }
+# See vendor/README.md — Kerberos behind an off-by-default feature; mdrdp logs on via NTLM.
+sspi = { path = "vendor/sspi" }

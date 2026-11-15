@@ -1,5 +1,6 @@
 use std::fmt;
 
+#[cfg(feature = "kerberos")]
 use picky::key::PrivateKey;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -47,15 +48,18 @@ impl<T: Zeroize> From<T> for Secret<T> {
     }
 }
 
+#[cfg(feature = "kerberos")]
 #[derive(Clone, PartialEq)]
 pub struct SecretPrivateKey(PrivateKey);
 
+#[cfg(feature = "kerberos")]
 impl SecretPrivateKey {
     pub fn new(inner: PrivateKey) -> Self {
         Self(inner)
     }
 }
 
+#[cfg(feature = "kerberos")]
 impl fmt::Debug for SecretPrivateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SecretPrivateKey")?;
@@ -64,6 +68,7 @@ impl fmt::Debug for SecretPrivateKey {
     }
 }
 
+#[cfg(feature = "kerberos")]
 impl fmt::Display for SecretPrivateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "(secret private key)")?;
@@ -72,12 +77,14 @@ impl fmt::Display for SecretPrivateKey {
     }
 }
 
+#[cfg(feature = "kerberos")]
 impl AsRef<PrivateKey> for SecretPrivateKey {
     fn as_ref(&self) -> &PrivateKey {
         &self.0
     }
 }
 
+#[cfg(feature = "kerberos")]
 impl From<PrivateKey> for SecretPrivateKey {
     fn from(inner: PrivateKey) -> Self {
         Self(inner)
