@@ -50,6 +50,7 @@ ironrdp-graphics = { path = "../../../vendor/ironrdp-graphics" }
 ironrdp-pdu = { path = "../../../vendor/ironrdp-pdu" }
 ironrdp-rdpsnd = { path = "../../../vendor/ironrdp-rdpsnd" }
 ironrdp-session = { path = "../../../vendor/ironrdp-session" }
+sspi = { path = "../../../vendor/sspi" }
 
 # Standalone: never a member of the mdrdp package above it.
 [workspace]
