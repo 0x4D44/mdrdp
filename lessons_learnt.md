@@ -6,6 +6,12 @@ Newest at the top. The **first line of each entry is the lesson** — self-conta
 start, so a line that needs the detail below it to make sense is a line that will not work.
 Indented lines below the first are detail: kept for lookup, never injected.
 
+- A vendored crate using another's new feature needs a version+path dep (`vendor/ironrdp-connector/Cargo.toml:sspi`).
+  Each vendor/ crate keeps its own Cargo.lock, and integration's bump runs
+  `cargo metadata --locked` on every manifest standalone, where mdrdp's [patch] table
+  does not apply: the connector resolved registry sspi, which lacks `kerberos`, and
+  integration failed. Also refresh `tools/latency-spike/viewer` and add the crate to its
+  own [patch] list; `cargo build` at the root catches neither.
 - Local text can hide an image beside it; announce every representation (`clipboard.rs:read_local_snapshot`).
   `get_content` returns one value, so a Deltic screenshot (PNG + its path as text)
   reached Windows as the macOS path only. Text now announces `CF_DIB` too when
